@@ -1,0 +1,11 @@
+[package]
+name = "kt-signal-engine"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+description = "KT Signal protocol engine sidecar (libsignal-based, AGPL-3.0)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
