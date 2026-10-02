@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! P1a 契约测试：起真实引擎进程（tempdir 数据目录），逐方法断言
+//! P1a/P1b 契约测试：起真实引擎进程（tempdir 数据目录），逐方法断言
 //! `docs/jsonrpc-compat.md` §3 的形状/错误码/调度日志纪律。
+//!
+//! IPC 形状与生命周期契约跑 fake 服务（`KT_ENGINE_FAKE_SERVICE=1`，compat §6）；
+//! real 模式只测无网络路径（无会话 finishLink、未知账号 send）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -177,10 +180,12 @@ fn jvm_environment_is_ignored() {
     );
 }
 
+const FAKE_SERVICE: &[(&str, &str)] = &[("KT_ENGINE_FAKE_SERVICE", "1")];
+
 #[test]
 fn start_and_finish_link_lifecycle() {
     let dir = temp_dir("link-lifecycle");
-    let mut engine = Engine::spawn(&dir);
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
 
     let started = engine.request("startLink", json!({}));
     let uri = started["result"]["deviceLinkUri"]
@@ -225,9 +230,34 @@ fn start_and_finish_link_lifecycle() {
 }
 
 #[test]
+fn real_mode_no_network_error_paths() {
+    let dir = temp_dir("real-no-net");
+    let mut engine = Engine::spawn(&dir);
+
+    // 无进行中会话的 finishLink：契约错误原文（不触网，compat §3）。
+    let (code, message) = engine.error_of(
+        "finishLink",
+        json!({ "deviceLinkUri": "sgnl://linkdevice?uuid=00000000-0000-0000-0000-000000000000&pub_key=AAA", "deviceName": "KT" }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "Unknown device link uri."));
+
+    // 未注册账号的 send：内部失败折叠（-32603，不触网，细节不外泄）。
+    let (code, message) = engine.error_of(
+        "send",
+        json!({ "account": "+15559990000", "recipient": ["+15555550101"], "message": "hi" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+}
+
+#[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");
-    let mut engine = Engine::spawn(&dir);
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
     let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
         .as_str()
         .unwrap()

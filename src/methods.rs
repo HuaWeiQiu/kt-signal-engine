@@ -2,41 +2,84 @@
 
 //! 白名单方法 dispatch（`docs/jsonrpc-compat.md` §3 逐方法）。
 //!
-//! P1a 边界：服务面为形状对齐桩——IPC 形状/错误码与夹具逐条一致，真实
-//! Signal 服务流量在 P1b（presage）接入。所有桩集中标注 `P1a-stub`，
-//! P1b 替换时按此清单机械排查。
+//! P1b 边界：startLink/finishLink/send 族走真实服务层（service::Service，
+//! Real/Fake 双实现）；listContacts/listGroups/getUserStatus 仍为契约内
+//! 占位（P2 真实，compat 表逐行注明）。send 族两模式同落调度日志。
 
-use serde_json::{json, Map, Value};
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
+use crate::service::{LinkError, Service};
 use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
 const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
 
-pub fn respond(outcome: &ParseOutcome, state: &mut EngineState) -> Value {
-    match outcome {
-        ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id.clone()),
-        ParseOutcome::Request(request) => dispatch(request, state),
+/// P1b 明确边界（ADR 0004）：群组发送是 P3 面，引擎显式拒绝而非静默错发。
+const GROUP_SEND_UNSUPPORTED: &str = "Group sends are not supported by this engine revision.";
+
+pub(crate) enum Inbound {
+    Line(String),
+    Overlong,
+}
+
+pub(crate) async fn respond(
+    inbound: &Inbound,
+    state: Arc<AsyncMutex<EngineState>>,
+    service: Arc<Service>,
+) -> Value {
+    match inbound {
+        Inbound::Overlong => jsonrpc::parse_error_response(Value::Null),
+        Inbound::Line(line) => match jsonrpc::parse_line(line.as_bytes()) {
+            ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id),
+            ParseOutcome::Request(request) => dispatch(&request, state, service).await,
+        },
     }
 }
 
-fn dispatch(request: &Request, state: &mut EngineState) -> Value {
+async fn dispatch(
+    request: &Request,
+    state: Arc<AsyncMutex<EngineState>>,
+    service: Arc<Service>,
+) -> Value {
     let Request { id, method, params } = request;
     match method.as_str() {
-        "startLink" => start_link(id, state),
-        "finishLink" => finish_link(id, params, state),
-        "listAccounts" => jsonrpc::success_response(
-            id,
-            Value::Array(
-                state
-                    .accounts()
-                    .iter()
-                    .map(|number| json!({ "number": number }))
-                    .collect(),
-            ),
-        ),
-        // P1a-stub：联系人/群组真实同步在 P2（contacts）/P3（groups）。
+        "startLink" => match service.start_link().await {
+            Ok(uri) => jsonrpc::success_response(id, json!({ "deviceLinkUri": uri })),
+            Err(_) => internal_error(id),
+        },
+        "finishLink" => {
+            let uri = params.get("deviceLinkUri").and_then(Value::as_str);
+            let name = params.get("deviceName").and_then(Value::as_str);
+            match (uri, name) {
+                (Some(uri), Some(name)) => match service.finish_link(uri, name).await {
+                    Ok(number) => jsonrpc::success_response(id, json!({ "number": number })),
+                    Err(LinkError::UnknownUri) => {
+                        jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI))
+                    }
+                    Err(LinkError::Internal) => internal_error(id),
+                },
+                // 参数缺失按非法链接会话处理（上游 fail-closed 同口径）。
+                _ => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
+            }
+        }
+        "listAccounts" => {
+            let state = state.lock().await;
+            jsonrpc::success_response(
+                id,
+                Value::Array(
+                    state
+                        .accounts()
+                        .iter()
+                        .map(|entry| json!({ "number": entry.number }))
+                        .collect(),
+                ),
+            )
+        }
+        // P2 契约内占位（compat §3）：联系人/群组真实同步在 P2/P3。
         "listContacts" | "listGroups" => jsonrpc::success_response(id, json!([])),
         "deleteLocalAccountData" => {
             let account = params
@@ -44,19 +87,124 @@ fn dispatch(request: &Request, state: &mut EngineState) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             // 上游对不存在账号同样幂等回 {}（夹具口径）。
-            let _ = state.delete_account(account);
-            jsonrpc::success_response(id, json!({}))
+            match service.delete_account(account).await {
+                Ok(_) => jsonrpc::success_response(id, json!({})),
+                Err(_) => internal_error(id),
+            }
         }
         "send" => {
-            state.append_dispatch(method, params);
-            // P1a-stub：timestamp 为本机毫秒；真实值是发送管线的消息时间戳。
-            jsonrpc::success_response(id, json!({ "timestamp": now_ms(), "results": [] }))
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            if params.get("groupId").is_some() {
+                return jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED));
+            }
+            let message = params.get("message").and_then(Value::as_str);
+            match (account, message, recipients_of(params)) {
+                (Some(account), Some(message), Ok(recipients)) => {
+                    match service.send_text(account, &recipients, message).await {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                // 空 account/message 或 recipient 形状非法：fail-closed。
+                _ => internal_error(id),
+            }
         }
-        "remoteDelete" | "sendReaction" | "updateContact" | "sendTyping" => {
-            state.append_dispatch(method, params);
-            jsonrpc::success_response(id, json!({}))
+        "remoteDelete" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            match (account, target, recipients_of(params)) {
+                (Some(account), Some(target), Ok(recipients))
+                    if params.get("groupId").is_none() =>
+                {
+                    match service
+                        .send_remote_delete(account, &recipients, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(_), Some(_), Ok(_)) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
+                }
+                _ => internal_error(id),
+            }
         }
-        // P1a-stub：真实注册态查询在 P2；解绑态 -32603 形状见 compat §3。
+        "sendReaction" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target_author = params.get("targetAuthor").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            let emoji = params.get("emoji").and_then(Value::as_str);
+            let remove = params.get("remove").and_then(Value::as_bool);
+            match (
+                account,
+                target_author,
+                target,
+                emoji,
+                remove,
+                recipients_of(params),
+            ) {
+                (
+                    Some(account),
+                    Some(target_author),
+                    Some(target),
+                    Some(emoji),
+                    Some(remove),
+                    Ok(recipients),
+                ) if params.get("groupId").is_none() => {
+                    match service
+                        .send_reaction(account, &recipients, target_author, target, emoji, remove)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(_), Some(_), Some(_), Some(_), Some(_), Ok(_)) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
+                }
+                _ => internal_error(id),
+            }
+        }
+        "updateContact" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let recipient = params.get("recipient").and_then(Value::as_str);
+            let name = params.get("name").and_then(Value::as_str);
+            match (account, recipient, name) {
+                (Some(account), Some(recipient), Some(name)) => {
+                    match service.update_contact(account, recipient, name).await {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        "sendTyping" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let stop = params.get("stop").and_then(Value::as_bool);
+            match (account, stop, recipients_of(params)) {
+                (Some(account), Some(stop), Ok(recipients)) if params.get("groupId").is_none() => {
+                    match service.send_typing(account, &recipients, stop).await {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(_), Some(_), Ok(_)) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
+                }
+                _ => internal_error(id),
+            }
+        }
+        // P2 契约内占位（compat §3）：解绑态 -32603 形状见 compat §3 头。
         "getUserStatus" => jsonrpc::success_response(id, json!({ "isRegistered": true })),
         _ => jsonrpc::error_response(
             id,
@@ -65,47 +213,20 @@ fn dispatch(request: &Request, state: &mut EngineState) -> Value {
     }
 }
 
-fn start_link(id: &Value, state: &mut EngineState) -> Value {
-    // P1a-stub：URI 为形状合法的本地占位（uuid/pub_key 十六进制段），
-    // 不代表真实 provisioning 会话。
-    let uri = stub_link_uri();
-    state.pending_link_uri = Some(uri.clone());
-    jsonrpc::success_response(id, json!({ "deviceLinkUri": uri }))
-}
-
-fn finish_link(id: &Value, params: &Map<String, Value>, state: &mut EngineState) -> Value {
-    let presented = params.get("deviceLinkUri").and_then(Value::as_str);
-    let matches = presented.is_some() && state.pending_link_uri.as_deref() == presented;
-    if !matches {
-        return jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI));
-    }
-    state.pending_link_uri = None;
-    match state.link_new_account() {
-        Ok(number) => jsonrpc::success_response(id, json!({ "number": number })),
-        Err(_) => jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error")),
+/// recipient 参数归一：数组（send/sendTyping/remoteDelete/sendReaction）或
+/// 单字符串（updateContact 的 recipient）；缺省为空表。
+fn recipients_of(params: &serde_json::Map<String, Value>) -> Result<Vec<String>, ()> {
+    match params.get("recipient") {
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| entry.as_str().map(str::to_owned).ok_or(()))
+            .collect(),
+        Some(Value::String(single)) => Ok(vec![single.clone()]),
+        None => Ok(Vec::new()),
+        Some(_) => Err(()),
     }
 }
 
-fn stub_link_uri() -> String {
-    // 无 rand 依赖：时间纳秒 + pid 过 splitmix64 得两段十六进制。
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ ((std::process::id() as u64) << 32);
-    let mut next = || {
-        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    format!("sgnl://link?uuid={:016x}&pub_key={:016x}", next(), next())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn internal_error(id: &Value) -> Value {
+    jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
 }

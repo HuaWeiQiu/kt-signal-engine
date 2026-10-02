@@ -1,6 +1,6 @@
 # P1：引擎骨架——设计与验收
 
-状态：P1a 动工基线 ｜ 依据：README 阶段规划、ADR 0001/0002/0003
+状态：P1a/P1b 完成基线 ｜ 依据：README 阶段规划、ADR 0001/0002/0003/0004
 
 ## 范围切分（P1 = P1a + P1b）
 
@@ -37,9 +37,10 @@ tests/
   contract.rs  起真实进程、tempdir 数据目录，逐方法断言形状/错误码/事件
 ```
 
-依赖最小化：仅 `serde` + `serde_json`（均为 MIT/Apache-2.0）。不引
-tokio/anyhow/thiserror——P1a 的 std 足够，P1b 接 presage 时随其依赖树
-评审再放行。
+依赖最小化：P1a 仅 `serde` + `serde_json`；P1b 随 presage 接入放行
+`tokio`/`futures`/`url`/`libsqlite3-sys` 与 presage 全家桶（git rev 钉定，
+许可清单见下文 P1b 出口第 5 条与 ADR 0004）。不引 anyhow/thiserror——
+错误折叠为枚举的纪律保持。
 
 ## 验收标准（P1a 出口）
 
@@ -53,3 +54,28 @@ tokio/anyhow/thiserror——P1a 的 std 足够，P1b 接 presage 时随其依赖
    JVM 环境变量存在不影响启动、media/群组忽略参数被接受。
 4. 桩边界不撒谎：compat 表每个桩格在代码中集中于 `service` 注解点，
    P1b 替换时有机械可查的清单（`grep "P1a-stub"`）。
+
+## P1b 出口（本批落点）
+
+1. **真实 provisioning**（ADR 0004）：startLink 走 presage
+   `Manager::link_secondary_device`，官方 `sgnl://linkdevice` URI；
+   finishLink 阻塞等手机确认（LocalSet 并发不饿死其他方法），设备名
+   占位→改写→attributes 覆盖三段式。占位方案废除原因见 ADR 0004
+   （`SignalWebSocket::take_request_stream` 为 pub(crate)，外部无法消费）。
+2. **真实接收管线**：每账号一条 presage websocket 管线，断流退避重连；
+   投影边界见 compat §3 receive 段。
+3. **真实发送**：直聊文本/remoteDelete/reaction/typing 逐号码发送；
+   群组显式拒绝；号码→ServiceId 经 contacts 解析（compat §5 差异）。
+4. **状态 v2**：`accounts/lk-<hex>/` 目录定名于链接开始（免重命名竞态），
+   注册表只存号码→目录映射；v1 状态文件检测到即重置。
+5. **依赖**：presage + presage-store-sqlite 钉 rev 33dd149（default
+   features 关），传递钉 libsignal-service 9e6c08b8 / libsignal v0.99.0；
+   tokio/futures/url/libsqlite3-sys 随评审放行（AGPL 边界与许可清单见
+   ADR 0004 与 Cargo.toml 注释）。
+6. **并发模型**：presage future 持有非 Send 状态（ThreadRng、
+   dyn ProtocolStore），请求 dispatch 与接收管线统一跑本线程 LocalSet；
+   stdin 阻塞读线程 + channel 桥、stdout 单写队列不变（P1a 装配原样）。
+7. **测试分层**：IPC 契约（形状/错误码/日志）走 fake 模式
+   （`KT_ENGINE_FAKE_SERVICE=1`，compat §6）；real 模式只测无网络路径
+   （无会话 finishLink、未知账号 send）。真实链接/收发的端到端验证属
+   connector 联调（P1 出口后的手工冒烟），不进 cargo test。
