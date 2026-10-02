@@ -1,0 +1,42 @@
+version: 2
+# Dependabot 自动依赖更新
+# 文档: https://docs.github.com/code-security/dependabot
+# 提示: 删除本仓库用不到的生态,按技术栈保留/启用对应项即可。
+updates:
+  # ───── GitHub Actions(所有仓库通用) ─────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ───── Go ─────
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ───── Node / npm(按需启用) ─────
+  # - package-ecosystem: "npm"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   open-pull-requests-limit: 5
+
+  # ───── Python / pip(按需启用) ─────
+  # - package-ecosystem: "pip"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"
+  #   open-pull-requests-limit: 5
+
+  # ───── Docker(按需启用) ─────
+  # - package-ecosystem: "docker"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"

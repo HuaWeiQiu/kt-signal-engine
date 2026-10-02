@@ -1,0 +1,22 @@
+# CODEOWNERS — 定义各路径的默认审核者
+# 语法: <路径模式>  <@用户 或 @组织/团队>
+# 文档: https://docs.github.com/articles/about-code-owners
+#
+# TODO: 将 @D36u99er 替换为实际审核团队(如 @KTAIorg/backend)。
+#       团队需在组织中存在且对本仓库有写权限,否则规则不生效。
+
+# 全局默认审核者
+*                       @D36u99er
+
+# ───── 按目录细分(按需启用) ─────
+# /cmd/                 @KTAIorg/go-team
+# /internal/            @KTAIorg/go-team
+# /src/                 @KTAIorg/frontend-team
+# /migrations/          @KTAIorg/dba-team
+
+# 方法论与规范文件(改动需 owner 审核)
+/AGENTS.md              @D36u99er
+/constitution.md        @D36u99er
+/contracts/             @D36u99er
+/adr/                   @D36u99er
+/.github/               @D36u99er
