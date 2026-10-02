@@ -19,6 +19,7 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 # 接收管线（Stream 组合）与异步运行时；io-std/io-util 供 stdout writer。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+base64 = "0.22"
 url = "2.5"
 
 # store 的 sqlite 后端走 bundled 纯 sqlite（无系统依赖、无 sqlcipher/openssl）；

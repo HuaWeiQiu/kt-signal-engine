@@ -1521,6 +1521,7 @@ dependencies = [
 name = "kt-signal-engine"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
  "libsqlite3-sys",
  "presage",

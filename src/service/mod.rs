@@ -19,6 +19,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::ContentBody;
+use presage::libsignal_service::protocol::ServiceId;
 use presage::manager::Manager;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
@@ -482,6 +483,192 @@ impl Service {
         Ok(())
     }
 
+    /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
+    /// profile 拆名面（givenName/familyName）presage Contact 未建模，P2+ 补。
+    pub(crate) async fn list_contacts(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<Value>, SendError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let contacts = manager
+            .store()
+            .contacts()
+            .await
+            .map_err(|_| SendError::Internal)?;
+        let mut out = Vec::new();
+        for contact in contacts.filter_map(Result::ok) {
+            let number = contact
+                .phone_number
+                .as_ref()
+                .map(e164_string)
+                .unwrap_or_else(|| contact.uuid.to_string());
+            let mut entry = json!({ "number": number });
+            if !contact.name.is_empty() {
+                entry["name"] = json!(contact.name);
+            }
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    /// listGroups：store 内已同步群组（本机所在群才会在库）。`isMember` 恒
+    /// true（入库即成员；被移出群的本地残留清理 P3）；群组 id = master key
+    /// 标准 base64（signal-cli 同源，connector send 回传同 id）。
+    pub(crate) async fn list_groups(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<Value>, SendError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let numbers = contacts_number_map(manager.store()).await;
+        let groups = manager
+            .store()
+            .groups()
+            .await
+            .map_err(|_| SendError::Internal)?;
+        let mut out = Vec::new();
+        for (master_key, group) in groups.filter_map(Result::ok) {
+            use base64::Engine as _;
+            let id = base64::engine::general_purpose::STANDARD.encode(master_key);
+            let members: Vec<Value> = group
+                .members
+                .iter()
+                .map(|member| {
+                    let sid = ServiceId::from(member.aci);
+                    let number = numbers
+                        .get(&sid.service_id_string().to_owned())
+                        .cloned()
+                        .unwrap_or_else(|| sid.service_id_string().to_owned());
+                    json!({ "number": number })
+                })
+                .collect();
+            out.push(json!({
+                "id": id,
+                "name": group.title,
+                "isMember": true,
+                "members": members,
+            }));
+        }
+        Ok(out)
+    }
+
+    pub(crate) async fn send_text_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        message: &str,
+    ) -> Result<(u64, Vec<Value>), SendError> {
+        if !self.real {
+            return Ok((now_ms(), Vec::new()));
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            body: Some(message.to_owned()),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await?;
+        Ok((timestamp, Vec::new()))
+    }
+
+    pub(crate) async fn send_remote_delete_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            delete: Some(presage::proto::data_message::Delete {
+                target_sent_timestamp: Some(target_timestamp),
+            }),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await
+    }
+
+    pub(crate) async fn send_reaction_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_author: &str,
+        target_timestamp: u64,
+        emoji: &str,
+        remove: bool,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        // 群内 targetAuthor 兼容号码与 ACI：contacts 命中转 UUID，UUID 形状直通。
+        let target_aci = resolve_author_aci(manager.store(), target_author).await;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            reaction: Some(presage::proto::data_message::Reaction {
+                emoji: Some(emoji.to_owned()),
+                target_author_aci: Some(target_aci),
+                target_sent_timestamp: Some(target_timestamp),
+                remove: Some(remove),
+                ..presage::proto::data_message::Reaction::default()
+            }),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await
+    }
+
+    pub(crate) async fn send_typing_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        stop: bool,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let body = ContentBody::TypingMessage(presage::proto::TypingMessage {
+            timestamp: Some(timestamp),
+            action: Some(if stop {
+                presage::proto::typing_message::Action::Stopped as i32
+            } else {
+                presage::proto::typing_message::Action::Started as i32
+            }),
+            group_id: None,
+        });
+        let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+        manager
+            .send_message_to_group(&master_key, body, timestamp)
+            .await
+            .map_err(|_| SendError::Internal)
+    }
+
+    /// 群组发送公共头：账号/群可解校验 + 时间戳统一此处取（fake 模式各方法
+    /// 自行早退，不走此处）。
+    async fn open_group_sender(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+    ) -> Result<(Manager<SqliteStore, Registered>, u64), SendError> {
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        decode_group_id(group_id).ok_or(SendError::Internal)?;
+        Ok((manager, now_ms()))
+    }
+
     /// updateContact：P1b 仅在本地 store 命中该号码时改名（uuid 归属需要
     /// contacts 同步，P2 补服务器面）；未命中为幂等 no-op（compat §3）。
     pub(crate) async fn update_contact(
@@ -558,12 +745,14 @@ async fn serve_account_stream(
             item = stream.next() => match item {
                 // QueueEmpty：历史队列排空，流继续保持。
                 Some(Received::QueueEmpty) => {}
-                // contacts 由 presage 自动入库；联系人/群组表面 P2。
+                // contacts 由 presage 自动入库（号码/名字面随之可用）。
                 Some(Received::Contacts) => {}
                 // 解密失败按事件丢弃（零日志；会话重置治理 P2）。
                 Some(Received::DecryptionError(_)) => {}
                 Some(Received::Content(content)) => {
-                    if let Some(notification) = project_content(number, &content) {
+                    if let Some(notification) =
+                        project_content(number, manager.store(), &content).await
+                    {
                         let _ = service.outbound.send(notification);
                     }
                 }
@@ -573,31 +762,110 @@ async fn serve_account_stream(
     }
 }
 
-/// P1b 投影边界（compat §3 receive 行）：仅直聊 dataMessage 文本面
-/// （sourceUuid/sourceDevice/timestamp + dataMessage{timestamp,message}）。
-/// 群组消息整体跳过（无 groupInfo 投影会误路由为直聊，P2/P3 补齐）；
-/// typing/receipt/sent-sync/edit 等非 DataMessage 体跳过（P2/P4）。
-fn project_content(
+/// P2-A 投影边界（compat §3 receive 段）：直聊 dataMessage 全消费面
+/// （正文/引用/reaction/remoteDelete/附件元数据/链接预览/mentions/viewOnce）、
+/// editMessage、typingMessage、receiptMessage、本机多设备 sent-sync。
+/// 群组消息（dataMessage.groupV2 / sent 内群组）整体跳过（connector 群组
+/// 行是已声明边界，宁缺勿错）；call/story/null 体跳过。
+/// 形状钉定 signal-cli 0.14.8 JSON（connector implementation-plan §4.13/
+/// §4.19/§4.20），作者号字段在 contacts 命中时给 E.164，未命中给 ACI 字符串。
+async fn project_content(
     account: &str,
+    store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
 ) -> Option<Value> {
-    let presage::libsignal_service::content::ContentBody::DataMessage(data_message) = &content.body
-    else {
-        return None;
-    };
-    if data_message.group_v2.is_some() {
-        return None;
-    }
-    let fallback_ts = content.metadata.client_timestamp.timestamp_millis().max(0) as u64;
-    let envelope = json!({
+    use presage::libsignal_service::content::ContentBody;
+
+    let envelope_ts = content.metadata.client_timestamp.timestamp_millis().max(0) as u64;
+    let mut envelope = json!({
         "sourceUuid": content.metadata.sender.service_id_string(),
         "sourceDevice": u32::from(content.metadata.sender_device),
-        "timestamp": fallback_ts,
-        "dataMessage": {
-            "timestamp": data_message.timestamp.unwrap_or(fallback_ts),
-            "message": data_message.body,
-        },
+        "timestamp": envelope_ts,
     });
+    if let Some(peer) = describe_peer(store, &content.metadata.sender).await {
+        if let Some(number) = peer.number {
+            envelope["sourceNumber"] = json!(number);
+        }
+        if let Some(name) = peer.name {
+            envelope["sourceName"] = json!(name);
+        }
+    }
+
+    match &content.body {
+        ContentBody::DataMessage(data_message) => {
+            if data_message.group_v2.is_some() {
+                return None;
+            }
+            let numbers = resolve_author_numbers(store, data_message).await;
+            envelope["dataMessage"] = project_data_message(data_message, &numbers);
+        }
+        ContentBody::EditMessage(edit) => {
+            let data_message = edit.data_message.as_ref()?;
+            if data_message.group_v2.is_some() {
+                return None;
+            }
+            let numbers = resolve_author_numbers(store, data_message).await;
+            envelope["editMessage"] = json!({
+                "targetSentTimestamp": edit.target_sent_timestamp.unwrap_or(0),
+                "dataMessage": project_data_message(data_message, &numbers),
+            });
+        }
+        ContentBody::TypingMessage(typing) => {
+            let action = match typing.action {
+                Some(value) if value == presage::proto::typing_message::Action::Stopped as i32 => {
+                    "STOPPED"
+                }
+                _ => "STARTED",
+            };
+            envelope["typingMessage"] = json!({
+                "action": action,
+                "timestamp": typing.timestamp.unwrap_or(envelope_ts),
+            });
+        }
+        ContentBody::ReceiptMessage(receipt) => {
+            let kind = receipt.r#type.unwrap_or_default();
+            let is_delivery = kind == presage::proto::receipt_message::Type::Delivery as i32;
+            let is_read = kind == presage::proto::receipt_message::Type::Read as i32;
+            let is_viewed = kind == presage::proto::receipt_message::Type::Viewed as i32;
+            envelope["receiptMessage"] = json!({
+                "timestamp": receipt.timestamp,
+                "when": envelope_ts,
+                "isDelivery": is_delivery,
+                "isRead": is_read,
+                "isViewed": is_viewed,
+            });
+        }
+        ContentBody::SynchronizeMessage(sync) => {
+            // sent 在 SyncMessage.content oneof 里（read/viewed 等其他面 P2+）。
+            let sent = match sync.content.as_ref() {
+                Some(presage::proto::sync_message::Content::Sent(sent)) => sent,
+                _ => return None,
+            };
+            let data_message = sent.message.as_ref()?;
+            if data_message.group_v2.is_some() {
+                return None;
+            }
+            let numbers = resolve_author_numbers(store, data_message).await;
+            let mut sent_json = project_data_message(data_message, &numbers);
+            sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
+            match (
+                sent.destination_e164.as_deref(),
+                sent.parse_destination_service_id(),
+            ) {
+                (Some(e164), _) => sent_json["destinationNumber"] = json!(e164),
+                (None, Some(service_id)) => {
+                    sent_json["destinationUuid"] = json!(service_id.service_id_string());
+                }
+                (None, None) => {}
+            }
+            envelope["syncMessage"] = json!({ "sentMessage": sent_json });
+        }
+        ContentBody::NullMessage(_)
+        | ContentBody::CallMessage(_)
+        | ContentBody::StoryMessage(_)
+        | ContentBody::DecryptionErrorMessage(_) => return None,
+    }
+
     Some(json!({
         "jsonrpc": "2.0",
         "method": "receive",
@@ -605,9 +873,270 @@ fn project_content(
     }))
 }
 
+struct PeerDescription {
+    number: Option<String>,
+    name: Option<String>,
+}
+
+async fn describe_peer(store: &SqliteStore, id: &ServiceId) -> Option<PeerDescription> {
+    let contact = store.contact_by_id(id).await.ok()??;
+    Some(PeerDescription {
+        number: contact.phone_number.as_ref().map(e164_string),
+        name: Some(contact.name).filter(|name| !name.is_empty()),
+    })
+}
+
+/// 引用/反应作者号解析：quote.author 与 reaction.targetAuthor 在 contacts 命中
+/// 时投影为 E.164（signal-cli 行为），未命中保留 ACI 字符串。
+async fn resolve_author_numbers(
+    store: &SqliteStore,
+    data_message: &presage::proto::DataMessage,
+) -> HashMap<String, String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(quote) = data_message.quote.as_ref() {
+        candidates.extend(quote.author_aci.clone());
+        if let Some(bytes) = quote.author_aci_binary.as_deref() {
+            if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+                candidates.push(uuid.to_string());
+            }
+        }
+    }
+    if let Some(reaction) = data_message.reaction.as_ref() {
+        candidates.extend(reaction.target_author_aci.clone());
+        if let Some(bytes) = reaction.target_author_aci_binary.as_deref() {
+            if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+                candidates.push(uuid.to_string());
+            }
+        }
+    }
+    let mut numbers = HashMap::new();
+    for aci in candidates {
+        if numbers.contains_key(&aci) {
+            continue;
+        }
+        if let Some(service_id) = ServiceId::parse_from_service_id_string(&aci) {
+            if let Some(peer) = describe_peer(store, &service_id).await {
+                if let Some(number) = peer.number {
+                    numbers.insert(aci, number);
+                }
+            }
+        }
+    }
+    numbers
+}
+
+/// dataMessage 面（正文/引用/reaction/remoteDelete/附件元数据/预览/mentions/
+/// viewOnce）。边界纪律：附件 ≤32、预览 ≤4、mentions ≤64（connector §4.13/
+/// §4.20 上限同源）；条目内字段协议缺省即省略键。
+fn project_data_message(
+    data_message: &presage::proto::DataMessage,
+    author_numbers: &HashMap<String, String>,
+) -> Value {
+    let timestamp = data_message.timestamp.unwrap_or(0);
+    let mut out = json!({ "timestamp": timestamp });
+    if let Some(body) = data_message.body.as_deref() {
+        out["message"] = json!(body);
+    }
+    if data_message.is_view_once == Some(true) {
+        out["viewOnce"] = json!(true);
+    }
+    if let Some(quote) = data_message.quote.as_ref() {
+        let author = quote
+            .author_aci
+            .as_deref()
+            .map(|aci| {
+                author_numbers
+                    .get(aci)
+                    .cloned()
+                    .unwrap_or_else(|| aci.to_owned())
+            })
+            .unwrap_or_default();
+        let mut quote_json = json!({
+            "id": quote.id.unwrap_or(0),
+            "author": author,
+        });
+        if let Some(text) = quote.text.as_deref() {
+            quote_json["text"] = json!(text);
+        }
+        out["quote"] = quote_json;
+    }
+    if let Some(reaction) = data_message.reaction.as_ref() {
+        let target_author = reaction
+            .target_author_aci
+            .as_deref()
+            .map(|aci| {
+                author_numbers
+                    .get(aci)
+                    .cloned()
+                    .unwrap_or_else(|| aci.to_owned())
+            })
+            .unwrap_or_default();
+        out["reaction"] = json!({
+            "emoji": reaction.emoji.clone().unwrap_or_default(),
+            "targetAuthor": target_author,
+            "targetSentTimestamp": reaction.target_sent_timestamp.unwrap_or(0),
+            "isRemove": reaction.remove.unwrap_or(false),
+        });
+    }
+    if let Some(delete) = data_message.delete.as_ref() {
+        out["remoteDelete"] = json!({ "timestamp": delete.target_sent_timestamp.unwrap_or(0) });
+    }
+    let attachments: Vec<Value> = data_message
+        .attachments
+        .iter()
+        .take(32)
+        .map(project_attachment_pointer)
+        .collect();
+    if !attachments.is_empty() {
+        out["attachments"] = json!(attachments);
+    }
+    let previews: Vec<Value> = data_message
+        .preview
+        .iter()
+        .take(4)
+        .map(|preview| {
+            let mut value = json!({ "url": preview.url.clone().unwrap_or_default() });
+            if let Some(title) = preview.title.as_deref() {
+                value["title"] = json!(title);
+            }
+            if let Some(description) = preview.description.as_deref() {
+                value["description"] = json!(description);
+            }
+            if let Some(image) = preview.image.as_ref() {
+                value["image"] = project_attachment_pointer(image);
+            }
+            value
+        })
+        .collect();
+    if !previews.is_empty() {
+        out["previews"] = json!(previews);
+    }
+    let mentions: Vec<Value> = data_message
+        .body_ranges
+        .iter()
+        .filter_map(|range| {
+            let uuid = match range.associated_value.as_ref()? {
+                presage::proto::body_range::AssociatedValue::MentionAci(aci) => aci.clone(),
+                presage::proto::body_range::AssociatedValue::MentionAciBinary(bytes) => {
+                    presage::libsignal_service::prelude::Uuid::from_slice(bytes)
+                        .ok()?
+                        .to_string()
+                }
+                presage::proto::body_range::AssociatedValue::Style(_) => return None,
+            };
+            Some(json!({
+                "number": uuid,
+                "start": range.start.unwrap_or(0),
+                "length": range.length.unwrap_or(0),
+            }))
+        })
+        .take(64)
+        .collect();
+    if !mentions.is_empty() {
+        out["mentions"] = json!(mentions);
+    }
+    out
+}
+
+/// 附件只投影元数据（connector §4.13/§6.7 媒体边界：字节永不下载）。
+/// `id` = AttachmentPointer.client_uuid（hyphenated UUID，signal-cli `id` 位）。
+fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Value {
+    use presage::proto::attachment_pointer::Flags;
+    let id = pointer
+        .client_uuid
+        .as_deref()
+        .and_then(|bytes| presage::libsignal_service::prelude::Uuid::from_slice(bytes).ok())
+        .map(|uuid| uuid.to_string())
+        .unwrap_or_default();
+    let mut value = json!({
+        "id": id,
+        "contentType": pointer.content_type.clone().unwrap_or_default(),
+    });
+    if let Some(filename) = pointer.file_name.as_deref() {
+        value["filename"] = json!(filename);
+    }
+    if let Some(size) = pointer.size {
+        value["size"] = json!(size);
+    }
+    if let Some(width) = pointer.width {
+        value["width"] = json!(width);
+    }
+    if let Some(height) = pointer.height {
+        value["height"] = json!(height);
+    }
+    if let Some(caption) = pointer.caption.as_deref() {
+        value["caption"] = json!(caption);
+    }
+    let voice_note = pointer
+        .flags
+        .is_some_and(|flags| flags & Flags::VoiceMessage as u32 != 0);
+    value["isVoiceNote"] = json!(voice_note);
+    value
+}
+
 // ---------------------------------------------------------------------------
 // real 模式共用件
 // ---------------------------------------------------------------------------
+
+/// 群组 id（signal-cli 同源：master key 标准 base64）→ 32 字节 master key。
+fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(group_id.trim())
+        .ok()?;
+    (key.len() == 32).then_some(key)
+}
+
+async fn dispatch_group(
+    manager: &mut Manager<SqliteStore, Registered>,
+    group_id: &str,
+    body: DataMessage,
+    timestamp: u64,
+) -> Result<(), SendError> {
+    let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+    manager
+        .send_message_to_group(&master_key, body, timestamp)
+        .await
+        .map_err(|_| SendError::Internal)
+}
+
+/// contacts 的 uuid 字符串 → E.164 映射（群组成员/作者号批量解析共用）。
+async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
+    let Ok(contacts) = store.contacts().await else {
+        return HashMap::new();
+    };
+    contacts
+        .filter_map(Result::ok)
+        .filter_map(|contact| {
+            let number = contact.phone_number.as_ref().map(e164_string)?;
+            Some((contact.uuid.to_string(), number))
+        })
+        .collect()
+}
+
+/// 群内作者号：入参号码 → contacts 解析 UUID；已是 UUID 形状则直通；都
+/// 不中返回原样（协议侧报错，不在此编造）。
+async fn resolve_author_aci(store: &SqliteStore, author: &str) -> String {
+    let trimmed = author.trim();
+    if let Some(service_id) = ServiceId::parse_from_service_id_string(trimmed) {
+        return service_id.service_id_string().to_owned();
+    }
+    let normalized = if trimmed.starts_with('+') {
+        trimmed.to_owned()
+    } else {
+        format!("+{trimmed}")
+    };
+    let contacts = contacts_number_map(store).await;
+    let want: String = normalized.chars().filter(char::is_ascii_digit).collect();
+    contacts
+        .into_iter()
+        .find(|(_, number)| {
+            let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+            digits.ends_with(&want)
+        })
+        .map(|(uuid, _)| uuid)
+        .unwrap_or_else(|| trimmed.to_owned())
+}
 
 async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
     std::fs::create_dir_all(dir).map_err(|_| ())?;
@@ -711,4 +1240,116 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use presage::proto::attachment_pointer::Flags;
+    use presage::proto::body_range::AssociatedValue;
+    use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
+
+    #[test]
+    fn data_message_projection_carries_all_consumed_surfaces() {
+        let author = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let mut numbers = HashMap::new();
+        numbers.insert(author.to_owned(), "+15551230000".to_owned());
+
+        let dm = DataMessage {
+            timestamp: Some(1_700_000_000_000),
+            body: Some("hi @bob".to_owned()),
+            is_view_once: Some(true),
+            quote: Some(data_message::Quote {
+                id: Some(1_699_999_000_000),
+                author_aci: Some(author.to_owned()),
+                text: Some("earlier".to_owned()),
+                ..Default::default()
+            }),
+            reaction: Some(data_message::Reaction {
+                emoji: Some("👍".to_owned()),
+                target_author_aci: Some(author.to_owned()),
+                target_sent_timestamp: Some(1_699_999_000_000),
+                remove: Some(false),
+                ..Default::default()
+            }),
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: Some(1_699_998_000_000),
+            }),
+            attachments: vec![AttachmentPointer {
+                client_uuid: Some(uuid_bytes("11111111-2222-4333-8444-555555555555")),
+                content_type: Some("image/png".to_owned()),
+                file_name: Some("shot.png".to_owned()),
+                size: Some(2048),
+                width: Some(64),
+                height: Some(32),
+                caption: Some("cap".to_owned()),
+                flags: Some(Flags::VoiceMessage as u32),
+                ..Default::default()
+            }],
+            body_ranges: vec![BodyRange {
+                start: Some(3),
+                length: Some(4),
+                associated_value: Some(AssociatedValue::MentionAci(author.to_owned())),
+            }],
+            ..Default::default()
+        };
+
+        let out = project_data_message(&dm, &numbers);
+        assert_eq!(out["timestamp"], json!(1_700_000_000_000_u64));
+        assert_eq!(out["message"], json!("hi @bob"));
+        assert_eq!(out["viewOnce"], json!(true));
+        assert_eq!(out["quote"]["author"], json!("+15551230000"));
+        assert_eq!(out["quote"]["id"], json!(1_699_999_000_000_u64));
+        assert_eq!(out["reaction"]["targetAuthor"], json!("+15551230000"));
+        assert_eq!(out["reaction"]["isRemove"], json!(false));
+        assert_eq!(
+            out["remoteDelete"]["timestamp"],
+            json!(1_699_998_000_000_u64)
+        );
+        assert_eq!(
+            out["attachments"][0]["id"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(out["attachments"][0]["isVoiceNote"], json!(true));
+        assert_eq!(out["attachments"][0]["size"], json!(2048));
+        assert_eq!(out["mentions"][0]["number"], json!(author));
+        assert_eq!(out["mentions"][0]["start"], json!(3));
+    }
+
+    #[test]
+    fn data_message_projection_resolves_unmapped_author_to_aci() {
+        let author = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let dm = DataMessage {
+            reaction: Some(data_message::Reaction {
+                target_author_aci: Some(author.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = project_data_message(&dm, &HashMap::new());
+        assert_eq!(out["reaction"]["targetAuthor"], json!(author));
+        assert!(out.get("message").is_none(), "body absent stays absent");
+        assert!(out.get("attachments").is_none());
+    }
+
+    #[test]
+    fn group_id_decodes_standard_base64_master_key() {
+        let key = [7u8; 32];
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        assert_eq!(decode_group_id(&encoded).as_deref(), Some(key.as_slice()));
+        // 非 32 字节（GV1 残留/截断）一律拒绝。
+        assert_eq!(
+            decode_group_id(&base64::engine::general_purpose::STANDARD.encode([7u8; 16])),
+            None
+        );
+        assert_eq!(decode_group_id("not base64!!"), None);
+    }
+
+    fn uuid_bytes(text: &str) -> Vec<u8> {
+        presage::libsignal_service::prelude::Uuid::parse_str(text)
+            .expect("uuid parses")
+            .into_bytes()
+            .to_vec()
+    }
 }

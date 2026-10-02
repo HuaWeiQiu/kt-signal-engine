@@ -1,6 +1,6 @@
 # JSON-RPC 兼容层契约（signal-cli 兼容子集）
 
-状态：P1b 逐方法对齐基线 ｜ 依据：ADR 0002/0004 ｜ 上游参照：connector
+状态：P2 逐方法对齐基线 ｜ 依据：ADR 0002/0004 ｜ 上游参照：connector
 `docs/implementation-plan.md` §4/§5 已固化语义 + `tests/fixtures/fake-signal-cli.py`
 （黄金对照，pinned 0.14.x 行为投影）
 
@@ -58,26 +58,38 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…`） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number}` | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number": …}]`；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
-| `listContacts` | `{account}` | `[{number, name?, profile:{givenName?, familyName?}}]` | — | P1a 桩；presage 已自动入库 contacts，列表投影 P2 |
-| `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}]}]` | — | P1a 桩；P2/P3 真实 |
+| `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
+| `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}]}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
-| `send` | `{account, recipient[]/groupId, message, attachments?, quoteTimestamp?, quoteAuthor?, previews?}` | `{timestamp, results:[]}` | 群组：`-1`（§5 原文）；收件人未解析：`-32603` | **P1b real**：直聊逐号码真实发送（号码→ServiceId 经 contacts，§5）；附件/引用 P2 |
-| `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P1b real**：dataMessage.delete 直聊；群组拒绝 |
-| `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P1b real**：targetAuthor 号码→ACI 经 contacts（§5） |
+| `send` | `{account, recipient[]/groupId, message, attachments?, quoteTimestamp?, quoteAuthor?, previews?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解：`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；附件/引用上行 P3 |
+| `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
+| `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
-| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P1b real**：TypingMessage Started/Stopped 直聊 |
+| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组 |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文） | P1a 形状对齐；P2 真实 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
-P1b 起由 presage 接收管线产生**真实投影**，投影边界（其余面 P2+ 补齐）：
+P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
+0.14.8 JSON，见 connector implementation-plan §4.13/§4.19/§4.20）：
 
-- 仅直聊 `dataMessage` 文本面：`envelope = {sourceUuid（ACI service id 字符串）,
-  sourceDevice, timestamp, dataMessage:{timestamp, message}}`。
-- 群组消息（`groupV2`）整体跳过——无 groupInfo 投影会被连接器误路由为直聊，
-  宁缺勿错（P2/P3 补 groupInfo 后放开）。
-- typing/receipt/sent-sync/edit/attachment 元数据等非文本面跳过
-  （连接器 1.15 归一化契约的输入侧，P2/P4 逐面补）。
-- 解密失败按事件丢弃，不出流、不落日志。
+- 信封公共位：`sourceUuid`（ACI service id 字符串）、`sourceDevice`、
+  `timestamp`；contacts 命中时附 `sourceNumber`（E.164）与 `sourceName`。
+- `dataMessage`：`timestamp`、`message`、`quote {id, author, text?}`、
+  `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
+  `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
+  size?, width?, height?, caption?, isVoiceNote}`（≤32，元数据 only，
+  字节永不下载）、`previews[] {url, title?, description?, image?}`（≤4）、
+  `mentions[] {number, start, length}`（≤64，来自 bodyRanges）、
+  `viewOnce: true`。引用/反应作者号 contacts 命中投影 E.164，未命中保留
+  ACI 字符串。textStyles：本引擎钉定的 presage proto 版本无此面，不投影。
+- `editMessage {targetSentTimestamp, dataMessage}`（直聊）。
+- `typingMessage {action: STARTED|STOPPED, timestamp}`。
+- `receiptMessage {timestamp[], when, isDelivery, isRead, isViewed}`
+  （connector §4.19 三档面）。
+- `syncMessage.sentMessage`：本机其他设备发出的直聊（timestamp/message/
+  destinationNumber|destinationUuid + 同 dataMessage 控制面）。
+- 群组消息与群内 sent-sync 整体跳过（connector 群组行是已声明边界）；
+  call/story/null 体跳过；解密失败按事件丢弃。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -93,16 +105,18 @@ connector 测试驱动夹具的控制面，**引擎不实现也不接受**（按
   文件模拟的部分，引擎在对应阶段（P1b/P3/P4）以真实实现替换；替换前的
   桩行为都在本表「对齐状态」列注明，不得当成已完成。
 
-P1b real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）：
+P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）：
 
-- **群组发送拒绝**：`groupId` 参数出现即 `-1` +
-  `Group sends are not supported by this engine revision.`（引擎直接拒绝，
-  不做半吊子单发投影；群组面 P3）。
+- **群组面**：发送 P2 起 real（`send_message_to_group`，群 id = master key
+  标准 base64）；接收投影仍跳过群组消息（connector 群组行是已声明边界，
+  P3 补 groupInfo 投影后放开）。群 id 不可解/非法按 `-32603`。
 - **号码解析冷启动窗口**：send 系方法的 recipient 号码 → ServiceId 经本地
   contacts 解析；链接后手机端自动推送 contacts，推送落地前的窗口内发送按
   `-32603` 内部失败。connector 侧行为不变（失败即报，不重试语义未变）。
-- **reaction targetAuthor**：协议字段是 ACI UUID，引擎经 contacts 把号码
-  解析为 ACI；未命中同上 `-32603`。
+- **reaction targetAuthor**：协议字段是 ACI UUID；号码经 contacts 解析，
+  UUID 形状直通，均未命中保留原样由协议侧报错。
+- **作者号投影方向**（receive）：quote.author / reaction.targetAuthor 在
+  contacts 命中时投影 E.164（signal-cli 行为），未命中保留 ACI 字符串。
 - **设备名占位窗口**：startLink 即以占位名 `KT Signal Engine` 完成链接
   （provisioning 协议要求先给名字）；finishLink 的 `deviceName` 在本地
   store 改写 + 接收管线首推 attributes 覆盖为真名。窗口内设备管理器里
@@ -110,11 +124,16 @@ P1b real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）
 - **URI 形状**：real 模式发官方 `sgnl://linkdevice?uuid=…&pub_key=…`；
   fake 夹具保持 `sgnl://link?…`（仅测试）。连接器对 URI 不解析、只透传
   回 finishLink，两侧均不受影响。
-- **per-recipient results**：成功仅含 `{recipientNumber, success:{timestamp}}`；
-  部分失败的 result 形状（上游 identity failure / unregistered user 等枚举）
-  未对齐，遇到即整体 `-32603`（P2 逐枚举对齐）。
+- **per-recipient results**：成功仅含 `{recipientNumber, success:{timestamp}}`，
+  群组发送 `results` 恒 `[]`（成员级投影 P3）；部分失败的 result 形状
+  （上游 identity failure / unregistered user 等枚举）未对齐，遇到即整体
+  `-32603`（P3 逐枚举对齐）。
 - **updateContact 边界**：仅本地 store 已有该号码时改名；新联系人建立需要
-  contacts 同步/服务器面（P2），未命中 `-32603`。
+  contacts 同步/服务器面（P2+），未命中 `-32603`。
+- **getUserStatus**：仍为 `isRegistered: true` 契约内占位（真实鉴权检查需
+  触网；解绑态 `-32603` 原文契约不变）。
+- **textStyles**：本引擎钉定的 presage proto 版本无该面，receive 不投影
+  （connector 侧为可选富体字段，缺失即无该键）。
 - **finishLink 长等待**：等手机确认可阻塞数分钟；引擎在本线程 LocalSet
   并发 dispatch，其他方法不饿死。
 

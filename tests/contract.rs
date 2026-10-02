@@ -248,6 +248,12 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 listContacts/listGroups：同样折叠（store 打不开）。
+    for method in ["listContacts", "listGroups"] {
+        let (code, message) = engine.error_of(method, json!({ "account": "+15559990000" }));
+        assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    }
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -347,7 +353,9 @@ fn mutating_methods_log_dispatch_and_reply() {
 #[test]
 fn read_only_stubs_and_user_status_shapes() {
     let dir = temp_dir("read-only");
-    let mut engine = Engine::spawn(&dir);
+    // 桩形状契约在 fake 模式钉定（real 模式 listContacts/listGroups 已真实，
+    // 未注册账号走 -32603，见 real_mode_no_network_error_paths）。
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
     assert_eq!(
         engine.request("listContacts", json!({ "account": "+15550000000" }))["result"],
         json!([])

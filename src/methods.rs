@@ -2,9 +2,10 @@
 
 //! 白名单方法 dispatch（`docs/jsonrpc-compat.md` §3 逐方法）。
 //!
-//! P1b 边界：startLink/finishLink/send 族走真实服务层（service::Service，
-//! Real/Fake 双实现）；listContacts/listGroups/getUserStatus 仍为契约内
-//! 占位（P2 真实，compat 表逐行注明）。send 族两模式同落调度日志。
+//! P2 边界：startLink/finishLink/send 族（含群组）、listContacts/listGroups
+//! 走真实服务层（service::Service，Real/Fake 双实现）；getUserStatus 仍为
+//! 契约内占位（真实鉴权检查需触网，compat 表逐行注明）。send 族两模式同
+//! 落调度日志。
 
 use std::sync::Arc;
 
@@ -17,9 +18,6 @@ use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
 const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
-
-/// P1b 明确边界（ADR 0004）：群组发送是 P3 面，引擎显式拒绝而非静默错发。
-const GROUP_SEND_UNSUPPORTED: &str = "Group sends are not supported by this engine revision.";
 
 pub(crate) enum Inbound {
     Line(String),
@@ -79,8 +77,23 @@ async fn dispatch(
                 ),
             )
         }
-        // P2 契约内占位（compat §3）：联系人/群组真实同步在 P2/P3。
-        "listContacts" | "listGroups" => jsonrpc::success_response(id, json!([])),
+        // listContacts/listGroups：store 投影（fake 模式回空表）；未注册
+        // 账号 -32603（细节不外泄）。
+        "listContacts" | "listGroups" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let rows = if method == "listContacts" {
+                service.list_contacts(account).await
+            } else {
+                service.list_groups(account).await
+            };
+            match rows {
+                Ok(rows) => jsonrpc::success_response(id, json!(rows)),
+                Err(_) => internal_error(id),
+            }
+        }
         "deleteLocalAccountData" => {
             let account = params
                 .get("account")
@@ -95,12 +108,19 @@ async fn dispatch(
         "send" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
-            if params.get("groupId").is_some() {
-                return jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED));
-            }
             let message = params.get("message").and_then(Value::as_str);
-            match (account, message, recipients_of(params)) {
-                (Some(account), Some(message), Ok(recipients)) => {
+            let group = params.get("groupId").and_then(Value::as_str);
+            match (account, message, group, recipients_of(params)) {
+                (Some(account), Some(message), Some(group), _) => {
+                    match service.send_text_group(account, group, message).await {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(account), Some(message), None, Ok(recipients)) => {
                     match service.send_text(account, &recipients, message).await {
                         Ok((timestamp, results)) => jsonrpc::success_response(
                             id,
@@ -117,10 +137,18 @@ async fn dispatch(
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
-            match (account, target, recipients_of(params)) {
-                (Some(account), Some(target), Ok(recipients))
-                    if params.get("groupId").is_none() =>
-                {
+            let group = params.get("groupId").and_then(Value::as_str);
+            match (account, target, group, recipients_of(params)) {
+                (Some(account), Some(target), Some(group), _) => {
+                    match service
+                        .send_remote_delete_group(account, group, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(account), Some(target), None, Ok(recipients)) => {
                     match service
                         .send_remote_delete(account, &recipients, target)
                         .await
@@ -128,9 +156,6 @@ async fn dispatch(
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(_) => internal_error(id),
                     }
-                }
-                (Some(_), Some(_), Ok(_)) => {
-                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
                 }
                 _ => internal_error(id),
             }
@@ -156,8 +181,34 @@ async fn dispatch(
                     Some(target),
                     Some(emoji),
                     Some(remove),
+                    _,
+                ) if params.get("groupId").is_some() => {
+                    match service
+                        .send_reaction_group(
+                            account,
+                            params
+                                .get("groupId")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            target_author,
+                            target,
+                            emoji,
+                            remove,
+                        )
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (
+                    Some(account),
+                    Some(target_author),
+                    Some(target),
+                    Some(emoji),
+                    Some(remove),
                     Ok(recipients),
-                ) if params.get("groupId").is_none() => {
+                ) => {
                     match service
                         .send_reaction(account, &recipients, target_author, target, emoji, remove)
                         .await
@@ -165,9 +216,6 @@ async fn dispatch(
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(_) => internal_error(id),
                     }
-                }
-                (Some(_), Some(_), Some(_), Some(_), Some(_), Ok(_)) => {
-                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
                 }
                 _ => internal_error(id),
             }
@@ -191,15 +239,19 @@ async fn dispatch(
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let stop = params.get("stop").and_then(Value::as_bool);
-            match (account, stop, recipients_of(params)) {
-                (Some(account), Some(stop), Ok(recipients)) if params.get("groupId").is_none() => {
-                    match service.send_typing(account, &recipients, stop).await {
+            let group = params.get("groupId").and_then(Value::as_str);
+            match (account, stop, group, recipients_of(params)) {
+                (Some(account), Some(stop), Some(group), _) => {
+                    match service.send_typing_group(account, group, stop).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(_) => internal_error(id),
                     }
                 }
-                (Some(_), Some(_), Ok(_)) => {
-                    jsonrpc::error_response(id, &RpcError::new(-1, GROUP_SEND_UNSUPPORTED))
+                (Some(account), Some(stop), None, Ok(recipients)) => {
+                    match service.send_typing(account, &recipients, stop).await {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
                 }
                 _ => internal_error(id),
             }
