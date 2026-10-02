@@ -1168,10 +1168,16 @@ async fn resolve_author_aci(store: &SqliteStore, author: &str) -> String {
 
 async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
     std::fs::create_dir_all(dir).map_err(|_| ())?;
-    let url = url::Url::from_file_path(dir).map_err(|_| ())?;
-    SqliteStore::open(url.as_str(), OnNewIdentity::Trust)
+    // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
+    // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。这里固定
+    // 在账号目录下落 store.db、直接传裸路径。路径来自受信启动器，可入日志。
+    let path = dir.join("store.db");
+    let path = path.to_str().ok_or(())?;
+    SqliteStore::open(path, OnNewIdentity::Trust)
         .await
-        .map_err(|_| ())
+        .map_err(|error| {
+            eprintln!("kt-signal-engine: sqlite store open failed: {error}");
+        })
 }
 
 async fn open_registered(
