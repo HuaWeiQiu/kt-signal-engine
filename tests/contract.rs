@@ -254,6 +254,13 @@ fn real_mode_no_network_error_paths() {
         assert_eq!((code, message.as_str()), (-32603, "Internal error"));
     }
 
+    // 未注册账号的 getUserStatus：whoami 前置即内部失败（不触网）。
+    let (code, message) = engine.error_of(
+        "getUserStatus",
+        json!({ "account": "+15559990000", "recipient": "+15555550101" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])

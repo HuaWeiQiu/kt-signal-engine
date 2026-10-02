@@ -13,11 +13,16 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
-use crate::service::{LinkError, Service};
+use crate::service::{LinkError, Service, UserStatusError};
 use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
 const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
+
+/// 解绑态错误原文（上游把 AuthorizationFailedException 包进
+/// UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
+const USER_UNBOUND_MESSAGE: &str =
+    "Failed to send message: Authorization failed! (AuthorizationFailedException)";
 
 pub(crate) enum Inbound {
     Line(String),
@@ -256,8 +261,21 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
-        // P2 契约内占位（compat §3）：解绑态 -32603 形状见 compat §3 头。
-        "getUserStatus" => jsonrpc::success_response(id, json!({ "isRegistered": true })),
+        // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头）；
+        // fake 模式恒已注册。
+        "getUserStatus" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match service.get_user_status(account).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "isRegistered": true })),
+                Err(UserStatusError::Unbound) => {
+                    jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+                }
+                Err(UserStatusError::Internal) => internal_error(id),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),

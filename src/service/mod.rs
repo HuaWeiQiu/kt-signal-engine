@@ -56,6 +56,13 @@ pub(crate) enum SendError {
     Internal,
 }
 
+#[derive(Debug)]
+pub(crate) enum UserStatusError {
+    /// 账号在服务器侧已解绑（401）：connector 1.21 靠错误原文识别解绑态。
+    Unbound,
+    Internal,
+}
+
 /// 链接结果共享槽：finishLink 可被连接器超时重试（connector service.rs 语义），
 /// 多个等待者共享同一次结果。
 struct LinkResultSlot {
@@ -667,6 +674,27 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         decode_group_id(group_id).ok_or(SendError::Internal)?;
         Ok((manager, now_ms()))
+    }
+
+    /// getUserStatus：whoami 轻量鉴权探测（real 模式触网；fake 恒已注册）。
+    /// 仅 401 判解绑——网络等其他失败按内部失败，不误报解绑态。
+    pub(crate) async fn get_user_status(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<(), UserStatusError> {
+        if !self.real {
+            return Ok(());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(UserStatusError::Internal)?;
+        match manager.whoami().await {
+            Ok(_) => Ok(()),
+            Err(presage::Error::ServiceError(
+                presage::libsignal_service::prelude::ServiceError::Unauthorized,
+            )) => Err(UserStatusError::Unbound),
+            Err(_) => Err(UserStatusError::Internal),
+        }
     }
 
     /// updateContact：P1b 仅在本地 store 命中该号码时改名（uuid 归属需要

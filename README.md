@@ -73,10 +73,10 @@ P0 spike 产出两种方案的可行性证据，再定 ADR 0003。
 | 阶段 | 内容 | 门禁 |
 |---|---|---|
 | P0 | 可行性 spike：libsignal Rust crates 在 mac/win/linux 构建目标验证；FFI/桥接方式；signal-cli 数据目录密钥材料可读性评估（迁移 A/B 方案取证） | ✅ 完成，见 ADR 0003（2026-10-03） |
-| P1 | 引擎骨架：进程模型、IPC 白名单子集（按 ADR 0002 逐方法）、身份与会话建立 | 契约测试对 fake 夹具全绿 |
-| P2 | 收发链路：文本/回执/typing/反应/编辑/删除，逐项对齐官方桌面行为 | connector 集成测试 + 实机收发 |
-| P3 | 群组（Sender Keys）、多设备（Sesame） | 实机多端验证 |
-| P4 | 附件 CDN、profile/sticker 密钥、链接预览 | 实机全功能 |
+| P1 | 引擎骨架：进程模型、IPC 白名单子集（按 ADR 0002 逐方法）、身份与会话建立 | ✅ 完成：P1a 骨架 + P1b presage 真实链接/接收/直聊发送（2026-10-03） |
+| P2 | 收发链路：文本/回执/typing/反应/编辑/删除，逐项对齐官方桌面行为 | ✅ 代码侧完成：接收投影全消费面/群组发送/联系人群组列表/getUserStatus 探测（2026-10-03）；connector 集成测试 + 实机收发联调待做 |
+| P3 | 群组（Sender Keys）、多设备（Sesame） | 群组发送 P2 已 real；群组接收投影/成员级 results/多设备待做 |
+| P4 | 附件 CDN、profile/sticker 密钥、链接预览 | 附件元数据投影 P2 已 real；字节下载/上行待做 |
 | P5 | 灰度替换：connector 引擎开关，soak 24h×N | soak PASS + 实机回归 |
 | P6 | signal-cli 退役 | 全量切流 + 观察窗 |
 

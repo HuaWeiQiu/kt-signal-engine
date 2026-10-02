@@ -66,7 +66,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
 | `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组 |
-| `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文） | P1a 形状对齐；P2 真实 |
+| `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -130,8 +130,9 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
   `-32603`（P3 逐枚举对齐）。
 - **updateContact 边界**：仅本地 store 已有该号码时改名；新联系人建立需要
   contacts 同步/服务器面（P2+），未命中 `-32603`。
-- **getUserStatus**：仍为 `isRegistered: true` 契约内占位（真实鉴权检查需
-  触网；解绑态 `-32603` 原文契约不变）。
+- **getUserStatus**：P2 起 real——whoami 轻量探测；仅服务器 401 映射解绑态
+  原文（`-32603`），网络等其他失败按 `-32603` "Internal error" 不误报解绑。
+  recipient 维度的注册态需 CDSI 查询，未做（保持 `isRegistered: true` 面）。
 - **textStyles**：本引擎钉定的 presage proto 版本无该面，receive 不投影
   （connector 侧为可选富体字段，缺失即无该键）。
 - **finishLink 长等待**：等手机确认可阻塞数分钟；引擎在本线程 LocalSet
