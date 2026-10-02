@@ -17,6 +17,14 @@ fixture 同款）：
 <engine> --data-dir <dir> jsonRpc --receive-mode on-start [--ignore-attachments] --ignore-stories --ignore-stickers
 ```
 
+环境变量（可选）：
+
+- `KT_SIGNAL_SOCKS_PROXY=host:port`：connector 注入的出口代理（与 signal-cli
+  JVM 形态同一变量）。引擎在校验后映射为 `ALL_PROXY=socks5://host:port`，
+  由 libsignal-service 的 reqwest 传输面（HTTP + WebSocket 共用同一 client，
+  缺省读系统/环境代理）统一走 SOCKS5；要求依赖图含 reqwest `socks` feature
+  （本仓显式声明）。非法值启动即 exit 2；空值视为未配置（直连）。
+
 - `--data-dir`：引擎全部本地状态根（真实引擎为 presage SqliteStore 目录，
   `accounts/lk-<hex>/` 每账号一库 + `engine-state.json` 注册表；注册表里不落
   除号码/目录名以外的任何内容）。

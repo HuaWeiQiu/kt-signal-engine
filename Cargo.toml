@@ -25,3 +25,9 @@ url = "2.5"
 # store 的 sqlite 后端走 bundled 纯 sqlite（无系统依赖、无 sqlcipher/openssl）；
 # 版本以 Cargo.lock 实际解析的 sqlx 同版为准，特性经由全图归一生效。
 libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+
+# 出口代理：libsignal-service 的 HTTP/WS 传输就是 reqwest（缺省读系统/环境变量
+# 代理），本仓显式引入只为把 `socks` feature 并入全图——使 ALL_PROXY=socks5://…
+# 生效（main.rs 把 connector 注入的 KT_SIGNAL_SOCKS_PROXY 映射过去）。特性按
+# additive 归一，不改变上游用法；reqwest 许可 MIT/Apache-2.0。
+reqwest = { version = "0.13", default-features = false, features = ["socks"] }

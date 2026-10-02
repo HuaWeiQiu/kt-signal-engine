@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! 进程装配：argv 解析（严格模式）+ 异步 stdio 主循环。
+//! 进程装配：argv 解析（严格模式）+ 出口代理 env 映射 + 异步 stdio 主循环。
 //!
 //! 启动契约见 `docs/jsonrpc-compat.md` §1：connector 以
 //! `--data-dir <dir> jsonRpc [--receive-mode on-start] [--ignore-attachments]
 //! --ignore-stories --ignore-stickers` 拉起本进程；JVM 相关环境变量必须被
-//! 忽略。stdin EOF 是唯一干净退出路径（exit 0）；argv 非法 exit 2；内部
-//! 致命 exit 1。stderr 保持安静（connector watchdog 以 stderr ERROR 行
+//! 忽略。可选 `KT_SIGNAL_SOCKS_PROXY=host:port`（connector 与桌面探测链路
+//! 注入的同一变量）映射为 `ALL_PROXY=socks5://…`，由 libsignal-service 的
+//! reqwest 传输面（HTTP + WebSocket 同一 client）统一走 SOCKS5 出口；非法
+//! 值 exit 2。stdin EOF 是唯一干净退出路径（exit 0）；argv 非法 exit 2；
+//! 内部致命 exit 1。stderr 保持安静（connector watchdog 以 stderr ERROR 行
 //! 判死活）。
 //!
 //! P1b 装配：stdin 有界读搬到阻塞线程（P1a 逻辑原样），经 channel 桥进
@@ -70,8 +73,53 @@ fn parse_launch_args<I: Iterator<Item = std::ffi::OsString>>(args: I) -> Result<
     })
 }
 
+/// 出口代理注入变量：connector 以同一变量把代理组代理传给引擎子进程（与
+/// signal-cli JVM 形态共用环境面），桌面探测链路也写它。
+const SOCKS_PROXY_ENV: &str = "KT_SIGNAL_SOCKS_PROXY";
+
+/// 校验 host:port 并返回 `socks5://host:port` 代理 URL。口径与 connector
+/// 侧 `SocksProxy::parse` 一致：host 非空、无空白与 ':'、≤253 字节；端口
+/// 1-65535。
+fn socks_proxy_url(value: &str) -> Result<String, &'static str> {
+    let (host, port) = value.trim().split_once(':').ok_or("expected host:port")?;
+    if host.is_empty() || host.len() > 253 || host.chars().any(|c| c.is_whitespace() || c == ':') {
+        return Err("invalid proxy host");
+    }
+    let port: u16 = port.parse().map_err(|_| "invalid proxy port")?;
+    if port == 0 {
+        return Err("invalid proxy port");
+    }
+    Ok(format!("socks5://{host}:{port}"))
+}
+
+/// `KT_SIGNAL_SOCKS_PROXY` → `ALL_PROXY`。必须在任何 libsignal-service
+/// reqwest client 构建之前生效（reqwest 缺省读系统/环境代理面，HTTP 与
+/// WebSocket 共用同一 client），因此放在两段式 `main` 的同步段：此刻进程
+/// 单线程（tokio worker 与 stdin 读线程都尚未启动），set_var 无并发读者。
+/// 空值视为未配置（直连）。
+fn setup_socks_proxy_env() -> Result<(), &'static str> {
+    let Ok(value) = std::env::var(SOCKS_PROXY_ENV) else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let url = socks_proxy_url(value)?;
+    std::env::set_var("ALL_PROXY", url);
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    if let Err(message) = setup_socks_proxy_env() {
+        eprintln!("kt-signal-engine: invalid {SOCKS_PROXY_ENV}: {message}");
+        return ExitCode::from(2);
+    }
+    amain()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn amain() -> ExitCode {
     let args = match parse_launch_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(()) => {
@@ -200,5 +248,33 @@ fn read_bounded_line(stdin: &std::io::Stdin, buf: &mut Vec<u8>) -> ReadOutcome {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::socks_proxy_url;
+
+    #[test]
+    fn socks_proxy_url_accepts_host_port() {
+        assert_eq!(
+            socks_proxy_url("127.0.0.1:7890").as_deref(),
+            Ok("socks5://127.0.0.1:7890")
+        );
+        assert_eq!(
+            socks_proxy_url(" relay.example.com:1080 ").as_deref(),
+            Ok("socks5://relay.example.com:1080")
+        );
+    }
+
+    #[test]
+    fn socks_proxy_url_rejects_bad_shapes() {
+        assert!(socks_proxy_url("").is_err());
+        assert!(socks_proxy_url("host").is_err());
+        assert!(socks_proxy_url("host:notaport").is_err());
+        assert!(socks_proxy_url("host:0").is_err());
+        assert!(socks_proxy_url(":7890").is_err());
+        assert!(socks_proxy_url("host with space:7890").is_err());
+        assert!(socks_proxy_url("socks5://host:7890").is_err());
     }
 }
