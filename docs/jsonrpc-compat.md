@@ -71,7 +71,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
 | `send` | `{account, recipient[]/groupId, message, attachments?, quoteTimestamp?, quoteAuthor?, previews?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解：`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；附件/引用上行 P3 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
-| `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（contacts 命中 E.164，UUID 形状直通） |
+| `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
 | `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组 |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
@@ -121,8 +121,9 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
 - **号码解析冷启动窗口**：send 系方法的 recipient 号码 → ServiceId 经本地
   contacts 解析；链接后手机端自动推送 contacts，推送落地前的窗口内发送按
   `-32603` 内部失败。connector 侧行为不变（失败即报，不重试语义未变）。
-- **reaction targetAuthor**：协议字段是 ACI UUID；号码经 contacts 解析，
-  UUID 形状直通，均未命中保留原样由协议侧报错。
+- **reaction targetAuthor**：协议字段是 ACI UUID；本机号走注册数据（回应
+  自己的消息），其余号码经 contacts 解析，UUID 形状直通；1:1 均未命中按
+  内部失败，群内保留原样由协议侧报错。
 - **作者号投影方向**（receive）：quote.author / reaction.targetAuthor 在
   contacts 命中时投影 E.164（signal-cli 行为），未命中保留 ACI 字符串。
 - **设备名占位窗口**：startLink 即以占位名 `KT Signal Engine` 完成链接

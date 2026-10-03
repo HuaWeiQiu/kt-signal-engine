@@ -435,11 +435,11 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = manager;
         let timestamp = now_ms();
-        // 协议字段是 targetAuthorAci（UUID）：经 contacts 映射解析号码
-        // （ADR 0004）；冷启动未命中按内部失败，不透传号码。
-        let target_aci = find_contact_by_number(&manager, target_author)
+        // 协议字段是 targetAuthorAci（UUID）：本机号走注册数据（回应自己发的
+        // 消息），其余经 contacts 映射解析（ADR 0004）；都未命中按内部失败，
+        // 不透传号码。
+        let target_aci = resolve_author_aci(manager.store(), target_author)
             .await
-            .map(|contact| contact.uuid.to_string())
             .ok_or(SendError::Internal)?;
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
@@ -629,8 +629,11 @@ impl Service {
             return Ok(());
         }
         let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
-        // 群内 targetAuthor 兼容号码与 ACI：contacts 命中转 UUID，UUID 形状直通。
-        let target_aci = resolve_author_aci(manager.store(), target_author).await;
+        // 群内 targetAuthor 兼容号码与 ACI：本机号/contacts 命中转 UUID，
+        // UUID 形状直通；都未命中原样透传，协议侧报错，不在此编造。
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .unwrap_or_else(|| target_author.trim().to_owned());
         let body = DataMessage {
             timestamp: Some(timestamp),
             reaction: Some(presage::proto::data_message::Reaction {
@@ -1151,20 +1154,26 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
         .collect()
 }
 
-/// 群内作者号：入参号码 → contacts 解析 UUID；已是 UUID 形状则直通；都
-/// 不中返回原样（协议侧报错，不在此编造）。
-async fn resolve_author_aci(store: &SqliteStore, author: &str) -> String {
+/// 回应/群内作者号 → ACI 字符串。解析顺序：UUID 形状直通 → 本机注册数据
+/// （回应自己发的消息时 targetAuthor 是本机号，不在 contacts）→ contacts
+/// 数字位匹配；都不中返回 None，回退语义由调用方决定。
+async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String> {
     let trimmed = author.trim();
     if let Some(service_id) = ServiceId::parse_from_service_id_string(trimmed) {
-        return service_id.service_id_string().to_owned();
+        return Some(service_id.service_id_string().to_owned());
     }
-    let normalized = if trimmed.starts_with('+') {
-        trimmed.to_owned()
-    } else {
-        format!("+{trimmed}")
-    };
+    let want: String = trimmed.chars().filter(char::is_ascii_digit).collect();
+    if want.is_empty() {
+        return None;
+    }
+    if let Some(data) = store.load_registration_data().await.ok().flatten() {
+        let own = e164_string(&data.phone_number);
+        let own_digits: String = own.chars().filter(char::is_ascii_digit).collect();
+        if own_digits == want {
+            return Some(data.service_ids.aci.to_string());
+        }
+    }
     let contacts = contacts_number_map(store).await;
-    let want: String = normalized.chars().filter(char::is_ascii_digit).collect();
     contacts
         .into_iter()
         .find(|(_, number)| {
@@ -1172,7 +1181,6 @@ async fn resolve_author_aci(store: &SqliteStore, author: &str) -> String {
             digits.ends_with(&want)
         })
         .map(|(uuid, _)| uuid)
-        .unwrap_or_else(|| trimmed.to_owned())
 }
 
 async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
