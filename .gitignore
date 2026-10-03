@@ -28,7 +28,7 @@ coverage.out
 coverage/
 
 # ───────── Go ─────────
-bin/
+/bin/
 *.exe
 *.test
 *.out

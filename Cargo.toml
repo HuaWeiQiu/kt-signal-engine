@@ -31,3 +31,7 @@ libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 # 生效（main.rs 把 connector 注入的 KT_SIGNAL_SOCKS_PROXY 映射过去）。特性按
 # additive 归一，不改变上游用法；reqwest 许可 MIT/Apache-2.0。
 reqwest = { version = "0.13", default-features = false, features = ["socks"] }
+
+# 仅 backup5-spike bin（ADR 0005 S1）生成链接密码用；与 presage 传递的 rand
+# 0.9 同源，许可 MIT/Apache-2.0。
+rand = "0.9"
