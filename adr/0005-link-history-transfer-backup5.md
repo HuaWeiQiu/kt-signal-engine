@@ -1,6 +1,6 @@
 # ADR 0005：链接时存量历史迁移（backup5）自研立项
 
-日期：2026-10-03 ｜ 状态：已接受（立项）
+日期：2026-10-03 ｜ 状态：已接受（S1 spike 真机取证通过，见取证记录 §4；下一步 S2）
 
 ## 背景
 
@@ -40,6 +40,32 @@ pinned signal-cli 0.14.x 无此能力，官方桌面有。本文立项自研，�
 | b | 下载端点：libsignal-service-rs（presage 栈）无 `TransferArchive` 等价物 | S1 比对官方 libsignal-service Java 行为，按公开行为在引擎实现 REST | 无——本就是自研面 |
 | c | presage 的 ProvisionMessage 是否暴露 `ephemeralBackupKey` 字段 | S1 编译期检查 | 无——presage 补丁（AGPL 合规）或引擎层自行解包信封 |
 
+**S1 结果（2026-10-03）：三个未知数全部落定为可行**，详见 §4。
+
+## S1 spike 真机取证记录（2026-10-03）
+
+工具：`src/bin/backup5-spike.rs`（独立 bin，零改动现有链接链路；提交 3e7c77e）。方法：
+绕过 presage `Manager::link_secondary_device`（其内部丢弃 `ephemeral_backup_key`），直调
+`libsignal_service::provisioning::link_device`；在产出的 provisioning URL 上追加
+`&capabilities=backup5` 生成二维码；真机扫码链接后捕获信封字段并设备鉴权下载档案。
+全程不打印任何密钥值、不保存注册数据（store 落临时目录）。
+
+证据三点（全部命中）：
+
+1. **真机配合性（未知数 a）**：信封携带 `ephemeral_backup_key: Some([u8; 32])`——真机对
+   第三方客户端 QR 声明的 `backup5` capability 照常发起迁移并上传备份。一票否决点通过。
+2. **下载端点（未知数 b）**：`GET /v1/devices/transfer_archive?timeout=60`（设备鉴权，
+   基础认证）返回 200 `{cdn: 3, key: "…"}`，随后 `GET {cdn3}/attachments/{key}` 200 下载
+   成功。libsignal-service `PushService::request` + `Endpoint` 原样可用，无需任何上游改动。
+3. **字段暴露（未知数 c）**：`NewDeviceRegistration.ephemeral_backup_key` 是 pub 字段，
+   presage 只是高层封装丢弃它——**无需 presage 补丁**，引擎层直调 provisioning 层即可。
+
+下载产物：6576 字节，落盘临时文件（sha256 `efb73508…0111c`，`file` 判为 data——加密档案，
+解密留 S2）。档案量级与该 dev 账号消息量相符，仅作字节级验证。
+
+边界实录：provisioning WS 空闲约 90 秒被服务端掐断（第一次扫码超时即此），S2 落地时
+链接会话须有界并在超时后整会话作废重来，不得复用旧 QR。
+
 ## 决策
 
 在 **kt-signal-engine** 自研 backup5 接收侧（链接能力声明、信封钥匙截获、迁移档案下载、
@@ -50,8 +76,8 @@ signal-cli、不抄 signal-cli/官方桌面源码**；libsignal 原语按 v0.99.
 
 ## 阶段（README 阶段规划挂载点）
 
-- **S1 spike**：真机一次会话闭环取证——QR 加 `backup5` → 信封 `ephemeralBackupKey` 存在性
-  → 档案下载字节级成功（不解密）。产出 spike 记录进 docs/。
+- **S1 spike（✅ 2026-10-03 完成，取证记录见 §4 上一节）**：真机一次会话闭环取证——QR 加
+  `backup5` → 信封 `ephemeralBackupKey` 存在性 → 档案下载字节级成功（不解密）。
 - **S2 引擎**：下载 + 解密 + 逐帧导出（`message-backup` crate）；附件 metadata-only
   （v1 不下载字节，沿 §6.7 哲学）。
 - **S3 connector**：契约扩展（link.finish 携带导入结果或独立 history.import 状态方法，
