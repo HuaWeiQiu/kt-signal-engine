@@ -49,6 +49,8 @@ Signal 服务端
 - **ADR 0002** IPC 形状采用 **signal-cli JSON-RPC 兼容子集**：只实现 connector 已核实的
   白名单方法语义，最大化复用 connector 适配层、测试夹具（fake-signal-cli.py）与冒烟脚本；
   新能力一律经 connector 契约版本演进，不塞进兼容层。
+- **ADR 0005** 链接时存量历史迁移（backup5）自研立项：产品刚需；S1 真机 spike 一票否决点
+  与三个未知数、分阶段计划、备选否决均见该文（2026-10-03）。
 
 ## 复用清单（从现有链路继承，不重造）
 
@@ -77,6 +79,7 @@ P0 spike 产出两种方案的可行性证据，再定 ADR 0003。
 | P2 | 收发链路：文本/回执/typing/反应/编辑/删除，逐项对齐官方桌面行为 | ✅ 代码侧完成：接收投影全消费面/群组发送/联系人群组列表/getUserStatus 探测（2026-10-03）；connector 接线已落地——`kt-engine` 实验模式 + 门控真机冒烟通过（fake 服务，2026-10-03）；实机收发联调待做 |
 | P3 | 群组（Sender Keys）、多设备（Sesame） | 群组发送 P2 已 real；群组接收投影/成员级 results/多设备待做 |
 | P4 | 附件 CDN、profile/sticker 密钥、链接预览 | 附件元数据投影 P2 已 real；字节下载/上行待做 |
+| backup5 | 链接时存量历史迁移（并行专项，ADR 0005）：S1 真机 spike（一票否决点）→ S2 引擎接收/下载/解密 → S3 connector 契约+导入 → S4 桌面 UI+真机验收 | 立项 2026-10-03，S1 待做 |
 | P5 | 灰度替换：connector 引擎开关，soak 24h×N | 引擎开关已落地（connector `--signal-cli-engine kt-engine`，实验，proxy/media 能力 fail-closed）；soak PASS + 实机回归待做 |
 | P6 | signal-cli 退役 | 全量切流 + 观察窗 |
 
