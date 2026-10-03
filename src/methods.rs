@@ -225,6 +225,108 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        "sendPinMessage" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target_author = params.get("targetAuthor").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            // 官方语义：字段缺席/null = pinDurationForever；数值超 u32 视为
+            // 非法参数 fail-closed。
+            let duration = match params.get("pinDurationSeconds") {
+                None | Some(Value::Null) => Some(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|seconds| u32::try_from(seconds).ok())
+                    .map(Some),
+            };
+            let group = params.get("groupId").and_then(Value::as_str);
+            match (
+                account,
+                target_author,
+                target,
+                duration,
+                group,
+                recipients_of(params),
+            ) {
+                (Some(account), Some(author), Some(target), Some(duration), Some(group), _) => {
+                    match service
+                        .send_pin_message_group(account, group, author, target, duration)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (
+                    Some(account),
+                    Some(author),
+                    Some(target),
+                    Some(duration),
+                    None,
+                    Ok(recipients),
+                ) if !recipients.is_empty() => {
+                    match service
+                        .send_pin_message(account, &recipients, author, target, duration)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        "sendUnpinMessage" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target_author = params.get("targetAuthor").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            let group = params.get("groupId").and_then(Value::as_str);
+            match (account, target_author, target, group, recipients_of(params)) {
+                (Some(account), Some(author), Some(target), Some(group), _) => {
+                    match service
+                        .send_unpin_message_group(account, group, author, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                (Some(account), Some(author), Some(target), None, Ok(recipients))
+                    if !recipients.is_empty() =>
+                {
+                    match service
+                        .send_unpin_message(account, &recipients, author, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        "sendAdminDelete" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target_author = params.get("targetAuthor").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            let group = params.get("groupId").and_then(Value::as_str);
+            // 直聊无 admin 概念（官方 adminDelete 仅群语义）：无 groupId
+            // fail-closed。
+            match (account, target_author, target, group) {
+                (Some(account), Some(author), Some(target), Some(group)) => {
+                    match service
+                        .send_admin_delete_group(account, group, author, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         "updateContact" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);

@@ -450,6 +450,183 @@ impl Service {
         Ok(())
     }
 
+    /// sendPinMessage：官方 DataMessage.pinMessage=27（SignalService.proto §27，
+    /// 官方桌面 SendMessage.preload.ts 行为对齐）。`pin_duration_seconds=None`
+    /// = pinDurationForever；`Some(s)` = pinDurationSeconds（u32）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_pin_message(
+        self: &Arc<Self>,
+        account: &str,
+        recipients: &[String],
+        target_author: &str,
+        target_timestamp: u64,
+        pin_duration_seconds: Option<u32>,
+    ) -> Result<(), SendError> {
+        self.send_targeted_data_message(
+            account,
+            recipients,
+            target_author,
+            |aci_bytes, timestamp| DataMessage {
+                timestamp: Some(timestamp),
+                pin_message: Some(pin_message_proto(
+                    aci_bytes,
+                    target_timestamp,
+                    pin_duration_seconds,
+                )),
+                ..DataMessage::default()
+            },
+        )
+        .await
+    }
+
+    /// sendUnpinMessage：官方 DataMessage.unpinMessage=28。
+    pub(crate) async fn send_unpin_message(
+        self: &Arc<Self>,
+        account: &str,
+        recipients: &[String],
+        target_author: &str,
+        target_timestamp: u64,
+    ) -> Result<(), SendError> {
+        self.send_targeted_data_message(
+            account,
+            recipients,
+            target_author,
+            |aci_bytes, timestamp| DataMessage {
+                timestamp: Some(timestamp),
+                unpin_message: Some(presage::proto::data_message::UnpinMessage {
+                    target_author_aci_binary: Some(aci_bytes),
+                    target_sent_timestamp: Some(target_timestamp),
+                }),
+                ..DataMessage::default()
+            },
+        )
+        .await
+    }
+
+    /// sendAdminDelete（群组）：官方 DataMessage.adminDelete=29，语义 = 群管理
+    /// 员删除他人消息；直聊无 admin 概念，仅 groupId 形态。
+    pub(crate) async fn send_admin_delete_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_author: &str,
+        target_timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        // 官方语义 targetAuthor 一律 ACI；群内兼容号码/UUID 解析，未命中
+        // 原样透传（协议侧报错，不在此编造）。
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .unwrap_or_else(|| target_author.trim().to_owned());
+        let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            admin_delete: Some(presage::proto::data_message::AdminDelete {
+                target_author_aci_binary: Some(aci_bytes),
+                target_sent_timestamp: Some(target_timestamp),
+            }),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await
+    }
+
+    /// sendPinMessage（群组）：目标消息置顶跨群发（官方群内置顶同字段）。
+    pub(crate) async fn send_pin_message_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_author: &str,
+        target_timestamp: u64,
+        pin_duration_seconds: Option<u32>,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .unwrap_or_else(|| target_author.trim().to_owned());
+        let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            pin_message: Some(pin_message_proto(
+                aci_bytes,
+                target_timestamp,
+                pin_duration_seconds,
+            )),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await
+    }
+
+    /// sendUnpinMessage（群组）。
+    pub(crate) async fn send_unpin_message_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_author: &str,
+        target_timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .unwrap_or_else(|| target_author.trim().to_owned());
+        let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            unpin_message: Some(presage::proto::data_message::UnpinMessage {
+                target_author_aci_binary: Some(aci_bytes),
+                target_sent_timestamp: Some(target_timestamp),
+            }),
+            ..DataMessage::default()
+        };
+        dispatch_group(&mut manager, group_id, body, timestamp).await
+    }
+
+    /// 直聊 targeted dataMessage 公共头（pin/unpin 共用）：解析作者 ACI、
+    /// 逐 recipient 发送。`body` 闭包收 (16B ACI bytes, timestamp)。
+    async fn send_targeted_data_message<F>(
+        self: &Arc<Self>,
+        account: &str,
+        recipients: &[String],
+        target_author: &str,
+        body: F,
+    ) -> Result<(), SendError>
+    where
+        F: Fn(Vec<u8>, u64) -> DataMessage,
+    {
+        if !self.real {
+            return Ok(());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let timestamp = now_ms();
+        // 直聊回应用自己发的消息时 targetAuthor 是本机号（不在 contacts），
+        // resolve_author_aci 已含注册数据回退。
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .ok_or(SendError::Internal)?;
+        let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
+        for number in recipients {
+            let service_id = resolve_recipient(&manager, number)
+                .await
+                .ok_or(SendError::Internal)?;
+            manager
+                .send_message(service_id, body(aci_bytes.clone(), timestamp), timestamp)
+                .await
+                .map_err(|_| SendError::Internal)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn send_typing(
         self: &Arc<Self>,
         account: &str,
@@ -904,6 +1081,19 @@ struct PeerDescription {
     name: Option<String>,
 }
 
+/// pin/unpin/adminDelete 的 targetAuthor 投影：16B UUID → contacts 命中转
+/// E.164，未命中 ACI 字符串（与 quote/reaction 面同口径）。
+fn targeted_author_json(
+    aci_binary: Option<&[u8]>,
+    author_numbers: &HashMap<String, String>,
+) -> Value {
+    let aci = aci_binary
+        .and_then(|bytes| presage::libsignal_service::prelude::Uuid::from_slice(bytes).ok())
+        .map(|uuid| uuid.to_string())
+        .unwrap_or_default();
+    json!(author_numbers.get(&aci).cloned().unwrap_or(aci))
+}
+
 async fn describe_peer(store: &SqliteStore, id: &ServiceId) -> Option<PeerDescription> {
     let contact = store.contact_by_id(id).await.ok()??;
     Some(PeerDescription {
@@ -935,6 +1125,31 @@ async fn resolve_author_numbers(
             }
         }
     }
+    // pin/unpin/adminDelete 的 targetAuthor 与 reaction 同解析口径（E.164
+    // 优先，contacts 未命中保留 ACI）。
+    for targeted in [
+        data_message
+            .pin_message
+            .as_ref()
+            .map(|p| &p.target_author_aci_binary),
+        data_message
+            .unpin_message
+            .as_ref()
+            .map(|p| &p.target_author_aci_binary),
+        data_message
+            .admin_delete
+            .as_ref()
+            .map(|p| &p.target_author_aci_binary),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(bytes) = targeted.as_deref() {
+            if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+                candidates.push(uuid.to_string());
+            }
+        }
+    }
     let mut numbers = HashMap::new();
     for aci in candidates {
         if numbers.contains_key(&aci) {
@@ -951,9 +1166,10 @@ async fn resolve_author_numbers(
     numbers
 }
 
-/// dataMessage 面（正文/引用/reaction/remoteDelete/附件元数据/预览/mentions/
-/// viewOnce）。边界纪律：附件 ≤32、预览 ≤4、mentions ≤64（connector §4.13/
-/// §4.20 上限同源）；条目内字段协议缺省即省略键。
+/// dataMessage 面（正文/引用/reaction/remoteDelete/pinMessage/unpinMessage/
+/// adminDelete/附件元数据/预览/mentions/viewOnce）。边界纪律：附件 ≤32、
+/// 预览 ≤4、mentions ≤64（connector §4.13/§4.20 上限同源）；条目内字段协议
+/// 缺省即省略键。
 fn project_data_message(
     data_message: &presage::proto::DataMessage,
     author_numbers: &HashMap<String, String>,
@@ -1006,6 +1222,35 @@ fn project_data_message(
     }
     if let Some(delete) = data_message.delete.as_ref() {
         out["remoteDelete"] = json!({ "timestamp": delete.target_sent_timestamp.unwrap_or(0) });
+    }
+    // 官方 pinMessage=27/unpinMessage=28/adminDelete=29（SignalService.proto，
+    // processDataMessage.preload.ts processPinMessage 行为对齐）。targetAuthor
+    // 与 reaction 同口径（E.164 命中转号码，未命中 ACI）；pinDurationSeconds
+    // 缺席 = forever（官方 pinDuration null 语义）。
+    if let Some(pin) = data_message.pin_message.as_ref() {
+        let mut value = json!({
+            "targetAuthor": targeted_author_json(pin.target_author_aci_binary.as_deref(), author_numbers),
+            "targetSentTimestamp": pin.target_sent_timestamp.unwrap_or(0),
+        });
+        if let Some(presage::proto::data_message::pin_message::PinDuration::PinDurationSeconds(
+            seconds,
+        )) = pin.pin_duration.as_ref()
+        {
+            value["pinDurationSeconds"] = json!(seconds);
+        }
+        out["pinMessage"] = value;
+    }
+    if let Some(unpin) = data_message.unpin_message.as_ref() {
+        out["unpinMessage"] = json!({
+            "targetAuthor": targeted_author_json(unpin.target_author_aci_binary.as_deref(), author_numbers),
+            "targetSentTimestamp": unpin.target_sent_timestamp.unwrap_or(0),
+        });
+    }
+    if let Some(admin_delete) = data_message.admin_delete.as_ref() {
+        out["adminDelete"] = json!({
+            "targetAuthor": targeted_author_json(admin_delete.target_author_aci_binary.as_deref(), author_numbers),
+            "targetSentTimestamp": admin_delete.target_sent_timestamp.unwrap_or(0),
+        });
     }
     let attachments: Vec<Value> = data_message
         .attachments
@@ -1348,6 +1593,30 @@ async fn download_transfer_archive(
 // real 模式共用件
 // ---------------------------------------------------------------------------
 
+/// 官方 pinMessage=27 proto 组装（SignalService.proto §27；对齐官方桌面
+/// SendMessage.preload.ts：`pinDurationSeconds != null ? {seconds} : {forever}`）。
+fn pin_message_proto(
+    target_author_aci_bytes: Vec<u8>,
+    target_sent_timestamp: u64,
+    pin_duration_seconds: Option<u32>,
+) -> presage::proto::data_message::PinMessage {
+    use presage::proto::data_message::pin_message::PinDuration;
+    presage::proto::data_message::PinMessage {
+        target_author_aci_binary: Some(target_author_aci_bytes),
+        target_sent_timestamp: Some(target_sent_timestamp),
+        pin_duration: Some(match pin_duration_seconds {
+            Some(seconds) => PinDuration::PinDurationSeconds(seconds),
+            None => PinDuration::PinDurationForever(true),
+        }),
+    }
+}
+
+/// ACI 字符串 → 16 字节原始 UUID（官方 targetAuthorAciBinary 形态）。
+fn aci_to_bytes(aci: &str) -> Option<Vec<u8>> {
+    let uuid = presage::libsignal_service::prelude::Uuid::parse_str(aci.trim()).ok()?;
+    Some(uuid.into_bytes().to_vec())
+}
+
 /// 群组 id（signal-cli 同源：master key 标准 base64）→ 32 字节 master key。
 fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
@@ -1668,6 +1937,77 @@ mod tests {
         assert_eq!(out["reaction"]["targetAuthor"], json!(author));
         assert!(out.get("message").is_none(), "body absent stays absent");
         assert!(out.get("attachments").is_none());
+    }
+
+    /// pinMessage=27/unpinMessage=28/adminDelete=29 投影（官方
+    /// processDataMessage.preload.ts processPinMessage 行为对齐）。
+    #[test]
+    fn data_message_projection_carries_pin_unpin_admin_delete() {
+        use presage::proto::data_message::{pin_message, AdminDelete, PinMessage, UnpinMessage};
+        let author = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let author_bytes = uuid_bytes(author);
+        let mut numbers = HashMap::new();
+        numbers.insert(author.to_owned(), "+15551230000".to_owned());
+
+        // 定时置顶：pinDurationSeconds 存在。
+        let out = project_data_message(
+            &DataMessage {
+                pin_message: Some(PinMessage {
+                    target_author_aci_binary: Some(author_bytes.clone()),
+                    target_sent_timestamp: Some(1_700_000_000_000),
+                    pin_duration: Some(pin_message::PinDuration::PinDurationSeconds(86_400)),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["pinMessage"]["targetAuthor"], json!("+15551230000"));
+        assert_eq!(
+            out["pinMessage"]["targetSentTimestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(out["pinMessage"]["pinDurationSeconds"], json!(86_400));
+
+        // 永久置顶：pinDurationSeconds 缺席（官方 pinDuration null 语义）。
+        let out = project_data_message(
+            &DataMessage {
+                pin_message: Some(PinMessage {
+                    target_author_aci_binary: Some(author_bytes.clone()),
+                    target_sent_timestamp: Some(1),
+                    pin_duration: Some(pin_message::PinDuration::PinDurationForever(true)),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out["pinMessage"].get("pinDurationSeconds").is_none());
+
+        // 取消置顶与管理员删除：targetAuthor 同 E.164 口径。
+        let out = project_data_message(
+            &DataMessage {
+                unpin_message: Some(UnpinMessage {
+                    target_author_aci_binary: Some(author_bytes.clone()),
+                    target_sent_timestamp: Some(2),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["unpinMessage"]["targetAuthor"], json!("+15551230000"));
+        assert_eq!(out["unpinMessage"]["targetSentTimestamp"], json!(2));
+
+        let out = project_data_message(
+            &DataMessage {
+                admin_delete: Some(AdminDelete {
+                    target_author_aci_binary: Some(author_bytes),
+                    target_sent_timestamp: Some(3),
+                }),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(out["adminDelete"]["targetAuthor"], json!(author));
+        assert_eq!(out["adminDelete"]["targetSentTimestamp"], json!(3));
     }
 
     #[test]
