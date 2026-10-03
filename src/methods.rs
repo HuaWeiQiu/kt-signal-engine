@@ -142,7 +142,27 @@ async fn dispatch(
                         .get("previewDescription")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    image: params
+                        .get("previewImage")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 });
+            // 附件条目：connector 上游唯一形状（data URI 字符串数组）；
+            // 非字符串条目 fail-closed。
+            let attachments = match params.get("attachments") {
+                None => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(uri) => parsed.push(uri.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
             let mentions = match params.get("mentions") {
                 None => Vec::new(),
                 Some(Value::Array(entries)) => {
@@ -180,6 +200,7 @@ async fn dispatch(
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
+                            &attachments,
                         )
                         .await
                     {
@@ -199,6 +220,7 @@ async fn dispatch(
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
+                            &attachments,
                         )
                         .await
                     {

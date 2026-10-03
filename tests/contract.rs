@@ -352,10 +352,22 @@ fn mutating_methods_log_dispatch_and_reply() {
             "quoteAuthor": "+15555550101",
             "previewUrl": "https://example.com",
             "previewTitle": "Example",
-            "mentions": [{ "number": "+15555550101", "start": 0, "length": 2 }]
+            "mentions": [{ "number": "+15555550101", "start": 0, "length": 2 }],
+            "attachments": ["data:text/plain;filename=hello%20world.txt;base64,aGVsbG8="]
         }),
     );
     assert!(expanded["result"]["timestamp"].is_u64());
+    // 附件条目非字符串 fail-closed。
+    let bad_attachment = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "bad attachment",
+            "attachments": [42]
+        }),
+    );
+    assert_eq!(bad_attachment["error"]["code"], -32603);
     // 半参引用 fail-closed（quoteTimestamp 无 quoteAuthor）。
     let half_quote = engine.request(
         "send",
@@ -390,6 +402,7 @@ fn mutating_methods_log_dispatch_and_reply() {
             "sendReadReceipt",
             "sendViewedReceipt",
             "sendDeliveryReceipt",
+            "send",
             "send",
             "send"
         ]
@@ -433,11 +446,19 @@ fn mutating_methods_log_dispatch_and_reply() {
         entries[8]["params"]["mentions"],
         json!([{ "number": "+15555550101", "start": 0, "length": 2 }])
     );
-    assert_eq!(entries[9]["params"]["quoteTimestamp"], json!(42));
-    assert!(entries[9]
+    // 坏附件那次（entries[9]）：非字符串条目被拒但派发记录原样保留。
+    assert_eq!(entries[9]["params"]["attachments"], json!([42]));
+    // 半参引用（entries[10]）：quoteTimestamp 无 quoteAuthor，记录的是派发。
+    assert_eq!(entries[10]["params"]["quoteTimestamp"], json!(42));
+    assert!(entries[10]
         .get("params")
         .and_then(|p| p.get("quoteAuthor"))
         .is_none());
+    // 附件：data URI 数组逐字进调度日志（connector 上游唯一形状）。
+    assert_eq!(
+        entries[8]["params"]["attachments"],
+        json!(["data:text/plain;filename=hello%20world.txt;base64,aGVsbG8="])
+    );
 }
 
 #[test]

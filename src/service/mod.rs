@@ -61,6 +61,8 @@ pub(crate) struct SendPreview {
     pub(crate) url: String,
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
+    /// previewImage 数据 URI（data URI 同附件形状）；随同批 CDN 上行。
+    pub(crate) image: Option<String>,
 }
 
 /// mentions 条目：number 经 resolve_author_aci 转 ACI；start/length 为
@@ -69,6 +71,82 @@ pub(crate) struct SendMention {
     pub(crate) number: String,
     pub(crate) start: u32,
     pub(crate) length: u32,
+}
+
+/// 附件条数上限：与接收投影 §4.13/compat receive 32 条同口径，超出
+/// fail-closed。
+const ATTACHMENT_MAX_COUNT: usize = 32;
+
+/// 单附件字节上限：官方桌面 100MB CDN 上限同源，超出 fail-closed。
+const ATTACHMENT_MAX_BYTES: usize = 100_000_000;
+
+struct ParsedAttachment {
+    spec: presage::libsignal_service::sender::AttachmentSpec,
+    bytes: Vec<u8>,
+}
+
+/// send 附件条目解析：data URI 唯一形状 = connector 上游形状
+/// `data:<mediatype>[;filename=<percent-encoded>];base64,<payload>`（RFC
+/// 2397 扩展 filename 参数同款）。mediatype 缺省 application/octet-stream；
+/// 非 base64 / 坏 percent / 坏 base64 / 超上限一律 None（fail-closed）。
+fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut parts = meta.split(';');
+    let declared = parts.next().unwrap_or_default();
+    let content_type = if declared.is_empty() {
+        "application/octet-stream"
+    } else {
+        declared
+    };
+    let mut filename = None;
+    let mut is_base64 = false;
+    for param in parts {
+        if param.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        } else if let Some(value) = param.strip_prefix("filename=") {
+            filename = Some(percent_decode(value)?);
+        }
+    }
+    if !is_base64 {
+        return None;
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    if bytes.len() > ATTACHMENT_MAX_BYTES {
+        return None;
+    }
+    Some(ParsedAttachment {
+        spec: presage::libsignal_service::sender::AttachmentSpec {
+            content_type: content_type.to_owned(),
+            length: bytes.len(),
+            file_name: filename,
+            ..presage::libsignal_service::sender::AttachmentSpec::default()
+        },
+        bytes,
+    })
+}
+
+/// percent-decode（connector build_attachment_data_uri 的 encodeURIComponent
+/// 语义逆运算）；坏序列/非 UTF-8 一律 None。
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes.get(index + 1..index + 3)?;
+            let byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// fake 服务开关（compat §6）：仅显式环境变量，生产缺省为真实服务。
@@ -359,6 +437,7 @@ impl Service {
         Ok(had_dir || !self.real)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_text(
         self: &Arc<Self>,
         account: &str,
@@ -367,6 +446,7 @@ impl Service {
         quote: Option<&SendQuote>,
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
+        attachments: &[String],
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -376,6 +456,13 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = manager;
         let timestamp = now_ms();
+        // 附件/预览图一次上行（多收件人共享同一批指针）。
+        let (pointers, preview_image) = upload_attachments_for_send(
+            &manager,
+            attachments,
+            preview.and_then(|item| item.image.as_deref()),
+        )
+        .await?;
         let mut results = Vec::new();
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
@@ -387,6 +474,8 @@ impl Service {
                 quote,
                 preview,
                 mentions,
+                pointers.clone(),
+                preview_image.clone(),
                 timestamp,
             )
             .await?;
@@ -811,6 +900,7 @@ impl Service {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_text_group(
         self: &Arc<Self>,
         account: &str,
@@ -819,17 +909,26 @@ impl Service {
         quote: Option<&SendQuote>,
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
+        attachments: &[String],
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
         let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (pointers, preview_image) = upload_attachments_for_send(
+            &manager,
+            attachments,
+            preview.and_then(|item| item.image.as_deref()),
+        )
+        .await?;
         let body = build_text_data_message(
             manager.store(),
             message,
             quote,
             preview,
             mentions,
+            pointers,
+            preview_image,
             timestamp,
         )
         .await?;
@@ -1777,27 +1876,82 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
 /// 回应/群内作者号 → ACI 字符串。解析顺序：UUID 形状直通 → 本机注册数据
 /// （回应自己发的消息时 targetAuthor 是本机号，不在 contacts）→ contacts
 /// 数字位匹配；都不中返回 None，回退语义由调用方决定。
+/// send 附件上行：官方 CDN v4 面零 fork（presage upload_attachments，加密/
+/// padding/digest/上传全官方原语）。任何一条失败整体 fail-closed（半发的
+/// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。
+async fn upload_attachments_for_send(
+    manager: &Manager<SqliteStore, Registered>,
+    entries: &[String],
+    preview_image: Option<&str>,
+) -> Result<
+    (
+        Vec<presage::proto::AttachmentPointer>,
+        Option<presage::proto::AttachmentPointer>,
+    ),
+    SendError,
+> {
+    let mut parsed = entries
+        .iter()
+        .map(|entry| parse_attachment_data_uri(entry))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(SendError::Internal)?;
+    let image_index = match preview_image {
+        Some(uri) => {
+            parsed.push(parse_attachment_data_uri(uri).ok_or(SendError::Internal)?);
+            Some(parsed.len() - 1)
+        }
+        None => None,
+    };
+    if parsed.len() > ATTACHMENT_MAX_COUNT {
+        return Err(SendError::Internal);
+    }
+    if parsed.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let uploads = manager
+        .upload_attachments(
+            parsed
+                .into_iter()
+                .map(|item| (item.spec, item.bytes))
+                .collect(),
+        )
+        .await
+        .map_err(|_| SendError::Internal)?;
+    let mut pointers = uploads
+        .into_iter()
+        .map(|result| result.ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(SendError::Internal)?;
+    let image = image_index.map(|index| pointers.remove(index));
+    Ok((pointers, image))
+}
+
 /// send 文本 dataMessage 公共构造（直聊/群组同形状，compat §3 send 行
-/// quoteTimestamp/quoteAuthor/previewUrl/mentions 扩面）：
+/// quoteTimestamp/quoteAuthor/previewUrl/mentions/attachments 扩面）：
 /// - quote：id=被引消息 upstream 时间戳、author=原作者 ACI（号码经
 ///   resolve_author_aci）；text 从本机 store 找回——presage 官方接收路径
 ///   已落库的消息（引擎无新增落库面），找不到按官方/上游同款降级缺省
 ///   text（收端仅少预览文案，协议面合法）。
-/// - preview：url/title/description 直投 proto Preview；previewImage 缺席
-///   （附件 CDN 上行 P3；无图预览官方合法）。
+/// - preview：url/title/description 直投 proto Preview；previewImage 数据
+///   URI 随同批 CDN 上行后挂 Preview.image（官方同构）。
 /// - mentions：number→ACI 后 BodyRange.MentionAci（≤条目数即上限，与接收
 ///   投影 ≤64 同口径的调用方纪律）；offsets 透传。
+/// - attachments：caller 已上行完毕的 AttachmentPointer 原样入消息。
+#[allow(clippy::too_many_arguments)]
 async fn build_text_data_message(
     store: &SqliteStore,
     message: &str,
     quote: Option<&SendQuote>,
     preview: Option<&SendPreview>,
     mentions: &[SendMention],
+    attachment_pointers: Vec<presage::proto::AttachmentPointer>,
+    preview_image: Option<presage::proto::AttachmentPointer>,
     timestamp: u64,
 ) -> Result<DataMessage, SendError> {
     let mut dm = DataMessage {
         timestamp: Some(timestamp),
         body: Some(message.to_owned()),
+        attachments: attachment_pointers,
         ..DataMessage::default()
     };
     if let Some(quote) = quote {
@@ -1819,6 +1973,7 @@ async fn build_text_data_message(
             url: Some(preview.url.clone()),
             title: preview.title.clone(),
             description: preview.description.clone(),
+            image: preview_image,
             ..presage::proto::Preview::default()
         }];
     }
