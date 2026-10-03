@@ -40,6 +40,9 @@ pub(crate)，provisioning WS 的消费面在 crate 外**无法**公共组装—�
    splitmix 时间熵命名，避开「先开店后知道号码」的重命名竞态）；
    `engine-state.json` 升 v2 登记 `{number, dir}`；v1（P1a 桩合成号码）
    重置为空不迁移。删除账号 = 删登记 + `remove_dir_all` + 停接收管线。
+   启动清扫：链接任务失败路径自清目录，但进程被杀/崩溃会残留孤儿；启动
+   时（无在途链接）凡登记表未引用的 `accounts/lk-*` 目录一律删除——其
+   store 至多持半程注册数据，不触及聊天内容；登记是权威。
 6. **发送管线**：每次发送短命 `Manager::load_registered(store.clone())`
    实例（接收实例长期持有 Manager，二者不共享）；直聊号码经 contacts
    同步入库的 number→ACI 映射解析（`Contact.phone_number`），冷启动窗口

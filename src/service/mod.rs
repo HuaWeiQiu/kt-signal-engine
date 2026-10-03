@@ -11,7 +11,7 @@
 //! 纪律（compat §1）：本层不产生任何 stderr 输出；错误统一折叠为枚举，
 //! 响应面错误码由 methods.rs 固定；不落正文/号码/URI/密钥。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -140,6 +140,15 @@ impl Service {
         if !self.real {
             return;
         }
+        let referenced: HashSet<String> = {
+            let state = self.state.lock().await;
+            state
+                .accounts()
+                .iter()
+                .filter_map(|entry| entry.dir.clone())
+                .collect()
+        };
+        sweep_orphan_store_dirs(&self.data_dir, &referenced);
         let accounts: Vec<(String, PathBuf)> = {
             let state = self.state.lock().await;
             state
@@ -1272,6 +1281,33 @@ fn random_dir_name() -> String {
     format!("lk-{:016x}", mix_seed_step(mix_seed()))
 }
 
+/// 启动清扫：孤儿 store 目录。链接目录「开始即定名」，正常失败路径由链接
+/// 任务自清，但进程被杀/崩溃时残留。启动时机无在途链接，凡 engine-state.json
+/// 未登记的 `accounts/lk-*` 目录一律删除：其 store 至多持有半程注册数据，
+/// 用户消息只在链接成功后落 store，清扫不触及任何聊天内容。链接成功与登记
+/// 之间被杀的毫秒级窗口会连已注册 store 一起删——状态文件是权威，恢复只能
+/// 重新扫码，窗口代价可接受。本层纪律：无 stderr 输出，失败按尽力而为跳过
+/// （下次启动重试）。
+fn sweep_orphan_store_dirs(data_dir: &Path, referenced: &HashSet<String>) -> usize {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("lk-") || !entry.path().is_dir() {
+            continue;
+        }
+        if referenced.contains(&format!("accounts/{name}")) {
+            continue;
+        }
+        removed += usize::from(std::fs::remove_dir_all(entry.path()).is_ok());
+    }
+    removed
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1285,6 +1321,33 @@ mod tests {
     use presage::proto::attachment_pointer::Flags;
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
+
+    #[test]
+    fn orphan_store_sweep_removes_only_unreferenced_lk_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "kt-engine-sweep-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let accounts = root.join("accounts");
+        std::fs::create_dir_all(accounts.join("lk-live/nested")).unwrap();
+        std::fs::write(accounts.join("lk-live/store.db"), b"x").unwrap();
+        std::fs::create_dir_all(accounts.join("lk-orphan-empty")).unwrap();
+        std::fs::create_dir_all(accounts.join("lk-orphan-db")).unwrap();
+        std::fs::write(accounts.join("lk-orphan-db/store.db"), b"x").unwrap();
+        std::fs::create_dir_all(accounts.join("not-lk")).unwrap();
+        std::fs::write(accounts.join("lk-loose-file"), b"x").unwrap();
+
+        let referenced: HashSet<String> = ["accounts/lk-live".to_owned()].into_iter().collect();
+        let removed = sweep_orphan_store_dirs(&root, &referenced);
+
+        assert_eq!(removed, 2);
+        assert!(accounts.join("lk-live/store.db").exists());
+        assert!(accounts.join("not-lk").is_dir());
+        assert!(accounts.join("lk-loose-file").exists());
+        assert!(!accounts.join("lk-orphan-empty").try_exists().unwrap());
+        assert!(!accounts.join("lk-orphan-db").try_exists().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn data_message_projection_carries_all_consumed_surfaces() {
