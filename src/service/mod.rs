@@ -51,6 +51,26 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VE
 /// 超出按官方分帧继续发（非 fail-closed）。
 const RECEIPT_CHUNK_SIZE: usize = 100;
 
+/// send 扩面 payload（compat §3 send 行，键名与 connector 上游同名直投）。
+pub(crate) struct SendQuote {
+    pub(crate) timestamp: u64,
+    pub(crate) author: String,
+}
+
+pub(crate) struct SendPreview {
+    pub(crate) url: String,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+}
+
+/// mentions 条目：number 经 resolve_author_aci 转 ACI；start/length 为
+/// UTF-16 code units（官方 BodyRange 同语义），透传不校验正文对齐。
+pub(crate) struct SendMention {
+    pub(crate) number: String,
+    pub(crate) start: u32,
+    pub(crate) length: u32,
+}
+
 /// fake 服务开关（compat §6）：仅显式环境变量，生产缺省为真实服务。
 pub(crate) fn mode_from_env() -> bool {
     std::env::var("KT_ENGINE_FAKE_SERVICE").ok().as_deref() == Some("1")
@@ -344,6 +364,9 @@ impl Service {
         account: &str,
         recipients: &[String],
         message: &str,
+        quote: Option<&SendQuote>,
+        preview: Option<&SendPreview>,
+        mentions: &[SendMention],
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -358,11 +381,15 @@ impl Service {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
-            let body = DataMessage {
-                timestamp: Some(timestamp),
-                body: Some(message.to_owned()),
-                ..DataMessage::default()
-            };
+            let body = build_text_data_message(
+                manager.store(),
+                message,
+                quote,
+                preview,
+                mentions,
+                timestamp,
+            )
+            .await?;
             manager
                 .send_message(service_id, body, timestamp)
                 .await
@@ -789,16 +816,23 @@ impl Service {
         account: &str,
         group_id: &str,
         message: &str,
+        quote: Option<&SendQuote>,
+        preview: Option<&SendPreview>,
+        mentions: &[SendMention],
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
         let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
-        let body = DataMessage {
-            timestamp: Some(timestamp),
-            body: Some(message.to_owned()),
-            ..DataMessage::default()
-        };
+        let body = build_text_data_message(
+            manager.store(),
+            message,
+            quote,
+            preview,
+            mentions,
+            timestamp,
+        )
+        .await?;
         dispatch_group(&mut manager, group_id, body, timestamp).await?;
         Ok((timestamp, Vec::new()))
     }
@@ -1712,6 +1746,85 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
 /// 回应/群内作者号 → ACI 字符串。解析顺序：UUID 形状直通 → 本机注册数据
 /// （回应自己发的消息时 targetAuthor 是本机号，不在 contacts）→ contacts
 /// 数字位匹配；都不中返回 None，回退语义由调用方决定。
+/// send 文本 dataMessage 公共构造（直聊/群组同形状，compat §3 send 行
+/// quoteTimestamp/quoteAuthor/previewUrl/mentions 扩面）：
+/// - quote：id=被引消息 upstream 时间戳、author=原作者 ACI（号码经
+///   resolve_author_aci）；text 从本机 store 找回——presage 官方接收路径
+///   已落库的消息（引擎无新增落库面），找不到按官方/上游同款降级缺省
+///   text（收端仅少预览文案，协议面合法）。
+/// - preview：url/title/description 直投 proto Preview；previewImage 缺席
+///   （附件 CDN 上行 P3；无图预览官方合法）。
+/// - mentions：number→ACI 后 BodyRange.MentionAci（≤条目数即上限，与接收
+///   投影 ≤64 同口径的调用方纪律）；offsets 透传。
+async fn build_text_data_message(
+    store: &SqliteStore,
+    message: &str,
+    quote: Option<&SendQuote>,
+    preview: Option<&SendPreview>,
+    mentions: &[SendMention],
+    timestamp: u64,
+) -> Result<DataMessage, SendError> {
+    let mut dm = DataMessage {
+        timestamp: Some(timestamp),
+        body: Some(message.to_owned()),
+        ..DataMessage::default()
+    };
+    if let Some(quote) = quote {
+        let author_aci = resolve_author_aci(store, &quote.author)
+            .await
+            .ok_or(SendError::Internal)?;
+        let mut q = presage::proto::data_message::Quote {
+            id: Some(quote.timestamp),
+            author_aci: Some(author_aci.clone()),
+            ..presage::proto::data_message::Quote::default()
+        };
+        if let Some(text) = quoted_text(store, &author_aci, quote.timestamp).await {
+            q.text = Some(text);
+        }
+        dm.quote = Some(q);
+    }
+    if let Some(preview) = preview {
+        dm.preview = vec![presage::proto::Preview {
+            url: Some(preview.url.clone()),
+            title: preview.title.clone(),
+            description: preview.description.clone(),
+            ..presage::proto::Preview::default()
+        }];
+    }
+    if !mentions.is_empty() {
+        let mut ranges = Vec::with_capacity(mentions.len());
+        for mention in mentions {
+            let aci = resolve_author_aci(store, &mention.number)
+                .await
+                .ok_or(SendError::Internal)?;
+            ranges.push(presage::proto::BodyRange {
+                start: Some(mention.start),
+                length: Some(mention.length),
+                associated_value: Some(presage::proto::body_range::AssociatedValue::MentionAci(
+                    aci,
+                )),
+            });
+        }
+        dm.body_ranges = ranges;
+    }
+    Ok(dm)
+}
+
+/// 被引消息正文找回：author ACI + upstream 时间戳定位 presage 线程消息，
+/// 直聊/群组 thread 都命中；任何环节失败 = 引用缺 text（官方降级同款）。
+async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> Option<String> {
+    let sender = ServiceId::parse_from_service_id_string(author_aci)?;
+    let thread = store
+        .thread_for_sender_and_timestamp(&sender, timestamp)
+        .await
+        .ok()??;
+    let content = store.message(&thread, timestamp).await.ok()??;
+    match content.body {
+        ContentBody::DataMessage(dm) => dm.body,
+        _ => None,
+    }
+}
+
 async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String> {
     let trimmed = author.trim();
     if let Some(service_id) = ServiceId::parse_from_service_id_string(trimmed) {

@@ -69,7 +69,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
 | `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}]}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
-| `send` | `{account, recipient[]/groupId, message, attachments?, quoteTimestamp?, quoteAuthor?, previews?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解：`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；附件/引用上行 P3 |
+| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, mentions?: [{number, start, length}], attachments?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/mentions 条目缺字段 `-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；previewUrl/title/description 直投 proto（previewImage 随附件上行 P3）；mentions→BodyRange.MentionAci；attachments P3 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |

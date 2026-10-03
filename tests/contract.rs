@@ -340,6 +340,34 @@ fn mutating_methods_log_dispatch_and_reply() {
         json!({})
     );
 
+    // send 扩面：quote/preview/mentions 键原样进调度日志（connector 上游
+    // 同名直投的契约面）。
+    let expanded = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "reply with quote",
+            "quoteTimestamp": 42,
+            "quoteAuthor": "+15555550101",
+            "previewUrl": "https://example.com",
+            "previewTitle": "Example",
+            "mentions": [{ "number": "+15555550101", "start": 0, "length": 2 }]
+        }),
+    );
+    assert!(expanded["result"]["timestamp"].is_u64());
+    // 半参引用 fail-closed（quoteTimestamp 无 quoteAuthor）。
+    let half_quote = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "bad quote",
+            "quoteTimestamp": 42
+        }),
+    );
+    assert_eq!(half_quote["error"]["code"], -32603);
+
     // 调度日志：逐行 {method, params}，参数形状供 connector 侧依赖断言。
     let log_path = dir.join("engine-send-log.jsonl");
     let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
@@ -361,7 +389,9 @@ fn mutating_methods_log_dispatch_and_reply() {
             "updateContact",
             "sendReadReceipt",
             "sendViewedReceipt",
-            "sendDeliveryReceipt"
+            "sendDeliveryReceipt",
+            "send",
+            "send"
         ]
     );
     assert_eq!(
@@ -392,6 +422,22 @@ fn mutating_methods_log_dispatch_and_reply() {
     );
     assert_eq!(entries[6]["params"]["timestamps"], json!([44]));
     assert_eq!(entries[7]["params"]["timestamps"], json!([45]));
+    // send 扩面键在调度日志逐字保留（半参失败那次也落日志，记录的是派发）。
+    assert_eq!(entries[8]["params"]["quoteTimestamp"], json!(42));
+    assert_eq!(entries[8]["params"]["quoteAuthor"], json!("+15555550101"));
+    assert_eq!(
+        entries[8]["params"]["previewUrl"],
+        json!("https://example.com")
+    );
+    assert_eq!(
+        entries[8]["params"]["mentions"],
+        json!([{ "number": "+15555550101", "start": 0, "length": 2 }])
+    );
+    assert_eq!(entries[9]["params"]["quoteTimestamp"], json!(42));
+    assert!(entries[9]
+        .get("params")
+        .and_then(|p| p.get("quoteAuthor"))
+        .is_none());
 }
 
 #[test]

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
-use crate::service::{LinkError, Service, UserStatusError};
+use crate::service::{LinkError, SendMention, SendPreview, SendQuote, Service, UserStatusError};
 use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
@@ -115,9 +115,74 @@ async fn dispatch(
             let account = params.get("account").and_then(Value::as_str);
             let message = params.get("message").and_then(Value::as_str);
             let group = params.get("groupId").and_then(Value::as_str);
+            // 引用/预览/mentions 扩面：键名与 connector 上游同名直投。
+            // quote 半参（只有 timestamp 或只有 author）fail-closed；mentions
+            // 条目缺字段/超 u32 fail-closed。
+            let quote = match (params.get("quoteTimestamp"), params.get("quoteAuthor")) {
+                (None, None) => None,
+                (Some(ts), Some(author)) => match (ts.as_u64(), author.as_str()) {
+                    (Some(ts), Some(author)) => Some(SendQuote {
+                        timestamp: ts,
+                        author: author.to_owned(),
+                    }),
+                    _ => return internal_error(id),
+                },
+                _ => return internal_error(id),
+            };
+            let preview = params
+                .get("previewUrl")
+                .and_then(Value::as_str)
+                .map(|url| SendPreview {
+                    url: url.to_owned(),
+                    title: params
+                        .get("previewTitle")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    description: params
+                        .get("previewDescription")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            let mentions = match params.get("mentions") {
+                None => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let number = entry.get("number").and_then(Value::as_str);
+                        let start = entry
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let length = entry
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        match (number, start, length) {
+                            (Some(number), Some(start), Some(length)) => parsed.push(SendMention {
+                                number: number.to_owned(),
+                                start,
+                                length,
+                            }),
+                            _ => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
             match (account, message, group, recipients_of(params)) {
                 (Some(account), Some(message), Some(group), _) => {
-                    match service.send_text_group(account, group, message).await {
+                    match service
+                        .send_text_group(
+                            account,
+                            group,
+                            message,
+                            quote.as_ref(),
+                            preview.as_ref(),
+                            &mentions,
+                        )
+                        .await
+                    {
                         Ok((timestamp, results)) => jsonrpc::success_response(
                             id,
                             json!({ "timestamp": timestamp, "results": results }),
@@ -126,7 +191,17 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(message), None, Ok(recipients)) => {
-                    match service.send_text(account, &recipients, message).await {
+                    match service
+                        .send_text(
+                            account,
+                            &recipients,
+                            message,
+                            quote.as_ref(),
+                            preview.as_ref(),
+                            &mentions,
+                        )
+                        .await
+                    {
                         Ok((timestamp, results)) => jsonrpc::success_response(
                             id,
                             json!({ "timestamp": timestamp, "results": results }),
