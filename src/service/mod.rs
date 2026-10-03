@@ -17,16 +17,24 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::configuration::{Endpoint, ServiceCredentials, SignalServers};
 use presage::libsignal_service::content::ContentBody;
-use presage::libsignal_service::protocol::ServiceId;
-use presage::manager::Manager;
-use presage::manager::Registered;
+use presage::libsignal_service::prelude::PushService;
+use presage::libsignal_service::protocol::{IdentityKeyPair, ServiceId};
+use presage::libsignal_service::provisioning::{
+    link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
+};
+use presage::libsignal_service::push_service::HttpAuthOverride;
+use presage::libsignal_service::utils::phonenumber_from_signal;
+use presage::manager::{Manager, Registered, RegistrationData};
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::DataMessage;
-use presage::store::{ContentsStore, StateStore};
+use presage::store::{ContentsStore, StateStore, Store};
 use presage_store_sqlite::SqliteStore;
+use rand::distr::{Alphanumeric, SampleString};
+use rand::rng;
+use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 
@@ -35,6 +43,9 @@ use crate::state::EngineState;
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
 const PLACEHOLDER_DEVICE_NAME: &str = "KT Signal Engine";
+
+/// 出网 UA：官方审计面统一标识（引擎所有直连 REST/WS 共用）。
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 /// fake 服务开关（compat §6）：仅显式环境变量，生产缺省为真实服务。
 pub(crate) fn mode_from_env() -> bool {
@@ -205,34 +216,9 @@ impl Service {
         let task_dir = store_dir.clone();
         let task_slot = Arc::clone(&slot);
         tokio::task::spawn_local(async move {
-            let linked = Manager::link_secondary_device(
-                store,
-                SignalServers::Production,
-                PLACEHOLDER_DEVICE_NAME.to_owned(),
-                url_tx,
-            )
-            .await;
-            match linked {
-                Ok(manager) => {
-                    let number = manager
-                        .store()
-                        .load_registration_data()
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|data| e164_string(&data.phone_number));
-                    match number {
-                        Some(number) => task_slot.complete(Ok(number)),
-                        None => {
-                            let _ = std::fs::remove_dir_all(&task_dir);
-                            task_slot.complete(Err(()));
-                        }
-                    }
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_dir_all(&task_dir);
-                    task_slot.complete(Err(()));
-                }
+            match link_flow(store, url_tx, task_dir).await {
+                Ok(number) => task_slot.complete(Ok(number)),
+                Err(()) => task_slot.complete(Err(())),
             }
         });
 
@@ -1115,6 +1101,250 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
 }
 
 // ---------------------------------------------------------------------------
+// ADR 0005 S2：backup5 链接流程与存量历史迁移下载
+// ---------------------------------------------------------------------------
+
+/// 链接主流程：绕过 `Manager::link_secondary_device`（其内部丢弃
+/// `ephemeral_backup_key`，且 `RegistrationData` 的 password/profile_key 为
+/// pub(crate) 无法外部构造），直调 provisioning 层 `link_device`；QR URL 追加
+/// `capabilities=backup5`（官方 Provisioner 语义：手机读到声明才发起存量历史
+/// 迁移上传；URL 文本层追加，connector 展示面零改动）。拿到
+/// `NewDeviceRegistration` 后按官方 store 落库格式经 serde 数据面构造
+/// `RegistrationData`，回归既有 `load_registered` 收发管线。key 命中时后台
+/// best-effort 下载迁移档案，不阻塞链接成功（ADR 0005 §S2 定案）。
+///
+/// 纪律：失败即整会话作废（删目录 + Err）——provisioning WS 约 90s 服务端
+/// 空闲超时，旧 QR 不可复用，重试由 connector 重新 startLink。
+async fn link_flow(
+    mut store: SqliteStore,
+    url_tx: futures::channel::oneshot::Sender<url::Url>,
+    store_dir: PathBuf,
+) -> Result<String, ()> {
+    let mut rng = rng();
+    let password = Alphanumeric.sample_string(&mut rng, 24);
+    let push_service = PushService::new(SignalServers::Production, None, USER_AGENT);
+    let (event_tx, mut event_rx) = futures::channel::mpsc::channel(1);
+
+    let (link_outcome, registration) = futures::future::join(
+        link_device(
+            &mut store.aci_protocol_store(),
+            &mut store.pni_protocol_store(),
+            &mut rng,
+            push_service,
+            &password,
+            PLACEHOLDER_DEVICE_NAME,
+            event_tx,
+        ),
+        async move {
+            let url = match event_rx.next().await {
+                Some(SecondaryDeviceProvisioning::Url(url)) => url,
+                _ => return Err(()),
+            };
+            let mut qr_url = url;
+            qr_url
+                .query_pairs_mut()
+                .append_pair("capabilities", "backup5");
+            let _ = url_tx.send(qr_url);
+            match event_rx.next().await {
+                Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => Ok(data),
+                _ => Err(()),
+            }
+        },
+    )
+    .await;
+
+    link_outcome.map_err(|_| ())?;
+    let NewDeviceRegistration {
+        phone_number,
+        device_id,
+        registration_id,
+        pni_registration_id,
+        service_ids,
+        aci_private_key,
+        aci_public_key,
+        pni_private_key,
+        pni_public_key,
+        profile_key,
+        account_entropy_pool,
+        ephemeral_backup_key,
+    } = registration.map_err(|_| ())?;
+
+    // serde 数据面构造（官方 store 落库格式）：pub(crate) 字段的唯一合法
+    // 构造路径；键面与序列化形态由往返单测锁死。
+    let number = e164_string(&phonenumber_from_signal(&phone_number));
+    let servers = serde_json::to_value(SignalServers::Production).map_err(|_| ())?;
+    let phone = serde_json::to_value(phonenumber_from_signal(&phone_number)).map_err(|_| ())?;
+    use base64::Engine as _;
+    let profile_key_b64 = base64::engine::general_purpose::STANDARD.encode(profile_key.bytes);
+    // 注意 from_str 而非 from_value：上游 serde_profile_key 用借用反序列化
+    // （<&str>::deserialize），owned Value 路径直接报 "expected a borrowed
+    // string"；字符串 deserializer 才满足借用生命周期。
+    let registration_data: RegistrationData = serde_json::from_str(
+        &serde_json::to_string(&json!({
+            "signal_servers": servers,
+            "device_name": PLACEHOLDER_DEVICE_NAME,
+            "phone_number": phone,
+            // ServiceIds flatten 后 aci 的 JSON 键名是 "uuid"（上游 serde rename）。
+            "uuid": service_ids.aci,
+            "pni": service_ids.pni,
+            "password": password,
+            "device_id": Some(u32::from(device_id)),
+            "registration_id": registration_id,
+            "pni_registration_id": Some(pni_registration_id),
+            "profile_key": profile_key_b64,
+        }))
+        .map_err(|_| ())?,
+    )
+    .map_err(|_| ())?;
+
+    // 落库顺序与官方 link_secondary_device 一致。
+    store
+        .set_aci_identity_key_pair(IdentityKeyPair::new(aci_public_key, aci_private_key))
+        .await
+        .map_err(|_| ())?;
+    store
+        .set_pni_identity_key_pair(IdentityKeyPair::new(pni_public_key, pni_private_key))
+        .await
+        .map_err(|_| ())?;
+    let master_key = account_entropy_pool.as_ref().and_then(|aep| {
+        presage::libsignal_service::prelude::MasterKey::from_slice(aep.derive_svr_key().as_slice())
+            .ok()
+    });
+    store
+        .store_master_key(master_key.as_ref())
+        .await
+        .map_err(|_| ())?;
+    store
+        .store_account_entropy_pool(account_entropy_pool.as_ref())
+        .await
+        .map_err(|_| ())?;
+    store
+        .save_registration_data(&registration_data)
+        .await
+        .map_err(|_| ())?;
+
+    // 回归既有收发管线的门禁：标准 load 路径能读回（本任务内 Manager 即弃，
+    // 接收管线在 finish_link 后由 spawn_pipeline 自行 load）。
+    Manager::load_registered(store).await.map_err(|_| ())?;
+
+    if let Some(backup_key) = ephemeral_backup_key {
+        let credentials = ServiceCredentials {
+            aci: Some(service_ids.aci),
+            pni: Some(service_ids.pni),
+            phonenumber: phone_number,
+            password: Some(password),
+            device_id: Some(device_id),
+        };
+        // 导出面 future 非 Send（上游 FramesReader 持 Rc 状态）：与链接/
+        // 接收任务同策略，LocalSet 承载（main 装配提供上下文）。
+        tokio::task::spawn_local(download_transfer_archive(
+            store_dir,
+            service_ids.aci,
+            backup_key,
+            credentials,
+        ));
+    }
+    Ok(number)
+}
+
+/// 存量历史迁移下载（best-effort）：`transfer_archive` 长轮询等手机上传
+/// 就绪（204 重试上限 10 次、间隔 3s、服务端单次挂起 60s），200 后从 CDN
+/// 拉档案，`history::export_archive` 解密逐帧导出 NDJSON 到账号 store 目录
+/// （`history-import.ndjson`，S3 connector 消费）。任何一步失败静默放弃并
+/// 清理半成品——失败形态即 NDJSON 缺席，消费方以文件存在性判定导入结果；
+/// 本任务不产生 stderr（compat §1），不影响链接成功。
+async fn download_transfer_archive(
+    store_dir: PathBuf,
+    aci: presage::libsignal_service::prelude::Uuid,
+    backup_key: [u8; 32],
+    credentials: ServiceCredentials,
+) {
+    let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
+
+    let manifest: Value = {
+        let mut polls = 0u32;
+        loop {
+            let response = match push.request(
+                Method::GET,
+                Endpoint::service("v1/devices/transfer_archive?timeout=60"),
+                HttpAuthOverride::NoOverride,
+            ) {
+                Ok(builder) => builder,
+                Err(_) => return,
+            };
+            let response = match response.send().await {
+                Ok(response) => response,
+                Err(_) => return,
+            };
+            match response.status().as_u16() {
+                200 => {
+                    let bytes = match response.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(_) => return,
+                    };
+                    match serde_json::from_slice(&bytes) {
+                        Ok(value) => break value,
+                        Err(_) => return,
+                    }
+                }
+                204 if polls >= 9 => return,
+                204 => {
+                    polls += 1;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                _ => return,
+            }
+        }
+    };
+    let (Some(cdn), Some(key)) = (
+        manifest["cdn"].as_u64().map(|value| value as u32),
+        manifest["key"].as_str().map(str::to_owned),
+    ) else {
+        return;
+    };
+
+    let response = match push.request(
+        Method::GET,
+        Endpoint::cdn(cdn, format!("attachments/{key}")),
+        HttpAuthOverride::NoOverride,
+    ) {
+        Ok(builder) => builder,
+        Err(_) => return,
+    };
+    let bytes = match response.send().await {
+        Ok(response) => match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+
+    let archive_path = store_dir.join("transfer-archive.bin");
+    if std::fs::write(&archive_path, &bytes).is_err() {
+        return;
+    }
+    let ndjson_path = store_dir.join("history-import.ndjson");
+    let outcome = std::fs::File::create(&ndjson_path)
+        .map_err(|_| ())
+        .map(std::io::BufWriter::new);
+    let mut writer = match outcome {
+        Ok(writer) => writer,
+        Err(_) => {
+            let _ = std::fs::remove_file(&archive_path);
+            return;
+        }
+    };
+    let exported =
+        crate::history::export_archive(&archive_path, aci, backup_key, &mut writer).await;
+    let _ = std::io::Write::flush(&mut writer);
+    drop(writer);
+    if exported.is_err() {
+        let _ = std::fs::remove_file(&ndjson_path);
+    }
+    let _ = std::fs::remove_file(&archive_path);
+}
+
+// ---------------------------------------------------------------------------
 // real 模式共用件
 // ---------------------------------------------------------------------------
 
@@ -1452,6 +1682,39 @@ mod tests {
             None
         );
         assert_eq!(decode_group_id("not base64!!"), None);
+    }
+
+    /// ADR 0005 §S2：serde 数据面是 `RegistrationData` pub(crate) 字段（
+    /// password/profile_key）的唯一外部构造路径；JSON 形态 = presage 官方
+    /// store 落库格式，往返锁死 = 格式稳定性等价 store 格式稳定性。
+    #[test]
+    fn registration_data_serde_official_store_shape_roundtrip() {
+        use base64::Engine as _;
+        use presage::libsignal_service::utils::TryIntoE164;
+
+        let e164 = "+15551234567".try_into_e164().expect("e164");
+        let phone_number = presage::libsignal_service::utils::phonenumber_from_signal(&e164);
+        let value = json!({
+            "signal_servers": "Production",
+            "device_name": "KT Signal Engine",
+            "phone_number": serde_json::to_value(&phone_number).expect("phone serializes"),
+            "uuid": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+            "pni": "7b3dc19e-11f2-4c5a-9d0e-2f6a8b4c1d3e",
+            "password": "abcdefghijklmnopqrstuvwx",
+            "device_id": Some(2u32),
+            "registration_id": 1234u32,
+            "pni_registration_id": Some(5678u32),
+            "profile_key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        });
+
+        let data: RegistrationData =
+            serde_json::from_str(&value.to_string()).expect("deserializes");
+        let round: Value = serde_json::to_value(&data).expect("serializes");
+        assert_eq!(round, value);
+        let data2: RegistrationData =
+            serde_json::from_str(&round.to_string()).expect("re-deserializes");
+        let round2: Value = serde_json::to_value(&data2).expect("re-serializes");
+        assert_eq!(round2, value);
     }
 
     fn uuid_bytes(text: &str) -> Vec<u8> {

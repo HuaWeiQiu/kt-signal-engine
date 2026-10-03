@@ -35,3 +35,20 @@ reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 # 仅 backup5-spike bin（ADR 0005 S1）生成链接密码用；与 presage 传递的 rand
 # 0.9 同源，许可 MIT/Apache-2.0。
 rand = "0.9"
+
+# ADR 0005 S2：存量历史迁移（backup5）接收侧。
+# - libsignal-message-backup（官方，v0.99.0 与传递钉定同 tag）：frame（HMAC+AES-CBC+gzip
+#   解密面）与 parse（varint 分帧）均为 pub 生产 API；default-features=false 不引
+#   json/cli/scramble/test-util。
+# - prost（MIT/Apache-2.0）：运行时解码自持的 backup.proto 生成代码（src/proto/，
+#   官方开源协议 schema 经 prost-build 一次性生成提交，构建期无 protoc 依赖）。
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+# BackupKey/BackupId 派生（ADR 0005 S2，同 tag 直接依赖）。
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
+thiserror = "2"
+
+[dev-dependencies]
+# fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
+# 仅测试编译面合并，不进运行时依赖图。
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false, features = ["test-util"] }
