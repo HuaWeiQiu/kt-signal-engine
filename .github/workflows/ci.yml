@@ -1,3 +1,6 @@
+# 自包含 Rust CI（KTAIorg/kt-rust-cli-template 同款基线，2026-08-30 实查 action 主版本）。
+# 注: KTAIorg/kt-workflows 共享 polyglot-ci 仓不存在（reuse 解析 0s 失败），故内置。
+# protoc: libsignal-message-backup（ADR 0005 S2）build.rs 经 protobuf-codegen 调 protoc。
 name: CI
 
 on:
@@ -14,5 +17,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    uses: KTAIorg/kt-workflows/.github/workflows/polyglot-ci.yml@v1.9.2
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: cargo build
+        run: cargo build --release
