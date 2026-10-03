@@ -66,6 +66,49 @@ pinned signal-cli 0.14.x 无此能力，官方桌面有。本文立项自研，�
 边界实录：provisioning WS 空闲约 90 秒被服务端掐断（第一次扫码超时即此），S2 落地时
 链接会话须有界并在超时后整会话作废重来，不得复用旧 QR。
 
+## S2 设计定案（2026-10-03，实现前落档）
+
+### 解密与分帧（全部官方 pub API，v0.99.0 `libsignal-message-backup`）
+
+- 密钥派生（对齐官方 node bridge `from_backup_key_and_backup_id` 语义）：
+  `BackupKey(ephemeral_backup_key)` → `derive_backup_id(&aci)` →
+  `MessageBackupKey::derive(&key, &id, None)`（forward-secrecy token 为 None = 官方桌面
+  同款 DST）。
+- 解密面：`frame::FramesReader::new(&key, FileReaderFactory)`（官方：HMAC-SHA256 尾验证 +
+  AES-256-CBC 解密 + gzip 解压 + padding 剥离，实现为 `AsyncRead`）→
+  `parse::VarintDelimitedReader::read_next()` 循环（官方 varint 分帧）。首帧 `BackupInfo`，
+  后续帧为 `backup.Frame`。
+- 帧 proto：engine 自持 `backup.proto` 副本（官方开源协议 schema，1466 行，prost-build
+  编译；协议定义非上游源码）。**不启用 `test-util`/`json` feature**（proto pub 面与 JSON
+  导出面仅限 fixture 构建 dev-dependency）。
+- 导出：逐帧流式转 receive-compatible 中间表示（NDJSON），O(1) 帧内存，符合 ADR 0002
+  bounded 纪律。v1 范围：`Chat`（会话归属）、`ChatItem`/`StandardMessageItem`（text +
+  附件 metadata（名称/大小/contentType，**不下载字节**）+ quote）、`RemoteDeletedMessage`；
+  其余 item 类型（call/poll/sticker/viewOnce/payment/groupUpdate）计数跳过并上报。
+
+### 链接集成（零 fork）
+
+- presage `Manager::link_secondary_device` 内部丢弃 `ephemeral_backup_key`，且
+  `RegistrationData.password/profile_key` 为 `pub(crate)` 无法直接构造。定案：engine 链接
+  任务绕过该 Manager 入口，直调 `libsignal_service::provisioning::link_device`（S1 spike
+  同款），拿到 `NewDeviceRegistration`（含 key）后，**经 serde 数据面构造
+  `RegistrationData`**——该结构 `#[derive(Serialize, Deserialize)]`，serde 格式即 presage
+  官方 store 落库格式（`SqliteStore::save_registration` 同源）：`signal_servers` 枚举名、
+  `phone_number` E.164 串、`service_ids` flatten（aci/pni UUID）、`profile_key` 标准
+  base64（serde_profile_key）。构造后 `store.save_registration` +
+  `Manager::load_registered` 回到既有收发管线，后续逻辑零改动。
+- 该路线零 fork、零 upstream 等待；格式稳定性等价 store 格式稳定性（presage 有 store
+  版本迁移机制）；rev 钉定无漂移。往返单测锁死格式。
+- QR 声明 `capabilities=backup5`（官方语义：链接新设备=从未注册，`isLinkAndSyncEnabled`
+  门控恒真）；key 捕获失败/档案下载失败均 best-effort 不阻塞链接成功。
+
+### 测试与 fixture
+
+- 解密分帧往返：用官方 `export` 原语（gzip→pad→AES-CBC→HMAC，test-util feature 仅入
+  dev-dependencies，不进运行时依赖图）构造加密备份 fixture，验证
+  FramesReader→分帧→proto 解析→NDJSON 导出全链路。
+- serde 构造：`RegistrationData` 序列化→反序列化往返单测（拿 spike 真机数据形态）。
+
 ## 决策
 
 在 **kt-signal-engine** 自研 backup5 接收侧（链接能力声明、信封钥匙截获、迁移档案下载、
