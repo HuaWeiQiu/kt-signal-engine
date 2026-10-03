@@ -1194,16 +1194,19 @@ async fn open_registered(
     Manager::load_registered(store).await.ok()
 }
 
-/// 号码 → ServiceId：contacts 同步入库的 number→uuid 映射（链接后手机端
-/// 立即推送）。冷启动窗口内未命中返回 None（发送按内部失败处理，compat §5）。
+/// 收件人 → ServiceId：号码与 UUID 双形态都收（对齐 signal-cli 公开 JSON-RPC
+/// 的 recipient 语义）——UUID 直通为 ACI；号码走 contacts 数字位匹配（链接后
+/// 手机端立即推送同步）。冷启动窗口内未命中返回 None（发送按内部失败处理，
+/// compat §5）。
 async fn resolve_recipient(
     manager: &Manager<SqliteStore, Registered>,
-    number: &str,
+    recipient: &str,
 ) -> Option<presage::libsignal_service::protocol::ServiceId> {
-    let contact = find_contact_by_number(manager, number).await?;
-    Some(presage::libsignal_service::protocol::ServiceId::Aci(
-        contact.uuid.into(),
-    ))
+    if let Some(service_id) = ServiceId::parse_from_service_id_string(recipient.trim()) {
+        return Some(service_id);
+    }
+    let contact = find_contact_by_number(manager, recipient).await?;
+    Some(ServiceId::Aci(contact.uuid.into()))
 }
 
 async fn find_contact_by_number(
