@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
-use crate::service::{LinkError, SendMention, SendPreview, SendQuote, Service, UserStatusError};
+use crate::service::{
+    LinkError, SendMention, SendPreview, SendQuote, SendSticker, Service, UserStatusError,
+};
 use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
@@ -190,17 +192,71 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // 贴纸扩面：对象形状，packId(hex)/packKey(base64)/stickerId/image
+            // 必填，emoji/width/height 可选；缺字段/超 u32 fail-closed。
+            let sticker = match params.get("sticker") {
+                None => None,
+                Some(value) if value.is_object() => {
+                    let pack_id = value.get("packId").and_then(Value::as_str);
+                    let pack_key = value.get("packKey").and_then(Value::as_str);
+                    let sticker_id = value
+                        .get("stickerId")
+                        .and_then(Value::as_u64)
+                        .and_then(|item| u32::try_from(item).ok());
+                    let image = value.get("image").and_then(Value::as_str);
+                    let width = value
+                        .get("width")
+                        .and_then(Value::as_u64)
+                        .and_then(|item| u32::try_from(item).ok());
+                    let height = value
+                        .get("height")
+                        .and_then(Value::as_u64)
+                        .and_then(|item| u32::try_from(item).ok());
+                    match (pack_id, pack_key, sticker_id, image) {
+                        (Some(pack_id), Some(pack_key), Some(sticker_id), Some(image)) => {
+                            Some(SendSticker {
+                                pack_id: pack_id.to_owned(),
+                                pack_key: pack_key.to_owned(),
+                                sticker_id,
+                                emoji: value
+                                    .get("emoji")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                image: image.to_owned(),
+                                width,
+                                height,
+                            })
+                        }
+                        _ => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            // 官方 sendStickerMessage 边界：贴纸与文本/附件/预览/mentions
+            // 互斥（body=undefined、attachments=[]、无 preview/bodyRanges）；
+            // quote 可共存（官方 quote 选项）。
+            if sticker.is_some()
+                && (!message.unwrap_or_default().is_empty()
+                    || !attachments.is_empty()
+                    || preview.is_some()
+                    || !mentions.is_empty())
+            {
+                return internal_error(id);
+            }
             match (account, message, group, recipients_of(params)) {
-                (Some(account), Some(message), Some(group), _) => {
+                (Some(account), message, Some(group), _)
+                    if sticker.is_some() || message.is_some() =>
+                {
                     match service
                         .send_text_group(
                             account,
                             group,
-                            message,
+                            message.unwrap_or_default(),
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
                             &attachments,
+                            sticker.as_ref(),
                         )
                         .await
                     {
@@ -211,16 +267,19 @@ async fn dispatch(
                         Err(_) => internal_error(id),
                     }
                 }
-                (Some(account), Some(message), None, Ok(recipients)) => {
+                (Some(account), message, None, Ok(recipients))
+                    if sticker.is_some() || message.is_some() =>
+                {
                     match service
                         .send_text(
                             account,
                             &recipients,
-                            message,
+                            message.unwrap_or_default(),
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
                             &attachments,
+                            sticker.as_ref(),
                         )
                         .await
                     {

@@ -73,6 +73,23 @@ pub(crate) struct SendMention {
     pub(crate) length: u32,
 }
 
+/// send 贴纸参数（compat §3 send 行 sticker 扩面，键名与官方桌面
+/// sendStickerMessage 序列化同构：packId hex（Bytes.fromHex 逆运算）、
+/// packKey base64（Bytes.fromBase64 逆运算）、emoji、image data URI、
+/// width/height（官方随 sticker.data AttachmentPointer 出站的展示元数据）。
+/// 与 message/attachments/preview/mentions 互斥（官方 body=undefined、
+/// attachments=[]、无 preview/bodyRanges），quote 可共存（官方 quote 选项）。
+#[derive(Clone)]
+pub(crate) struct SendSticker {
+    pub(crate) pack_id: String,
+    pub(crate) pack_key: String,
+    pub(crate) sticker_id: u32,
+    pub(crate) emoji: Option<String>,
+    pub(crate) image: String,
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+}
+
 /// 附件条数上限：与接收投影 §4.13/compat receive 32 条同口径，超出
 /// fail-closed。
 const ATTACHMENT_MAX_COUNT: usize = 32;
@@ -159,6 +176,22 @@ fn percent_decode(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// packId hex（官方桌面 Bytes.fromHex 逆运算）；奇数长/非 hex 字符 None。
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+/// packId hex 编码（接收投影官方序列化同构）。
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// fake 服务开关（compat §6）：仅显式环境变量，生产缺省为真实服务。
@@ -459,6 +492,7 @@ impl Service {
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
         attachments: &[String],
+        sticker: Option<&SendSticker>,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -468,29 +502,43 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = manager;
         let timestamp = now_ms();
-        // 附件/预览图一次上行（多收件人共享同一批指针）。
+        // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
+        // 同样多收件人共享指针。
         let (pointers, preview_image) = upload_attachments_for_send(
             &manager,
             attachments,
             preview.and_then(|item| item.image.as_deref()),
         )
         .await?;
+        let sticker_pointer = match sticker {
+            Some(sticker) => Some(upload_sticker_image(&manager, sticker).await?),
+            None => None,
+        };
         let mut results = Vec::new();
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
-            let body = build_text_data_message(
-                manager.store(),
-                message,
-                quote,
-                preview,
-                mentions,
-                pointers.clone(),
-                preview_image.clone(),
-                timestamp,
-            )
-            .await?;
+            let body = match sticker {
+                Some(sticker) => build_sticker_data_message(
+                    sticker,
+                    sticker_pointer.clone().ok_or(SendError::Internal)?,
+                    timestamp,
+                )?,
+                None => {
+                    build_text_data_message(
+                        manager.store(),
+                        message,
+                        quote,
+                        preview,
+                        mentions,
+                        pointers.clone(),
+                        preview_image.clone(),
+                        timestamp,
+                    )
+                    .await?
+                }
+            };
             manager
                 .send_message(service_id, body, timestamp)
                 .await
@@ -922,6 +970,7 @@ impl Service {
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
         attachments: &[String],
+        sticker: Option<&SendSticker>,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -933,17 +982,25 @@ impl Service {
             preview.and_then(|item| item.image.as_deref()),
         )
         .await?;
-        let body = build_text_data_message(
-            manager.store(),
-            message,
-            quote,
-            preview,
-            mentions,
-            pointers,
-            preview_image,
-            timestamp,
-        )
-        .await?;
+        let body = match sticker {
+            Some(sticker) => {
+                let pointer = upload_sticker_image(&manager, sticker).await?;
+                build_sticker_data_message(sticker, pointer, timestamp)?
+            }
+            None => {
+                build_text_data_message(
+                    manager.store(),
+                    message,
+                    quote,
+                    preview,
+                    mentions,
+                    pointers,
+                    preview_image,
+                    timestamp,
+                )
+                .await?
+            }
+        };
         dispatch_group(&mut manager, group_id, body, timestamp).await?;
         Ok((timestamp, Vec::new()))
     }
@@ -1538,6 +1595,26 @@ fn project_data_message(
     if !mentions.is_empty() {
         out["mentions"] = json!(mentions);
     }
+    // 贴纸投影：官方接收面 = DataMessage.Sticker（packId hex/packKey base64
+    // 官方桌面序列化同构），data 经既有附件指针投影（connector 媒体边界
+    // 同口径：元数据 only，字节永不下载）。
+    if let Some(sticker) = data_message.sticker.as_ref() {
+        use base64::Engine as _;
+        let pack_key = base64::engine::general_purpose::STANDARD
+            .encode(sticker.pack_key.as_deref().unwrap_or_default());
+        let mut value = json!({
+            "packId": hex_encode(sticker.pack_id.as_deref().unwrap_or_default()),
+            "packKey": pack_key,
+            "stickerId": sticker.sticker_id.unwrap_or(0),
+        });
+        if let Some(emoji) = sticker.emoji.as_deref() {
+            value["emoji"] = json!(emoji);
+        }
+        if let Some(data) = sticker.data.as_ref() {
+            value["data"] = project_attachment_pointer(data);
+        }
+        out["sticker"] = value;
+    }
     out
 }
 
@@ -2023,6 +2100,66 @@ async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> O
     }
 }
 
+/// 贴纸图单条上行（官方 sendStickerMessage 同构：贴纸字节原样 upload，无
+/// 常规附件的 voice 语义）。mediatype 必须 image/*（官方 MIME 嗅探只接受
+/// image 且禁 video/text，回退 image/webp 的语义由上游声明等价承担）；
+/// width/height 官方随 AttachmentPointer 出站，经 AttachmentSpec 透传。
+async fn upload_sticker_image(
+    manager: &Manager<SqliteStore, Registered>,
+    sticker: &SendSticker,
+) -> Result<presage::proto::AttachmentPointer, SendError> {
+    let parsed = parse_attachment_data_uri(&sticker.image).ok_or(SendError::Internal)?;
+    if !parsed.spec.content_type.starts_with("image/") {
+        return Err(SendError::Internal);
+    }
+    let spec = presage::libsignal_service::sender::AttachmentSpec {
+        width: sticker.width,
+        height: sticker.height,
+        ..parsed.spec
+    };
+    let mut uploads = manager
+        .upload_attachments(vec![(spec, parsed.bytes)])
+        .await
+        .map_err(|_| SendError::Internal)?;
+    uploads
+        .pop()
+        .and_then(|result| result.ok())
+        .ok_or(SendError::Internal)
+}
+
+/// 贴纸 dataMessage 构造（proto 面 = 线上 DataMessage.Sticker：packId/packKey
+/// 字节、stickerId、emoji、data=已上行指针）。packId hex / packKey base64
+/// 解码失败或空字节 fail-closed（官方桌面本地贴纸包必带两者，上游同契约）。
+fn build_sticker_data_message(
+    sticker: &SendSticker,
+    data: presage::proto::AttachmentPointer,
+    timestamp: u64,
+) -> Result<DataMessage, SendError> {
+    let pack_id = hex_decode(&sticker.pack_id).ok_or(SendError::Internal)?;
+    let pack_key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(sticker.pack_key.as_bytes())
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or(SendError::Internal)?
+    };
+    if pack_id.is_empty() {
+        return Err(SendError::Internal);
+    }
+    Ok(DataMessage {
+        timestamp: Some(timestamp),
+        sticker: Some(presage::proto::data_message::Sticker {
+            pack_id: Some(pack_id),
+            pack_key: Some(pack_key),
+            sticker_id: Some(sticker.sticker_id),
+            emoji: sticker.emoji.clone(),
+            data: Some(data),
+        }),
+        ..DataMessage::default()
+    })
+}
+
 async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String> {
     let trimmed = author.trim();
     if let Some(service_id) = ServiceId::parse_from_service_id_string(trimmed) {
@@ -2421,6 +2558,98 @@ mod tests {
         );
         assert_eq!(out["adminDelete"]["targetAuthor"], json!(author));
         assert_eq!(out["adminDelete"]["targetSentTimestamp"], json!(3));
+    }
+
+    /// 贴纸收发面（官方 sendStickerMessage / DataMessage.Sticker 同构）：
+    /// 接收投影 packId hex + packKey base64 官方序列化同构、data 经附件指针
+    /// 投影；send 构造 packId/packKey 解码 fail-closed。
+    #[test]
+    fn sticker_send_build_and_receive_projection() {
+        use presage::proto::data_message::Sticker;
+
+        // send 构造：合法 hex packId + base64 packKey → DM 贴纸面齐备。
+        let sticker = SendSticker {
+            pack_id: "0123456789abcdef".to_owned(),
+            pack_key: "QUJDREVG".to_owned(),
+            sticker_id: 7,
+            emoji: Some("😅".to_owned()),
+            image: "data:image/webp;base64,aGVsbG8=".to_owned(),
+            width: Some(512),
+            height: Some(512),
+        };
+        let pointer = presage::proto::AttachmentPointer {
+            content_type: Some("image/webp".to_owned()),
+            ..Default::default()
+        };
+        let dm = build_sticker_data_message(&sticker, pointer, 1_700_000_000_000).unwrap();
+        assert!(dm.body.is_none(), "官方贴纸消息 body=undefined");
+        let sent = dm.sticker.as_ref().unwrap();
+        assert_eq!(
+            sent.pack_id.as_deref(),
+            Some(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef][..])
+        );
+        assert_eq!(sent.pack_key.as_deref(), Some(b"ABCDEF".as_slice()));
+        assert_eq!(sent.sticker_id, Some(7));
+        assert_eq!(sent.emoji.as_deref(), Some("😅"));
+        assert_eq!(
+            sent.data.as_ref().unwrap().content_type.as_deref(),
+            Some("image/webp")
+        );
+        assert_eq!(dm.timestamp, Some(1_700_000_000_000));
+
+        // fail-closed：奇数长 hex / 非 hex 字符 / 非 base64 / 空字节。
+        let bad = |pack_id: &str, pack_key: &str| {
+            build_sticker_data_message(
+                &SendSticker {
+                    pack_id: pack_id.to_owned(),
+                    pack_key: pack_key.to_owned(),
+                    ..sticker.clone()
+                },
+                presage::proto::AttachmentPointer::default(),
+                1,
+            )
+            .is_err()
+        };
+        assert!(bad("012", "QUJDREVG"), "odd-length hex");
+        assert!(bad("0123456789abcdeg", "QUJDREVG"), "non-hex char");
+        assert!(bad("0123456789abcdef", "not@base64!"));
+        assert!(bad("0123456789abcdef", ""), "empty packKey");
+        assert!(bad("", "QUJDREVG"), "empty packId");
+
+        // 接收投影：packId hex + packKey base64（官方序列化逆运算），emoji
+        // 缺席不带键，data 走附件指针投影（id=client_uuid）。
+        let out = project_data_message(
+            &DataMessage {
+                sticker: Some(Sticker {
+                    pack_id: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                    pack_key: Some(b"KEY".to_vec()),
+                    sticker_id: Some(3),
+                    emoji: Some("🎉".to_owned()),
+                    data: Some(presage::proto::AttachmentPointer {
+                        client_uuid: Some(uuid_bytes("11111111-2222-4333-8444-555555555555")),
+                        content_type: Some("image/webp".to_owned()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(out["sticker"]["packId"], json!("deadbeef"));
+        assert_eq!(out["sticker"]["packKey"], json!("S0VZ"));
+        assert_eq!(out["sticker"]["stickerId"], json!(3));
+        assert_eq!(out["sticker"]["emoji"], json!("🎉"));
+        assert_eq!(
+            out["sticker"]["data"]["id"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+
+        // hex 助手 round-trip 与坏输入。
+        assert_eq!(
+            hex_decode(&hex_encode(&[0x00, 0xff, 0x10])),
+            Some(vec![0x00, 0xff, 0x10])
+        );
+        assert_eq!(hex_decode("0 1"), None);
     }
 
     /// 群组接收投影：groupV2 master key → signal-cli 同款

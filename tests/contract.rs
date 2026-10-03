@@ -459,6 +459,70 @@ fn mutating_methods_log_dispatch_and_reply() {
         entries[8]["params"]["attachments"],
         json!(["data:text/plain;filename=hello%20world.txt;base64,aGVsbG8="])
     );
+
+    // 贴纸扩面：sticker 对象逐字进调度日志；与文本互斥 fail-closed；缺字段
+    // fail-closed（官方 sendStickerMessage：body=undefined attachments=[]）。
+    let sticker_ok = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "sticker": {
+                "packId": "0123456789abcdef",
+                "packKey": "QUJDREVG",
+                "stickerId": 7,
+                "emoji": "😅",
+                "image": "data:image/webp;base64,aGVsbG8=",
+                "width": 512,
+                "height": 512
+            }
+        }),
+    );
+    assert!(sticker_ok["result"]["timestamp"].is_u64());
+    let sticker_with_text = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "nope",
+            "sticker": {
+                "packId": "0123456789abcdef",
+                "packKey": "QUJDREVG",
+                "stickerId": 7,
+                "image": "data:image/webp;base64,aGVsbG8="
+            }
+        }),
+    );
+    assert_eq!(sticker_with_text["error"]["code"], -32603);
+    let sticker_missing = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "sticker": { "packId": "0123456789abcdef", "stickerId": 7 }
+        }),
+    );
+    assert_eq!(sticker_missing["error"]["code"], -32603);
+
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let last = entries.last().expect("sticker entries appended");
+    assert_eq!(
+        last["params"]["sticker"]["packId"],
+        json!("0123456789abcdef")
+    );
+    assert_eq!(last["params"]["sticker"]["stickerId"], json!(7));
+    // 带 message 的贴纸拒绝也落日志（记录的是派发）。
+    let rejected = entries
+        .iter()
+        .rev()
+        .find(|entry| entry["params"].get("message").is_some())
+        .expect("rejected sticker send logged");
+    assert_eq!(rejected["params"]["message"], json!("nope"));
+    assert!(rejected["params"]["sticker"].is_object());
 }
 
 #[test]
