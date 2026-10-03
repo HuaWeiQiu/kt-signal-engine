@@ -47,6 +47,10 @@ const PLACEHOLDER_DEVICE_NAME: &str = "KT Signal Engine";
 /// 出网 UA：官方审计面统一标识（引擎所有直连 REST/WS 共用）。
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
+/// 回执 timestamps 每帧上限：官方 sendReceipts.preload.ts CHUNK_SIZE=100，
+/// 超出按官方分帧继续发（非 fail-closed）。
+const RECEIPT_CHUNK_SIZE: usize = 100;
+
 /// fake 服务开关（compat §6）：仅显式环境变量，生产缺省为真实服务。
 pub(crate) fn mode_from_env() -> bool {
     std::env::var("KT_ENGINE_FAKE_SERVICE").ok().as_deref() == Some("1")
@@ -653,6 +657,46 @@ impl Service {
                     presage::proto::typing_message::Action::Started as i32
                 }),
                 group_id: None,
+            });
+            manager
+                .send_message(service_id, body, timestamp)
+                .await
+                .map_err(|_| SendError::Internal)?;
+        }
+        Ok(())
+    }
+
+    /// sendDeliveryReceipt/sendReadReceipt/sendViewedReceipt 公共面：官方
+    /// sendReceipts.preload.ts + SendMessage.preload.ts #sendReceiptMessage
+    /// 行为对齐——ReceiptMessage{type, timestamp[]} 一律逐作者直发
+    /// （sendIndividualProto 同语义；原会话是群组也直发原作者，官方从不
+    /// 整组广播回执）；timestamps 按官方 CHUNK_SIZE=100 分帧，每帧独立
+    /// envelope 时间戳；空数组 fail-closed（协议面无意义的空回执）。
+    pub(crate) async fn send_receipt(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        timestamps: &[u64],
+        receipt_type: presage::proto::receipt_message::Type,
+    ) -> Result<(), SendError> {
+        if timestamps.is_empty() {
+            return Err(SendError::Internal);
+        }
+        if !self.real {
+            return Ok(());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let service_id = resolve_recipient(&manager, recipient)
+            .await
+            .ok_or(SendError::Internal)?;
+        for chunk in timestamps.chunks(RECEIPT_CHUNK_SIZE) {
+            let timestamp = now_ms();
+            let body = ContentBody::ReceiptMessage(presage::proto::ReceiptMessage {
+                r#type: Some(receipt_type as i32),
+                timestamp: chunk.to_vec(),
             });
             manager
                 .send_message(service_id, body, timestamp)

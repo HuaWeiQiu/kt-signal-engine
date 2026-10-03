@@ -318,6 +318,27 @@ fn mutating_methods_log_dispatch_and_reply() {
         )["result"],
         json!({})
     );
+    assert_eq!(
+        engine.request(
+            "sendReadReceipt",
+            json!({ "account": number, "recipient": "+15555550101", "timestamps": [42, 43] })
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "sendViewedReceipt",
+            json!({ "account": number, "recipient": "+15555550101", "timestamps": [44] })
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "sendDeliveryReceipt",
+            json!({ "account": number, "recipient": "+15555550101", "timestamps": [45] })
+        )["result"],
+        json!({})
+    );
 
     // 调度日志：逐行 {method, params}，参数形状供 connector 侧依赖断言。
     let log_path = dir.join("engine-send-log.jsonl");
@@ -337,7 +358,10 @@ fn mutating_methods_log_dispatch_and_reply() {
             "sendTyping",
             "sendReaction",
             "remoteDelete",
-            "updateContact"
+            "updateContact",
+            "sendReadReceipt",
+            "sendViewedReceipt",
+            "sendDeliveryReceipt"
         ]
     );
     assert_eq!(
@@ -355,6 +379,19 @@ fn mutating_methods_log_dispatch_and_reply() {
         json!("+15555550101"),
         "updateContact carries single-string recipient"
     );
+    // 回执面：单作者 recipient（官方按作者分组直发）+ 时间戳数组原样透传。
+    assert_eq!(
+        entries[5]["params"]["recipient"],
+        json!("+15555550101"),
+        "receipt carries single-author recipient"
+    );
+    assert_eq!(
+        entries[5]["params"]["timestamps"],
+        json!([42, 43]),
+        "receipt carries timestamps array"
+    );
+    assert_eq!(entries[6]["params"]["timestamps"], json!([44]));
+    assert_eq!(entries[7]["params"]["timestamps"], json!([45]));
 }
 
 #[test]

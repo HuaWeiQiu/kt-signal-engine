@@ -363,6 +363,40 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // 回执发送三面：官方 receiptMessage type=delivery/read/viewed。
+        // recipient 为单字符串（原消息作者；官方按作者分组直发，不整组
+        // 广播）；timestamps 非空数字数组，元素非数字 fail-closed。
+        "sendDeliveryReceipt" | "sendReadReceipt" | "sendViewedReceipt" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let recipient = params.get("recipient").and_then(Value::as_str);
+            let timestamps = params
+                .get("timestamps")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(Value::as_u64)
+                        .collect::<Option<Vec<u64>>>()
+                });
+            let kind = match method.as_str() {
+                "sendDeliveryReceipt" => presage::proto::receipt_message::Type::Delivery,
+                "sendReadReceipt" => presage::proto::receipt_message::Type::Read,
+                _ => presage::proto::receipt_message::Type::Viewed,
+            };
+            match (account, recipient, timestamps) {
+                (Some(account), Some(recipient), Some(Some(timestamps))) => {
+                    match service
+                        .send_receipt(account, recipient, &timestamps, kind)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头）；
         // fake 模式恒已注册。
         "getUserStatus" => {

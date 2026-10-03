@@ -74,6 +74,10 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
 | `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组 |
+| `sendPinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, pinDurationSeconds?}` | `{}` | 同 send；pinDurationSeconds 超 u32 `-32603` | **P2 real**：官方 pinMessage=27；字段缺席/null=pinDurationForever |
+| `sendUnpinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp}` | `{}` | 同 send | **P2 real**：官方 unpinMessage=28 |
+| `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
+| `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
@@ -96,8 +100,9 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   （connector §4.19 三档面）。
 - `syncMessage.sentMessage`：本机其他设备发出的直聊（timestamp/message/
   destinationNumber|destinationUuid + 同 dataMessage 控制面）。
-- 群组消息与群内 sent-sync 整体跳过（connector 群组行是已声明边界）；
-  call/story/null 体跳过；解密失败按事件丢弃。
+- 群组接收投影：dataMessage.groupV2 / sent 内群组带 `groupInfo {groupId}`
+  （master key 标准 base64，signal-cli 同款；直聊不带该键）；群更新类消息
+  （成员变更/权限面）仍跳过。call/story/null 体跳过；解密失败按事件丢弃。
 
 ## 4. 夹具专有动词（非引擎表面）
 
