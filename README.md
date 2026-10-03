@@ -51,7 +51,7 @@ Signal 服务端
   新能力一律经 connector 契约版本演进，不塞进兼容层。
 - **ADR 0005** 链接时存量历史迁移（backup5）自研立项：产品刚需；S1 真机 spike 已通过
   （2026-10-03：信封 `ephemeralBackupKey` 命中、transfer_archive+CDN 下载字节级成功、
-  无需 presage 补丁，取证记录见该文），下一步 S2。
+  无需 presage 补丁，取证记录见该文）；S2 引擎侧已落地（2026-10-04，提交 0eedc8c：transfer archive 解密分帧导出 + backup5 链接集成，存量档案落 history-import.ndjson），下一步 S3 connector。
 
 ## 复用清单（从现有链路继承，不重造）
 
@@ -80,7 +80,7 @@ P0 spike 产出两种方案的可行性证据，再定 ADR 0003。
 | P2 | 收发链路：文本/回执/typing/反应/编辑/删除，逐项对齐官方桌面行为 | ✅ 代码侧完成：接收投影全消费面/群组发送/联系人群组列表/getUserStatus 探测（2026-10-03）；connector 接线已落地——`kt-engine` 实验模式 + 门控真机冒烟通过（fake 服务，2026-10-03）；实机收发联调待做 |
 | P3 | 群组（Sender Keys）、多设备（Sesame） | 群组发送 P2 已 real；群组接收投影/成员级 results/多设备待做 |
 | P4 | 附件 CDN、profile/sticker 密钥、链接预览 | 附件元数据投影 P2 已 real；字节下载/上行待做 |
-| backup5 | 链接时存量历史迁移（并行专项，ADR 0005）：S1 真机 spike（一票否决点）→ S2 引擎接收/下载/解密 → S3 connector 契约+导入 → S4 桌面 UI+真机验收 | S1 PASS 2026-10-03（三未知数全落定）；S2 待做 |
+| backup5 | 链接时存量历史迁移（并行专项，ADR 0005）：S1 真机 spike（一票否决点）→ S2 引擎接收/下载/解密 → S3 connector 契约+导入 → S4 桌面 UI+真机验收 | S1 PASS 2026-10-03（三未知数全落定）；S2 DONE 2026-10-04（0eedc8c：解密分帧导出 + backup5 链接集成，18 测试全绿）；下一步 S3 connector |
 | P5 | 灰度替换：connector 引擎开关，soak 24h×N | 引擎开关已落地（connector `--signal-cli-engine kt-engine`，实验，proxy/media 能力 fail-closed）；soak PASS + 实机回归待做 |
 | P6 | signal-cli 退役 | 全量切流 + 观察窗 |
 

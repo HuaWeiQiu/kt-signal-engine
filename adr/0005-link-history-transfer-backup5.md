@@ -1,6 +1,6 @@
 # ADR 0005：链接时存量历史迁移（backup5）自研立项
 
-日期：2026-10-03 ｜ 状态：已接受（S1 spike 真机取证通过，见取证记录 §4；下一步 S2）
+日期：2026-10-03 ｜ 状态：已接受（S1 PASS；S2 引擎侧已落地 0eedc8c，见 §5；下一步 S3 connector）
 
 ## 背景
 
@@ -121,8 +121,12 @@ signal-cli、不抄 signal-cli/官方桌面源码**；libsignal 原语按 v0.99.
 
 - **S1 spike（✅ 2026-10-03 完成，取证记录见 §4 上一节）**：真机一次会话闭环取证——QR 加
   `backup5` → 信封 `ephemeralBackupKey` 存在性 → 档案下载字节级成功（不解密）。
-- **S2 引擎**：下载 + 解密 + 逐帧导出（`message-backup` crate）；附件 metadata-only
-  （v1 不下载字节，沿 §6.7 哲学）。
+- **S2 引擎（✅ 2026-10-04，提交 0eedc8c）**：下载 + 解密 + 逐帧导出（`message-backup`
+  crate）；附件 metadata-only（v1 不下载字节，沿 §6.7 哲学）。实现要点与定案的偏差
+  记录：`RegistrationData` 的 phone_number serde 为 phonenumber crate derive 的嵌套
+  对象（非预估的 E.164 串，以实查为准）；profile_key 借用反序列化限定 from_str 路径
+  （from_value 直接报 borrowed string）；导出面 future 非 Send（上游 FramesReader 持
+  Rc），下载任务走 spawn_local 与其他 presage 任务同策略。
 - **S3 connector**：契约扩展（link.finish 携带导入结果或独立 history.import 状态方法，
   契约先行改 schema + implementation-plan §6.6/§6.5），store 有界批量导入（幂等、
   bounded、按 sent_at 去重），空骨架就地充实。
