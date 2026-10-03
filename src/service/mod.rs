@@ -988,6 +988,8 @@ async fn receive_pipeline(
     dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
+    let mut last_contacts_sync: Option<std::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -995,7 +997,13 @@ async fn receive_pipeline(
         let mut serve_rx = shutdown.clone();
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = serve_account_stream(service, &number, &dir, &mut serve_rx) => {}
+            _ = serve_account_stream(
+                service,
+                &number,
+                &dir,
+                &mut serve_rx,
+                &mut last_contacts_sync,
+            ) => {}
         }
         // 流断开：短暂退避后重开（重连治理 P2 精化）。
         tokio::select! {
@@ -1010,6 +1018,7 @@ async fn serve_account_stream(
     number: &str,
     dir: &Path,
     shutdown: &mut watch::Receiver<bool>,
+    last_contacts_sync: &mut Option<std::time::Instant>,
 ) {
     let Ok(store) = open_store(dir).await else {
         return;
@@ -1020,9 +1029,31 @@ async fn serve_account_stream(
     let Ok(mut stream) = manager.receive_messages().await else {
         return;
     };
+    // 存量联系人/会话补同步（欠账 §10-1，官方行为对齐：signal-cli/桌面
+    // 链接后同样向主设备要一轮 contacts sync）：链路建立 2s 沉降后
+    // request_contacts（presage 官方 API，SyncMessage.request=contacts），
+    // 主设备回传经接收流落 contacts 表 → connector listContacts 出骨架。
+    // warn-only（本层零 stderr，失败静默）；每账号 60s 一次性，watchdog
+    // 断连重开不重复。群组不在本面（presage 栈无 groups sync 消费路径，
+    // 首条群消息渐进落库=官方链接设备同款）。
+    let mut sync_pending = match *last_contacts_sync {
+        Some(at) if at.elapsed() < Duration::from_secs(60) => None,
+        _ => Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+    };
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
+            _ = async {
+                if let Some(at) = sync_pending {
+                    tokio::time::sleep_until(at).await;
+                    // 官方 request_contacts：成功/失败都不重试（一次性纪律，
+                    // 下次链路建立再补）。
+                    let _ = manager.request_contacts().await;
+                    *last_contacts_sync = Some(std::time::Instant::now());
+                }
+            }, if sync_pending.is_some() => {
+                sync_pending = None;
+            }
             item = stream.next() => match item {
                 // QueueEmpty：历史队列排空，流继续保持。
                 Some(Received::QueueEmpty) => {}
