@@ -968,8 +968,10 @@ async fn serve_account_stream(
 /// P2-A 投影边界（compat §3 receive 段）：直聊 dataMessage 全消费面
 /// （正文/引用/reaction/remoteDelete/附件元数据/链接预览/mentions/viewOnce）、
 /// editMessage、typingMessage、receiptMessage、本机多设备 sent-sync。
-/// 群组消息（dataMessage.groupV2 / sent 内群组）整体跳过（connector 群组
-/// 行是已声明边界，宁缺勿错）；call/story/null 体跳过。
+/// 群组接收投影：dataMessage.groupV2 / sent 内群组投影 signal-cli 同款
+/// `groupInfo{groupId}`（connector 群会话管线既有形状）；群更新类消息
+/// （groupContext/groupChange 非空）v1 仍整体跳过（成员变更/权限面后续阶段）。
+/// call/story/null 体跳过。
 /// 形状钉定 signal-cli 0.14.8 JSON（connector implementation-plan §4.13/
 /// §4.19/§4.20），作者号字段在 contacts 命中时给 E.164，未命中给 ACI 字符串。
 async fn project_content(
@@ -996,21 +998,16 @@ async fn project_content(
 
     match &content.body {
         ContentBody::DataMessage(data_message) => {
-            if data_message.group_v2.is_some() {
-                return None;
-            }
             let numbers = resolve_author_numbers(store, data_message).await;
             envelope["dataMessage"] = project_data_message(data_message, &numbers);
         }
         ContentBody::EditMessage(edit) => {
             let data_message = edit.data_message.as_ref()?;
-            if data_message.group_v2.is_some() {
-                return None;
-            }
             let numbers = resolve_author_numbers(store, data_message).await;
+            let dm = project_data_message(data_message, &numbers);
             envelope["editMessage"] = json!({
                 "targetSentTimestamp": edit.target_sent_timestamp.unwrap_or(0),
-                "dataMessage": project_data_message(data_message, &numbers),
+                "dataMessage": dm,
             });
         }
         ContentBody::TypingMessage(typing) => {
@@ -1031,6 +1028,8 @@ async fn project_content(
             let is_read = kind == presage::proto::receipt_message::Type::Read as i32;
             let is_viewed = kind == presage::proto::receipt_message::Type::Viewed as i32;
             envelope["receiptMessage"] = json!({
+                // signal-cli JsonReceiptMessage 同款：timestamp 为命中的消息
+                // upstream 时间戳数组（connector 据此升级对应行为已送达/已读）。
                 "timestamp": receipt.timestamp,
                 "when": envelope_ts,
                 "isDelivery": is_delivery,
@@ -1045,9 +1044,6 @@ async fn project_content(
                 _ => return None,
             };
             let data_message = sent.message.as_ref()?;
-            if data_message.group_v2.is_some() {
-                return None;
-            }
             let numbers = resolve_author_numbers(store, data_message).await;
             let mut sent_json = project_data_message(data_message, &numbers);
             sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
@@ -1166,6 +1162,17 @@ async fn resolve_author_numbers(
     numbers
 }
 
+/// 群组接收投影 id：dataMessage.groupV2 master key 标准 base64（32 字节，
+/// signal-cli 同源形状，与 connector send 回传/群会话管线同 id 口径）。
+fn group_id_of(data_message: &presage::proto::DataMessage) -> Option<String> {
+    use base64::Engine as _;
+    let key = data_message.group_v2.as_ref()?.master_key.as_deref()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(key))
+}
+
 /// dataMessage 面（正文/引用/reaction/remoteDelete/pinMessage/unpinMessage/
 /// adminDelete/附件元数据/预览/mentions/viewOnce）。边界纪律：附件 ≤32、
 /// 预览 ≤4、mentions ≤64（connector §4.13/§4.20 上限同源）；条目内字段协议
@@ -1176,6 +1183,11 @@ fn project_data_message(
 ) -> Value {
     let timestamp = data_message.timestamp.unwrap_or(0);
     let mut out = json!({ "timestamp": timestamp });
+    if let Some(group_id) = group_id_of(data_message) {
+        // signal-cli 同款形状（dataMessage.groupV2 / sent 内群组同形状）：
+        // connector 既有群会话管线（data_message_group_id）直接消费。
+        out["groupInfo"] = json!({ "groupId": group_id });
+    }
     if let Some(body) = data_message.body.as_deref() {
         out["message"] = json!(body);
     }
@@ -2008,6 +2020,53 @@ mod tests {
         );
         assert_eq!(out["adminDelete"]["targetAuthor"], json!(author));
         assert_eq!(out["adminDelete"]["targetSentTimestamp"], json!(3));
+    }
+
+    /// 群组接收投影：groupV2 master key → signal-cli 同款
+    /// `groupInfo{groupId}`（标准 base64，connector 群会话管线同 id 口径）；
+    /// 直聊（无 groupV2 / master key 缺席）不带该键。
+    #[test]
+    fn data_message_projection_carries_group_info_only_for_groups() {
+        use base64::Engine as _;
+
+        let master_key = [9u8; 32];
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("group hello".to_owned()),
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out["groupInfo"]["groupId"],
+            json!(base64::engine::general_purpose::STANDARD.encode(master_key))
+        );
+        assert_eq!(out["message"], json!("group hello"));
+
+        // 直聊：不带 groupInfo 键。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("dm hello".to_owned()),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("groupInfo").is_none());
+
+        // groupV2 存在但 master key 缺席/为空：同样不带键（宁缺勿错）。
+        let out = project_data_message(
+            &DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2::default()),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("groupInfo").is_none());
     }
 
     #[test]
