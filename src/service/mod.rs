@@ -86,9 +86,11 @@ struct ParsedAttachment {
 }
 
 /// send 附件条目解析：data URI 唯一形状 = connector 上游形状
-/// `data:<mediatype>[;filename=<percent-encoded>];base64,<payload>`（RFC
-/// 2397 扩展 filename 参数同款）。mediatype 缺省 application/octet-stream；
-/// 非 base64 / 坏 percent / 坏 base64 / 超上限一律 None（fail-closed）。
+/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true];base64,<payload>`
+/// （RFC 2397 扩展 filename 参数同款；voice 参数映射官方 VOICE_MESSAGE
+/// flags，presage voice_note→AttachmentPointer.flags 官方同构）。mediatype
+/// 缺省 application/octet-stream；非 base64 / 坏 percent / 坏 base64 /
+/// 坏 voice 值 / 超上限一律 None（fail-closed）。
 fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     let rest = uri.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
@@ -101,11 +103,20 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     };
     let mut filename = None;
     let mut is_base64 = false;
+    let mut is_voice = false;
     for param in parts {
         if param.eq_ignore_ascii_case("base64") {
             is_base64 = true;
         } else if let Some(value) = param.strip_prefix("filename=") {
             filename = Some(percent_decode(value)?);
+        } else if param.eq_ignore_ascii_case("voice") {
+            is_voice = true;
+        } else if let Some(value) = param.strip_prefix("voice=") {
+            match value {
+                "true" => is_voice = true,
+                "false" => {}
+                _ => return None,
+            }
         }
     }
     if !is_base64 {
@@ -123,6 +134,7 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
             content_type: content_type.to_owned(),
             length: bytes.len(),
             file_name: filename,
+            voice_note: if is_voice { Some(true) } else { None },
             ..presage::libsignal_service::sender::AttachmentSpec::default()
         },
         bytes,
@@ -2209,6 +2221,52 @@ mod tests {
         assert!(!accounts.join("lk-orphan-empty").try_exists().unwrap());
         assert!(!accounts.join("lk-orphan-db").try_exists().unwrap());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attachment_data_uri_parses_filename_and_voice_params() {
+        let parsed = |uri| parse_attachment_data_uri(uri).expect("parses");
+        let none = |uri| assert!(parse_attachment_data_uri(uri).is_none());
+
+        // 基线形状（829e09f）：mediatype + filename。
+        let plain = parsed("data:text/plain;filename=hello%20world.txt;base64,aGVsbG8=");
+        assert_eq!(plain.spec.content_type, "text/plain");
+        assert_eq!(plain.spec.file_name.as_deref(), Some("hello world.txt"));
+        assert_eq!(plain.spec.voice_note, None);
+        assert_eq!(plain.bytes, b"hello");
+
+        // voice 裸参数与 voice=true 等价（官方 VOICE_MESSAGE 同一 flags 面）。
+        for uri in [
+            "data:audio/mpeg;voice;base64,aGVsbG8=",
+            "data:audio/mpeg;voice=true;base64,aGVsbG8=",
+            "data:audio/mpeg;voice=true;filename=voice%20note.mp3;base64,aGVsbG8=",
+        ] {
+            let voice = parsed(uri);
+            assert_eq!(voice.spec.content_type, "audio/mpeg");
+            assert_eq!(voice.spec.voice_note, Some(true));
+        }
+        assert_eq!(
+            parsed("data:audio/mpeg;voice=true;filename=voice%20note.mp3;base64,aGVsbG8=")
+                .spec
+                .file_name
+                .as_deref(),
+            Some("voice note.mp3")
+        );
+
+        // voice=false 显式不带 flags；非 bool 值 fail-closed。
+        assert_eq!(
+            parsed("data:audio/mpeg;voice=false;base64,aGVsbG8=")
+                .spec
+                .voice_note,
+            None
+        );
+        none("data:audio/mpeg;voice=1;base64,aGVsbG8=");
+        none("data:audio/mpeg;voice=yes;base64,aGVsbG8=");
+
+        // 既有 fail-closed 面不回归：非 base64 / 坏 percent / 超 base64 字符集。
+        none("data:text/plain,aGVsbG8=");
+        none("data:text/plain;filename=%zz;base64,aGVsbG8=");
+        none("data:text/plain;base64,not@base64!");
     }
 
     #[test]
