@@ -79,6 +79,10 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
 | `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
+| `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
+| `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
+| `getPinnedConversations` | `{account}` | `{pinned: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；存储条目映射不出引擎口径的跳过不炸面） | 未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P4 real**：Storage Service manifest → Account item → `AccountRecord.pinned_conversations` 投影；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{pinned: []}` |
+| `setConversationPinned` | `{account, conversationId, kind: contact\|group\|legacyGroup, pinned(bool)}` | `{pinned: [...]}`（写后全量，同 getPinnedConversations 形状） | 云引用解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次/写面冲突重放中失败 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/未知 kind/未注册账号 `-32603` | **P4 real**：官方 upload 语义（读改写 AccountRecord 仅动 pinned 字段、prost round-trip 保真其余字段、新 16B item id、version+1/source_device/record_ikm 透传）+ `PUT v1/storage/` + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；写面为 presage 上游缺口自建薄封装（上游补齐后替换）；fake：成功回 `{pinned: []}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -158,6 +162,30 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
   （connector 侧为可选富体字段，缺失即无该键）。
 - **finishLink 长等待**：等手机确认可阻塞数分钟；引擎在本线程 LocalSet
   并发 dispatch，其他方法不饿死。
+
+P4 扩面差异（2026-10-04，connector 1.36 契约对齐）：
+
+- **置顶写面是上游缺口**：libsignal-service-rs 只有 Storage Service 读面，
+  `setConversationPinned` 的写（`PUT v1/storage/` + WriteOperation）为引擎
+  自建薄封装（单点 `put_write_operation`），上游补齐后整段替换；路径与
+  官方桌面 WebAPI.preload.ts:831 同一端点。
+- **账号从未有 storage 状态**（无 master key 或 manifest 404）：读面回空
+  列表；写面先生成 32B master key 落库，再以 version 1 + 最小
+  AccountRecord（只含 `pinned_conversations`）建初始 manifest——与官方
+  首次启用 Storage Service 的写方播种语义同构；手机侧并发首建的竞争由
+  409 采纳重放兜底（服务器 manifest 为准）。
+- **结构化错误码 8 枚**（`-1` + message，connector 1.36 白名单逐字）：
+  贴纸 `STICKER_PACK_KEY_INVALID`/`STICKER_PACK_FETCH_FAILED`/
+  `STICKER_PACK_MALFORMED`/`STICKER_IMAGE_TOO_LARGE`；置顶
+  `CONVERSATION_NOT_RESOLVED`/`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`/
+  `STORAGE_WRITE_FAILED`。参数缺失/未知 kind/未注册账号不占用结构化码，
+  一律 `-32603` fail-closed。解密 MAC 失败与密文损坏密码学不可区分，统一
+  `STICKER_PACK_KEY_INVALID`；截断密文同样落该码（MAC 域先于 padding 校验）。
+- **置顶投影口径**：`AccountRecord.pinned_conversations` 数组序即置顶序；
+  contact 条目以 serviceIdBinary/serviceId 任一命中反投影引擎会话标识
+  （本机号走注册数据、号码经 contacts、UUID 直通），group/legacy 按标准
+  base64/原样字节往返；`ReleaseNotes` 等非引擎口径条目在增删时原样保留、
+  在读投影中跳过。
 
 ## 6. fake 服务模式（仅测试）
 
