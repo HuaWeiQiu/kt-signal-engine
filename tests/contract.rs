@@ -679,6 +679,25 @@ fn mutating_methods_log_dispatch_and_reply() {
         }),
     );
     assert!(sticker_ok["result"]["timestamp"].is_u64());
+    // 贴纸回应（官方 StagedStickerReply = 同一 DataMessage 带 sticker+quote，
+    // 非 reaction）：quote 与 sticker 共存成功，构造面 quote 进
+    // DataMessage.quote（author 不可解析才与文本分支同口径 -32603）。
+    let sticker_with_quote = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "quoteTimestamp": 50,
+            "quoteAuthor": "+15555550101",
+            "sticker": {
+                "packId": "0123456789abcdef",
+                "packKey": "QUJDREVG",
+                "stickerId": 7,
+                "image": "data:image/webp;base64,aGVsbG8="
+            }
+        }),
+    );
+    assert!(sticker_with_quote["result"]["timestamp"].is_u64());
     let sticker_with_text = engine.request(
         "send",
         json!({
@@ -723,6 +742,21 @@ fn mutating_methods_log_dispatch_and_reply() {
         .expect("rejected sticker send logged");
     assert_eq!(rejected["params"]["message"], json!("nope"));
     assert!(rejected["params"]["sticker"].is_object());
+    // 贴纸+quote 共存：调度日志两者齐备（keys 与文本分支同名直投）。
+    let with_quote = entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry["params"].get("quoteTimestamp").is_some()
+                && entry["params"]["sticker"].is_object()
+        })
+        .expect("sticker+quote send logged");
+    assert_eq!(with_quote["params"]["quoteTimestamp"], json!(50));
+    assert_eq!(with_quote["params"]["quoteAuthor"], json!("+15555550101"));
+    assert_eq!(
+        with_quote["params"]["sticker"]["packId"],
+        json!("0123456789abcdef")
+    );
 }
 
 #[test]

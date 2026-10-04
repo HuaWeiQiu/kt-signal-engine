@@ -529,11 +529,16 @@ impl Service {
                 .await
                 .ok_or(SendError::Internal)?;
             let body = match sticker {
-                Some(sticker) => build_sticker_data_message(
-                    sticker,
-                    sticker_pointer.clone().ok_or(SendError::Internal)?,
-                    timestamp,
-                )?,
+                Some(sticker) => {
+                    build_sticker_data_message(
+                        manager.store(),
+                        sticker,
+                        quote,
+                        sticker_pointer.clone().ok_or(SendError::Internal)?,
+                        timestamp,
+                    )
+                    .await?
+                }
                 None => {
                     build_text_data_message(
                         manager.store(),
@@ -994,7 +999,8 @@ impl Service {
         let body = match sticker {
             Some(sticker) => {
                 let pointer = upload_sticker_image(&manager, sticker).await?;
-                build_sticker_data_message(sticker, pointer, timestamp)?
+                build_sticker_data_message(manager.store(), sticker, quote, pointer, timestamp)
+                    .await?
             }
             None => {
                 build_text_data_message(
@@ -2176,10 +2182,7 @@ async fn upload_attachments_for_send(
 
 /// send 文本 dataMessage 公共构造（直聊/群组同形状，compat §3 send 行
 /// quoteTimestamp/quoteAuthor/previewUrl/mentions/attachments 扩面）：
-/// - quote：id=被引消息 upstream 时间戳、author=原作者 ACI（号码经
-///   resolve_author_aci）；text 从本机 store 找回——presage 官方接收路径
-///   已落库的消息（引擎无新增落库面），找不到按官方/上游同款降级缺省
-///   text（收端仅少预览文案，协议面合法）。
+/// - quote：assemble_quote 单点组装（与贴纸分支同源）。
 /// - preview：url/title/description 直投 proto Preview；previewImage 数据
 ///   URI 随同批 CDN 上行后挂 Preview.image（官方同构）。
 /// - mentions：number→ACI 后 BodyRange.MentionAci（≤条目数即上限，与接收
@@ -2203,18 +2206,7 @@ async fn build_text_data_message(
         ..DataMessage::default()
     };
     if let Some(quote) = quote {
-        let author_aci = resolve_author_aci(store, &quote.author)
-            .await
-            .ok_or(SendError::Internal)?;
-        let mut q = presage::proto::data_message::Quote {
-            id: Some(quote.timestamp),
-            author_aci: Some(author_aci.clone()),
-            ..presage::proto::data_message::Quote::default()
-        };
-        if let Some(text) = quoted_text(store, &author_aci, quote.timestamp).await {
-            q.text = Some(text);
-        }
-        dm.quote = Some(q);
+        dm.quote = Some(assemble_quote(store, quote).await?);
     }
     if let Some(preview) = preview {
         dm.preview = vec![presage::proto::Preview {
@@ -2259,6 +2251,30 @@ async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> O
     }
 }
 
+/// quote 组装（文本/贴纸分支共用单点，compat §3 send 行 quote 语义）：
+/// id=被引消息 upstream 时间戳、author=原作者 ACI（号码经
+/// resolve_author_aci，不可解析 fail-closed = SendError::Internal，与
+/// mentions 同口径）；text 从本机 store 找回——presage 官方接收路径已落库
+/// 的消息（引擎无新增落库面），找不到按官方/上游同款降级缺省 text（收端
+/// 仅少预览文案，协议面合法）。
+async fn assemble_quote(
+    store: &SqliteStore,
+    quote: &SendQuote,
+) -> Result<presage::proto::data_message::Quote, SendError> {
+    let author_aci = resolve_author_aci(store, &quote.author)
+        .await
+        .ok_or(SendError::Internal)?;
+    let mut q = presage::proto::data_message::Quote {
+        id: Some(quote.timestamp),
+        author_aci: Some(author_aci.clone()),
+        ..presage::proto::data_message::Quote::default()
+    };
+    if let Some(text) = quoted_text(store, &author_aci, quote.timestamp).await {
+        q.text = Some(text);
+    }
+    Ok(q)
+}
+
 /// 贴纸图单条上行（官方 sendStickerMessage 同构：贴纸字节原样 upload，无
 /// 常规附件的 voice 语义）。mediatype 必须 image/*（官方 MIME 嗅探只接受
 /// image 且禁 video/text，回退 image/webp 的语义由上游声明等价承担）；
@@ -2289,8 +2305,14 @@ async fn upload_sticker_image(
 /// 贴纸 dataMessage 构造（proto 面 = 线上 DataMessage.Sticker：packId/packKey
 /// 字节、stickerId、emoji、data=已上行指针）。packId hex / packKey base64
 /// 解码失败或空字节 fail-closed（官方桌面本地贴纸包必带两者，上游同契约）。
-fn build_sticker_data_message(
+/// quote 可共存（官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带
+/// sticker+quote，非 reaction——Reaction proto 无贴纸位）：经 assemble_quote
+/// 与文本分支同源组装，author 不可解析 fail-closed、正文找回失败降级缺
+/// text；body 维持 undefined。
+async fn build_sticker_data_message(
+    store: &SqliteStore,
     sticker: &SendSticker,
+    quote: Option<&SendQuote>,
     data: presage::proto::AttachmentPointer,
     timestamp: u64,
 ) -> Result<DataMessage, SendError> {
@@ -2306,7 +2328,7 @@ fn build_sticker_data_message(
     if pack_id.is_empty() {
         return Err(SendError::Internal);
     }
-    Ok(DataMessage {
+    let mut dm = DataMessage {
         timestamp: Some(timestamp),
         sticker: Some(presage::proto::data_message::Sticker {
             pack_id: Some(pack_id),
@@ -2316,7 +2338,11 @@ fn build_sticker_data_message(
             data: Some(data),
         }),
         ..DataMessage::default()
-    })
+    };
+    if let Some(quote) = quote {
+        dm.quote = Some(assemble_quote(store, quote).await?);
+    }
+    Ok(dm)
 }
 
 async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String> {
@@ -2723,10 +2749,18 @@ mod tests {
 
     /// 贴纸收发面（官方 sendStickerMessage / DataMessage.Sticker 同构）：
     /// 接收投影 packId hex + packKey base64 官方序列化同构、data 经附件指针
-    /// 投影；send 构造 packId/packKey 解码 fail-closed。
-    #[test]
-    fn sticker_send_build_and_receive_projection() {
+    /// 投影；send 构造 packId/packKey 解码 fail-closed；quote 可共存（官方
+    /// 贴纸回应 StagedStickerReply 同一 DataMessage sticker+quote，组装与
+    /// 文本分支同源：author 不可解析 fail-closed、正文找回降级缺 text）。
+    #[tokio::test]
+    async fn sticker_send_build_and_receive_projection() {
         use presage::proto::data_message::Sticker;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-sticker-quote-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
 
         // send 构造：合法 hex packId + base64 packKey → DM 贴纸面齐备。
         let sticker = SendSticker {
@@ -2742,8 +2776,12 @@ mod tests {
             content_type: Some("image/webp".to_owned()),
             ..Default::default()
         };
-        let dm = build_sticker_data_message(&sticker, pointer, 1_700_000_000_000).unwrap();
+        let dm =
+            build_sticker_data_message(&store, &sticker, None, pointer.clone(), 1_700_000_000_000)
+                .await
+                .unwrap();
         assert!(dm.body.is_none(), "官方贴纸消息 body=undefined");
+        assert!(dm.quote.is_none(), "缺省 quote 不带键");
         let sent = dm.sticker.as_ref().unwrap();
         assert_eq!(
             sent.pack_id.as_deref(),
@@ -2759,28 +2797,87 @@ mod tests {
         assert_eq!(dm.timestamp, Some(1_700_000_000_000));
 
         // fail-closed：奇数长 hex / 非 hex 字符 / 非 base64 / 空字节。
-        let bad = |pack_id: &str, pack_key: &str| {
+        async fn bad(
+            store: &SqliteStore,
+            base: &SendSticker,
+            pack_id: &str,
+            pack_key: &str,
+        ) -> bool {
             build_sticker_data_message(
+                store,
                 &SendSticker {
                     pack_id: pack_id.to_owned(),
                     pack_key: pack_key.to_owned(),
-                    ..sticker.clone()
+                    ..base.clone()
                 },
+                None,
                 presage::proto::AttachmentPointer::default(),
                 1,
             )
+            .await
             .is_err()
-        };
-        assert!(bad("012", "QUJDREVG"), "odd-length hex");
-        assert!(bad("0123456789abcdeg", "QUJDREVG"), "non-hex char");
-        assert!(bad("0123456789abcdef", "not@base64!"));
-        assert!(bad("0123456789abcdef", ""), "empty packKey");
-        assert!(bad("", "QUJDREVG"), "empty packId");
+        }
+        assert!(
+            bad(&store, &sticker, "012", "QUJDREVG").await,
+            "odd-length hex"
+        );
+        assert!(
+            bad(&store, &sticker, "0123456789abcdeg", "QUJDREVG").await,
+            "non-hex char"
+        );
+        assert!(bad(&store, &sticker, "0123456789abcdef", "not@base64!").await);
+        assert!(
+            bad(&store, &sticker, "0123456789abcdef", "").await,
+            "empty packKey"
+        );
+        assert!(bad(&store, &sticker, "", "QUJDREVG").await, "empty packId");
+
+        // quote 透传：ACI 直通 author，正文 store 无命中降级缺 text（与文本
+        // 分支同口径）；author 不可解析 fail-closed。
+        let aci = "11111111-2222-4333-8444-555555555555";
+        let quoted = build_sticker_data_message(
+            &store,
+            &sticker,
+            Some(&SendQuote {
+                timestamp: 1_699_999_000_000,
+                author: aci.to_owned(),
+            }),
+            pointer.clone(),
+            1_700_000_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(quoted.body.is_none());
+        let quote = quoted.quote.as_ref().expect("quote coexists with sticker");
+        assert_eq!(quote.id, Some(1_699_999_000_000));
+        assert_eq!(quote.author_aci.as_deref(), Some(aci));
+        assert!(quote.text.is_none(), "store 无命中降级缺 text");
+        assert!(
+            build_sticker_data_message(
+                &store,
+                &sticker,
+                Some(&SendQuote {
+                    timestamp: 1,
+                    author: "+15550009999".to_owned(),
+                }),
+                pointer,
+                1,
+            )
+            .await
+            .is_err(),
+            "quote author unresolvable fail-closed（文本分支同口径）"
+        );
 
         // 接收投影：packId hex + packKey base64（官方序列化逆运算），emoji
-        // 缺席不带键，data 走附件指针投影（id=client_uuid）。
+        // 缺席不带键，data 走附件指针投影（id=client_uuid）；quote+sticker
+        // 同一信封双投影（贴纸回应形态防回归）。
         let out = project_data_message(
             &DataMessage {
+                quote: Some(data_message::Quote {
+                    id: Some(1_699_999_000_000),
+                    author_aci: Some("11111111-2222-4333-8444-555555555555".to_owned()),
+                    ..Default::default()
+                }),
                 sticker: Some(Sticker {
                     pack_id: Some(vec![0xde, 0xad, 0xbe, 0xef]),
                     pack_key: Some(b"KEY".to_vec()),
@@ -2796,6 +2893,11 @@ mod tests {
             },
             &HashMap::new(),
         );
+        assert_eq!(
+            out["quote"]["author"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(out["quote"]["id"], json!(1_699_999_000_000_u64));
         assert_eq!(out["sticker"]["packId"], json!("deadbeef"));
         assert_eq!(out["sticker"]["packKey"], json!("S0VZ"));
         assert_eq!(out["sticker"]["stickerId"], json!(3));
@@ -2811,6 +2913,8 @@ mod tests {
             Some(vec![0x00, 0xff, 0x10])
         );
         assert_eq!(hex_decode("0 1"), None);
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// 群组接收投影：groupV2 master key → signal-cli 同款
