@@ -261,10 +261,117 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的置顶面：storage 上下文打不开（UnknownAccount）→ 引擎
+    // 内部错误折叠（compat §4.33 四码只覆盖 storage 链路本身）。
+    let (code, message) = engine.error_of(
+        "getPinnedConversations",
+        json!({ "account": "+15559990000" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    let (code, message) = engine.error_of(
+        "setConversationPinned",
+        json!({ "account": "+15559990000", "conversationId": "x", "kind": "contact", "pinned": true }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
     );
+}
+
+/// 贴纸包浏览（compat §4.32）：参数面 fail-closed 逐码位 + fake 模式网络面
+/// FETCH_FAILED（匿名 CDN 只读，无 account 参数）。
+#[test]
+fn sticker_pack_browsing_param_and_fetch_error_surface() {
+    let dir = temp_dir("sticker-browse");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let official_pack_id = "ae8fedafda4768fd3384d4b3b9db963d";
+    let official_pack_key = "U/Sqi5Xhwuda+rIyj+Z+ttev+81PUM1NqJ38Ml28c8o=";
+
+    // 参数缺失 → KEY_INVALID 码位（key 形状参数失败同码）。
+    let (code, message) = engine.error_of("getStickerPackManifest", json!({}));
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_KEY_INVALID"));
+    let (code, message) = engine.error_of("getStickerImage", json!({}));
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_KEY_INVALID"));
+
+    // packKey 非 32 字节 base64 → 同码位。
+    let (code, message) = engine.error_of(
+        "getStickerPackManifest",
+        json!({ "packId": official_pack_id, "packKey": "short" }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_KEY_INVALID"));
+
+    // packId 大写 hex → 拒绝（官方 [0-9a-f]{32} 仅小写）。
+    let (code, message) = engine.error_of(
+        "getStickerPackManifest",
+        json!({ "packId": "AE8FEDAFDA4768FD3384D4B3B9DB963D", "packKey": official_pack_key }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_KEY_INVALID"));
+
+    // 参数合法：fake 模式无网络 → FETCH_FAILED（manifest 与单图同构）。
+    let (code, message) = engine.error_of(
+        "getStickerPackManifest",
+        json!({ "packId": official_pack_id, "packKey": official_pack_key }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_FETCH_FAILED"));
+    let (code, message) = engine.error_of(
+        "getStickerImage",
+        json!({ "packId": official_pack_id, "packKey": official_pack_key, "stickerId": 0 }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_FETCH_FAILED"));
+
+    // stickerId 缺失/非数值 → KEY_INVALID 码位。
+    let (code, message) = engine.error_of(
+        "getStickerImage",
+        json!({ "packId": official_pack_id, "packKey": official_pack_key }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "STICKER_PACK_KEY_INVALID"));
+}
+
+/// 会话级置顶（compat §4.33）：fake 模式空列表成功面 + 参数面 fail-closed
+/// （-32603，四码只覆盖 storage 链路本身，参数错误不占用结构化码）。
+#[test]
+fn conversation_pinned_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("pinned-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 读：空列表成功。
+    assert_eq!(
+        engine.request(
+            "getPinnedConversations",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({ "pinned": [] })
+    );
+
+    // fake 写：成功回写后列表（空）。
+    assert_eq!(
+        engine.request(
+            "setConversationPinned",
+            json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact", "pinned": true }),
+        )["result"],
+        json!({ "pinned": [] })
+    );
+
+    // 参数缺失/未知 kind fail-closed：conversationId、kind、pinned、account。
+    let (code, _) = engine.error_of("setConversationPinned", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationPinned",
+        json!({ "conversationId": "x", "kind": "contact", "pinned": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationPinned",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "bogus", "pinned": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationPinned",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact" }),
+    );
+    assert_eq!(code, -32603);
 }
 
 #[test]

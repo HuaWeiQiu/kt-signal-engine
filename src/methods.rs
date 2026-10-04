@@ -14,7 +14,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    LinkError, SendMention, SendPreview, SendQuote, SendSticker, Service, UserStatusError,
+    storage_sync, LinkError, SendMention, SendPreview, SendQuote, SendSticker, Service,
+    UserStatusError,
 };
 use crate::state::EngineState;
 
@@ -568,11 +569,167 @@ async fn dispatch(
                 Err(UserStatusError::Internal) => internal_error(id),
             }
         }
+        // ---- KT 扩展方法（独立命名空间，非 signal-cli 兼容面）----
+        // 贴纸包浏览：匿名 CDN 只读，不依赖账号（无 account 参数）。
+        // 参数校验 fail-closed：packId 非 32 hex / packKey 非 32 字节按
+        // 结构化错误 STICKER_PACK_KEY_INVALID 同码位的参数面回 -1。
+        "getStickerPackManifest" => {
+            let pack_id = params.get("packId").and_then(Value::as_str);
+            let pack_key = params.get("packKey").and_then(Value::as_str);
+            let (Some(pack_id), Some(pack_key)) = (pack_id, pack_key) else {
+                return sticker_error(id, crate::service::stickers::StickerError::InvalidParams);
+            };
+            match service.sticker_pack_manifest(pack_id, pack_key).await {
+                Ok(projection) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "title": projection.title,
+                        "author": projection.author,
+                        "cover": projection.cover.map(|cover| json!({
+                            "id": cover.id,
+                            "emoji": cover.emoji,
+                            "contentType": cover.content_type,
+                        })),
+                        "stickers": projection.stickers.iter().map(|sticker| json!({
+                            "id": sticker.id,
+                            "emoji": sticker.emoji,
+                            "contentType": sticker.content_type,
+                        })).collect::<Vec<_>>(),
+                        "stickerCount": projection.sticker_count,
+                    }),
+                ),
+                Err(error) => sticker_error(id, error),
+            }
+        }
+        "getStickerImage" => {
+            let pack_id = params.get("packId").and_then(Value::as_str);
+            let pack_key = params.get("packKey").and_then(Value::as_str);
+            let sticker_id = params
+                .get("stickerId")
+                .and_then(Value::as_u64)
+                .and_then(|item| u32::try_from(item).ok());
+            let (Some(pack_id), Some(pack_key), Some(sticker_id)) = (pack_id, pack_key, sticker_id)
+            else {
+                return sticker_error(id, crate::service::stickers::StickerError::InvalidParams);
+            };
+            match service.sticker_image(pack_id, pack_key, sticker_id).await {
+                Ok(image) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "dataBase64": image.data_base64,
+                        "contentType": image.content_type,
+                        "size": image.size,
+                    }),
+                ),
+                Err(error) => sticker_error(id, error),
+            }
+        }
+        // 会话级置顶：Storage Service 真相源（带 account 参数，风格对齐
+        // send 系列的参数解析 fail-closed）。
+        "getPinnedConversations" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.pinned_conversations(account).await {
+                Ok(entries) => jsonrpc::success_response(id, pinned_payload(&entries)),
+                // 账号参数不指向已链接账号：非 storage 面错误（compat §4.33
+                // 四码只覆盖 storage 链路），按引擎通用内部错误 fail-closed。
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "setConversationPinned" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let conversation_id = params.get("conversationId").and_then(Value::as_str);
+            let kind = params.get("kind").and_then(Value::as_str);
+            let pinned = params.get("pinned").and_then(Value::as_bool);
+            let Some(conversation) = conversation_of(conversation_id, kind) else {
+                return internal_error(id);
+            };
+            let Some(pinned) = pinned else {
+                return internal_error(id);
+            };
+            match service
+                .set_conversation_pinned(account, conversation, pinned)
+                .await
+            {
+                Ok(entries) => jsonrpc::success_response(id, pinned_payload(&entries)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
         ),
     }
+}
+
+/// 置顶返回体（getPinnedConversations / setConversationPinned 共用形状）：
+/// 顺序 = 存储顺序；映射不出的条目跳过（不炸整面）。
+fn pinned_payload(entries: &[storage_sync::PinnedEntry]) -> Value {
+    json!({
+        "pinned": entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.id.as_ref()?;
+                Some(json!({
+                    "conversationId": id.id_string(),
+                    "kind": id.kind(),
+                }))
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// conversationId + kind → 引擎会话标识（未知 kind fail-closed）。
+fn conversation_of(
+    conversation_id: Option<&str>,
+    kind: Option<&str>,
+) -> Option<storage_sync::EngineConversationId> {
+    let conversation_id = conversation_id?;
+    match kind? {
+        "contact" => Some(storage_sync::EngineConversationId::Contact(
+            conversation_id.to_owned(),
+        )),
+        "group" => Some(storage_sync::EngineConversationId::Group(
+            conversation_id.to_owned(),
+        )),
+        "legacyGroup" => Some(storage_sync::EngineConversationId::LegacyGroup(
+            conversation_id.to_owned(),
+        )),
+        _ => None,
+    }
+}
+
+/// 贴纸包面错误 → JSON-RPC 错误码（compat §4.32，connector 白名单逐字）。
+fn sticker_error(id: &Value, error: crate::service::stickers::StickerError) -> Value {
+    let (code, message) = match error {
+        // 参数缺失/形状错与 packKey 校验失败同码位：key 形状参数失败。
+        crate::service::stickers::StickerError::InvalidParams => (-1, "STICKER_PACK_KEY_INVALID"),
+        crate::service::stickers::StickerError::KeyInvalid => (-1, "STICKER_PACK_KEY_INVALID"),
+        crate::service::stickers::StickerError::Fetch => (-1, "STICKER_PACK_FETCH_FAILED"),
+        crate::service::stickers::StickerError::Malformed => (-1, "STICKER_PACK_MALFORMED"),
+        crate::service::stickers::StickerError::ImageTooLarge => (-1, "STICKER_IMAGE_TOO_LARGE"),
+    };
+    jsonrpc::error_response(id, &RpcError::new(code, message))
+}
+
+/// 置顶面错误 → JSON-RPC 错误码（compat §4.33，connector 白名单逐字；
+/// UnknownAccount 已由调用点折叠为引擎内部错误）。
+fn storage_error(id: &Value, error: &storage_sync::StorageSyncError) -> Value {
+    let (code, message) = match error {
+        storage_sync::StorageSyncError::ConversationNotResolved => {
+            (-1, "CONVERSATION_NOT_RESOLVED")
+        }
+        storage_sync::StorageSyncError::Unavailable => (-1, "STORAGE_UNAVAILABLE"),
+        storage_sync::StorageSyncError::ReadFailed => (-1, "STORAGE_READ_FAILED"),
+        storage_sync::StorageSyncError::WriteFailed => (-1, "STORAGE_WRITE_FAILED"),
+        storage_sync::StorageSyncError::UnknownAccount => (-32603, "Internal error"),
+    };
+    jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
 /// recipient 参数归一：数组（send/sendTyping/remoteDelete/sendReaction）或

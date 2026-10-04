@@ -40,12 +40,15 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 
 use crate::state::EngineState;
 
+pub(crate) mod stickers;
+pub(crate) mod storage_sync;
+
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
 const PLACEHOLDER_DEVICE_NAME: &str = "KT Signal Engine";
 
 /// 出网 UA：官方审计面统一标识（引擎所有直连 REST/WS 共用）。
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 /// 回执 timestamps 每帧上限：官方 sendReceipts.preload.ts CHUNK_SIZE=100，
 /// 超出按官方分帧继续发（非 fail-closed）。
@@ -179,8 +182,13 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 /// packId hex（官方桌面 Bytes.fromHex 逆运算）；奇数长/非 hex 字符 None。
-fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
+/// 官方仅认小写（`[0-9a-f]{32}`），大写显式拒绝。
+pub(crate) fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     (0..value.len())
@@ -1144,6 +1152,129 @@ impl Service {
             .map_err(|_| SendError::Internal)?;
         Ok(())
     }
+
+    /// getStickerPackManifest（P4 扩面，不依赖账号）：匿名 CDN 下载 +
+    /// 解密 + 投影。参数校验 fail-closed。fake 模式走错误面（该开关仅
+    /// IPC 形状测试用，生产永远 real，compat §6）。
+    pub(crate) async fn sticker_pack_manifest(
+        &self,
+        pack_id: &str,
+        pack_key: &str,
+    ) -> Result<stickers::ManifestProjection, stickers::StickerError> {
+        let key =
+            stickers::decode_pack_key(pack_key).ok_or(stickers::StickerError::InvalidParams)?;
+        stickers::decode_pack_id(pack_id).ok_or(stickers::StickerError::InvalidParams)?;
+        if !self.real {
+            return Err(stickers::StickerError::Fetch);
+        }
+        stickers::fetch_manifest(pack_id, &key).await
+    }
+
+    /// getStickerImage（P4 扩面，不依赖账号）：匿名 CDN 单图下载 + 解密 +
+    /// MIME 嗅探。≤300KB fail-closed。
+    pub(crate) async fn sticker_image(
+        &self,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+    ) -> Result<stickers::ImageProjection, stickers::StickerError> {
+        let key =
+            stickers::decode_pack_key(pack_key).ok_or(stickers::StickerError::InvalidParams)?;
+        stickers::decode_pack_id(pack_id).ok_or(stickers::StickerError::InvalidParams)?;
+        if !self.real {
+            return Err(stickers::StickerError::Fetch);
+        }
+        stickers::fetch_image(pack_id, &key, sticker_id).await
+    }
+
+    /// getPinnedConversations（P4 扩面）：读 Storage Service
+    /// AccountRecord.pinnedConversations → 引擎会话标识投影（存储序）。
+    pub(crate) async fn pinned_conversations(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<storage_sync::PinnedEntry>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::read_pinned(&context).await
+    }
+
+    /// setConversationPinned（P4 扩面）：官方写语义（读改写 AccountRecord，
+    /// 仅动 pinned 字段）+ 409 冲突重放（conflictBackOff 3 次）。
+    pub(crate) async fn set_conversation_pinned(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: storage_sync::EngineConversationId,
+        pinned: bool,
+    ) -> Result<Vec<storage_sync::PinnedEntry>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::write_pinned(&context, conversation, pinned).await
+    }
+}
+
+/// storage 面共用上下文：已注册账号的 store + 手工构造凭据的 PushService
+/// + 账号 store 目录（service/mod.rs link_flow 凭据构造先例同构）。
+pub(crate) struct StorageContext {
+    pub(crate) store: SqliteStore,
+    pub(crate) push: PushService,
+    pub(crate) device_id: u32,
+    pub(crate) account_dir: PathBuf,
+}
+
+/// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。
+async fn storage_context(
+    service: &Service,
+    account: &str,
+) -> Result<StorageContext, storage_sync::StorageSyncError> {
+    let rel = {
+        let state = service.state.lock().await;
+        state
+            .account_dir(account)
+            .ok_or(storage_sync::StorageSyncError::UnknownAccount)?
+    };
+    let account_dir = service.data_dir.join(&rel);
+    let store = open_store(&account_dir)
+        .await
+        .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?;
+    let data = store
+        .load_registration_data()
+        .await
+        .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?
+        .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
+    // password 为 pub(crate)：经 serde 数据面读回（ADR 0005 §S2 唯一外部
+    // 构造路径，JSON 形态 = presage 官方 store 落库格式）。
+    let raw =
+        serde_json::to_value(&data).map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?;
+    let password = raw["password"]
+        .as_str()
+        .ok_or(storage_sync::StorageSyncError::UnknownAccount)?
+        .to_string();
+    // phonenumber 字段要 E164（与 link_flow / presage credentials() 同构）。
+    use presage::libsignal_service::utils::TryIntoE164;
+    let push = PushService::new(
+        SignalServers::Production,
+        Some(ServiceCredentials {
+            aci: Some(data.service_ids.aci),
+            pni: Some(data.service_ids.pni),
+            phonenumber: data
+                .phone_number
+                .try_into_e164()
+                .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?,
+            password: Some(password),
+            device_id: data.device_id.and_then(|id| id.try_into().ok()),
+        }),
+        USER_AGENT,
+    );
+    Ok(StorageContext {
+        store,
+        push,
+        device_id: data.device_id.unwrap_or(1),
+        account_dir,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,7 +2058,7 @@ fn aci_to_bytes(aci: &str) -> Option<Vec<u8>> {
 }
 
 /// 群组 id（signal-cli 同源：master key 标准 base64）→ 32 字节 master key。
-fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     let key = base64::engine::general_purpose::STANDARD
         .decode(group_id.trim())
@@ -2253,7 +2384,9 @@ async fn find_contact_by_number(
 
 /// PhoneNumber → E.164 文本（`+15551234567`）：Display 默认是 international
 /// 排版（带空格/连字符），不能直接当账号标识。
-fn e164_string(phone: &presage::libsignal_service::prelude::phonenumber::PhoneNumber) -> String {
+pub(crate) fn e164_string(
+    phone: &presage::libsignal_service::prelude::phonenumber::PhoneNumber,
+) -> String {
     use presage::libsignal_service::prelude::phonenumber::Mode;
     phone.format().mode(Mode::E164).to_string()
 }
