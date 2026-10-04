@@ -20,7 +20,8 @@ use prost::Message as _;
 
 use crate::proto::group::GroupAttributeBlob;
 use crate::proto::{
-    chat_item, frame, quote, recipient, Chat, ChatItem, FilePointer, Frame, Recipient,
+    chat_item, chat_update_message, frame, group_change_chat_update, quote, recipient, Chat,
+    ChatItem, ChatUpdateMessage, FilePointer, Frame, Recipient,
 };
 
 /// 导出计数：结果与跳过都要可见，禁静默丢帧。
@@ -211,13 +212,20 @@ fn blob_string(blob: &GroupAttributeBlob) -> String {
 }
 
 fn chat_record(c: &Chat) -> serde_json::Value {
-    serde_json::json!({
+    let mut record = serde_json::json!({
         "type": "chat",
         "id": c.id,
         "recipientId": c.recipient_id,
         "archived": c.archived,
         "pinnedOrder": c.pinned_order,
-    })
+    });
+    if let Some(timer_ms) = c.expiration_timer_ms {
+        record["expirationTimerMs"] = serde_json::json!(timer_ms);
+    }
+    if c.expire_timer_version > 0 {
+        record["expireTimerVersion"] = serde_json::json!(c.expire_timer_version);
+    }
+    record
 }
 
 /// v1 中间表示：text + 附件 metadata（不下载字节）+ quote + 远端删除。
@@ -241,6 +249,12 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
     }
     if let Some(pin) = &item.pin_details {
         record["pinnedAtTimestamp"] = serde_json::json!(pin.pinned_at_timestamp);
+    }
+    if let Some(start) = item.expire_start_date.filter(|start| *start > 0) {
+        record["expireStartDate"] = serde_json::json!(start);
+    }
+    if let Some(expires_in) = item.expires_in_ms.filter(|expires_in| *expires_in > 0) {
+        record["expiresInMs"] = serde_json::json!(expires_in);
     }
 
     match item.item.as_ref()? {
@@ -271,10 +285,43 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
         chat_item::Item::RemoteDeletedMessage(_) => {
             record["remoteDeleted"] = serde_json::json!(true);
         }
+        chat_item::Item::UpdateMessage(update) => {
+            record["expirationTimerChange"] = timer_change_record(update)?;
+        }
         // 其余 item 类型 v1 跳过（调用方计数）；方向可用的 update/call 类未来再扩。
         _ => return None,
     };
     Some(record)
+}
+
+/// E 批备份导出计时器变更行（connector 拿去做 system 行：会话归属 + 新
+/// timer 值 + 0=关闭语义）。1:1 取 ExpirationTimerChatUpdate；群取
+/// GroupChange 批内第一个 GroupExpirationTimerUpdate。其余 update 类型不投
+/// （返回 None 计入 skippedItems）。proto 只投影不发明：expiresInMs 为
+/// proto3 标量原样透出（0 原样保留）；updaterAci 为 16 字节 ACI 的小写
+/// UUID 形，畸形省略键。
+fn timer_change_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> {
+    match update.update.as_ref()? {
+        chat_update_message::Update::ExpirationTimerChange(change) => {
+            Some(serde_json::json!({ "expiresInMs": change.expires_in_ms }))
+        }
+        chat_update_message::Update::GroupChange(group) => {
+            group
+                .updates
+                .iter()
+                .find_map(|entry| match entry.update.as_ref()? {
+                    group_change_chat_update::update::Update::GroupExpirationTimerUpdate(timer) => {
+                        let mut change = serde_json::json!({ "expiresInMs": timer.expires_in_ms });
+                        if let Some(aci) = timer.updater_aci.as_deref().and_then(aci_string) {
+                            change["updaterAci"] = serde_json::Value::String(aci);
+                        }
+                        Some(change)
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    }
 }
 
 fn attachment_record(attachment: &crate::proto::MessageAttachment) -> Option<serde_json::Value> {
@@ -317,10 +364,11 @@ fn quote_type_name(value: i32) -> &'static str {
 mod tests {
     use super::*;
     use crate::proto::{
-        chat_item::{IncomingMessageDetails, Item, PinDetails},
-        file_pointer, frame,
+        chat_item::{DirectionlessMessageDetails, IncomingMessageDetails, Item, PinDetails},
+        chat_update_message, file_pointer, frame, group_change_chat_update,
         recipient::Destination,
-        BackupInfo, Contact, Group, StandardMessage, Text,
+        BackupInfo, ChatUpdateMessage, Contact, ExpirationTimerChatUpdate, Group,
+        GroupChangeChatUpdate, GroupExpirationTimerUpdate, StandardMessage, Text,
     };
     use base64::Engine as _;
     use libsignal_message_backup::export::{
@@ -407,6 +455,8 @@ mod tests {
                 id: 3,
                 recipient_id: 7,
                 archived: false,
+                expiration_timer_ms: Some(86_400_000),
+                expire_timer_version: 2,
                 ..Default::default()
             })),
         });
@@ -474,6 +524,25 @@ mod tests {
         });
         // 未知帧 item（官方语义：跳过不报错）。
         let skipped = frame_bytes(&Frame { item: None });
+        // E 批：1:1 计时器变更 update（官方导出 directionless 形态）成行。
+        let timer_update = frame_bytes(&Frame {
+            item: Some(frame::Item::ChatItem(ChatItem {
+                chat_id: 3,
+                author_id: 7,
+                date_sent: 400,
+                directional_details: Some(chat_item::DirectionalDetails::Directionless(
+                    DirectionlessMessageDetails::default(),
+                )),
+                item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                    update: Some(chat_update_message::Update::ExpirationTimerChange(
+                        ExpirationTimerChatUpdate {
+                            expires_in_ms: 86_400_000,
+                        },
+                    )),
+                })),
+                ..Default::default()
+            })),
+        });
 
         let payload: Vec<u8> = [
             info,
@@ -482,6 +551,7 @@ mod tests {
             chat,
             item,
             pinned,
+            timer_update,
             skipped,
         ]
         .into_iter()
@@ -501,10 +571,10 @@ mod tests {
             stats,
             ExportStats {
                 backup_version: 1,
-                frames: 7,
+                frames: 8,
                 recipients: 2,
                 chats: 1,
-                messages: 2,
+                messages: 3,
                 remote_deleted: 0,
                 skipped_items: 0,
                 skipped_frames: 1,
@@ -516,7 +586,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
         // E5：会话归属身份随帧投影（connector §4.38 消费形状）。
         assert_eq!(lines[0]["kind"], "contact");
         assert_eq!(lines[0]["name"], "A B");
@@ -528,12 +598,18 @@ mod tests {
             lines[1]["masterKey"],
             base64::engine::general_purpose::STANDARD.encode(GROUP_MASTER_KEY_BYTES)
         );
+        // E 批：chat 级计时器随帧投影。
+        assert_eq!(lines[2]["expirationTimerMs"], 86_400_000);
+        assert_eq!(lines[2]["expireTimerVersion"], 2);
         assert_eq!(lines[3]["text"], "hello");
         assert_eq!(lines[3]["direction"], "incoming");
         assert_eq!(lines[3]["attachments"][0]["size"], 5);
         assert_eq!(lines[3]["quote"]["text"], "quoted");
         assert_eq!(lines[4]["pinnedAtTimestamp"], 300);
         assert_eq!(lines[4]["direction"], "outgoing");
+        // E 批：计时器变更 update 成行（计入 messages），connector 拿去做 system 行。
+        assert_eq!(lines[5]["expirationTimerChange"]["expiresInMs"], 86_400_000);
+        assert_eq!(lines[5]["direction"], "directionless");
 
         std::fs::remove_file(&path).ok();
     }
@@ -622,6 +698,193 @@ mod tests {
         });
         assert!(malformed.get("aci").is_none());
         assert!(malformed.get("e164").is_none());
+    }
+
+    /// E 批计时器变更行三面：1:1 变更（含 0=关闭语义）、群变更（批内扫描 +
+    /// updaterAci 有/无/畸形）、非计时器 update 与方向缺失仍整行跳过。
+    #[test]
+    fn timer_update_projection_faces() {
+        // 1:1：expiresInMs 原样透出；directionless（官方导出形态）成行。
+        let one_to_one = message_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 400,
+            directional_details: Some(chat_item::DirectionalDetails::Directionless(
+                DirectionlessMessageDetails::default(),
+            )),
+            item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                update: Some(chat_update_message::Update::ExpirationTimerChange(
+                    ExpirationTimerChatUpdate {
+                        expires_in_ms: 86_400_000,
+                    },
+                )),
+            })),
+            ..Default::default()
+        })
+        .expect("1:1 计时器变更是行");
+        assert_eq!(one_to_one["direction"], "directionless");
+        assert_eq!(
+            one_to_one["expirationTimerChange"]["expiresInMs"],
+            86_400_000
+        );
+
+        // 0=关闭语义原样保留，不吞成「无键」。
+        let disabled = timer_change_record(&ChatUpdateMessage {
+            update: Some(chat_update_message::Update::ExpirationTimerChange(
+                ExpirationTimerChatUpdate { expires_in_ms: 0 },
+            )),
+        })
+        .expect("0=关闭仍是行");
+        assert_eq!(disabled["expiresInMs"], 0);
+
+        // 群：批内第一个 GroupExpirationTimerUpdate 命中，updaterAci 小写 UUID。
+        let group_update = |timer: GroupExpirationTimerUpdate| {
+            ChatUpdateMessage {
+            update: Some(chat_update_message::Update::GroupChange(
+                GroupChangeChatUpdate {
+                    updates: vec![
+                        group_change_chat_update::Update {
+                            update: Some(
+                                group_change_chat_update::update::Update::GroupNameUpdate(
+                                    Default::default(),
+                                ),
+                            ),
+                        },
+                        group_change_chat_update::Update {
+                            update: Some(
+                                group_change_chat_update::update::Update::GroupExpirationTimerUpdate(
+                                    timer,
+                                ),
+                            ),
+                        },
+                    ],
+                },
+            )),
+        }
+        };
+        let group = timer_change_record(&group_update(GroupExpirationTimerUpdate {
+            expires_in_ms: 604_800_000,
+            updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+        }))
+        .expect("群计时器变更是行");
+        assert_eq!(group["expiresInMs"], 604_800_000);
+        assert_eq!(group["updaterAci"], "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b");
+
+        // updaterAci 缺席/畸形（非 16B）→ 键省略，其余面照投。
+        for (name, timer) in [
+            (
+                "no-updater",
+                GroupExpirationTimerUpdate {
+                    expires_in_ms: 604_800_000,
+                    updater_aci: None,
+                },
+            ),
+            (
+                "malformed-updater",
+                GroupExpirationTimerUpdate {
+                    expires_in_ms: 604_800_000,
+                    updater_aci: Some(vec![0x11; 15]),
+                },
+            ),
+        ] {
+            let record = timer_change_record(&group_update(timer)).expect(name);
+            assert!(record.get("updaterAci").is_none(), "{name}: 键必须省略");
+            assert_eq!(record["expiresInMs"], 604_800_000);
+        }
+
+        // 非计时器 update（群改名 / SimpleUpdate）与 update 未设 → 整行跳过。
+        for (name, update) in [
+            (
+                "group-name-only",
+                chat_update_message::Update::GroupChange(GroupChangeChatUpdate {
+                    updates: vec![group_change_chat_update::Update {
+                        update: Some(group_change_chat_update::update::Update::GroupNameUpdate(
+                            Default::default(),
+                        )),
+                    }],
+                }),
+            ),
+            (
+                "simple-update",
+                chat_update_message::Update::SimpleUpdate(Default::default()),
+            ),
+        ] {
+            assert!(
+                timer_change_record(&ChatUpdateMessage {
+                    update: Some(update)
+                })
+                .is_none(),
+                "{name}: 非计时器 update 不投行"
+            );
+        }
+        assert!(
+            timer_change_record(&ChatUpdateMessage { update: None }).is_none(),
+            "update 未设不投行"
+        );
+
+        // 方向缺失（官方导入器跳过的形态）→ 计入 skippedItems 不投行。
+        assert!(message_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 401,
+            item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                update: Some(chat_update_message::Update::ExpirationTimerChange(
+                    ExpirationTimerChatUpdate {
+                        expires_in_ms: 86_400_000,
+                    },
+                )),
+            })),
+            ..Default::default()
+        })
+        .is_none());
+    }
+
+    /// E 批 chat/item 计时器字段两面：有（原样透出）/ 缺（键不在；proto3
+    /// 标量 0 视同未设；item 级 Some(0) 不投）。
+    #[test]
+    fn chat_and_item_timer_field_faces() {
+        let chat = chat_record(&Chat {
+            id: 3,
+            recipient_id: 7,
+            expiration_timer_ms: Some(86_400_000),
+            expire_timer_version: 2,
+            ..Default::default()
+        });
+        assert_eq!(chat["expirationTimerMs"], 86_400_000);
+        assert_eq!(chat["expireTimerVersion"], 2);
+
+        let bare = chat_record(&Chat {
+            id: 4,
+            recipient_id: 8,
+            ..Default::default()
+        });
+        assert!(bare.get("expirationTimerMs").is_none());
+        assert!(bare.get("expireTimerVersion").is_none());
+
+        let item = |expire_start_date: Option<u64>, expires_in_ms: Option<u64>| ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 1,
+            expire_start_date,
+            expires_in_ms,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::StandardMessage(StandardMessage {
+                text: Some(Text {
+                    body: "hi".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let with = message_record(&item(Some(1_000), Some(86_400_000))).expect("行");
+        assert_eq!(with["expireStartDate"], 1_000);
+        assert_eq!(with["expiresInMs"], 86_400_000);
+        let without = message_record(&item(Some(0), None)).expect("行");
+        assert!(without.get("expireStartDate").is_none());
+        assert!(without.get("expiresInMs").is_none());
     }
 
     #[tokio::test]

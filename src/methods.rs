@@ -619,6 +619,35 @@ async fn dispatch(
             }
         }
         // ---- KT 扩展方法（独立命名空间，非 signal-cli 兼容面）----
+        // setExpirationTimer（消失消息 E 批）：1:1 会话计时器设置 +
+        // expiration-update 广播（signal-cli Manager.setExpirationTimer
+        // 语义对位；updateContact 的 expiration 面独立成方法，本引擎
+        // updateContact 维持上游 params 形状不扩）。参数 fail-closed：
+        // recipient/expirationInSeconds 缺失或形状错（负数/小数/超 u32），
+        // 未注册联系人与发送失败同码 -32603 折叠。
+        "setExpirationTimer" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let recipient = params.get("recipient").and_then(Value::as_str);
+            let timer = params
+                .get("expirationInSeconds")
+                .and_then(Value::as_u64)
+                .and_then(|seconds| u32::try_from(seconds).ok());
+            match (account, recipient, timer) {
+                (Some(account), Some(recipient), Some(timer)) => {
+                    match service
+                        .set_expiration_timer(account, recipient, timer)
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // 贴纸包浏览：匿名 CDN 只读，不依赖账号（无 account 参数）。
         // 参数校验 fail-closed：packId 非 32 hex / packKey 非 32 字节按
         // 结构化错误 STICKER_PACK_KEY_INVALID 同码位的参数面回 -1。

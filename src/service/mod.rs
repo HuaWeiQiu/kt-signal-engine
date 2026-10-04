@@ -1210,6 +1210,71 @@ impl Service {
         Ok(())
     }
 
+    /// setExpirationTimer（消失消息 E 批，KT 扩展方法）：1:1 会话计时器
+    /// 设置，语义对位 signal-cli `Manager.setExpirationTimer`
+    /// （ManagerImpl.java:1419 = ContactHelper 持久化 + asExpirationUpdate
+    /// 广播）：持久化联系人计时器（presage store Contact 面真相源，
+    /// version 单调 +1，接收方据此做乱序丢弃）后向对端广播 expiration-
+    /// update（DataMessage.Flags.EXPIRATION_TIMER_UPDATE=2 位，官方桌面
+    /// v8.31 收发两侧同 flag 机制；信封 = flag + expireTimer +
+    /// expireTimerVersion，经 presage send 面 restore_thread_timer 注入
+    /// 刚持久化的 (timer, version) 对——构造面不设 expire_timer，显式设置
+    /// 会被 presage 对已设值再 +1 造成 store/线面脱节）。timer=0（关闭）
+    /// 经 presage 0→None 归一后线上 = 官方桌面关闭形态（无 expireTimer
+    /// 字段的 expiration-update，官方 updateExpirationTimer(undefined) 同
+    /// 形状）。fail-closed：未注册联系人（store contacts 无行——presage
+    /// update_expire_timer 对缺行静默 no-op，必须前置拒绝）与 timer 非法
+    /// 值（methods.rs 参数面）。同值 no-op 不广播不 bump（signal-cli
+    /// ContactHelper 同款）。返回广播信封时间戳（同值 no-op = 处理时刻）。
+    pub(crate) async fn set_expiration_timer(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        timer_seconds: u32,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let service_id = resolve_recipient(&manager, recipient)
+            .await
+            .ok_or(SendError::Internal)?;
+        let mut store = manager.store().clone();
+        // 未注册联系人拒绝：contacts 表必须已有该收件人行（UUID 形态直通
+        // 也不例外——无行 = presage 持久化面静默 no-op，宁拒不哑改）。
+        store
+            .contact_by_id(&service_id)
+            .await
+            .map_err(|_| SendError::Internal)?
+            .ok_or(SendError::Internal)?;
+        let thread = presage::store::Thread::Contact(service_id);
+        let current = store
+            .expire_timer(&thread)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        if current.map(|(timer, _)| timer) == Some(timer_seconds) {
+            return Ok(now_ms());
+        }
+        let version = current
+            .map(|(_, version)| version)
+            .unwrap_or(0)
+            .saturating_add(1);
+        store
+            .update_expire_timer(&thread, timer_seconds, version)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        let timestamp = now_ms();
+        let body = build_expiration_timer_update_data_message(timestamp);
+        manager
+            .send_message(service_id, body, timestamp)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(timestamp)
+    }
+
     /// getStickerPackManifest（P4 扩面，不依赖账号）：匿名 CDN 下载 +
     /// 解密 + 投影。参数校验 fail-closed。fake 模式走错误面（该开关仅
     /// IPC 形状测试用，生产永远 real，compat §6）。
@@ -1538,6 +1603,13 @@ async fn project_content(
                     let numbers = resolve_author_numbers(store, data_message).await;
                     let mut sent_json = project_data_message(data_message, &numbers);
                     sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
+                    // 消失消息 E 批：Sent.expirationStartTimestamp=4（官方多
+                    // 设备的精确起算同步位，官方 1:1 已读起算语义的线面对应）。
+                    // 0 无起算语义不投（同 history 面 0 过滤口径）；收侧
+                    // DataMessage 在钉定 rev 无同名字段（proto 缺口，§5）。
+                    if let Some(start) = sent_expiration_start(sent) {
+                        sent_json["expirationStartTimestamp"] = json!(start);
+                    }
                     match (
                         sent.destination_e164.as_deref(),
                         sent.parse_destination_service_id(),
@@ -1689,6 +1761,23 @@ fn group_id_of(data_message: &presage::proto::DataMessage) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(key))
 }
 
+/// 1:1 计时器变更行判定（收投影 isExpirationUpdate 对位）：官方 flag 位
+/// EXPIRATION_TIMER_UPDATE=2（钉定 rev proto 实名，见 project_data_message
+/// 注）。官方桌面 isValidTapToView 同代的 flagCount 断言（0 或 1 个 flag
+/// 位）在此不复制——引擎只读不 enforce，非法组合由消费方裁量。
+fn is_expiration_update_row(data_message: &presage::proto::DataMessage) -> bool {
+    use presage::proto::data_message::Flags;
+    data_message
+        .flags
+        .is_some_and(|flags| flags & Flags::ExpirationTimerUpdate as u32 != 0)
+}
+
+/// Sent 面起算时间（消失消息 E 批）：Some 且 >0 才投，0/缺席无起算语义
+/// 键不在（同 history 面 0 过滤口径）。
+fn sent_expiration_start(sent: &presage::proto::sync_message::Sent) -> Option<u64> {
+    sent.expiration_start_timestamp.filter(|start| *start > 0)
+}
+
 /// dataMessage 面（正文/引用/reaction/remoteDelete/pinMessage/unpinMessage/
 /// adminDelete/附件元数据/预览/mentions/viewOnce）。边界纪律：附件 ≤32、
 /// 预览 ≤4、mentions ≤64（connector §4.13/§4.20 上限同源）；条目内字段协议
@@ -1699,6 +1788,22 @@ fn project_data_message(
 ) -> Value {
     let timestamp = data_message.timestamp.unwrap_or(0);
     let mut out = json!({ "timestamp": timestamp });
+    // 消失消息 E 批（接收投影，缺省键不在）：expireTimer=5（秒）为官方
+    // 「每条消息携带会话计时器」语义位，收投影 faithful 透出（signal-cli
+    // JsonDataMessage.expiresInSeconds 同名）；发送构造面不设该字段（立项
+    // 红线，出站普通消息不加 expireTimer）。
+    if let Some(seconds) = data_message.expire_timer {
+        out["expiresInSeconds"] = json!(seconds);
+    }
+    // isExpirationUpdate 对位（proto 实名已核）：钉定 rev 的
+    // SignalService.proto 无 isExpirationUpdate bool（新版 field 38），官方
+    // 机制是 DataMessage.Flags.EXPIRATION_TIMER_UPDATE=2 位——官方桌面
+    // v8.31 收（processDataMessage）/发（conversations.updateExpirationTimer）
+    // 两侧都用该 flag 位，signal-cli 0.14.8 面的 isExpirationUpdate 即其
+    // 同义投影。
+    if is_expiration_update_row(data_message) {
+        out["isExpirationUpdate"] = json!(true);
+    }
     if let Some(group_id) = group_id_of(data_message) {
         // signal-cli 同款形状（dataMessage.groupV2 / sent 内群组同形状）：
         // connector 既有群会话管线（data_message_group_id）直接消费。
@@ -2450,6 +2555,23 @@ async fn build_sticker_data_message(
         dm.quote = Some(assemble_quote(store, quote).await?);
     }
     Ok(dm)
+}
+
+/// expiration-update DataMessage 构造（官方 asExpirationUpdate 同构，消失
+/// 消息 E 批）：只设 Flags.EXPIRATION_TIMER_UPDATE=2 位 + timestamp。不设
+/// expire_timer/expire_timer_version——presage send 面
+/// restore_thread_timer 注入刚持久化的 (timer, version) 对（官方信封 =
+/// flag 位 + expireTimer + expireTimerVersion，signal-cli SendHelper
+/// sendMessage 的 withExpiration/withExpireTimerVersion 同型）；显式设置
+/// 会被 presage 对已设 timer 再 bump version（持久化态/线面脱节），构造面
+/// 保持 None 即官方语义单点。
+fn build_expiration_timer_update_data_message(timestamp: u64) -> DataMessage {
+    use presage::proto::data_message::Flags;
+    DataMessage {
+        timestamp: Some(timestamp),
+        flags: Some(Flags::ExpirationTimerUpdate as u32),
+        ..DataMessage::default()
+    }
 }
 
 /// 阅后即焚媒体族判定（E1/E2 共用）：`image/*|video/*` 前缀族。官方桌面
@@ -3273,6 +3395,102 @@ mod tests {
         );
         assert!(out.get("viewOnce").is_none());
         assert!(out.get("viewOnceInvalid").is_none());
+    }
+
+    /// 消失消息 E 批收投影三面：expiresInSeconds（含 0=关闭）/ isExpirationUpdate
+    /// （flag 位）/ expirationStartTimestamp（Sent 面 >0）有/缺/组合——缺省键
+    /// 不在；非过期行零新键。
+    #[test]
+    fn expiration_receive_projection_faces() {
+        use presage::proto::data_message::Flags;
+        let numbers = HashMap::new();
+
+        // 有：timer + flag 位组合同投；expiresInSeconds 含 0（关闭语义透出）。
+        let out = project_data_message(
+            &DataMessage {
+                expire_timer: Some(0),
+                flags: Some(Flags::ExpirationTimerUpdate as u32),
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["expiresInSeconds"], json!(0));
+        assert_eq!(out["isExpirationUpdate"], json!(true));
+        assert_eq!(out["timestamp"], json!(1_700_000_000_000_u64));
+
+        let out = project_data_message(
+            &DataMessage {
+                expire_timer: Some(86_400),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["expiresInSeconds"], json!(86_400));
+        assert!(out.get("isExpirationUpdate").is_none(), "无 flag 位不投");
+
+        let out = project_data_message(
+            &DataMessage {
+                flags: Some(Flags::ExpirationTimerUpdate as u32),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("expiresInSeconds").is_none(), "timer 缺席键不在");
+        assert_eq!(out["isExpirationUpdate"], json!(true));
+
+        // flag 位组合性：ExpirationTimerUpdate 与其他位（ProfileKeyUpdate=4）
+        // 共存的位掩码仍命中。
+        let out = project_data_message(
+            &DataMessage {
+                flags: Some(Flags::ExpirationTimerUpdate as u32 | Flags::ProfileKeyUpdate as u32),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["isExpirationUpdate"], json!(true));
+
+        // 缺：普通行（正文/反应等）零过期键。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("plain".to_owned()),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("expiresInSeconds").is_none());
+        assert!(out.get("isExpirationUpdate").is_none());
+        assert!(out.get("expirationStartTimestamp").is_none());
+
+        // Sent 面起算时间：Some>0 投，Some(0)/None 键不在。
+        let sent = |start: Option<u64>| presage::proto::sync_message::Sent {
+            expiration_start_timestamp: start,
+            ..Default::default()
+        };
+        assert_eq!(
+            sent_expiration_start(&sent(Some(1_700_000_000_000))),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(sent_expiration_start(&sent(Some(0))), None);
+        assert_eq!(sent_expiration_start(&sent(None)), None);
+    }
+
+    /// 消失消息 E 批构造面：expiration-update 信封只设 flag 位 + timestamp，
+    /// 不设 expire_timer/expire_timer_version（presage send 面
+    /// restore_thread_timer 注入刚持久化的 (timer, version) 对；构造面显式
+    /// 设置会再 bump 造成 store/线面脱节）；亦不碰 requiredProtocolVersion。
+    #[test]
+    fn expiration_timer_update_build_sets_flag_only() {
+        use presage::proto::data_message::Flags;
+        let dm = build_expiration_timer_update_data_message(1_700_000_000_000);
+        assert_eq!(dm.flags, Some(Flags::ExpirationTimerUpdate as u32));
+        assert_eq!(dm.timestamp, Some(1_700_000_000_000));
+        assert_eq!(dm.expire_timer, None, "构造面不设 timer，注入归 presage");
+        assert_eq!(dm.expire_timer_version, None);
+        assert_eq!(dm.required_protocol_version, None, "官方不 bump");
+        assert_eq!(dm.body, None);
+        assert!(dm.attachments.is_empty());
+        assert!(dm.body_ranges.is_empty());
     }
 
     /// 阅后即焚 E3：viewOnceOpen sync 投影 {senderAci, timestamp}（binary

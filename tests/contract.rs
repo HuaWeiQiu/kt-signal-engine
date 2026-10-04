@@ -281,6 +281,14 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 setExpirationTimer：打开已注册 manager 前置即内部失败
+    // （不触网；消失消息 E 批）。
+    let (code, message) = engine.error_of(
+        "setExpirationTimer",
+        json!({ "account": "+15559990000", "recipient": "+15555550101", "expirationInSeconds": 60 }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -884,6 +892,76 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
     assert_eq!(open_entry["params"]["senderAci"], json!(sender_aci));
     assert_eq!(open_entry["params"]["timestamp"], json!(42));
     assert_eq!(open_entry["params"]["account"], json!(number));
+}
+
+/// setExpirationTimer（消失消息 E 批）：fake 形状成功 {"timestamp":u64}
+/// （0=关闭同形）；参数面 fail-closed（-32603：account/recipient/
+/// expirationInSeconds 缺失、recipient 数组形状、timer 字符串/负数/小数/
+/// 超 u32——不触网）；调度日志三元组逐字保留。
+#[test]
+fn set_expiration_timer_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("expire-timer");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake 成功面：{"timestamp": u64}；timer=0（关闭语义）同形成功。
+    let ok = engine.request(
+        "setExpirationTimer",
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": 86_400 }),
+    );
+    assert!(
+        ok["result"]["timestamp"].is_u64(),
+        "fake setExpirationTimer ok"
+    );
+    let off = engine.request(
+        "setExpirationTimer",
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": 0 }),
+    );
+    assert!(off["result"]["timestamp"].is_u64(), "timer=0 (off) ok");
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "recipient": "+15555550101", "expirationInSeconds": 60 }),
+        json!({ "account": number, "expirationInSeconds": 60 }),
+        json!({ "account": number, "recipient": "+15555550101" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "expirationInSeconds": 60 }),
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": "60" }),
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": -1 }),
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": 1.5 }),
+        json!({ "account": number, "recipient": "+15555550101", "expirationInSeconds": 4_294_967_296_u64 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("setExpirationTimer", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "setExpirationTimer rejects {params}"
+        );
+    }
+
+    // 调度日志：account/recipient/expirationInSeconds 逐字保留。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "setExpirationTimer")
+        .expect("setExpirationTimer logged");
+    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
+    assert_eq!(entry["params"]["expirationInSeconds"], json!(86_400));
 }
 
 #[test]

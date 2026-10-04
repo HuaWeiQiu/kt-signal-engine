@@ -86,6 +86,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setConversationPinned` | `{account, conversationId, kind: contact\|group\|legacyGroup, pinned(bool)}` | `{pinned: [...]}`（写后全量，同 getPinnedConversations 形状） | 云引用解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次/写面冲突重放中失败 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/未知 kind/未注册账号 `-32603` | **P4 real**：官方 upload 语义（读改写 AccountRecord 仅动 pinned 字段、prost round-trip 保真其余字段、新 16B item id、version+1/source_device/record_ikm 透传）+ `PUT v1/storage/` + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；写面为 presage 上游缺口自建薄封装（上游补齐后替换）；fake：成功回 `{pinned: []}` |
 | `getStickerPackSyncs` | `{account}` | `{packs: [{packId(hex 32 小写), packKey(base64 32B)\|null, position, deletedAtTimestampMs}]}`（存储序 = manifest STICKER identifiers 首现序；坏条目跳过不炸面；墓碑 packKey=null、带 deletedAtTimestampMs） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real**：Storage Service manifest → 全部 type=6 STICKER identifier 批量读 → StickerPackRecord 投影（记录面为 presage 上游 proto 缺口本地定义 + 加解密 shim，§5）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{packs: []}` |
 | `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
+| `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -103,7 +104,10 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   `viewOnceInvalid: true`（2026-10-04，官方 isTapToViewInvalid 同位；引擎
   metadata-only 只标记不擦除，§5）。引用/反应作者号 contacts 命中投影
   E.164，未命中保留 ACI 字符串。textStyles：本引擎钉定的 presage proto
-  版本无此面，不投影。
+  版本无此面，不投影。消失消息 E 批（2026-10-05）：`expiresInSeconds`
+  （DataMessage.expire_timer=5 透出，秒，0=关闭原样透出）与
+  `isExpirationUpdate: true`（DataMessage flag 位 EXPIRATION_TIMER_UPDATE=2
+  投影，官方桌面收发两侧同 flag 机制），缺省键不在。
 - `editMessage {targetSentTimestamp, dataMessage}`（直聊）。
 - `typingMessage {action: STARTED|STOPPED, timestamp}`。
 - `receiptMessage {timestamp[], when, isDelivery, isRead, isViewed}`
@@ -116,7 +120,9 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   （官方 DataMessage.Sticker 序列化同构；data 走附件指针投影，元数据
   only，2026-10-04）。
 - `syncMessage.sentMessage`：本机其他设备发出的直聊（timestamp/message/
-  destinationNumber|destinationUuid + 同 dataMessage 控制面）。
+  destinationNumber|destinationUuid + 同 dataMessage 控制面）；消失消息
+  E 批增 `expirationStartTimestamp`（Sent.expiration_start_timestamp=4，
+  官方多设备精确起算同步位；0/缺席不投）。
 - `syncMessage.viewOnceOpen {senderAci, timestamp}`（2026-10-04，官方
   content oneof viewOnceOpen=11 投影）：本机主设备/其他设备已打开某阅后
   即焚消息，上层据此把 (senderAci, timestamp) 命中的行置 Viewed 并执行
@@ -289,6 +295,68 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
 - **kind=self 无身份可投**：proto Self_ 只携带 avatar_color；connector
   以账号注册号码（engine-state.json registry 号码→目录映射）作 self
   会话归属与自发信源，档案无需重复携带身份。
+
+消失消息 E 批（2026-10-05，1:1 计时器设置 + 接收/导出投影）：
+
+- **`setExpirationTimer` 语义对位（signal-cli `Manager.setExpirationTimer`，
+  ManagerImpl:1419 = ContactHelper 持久化 + asExpirationUpdate 广播）**：
+  先持久化 presage store Contact 面 (timer, version+1)（version 单调，
+  接收方据此做乱序丢弃；新联系人 version 1，缺行 version 0+1），再向对端
+  广播 expiration-update。update_expire_timer 的 contact 分支只在
+  version > 现值时应用且 contacts 缺行静默 no-op——未注册联系人前置
+  fail-closed（`contact_by_id` 必须命中，否则 `-32603`），宁拒不哑改。
+- **构造面不设 expire_timer（上游行为登记）**：expiration-update 信封只设
+  `DataMessage.Flags.EXPIRATION_TIMER_UPDATE=2` 位 + timestamp；
+  presage send 面 `restore_thread_timer` 对 expire_timer==None 的出站
+  DataMessage 注入 store 里的 (timer, version)（store 为 0/无 → 不注入），
+  恰为官方线面信封 = flag 位 + expireTimer + expireTimerVersion
+  （signal-cli SendHelper.sendMessage 的 withExpiration/withExpireTimerVersion
+  同型）。若构造面显式设置 timer，presage 会对已设值再 bump version
+  （store/线面脱节）——单点持久化归 store，构造面保持 None。timer=0
+  （关闭）经 presage 0→None 归一后线上 = 官方桌面关闭形态（无
+  expireTimer 字段的 expiration-update，官方 updateExpirationTimer(undefined)
+  同形状）。
+- **同值 no-op 不广播**：timer 与 store 现值相同 → 不广播不 bump version，
+  返回处理时刻 timestamp（signal-cli ContactHelper 同款不触发对端）。
+- **接收投影三键（缺省键不在，proto 只投影不发明）**：
+  `dataMessage.expiresInSeconds` ← DataMessage.expire_timer=5（秒；
+  Some(0)=关闭原样透出）；`dataMessage.isExpirationUpdate: true` ←
+  flag 位 EXPIRATION_TIMER_UPDATE=2——钉定 rev 的 SignalService.proto 无
+  isExpirationUpdate bool（新版 field 38），官方桌面 v8.31 收
+  （processDataMessage）/发（updateExpirationTimer）两侧都用 flag 位，
+  signal-cli 0.14.8 面的 isExpirationUpdate 即其同义投影；
+  `syncMessage.sentMessage.expirationStartTimestamp` ←
+  Sent.expiration_start_timestamp=4（官方多设备精确起算同步位；0/缺席
+  不投）。收侧 DataMessage 在钉定 rev 无 expirationStartTimestamp 同名
+  字段（新版 field 37，prost 解码跳未知字段）——官方 1:1「已读起算」
+  语义的收侧对位缺位，本引擎不发明（新版字段上游升版后再接）。
+- **backup5 历史导出扩面**：chat 行 + `expirationTimerMs` ←
+  Chat.expiration_timer_ms=5（Some 才投）/ `expireTimerVersion` ←
+  Chat.expire_timer_version=10（>0 才投，proto3 标量 0=未设）；message
+  行 + `expireStartDate` ← ChatItem.expire_start_date=4 / `expiresInMs`
+  ← ChatItem.expires_in_ms=5（Some 且 >0 才投）；计时器变更 update 成
+  行（官方导出 directionless 形态，行计入 stats.messages）：
+  `expirationTimerChange {expiresInMs}` ← 1:1
+  ExpirationTimerChatUpdate / 群 GroupChangeChatUpdate 批内第一个
+  GroupExpirationTimerUpdate（expiresInMs 原样透出，0=关闭语义不吞；
+  `updaterAci` ← updater_aci 16 字节 → 小写连字 UUID，缺席/畸形省略键）；
+  其余 update 类型维持整行跳过（skippedItems 可见）。connector 拿去做
+  system 行（会话归属 + 新 timer 值 + 0=关闭语义）。
+- **universal timer（账户级默认计时器）本批不可达（只调研不实现）**：
+  钉定 rev 的 StorageService.proto ContactRecord 止于 field 27 无
+  expireTimer、AccountRecord 无 universal timer 字段；presage store 无
+  账户级计时器读写面；backup proto
+  `AccountSettings.universal_expire_timer_seconds`（field 7，0=无）仅
+  档案只读、导出不投 Account 帧——引擎栈无 live 读写面，等上游升版
+  或单独立项。
+- **边界（立项红线）**：不做群计时器设置（群计时器走群组更新面另行
+  立项）；不做 DAR；出站普通消息不加 expireTimer 字段（per-message
+  携带会话计时器是收侧兼容语义，引擎不主动扩散）；不 bump
+  requiredProtocolVersion（官方发送侧同）；不投影新版 proto 才有的
+  字段（钉定 rev 缺位如实登记，不发明）。
+- **fake 成功面**：fake 模式 `setExpirationTimer` 成功
+  `{"timestamp":u64}`，只落调度日志不触网（fake 开关仅 IPC 契约测试用，
+  §6）。
 
 ## 6. fake 服务模式（仅测试）
 
