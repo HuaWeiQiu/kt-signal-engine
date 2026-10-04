@@ -502,6 +502,7 @@ impl Service {
         mentions: &[SendMention],
         attachments: &[String],
         sticker: Option<&SendSticker>,
+        view_once: bool,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -539,6 +540,7 @@ impl Service {
                     )
                     .await?
                 }
+                None if view_once => build_view_once_data_message(pointers.clone(), timestamp)?,
                 None => {
                     build_text_data_message(
                         manager.store(),
@@ -896,6 +898,52 @@ impl Service {
         Ok(())
     }
 
+    /// sendViewOnceOpen（E4，官方 syncViewOnceOpen 同构）：向自己 ACI 发
+    /// SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof
+    /// viewOnceOpen=11，padded sync message），多设备同步「该阅后即焚已被
+    /// 本机打开」；与 sendViewedReceipt（作者面 VIEWED 回执）双通道独立。
+    /// presage self-send 通路已验证可行：`Manager::send_message` 对自 ACI
+    /// 发 SyncMessage 即官方 sendIndividualProto(ownAci) 同型线面（presage
+    /// 上游 request_contacts 同路径），无需降级；钉定 rev 的同内容二次转录
+    /// 重发怪癖登记 compat §5。senderAci 号码/UUID 双形态（reaction
+    /// targetAuthor 同解析口径），不可解析 fail-closed。
+    pub(crate) async fn send_view_once_open(
+        self: &Arc<Self>,
+        account: &str,
+        sender: &str,
+        timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let sender_aci = resolve_author_aci(manager.store(), sender)
+            .await
+            .ok_or(SendError::Internal)?;
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+            content: Some(presage::proto::sync_message::Content::ViewOnceOpen(
+                presage::proto::sync_message::ViewOnceOpen {
+                    sender_aci: Some(sender_aci.clone()),
+                    timestamp: Some(timestamp),
+                    sender_aci_binary: aci_to_bytes(&sender_aci),
+                },
+            )),
+            ..presage::proto::SyncMessage::with_padding(&mut rng())
+        });
+        let envelope_ts = now_ms();
+        manager
+            .send_message(own_aci, body, envelope_ts)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(())
+    }
+
     /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
     /// profile 拆名面（givenName/familyName）presage Contact 未建模，P2+ 补。
     pub(crate) async fn list_contacts(
@@ -985,6 +1033,7 @@ impl Service {
         mentions: &[SendMention],
         attachments: &[String],
         sticker: Option<&SendSticker>,
+        view_once: bool,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
@@ -1002,6 +1051,7 @@ impl Service {
                 build_sticker_data_message(manager.store(), sticker, quote, pointer, timestamp)
                     .await?
             }
+            None if view_once => build_view_once_data_message(pointers, timestamp)?,
             None => {
                 build_text_data_message(
                     manager.store(),
@@ -1480,26 +1530,35 @@ async fn project_content(
             });
         }
         ContentBody::SynchronizeMessage(sync) => {
-            // sent 在 SyncMessage.content oneof 里（read/viewed 等其他面 P2+）。
-            let sent = match sync.content.as_ref() {
-                Some(presage::proto::sync_message::Content::Sent(sent)) => sent,
-                _ => return None,
-            };
-            let data_message = sent.message.as_ref()?;
-            let numbers = resolve_author_numbers(store, data_message).await;
-            let mut sent_json = project_data_message(data_message, &numbers);
-            sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
-            match (
-                sent.destination_e164.as_deref(),
-                sent.parse_destination_service_id(),
-            ) {
-                (Some(e164), _) => sent_json["destinationNumber"] = json!(e164),
-                (None, Some(service_id)) => {
-                    sent_json["destinationUuid"] = json!(service_id.service_id_string());
+            // sent/viewOnceOpen 在 SyncMessage.content oneof 里（read/viewed
+            // 等其他面 P2+）。
+            match sync.content.as_ref() {
+                Some(presage::proto::sync_message::Content::Sent(sent)) => {
+                    let data_message = sent.message.as_ref()?;
+                    let numbers = resolve_author_numbers(store, data_message).await;
+                    let mut sent_json = project_data_message(data_message, &numbers);
+                    sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
+                    match (
+                        sent.destination_e164.as_deref(),
+                        sent.parse_destination_service_id(),
+                    ) {
+                        (Some(e164), _) => sent_json["destinationNumber"] = json!(e164),
+                        (None, Some(service_id)) => {
+                            sent_json["destinationUuid"] = json!(service_id.service_id_string());
+                        }
+                        (None, None) => {}
+                    }
+                    envelope["syncMessage"] = json!({ "sentMessage": sent_json });
                 }
-                (None, None) => {}
+                // E3：viewOnceOpen 投影（官方 content oneof viewOnceOpen=11）
+                // ——本机主设备/其他设备已打开某阅后即焚消息，上层据此把对应
+                // 行置 Viewed 并执行字节焚毁。
+                Some(presage::proto::sync_message::Content::ViewOnceOpen(open)) => {
+                    let projection = project_view_once_open(open)?;
+                    envelope["syncMessage"] = json!({ "viewOnceOpen": projection });
+                }
+                _ => return None,
             }
-            envelope["syncMessage"] = json!({ "sentMessage": sent_json });
         }
         ContentBody::NullMessage(_)
         | ContentBody::CallMessage(_)
@@ -1511,6 +1570,21 @@ async fn project_content(
         "jsonrpc": "2.0",
         "method": "receive",
         "params": { "account": account, "envelope": envelope },
+    }))
+}
+
+/// E3：SyncMessage.ViewOnceOpen 投影 `{senderAci, timestamp}`。senderAci
+/// 解析与官方 parse_sender_aci 同构（senderAciBinary 16B 优先、senderAci
+/// 字符串兜底，双写形态兼容）。不可解析（binary 坏 + string 缺）= 无法定位
+/// 目标行，warn-only 丢弃（None，零 stderr；乱序兜底口径与官方
+/// modifyTargetMessage 对齐——引擎侧只登记不暂存，compat §5）；timestamp
+/// 缺席投影 0 不丢弃（投影面 unwrap_or(0) 同风格）。
+fn project_view_once_open(open: &presage::proto::sync_message::ViewOnceOpen) -> Option<Value> {
+    let sender_aci = open.parse_sender_aci()?;
+    Some(json!({
+        "senderAci": presage::libsignal_service::protocol::ServiceId::from(sender_aci)
+            .service_id_string(),
+        "timestamp": open.timestamp.unwrap_or(0),
     }))
 }
 
@@ -1635,6 +1709,12 @@ fn project_data_message(
     }
     if data_message.is_view_once == Some(true) {
         out["viewOnce"] = json!(true);
+        // E2：官方 isValidTapToView 同构校验——非法行补 viewOnceInvalid
+        // （官方 isTapToViewInvalid 同位）。引擎 metadata-only 无字节可擦，
+        // 只标记不擦除（compat §5）。
+        if !is_valid_view_once_row(data_message) {
+            out["viewOnceInvalid"] = json!(true);
+        }
     }
     if let Some(quote) = data_message.quote.as_ref() {
         let author = quote
@@ -1781,6 +1861,33 @@ fn project_data_message(
         out["sticker"] = value;
     }
     out
+}
+
+/// 阅后即焚合法性校验（E2，官方 isValidTapToView 同构逐项）：body 空（官方
+/// JS `if (body)` 同口径：空串为 falsy 即合法）∧ 恰 1 附件 ∧ 媒体族
+/// image|video ∧ 无 quote/sticker/contact/preview。官方不查 mentions，接收
+/// 面同构不查（发送面 E1 更严：mentions 禁发，compat §5）。
+fn is_valid_view_once_row(data_message: &presage::proto::DataMessage) -> bool {
+    if data_message
+        .body
+        .as_deref()
+        .is_some_and(|body| !body.is_empty())
+    {
+        return false;
+    }
+    if data_message.attachments.len() != 1 {
+        return false;
+    }
+    let Some(content_type) = data_message.attachments[0].content_type.as_deref() else {
+        return false;
+    };
+    if !is_view_once_media(content_type) {
+        return false;
+    }
+    if data_message.quote.is_some() || data_message.sticker.is_some() {
+        return false;
+    }
+    data_message.contact.is_empty() && data_message.preview.is_empty()
 }
 
 /// 附件只投影元数据（connector §4.13/§6.7 媒体边界：字节永不下载）。
@@ -2343,6 +2450,44 @@ async fn build_sticker_data_message(
         dm.quote = Some(assemble_quote(store, quote).await?);
     }
     Ok(dm)
+}
+
+/// 阅后即焚媒体族判定（E1/E2 共用）：`image/*|video/*` 前缀族。官方桌面
+/// isValidTapToView 用 Chrome 支持集枚举表（GoogleChrome.std.ts：avif/bmp/
+/// gif/jpeg/webp/png/apng/ico 系 + mp4/ogg/webm），引擎 metadata-only 无渲染
+/// 面按族宽判——官方集外但手机端合法的 video/quicktime 等不被误标 invalid
+/// （差异登记 compat §5）。
+fn is_view_once_media(content_type: &str) -> bool {
+    let lowered = content_type.to_ascii_lowercase();
+    lowered.starts_with("image/") || lowered.starts_with("video/")
+}
+
+/// 阅后即焚 dataMessage 构造（E1，官方发送面同构）：body 无、单附件、
+/// is_view_once=Some(true)（线上 DataMessage.isViewOnce=14 bool；官方发送侧
+/// 不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入
+/// 的恒为默认 0 = 官方初值）。fail-closed：恰 1 附件 ∧ 媒体族 image|video；
+/// quote/preview/mentions/sticker/body 由参数面禁入（methods.rs），构造面
+/// 结构上不可能携带，违规 -32603（折叠 SendError::Internal）。
+fn build_view_once_data_message(
+    attachment_pointers: Vec<presage::proto::AttachmentPointer>,
+    timestamp: u64,
+) -> Result<DataMessage, SendError> {
+    if attachment_pointers.len() != 1 {
+        return Err(SendError::Internal);
+    }
+    let content_type = attachment_pointers[0]
+        .content_type
+        .as_deref()
+        .ok_or(SendError::Internal)?;
+    if !is_view_once_media(content_type) {
+        return Err(SendError::Internal);
+    }
+    Ok(DataMessage {
+        timestamp: Some(timestamp),
+        attachments: attachment_pointers,
+        is_view_once: Some(true),
+        ..DataMessage::default()
+    })
 }
 
 async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String> {
@@ -2976,6 +3121,211 @@ mod tests {
             None
         );
         assert_eq!(decode_group_id("not base64!!"), None);
+    }
+
+    /// 阅后即焚 E1：构造面 body 无/单附件/is_view_once=true，不碰
+    /// requiredProtocolVersion（官方发送侧不 bump；presage send 面注入默认
+    /// 0 = 官方初值）；媒体族 image|video 与附件数 fail-closed（参数面互斥
+    /// 在 methods.rs，构造面兜底服务层不可绕过的形状）。
+    #[test]
+    fn view_once_send_build_and_fail_closed() {
+        let pointer = |content_type: &str| presage::proto::AttachmentPointer {
+            content_type: Some(content_type.to_owned()),
+            ..Default::default()
+        };
+        for content_type in ["image/jpeg", "video/mp4"] {
+            let dm = build_view_once_data_message(vec![pointer(content_type)], 1_700_000_000_000)
+                .expect("valid view-once builds");
+            assert_eq!(dm.is_view_once, Some(true));
+            assert_eq!(dm.body, None);
+            assert_eq!(dm.attachments.len(), 1);
+            assert_eq!(
+                dm.attachments[0].content_type.as_deref(),
+                Some(content_type)
+            );
+            assert_eq!(dm.timestamp, Some(1_700_000_000_000));
+            assert_eq!(dm.required_protocol_version, None, "官方不 bump");
+            assert!(dm.quote.is_none());
+            assert!(dm.preview.is_empty());
+            assert!(dm.body_ranges.is_empty());
+            assert!(dm.sticker.is_none());
+        }
+        // fail-closed：0 附件 / 2 附件 / audio / mediatype 缺席。
+        assert!(build_view_once_data_message(Vec::new(), 1).is_err());
+        assert!(
+            build_view_once_data_message(vec![pointer("image/png"), pointer("image/png")], 1)
+                .is_err()
+        );
+        assert!(build_view_once_data_message(vec![pointer("audio/mp4")], 1).is_err());
+        assert!(build_view_once_data_message(
+            vec![presage::proto::AttachmentPointer::default()],
+            1
+        )
+        .is_err());
+    }
+
+    /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构
+    /// 校验，非法行补 viewOnceInvalid（metadata-only 只标记不擦除）；合法行
+    /// 不带该键；非 view-once 行完全不受影响。
+    #[test]
+    fn view_once_receive_projection_marks_invalid_rows() {
+        let image_pointer = presage::proto::AttachmentPointer {
+            content_type: Some("image/jpeg".to_owned()),
+            ..Default::default()
+        };
+        let audio_pointer = presage::proto::AttachmentPointer {
+            content_type: Some("audio/mp4".to_owned()),
+            ..Default::default()
+        };
+
+        // 合法行：viewOnce:true，无 viewOnceInvalid。
+        let out = project_data_message(
+            &DataMessage {
+                is_view_once: Some(true),
+                attachments: vec![image_pointer.clone()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(out["viewOnce"], json!(true));
+        assert!(out.get("viewOnceInvalid").is_none());
+
+        // 官方 body 空串 = falsy = 合法（isValidTapToView `if (body)` 同构）。
+        let out = project_data_message(
+            &DataMessage {
+                is_view_once: Some(true),
+                body: Some(String::new()),
+                attachments: vec![image_pointer.clone()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("viewOnceInvalid").is_none());
+
+        // 非法逐面：body 非空 / 0 附件 / 2 附件 / audio / mediatype 缺席 /
+        // quote / sticker / contact / preview。
+        let invalid = |dm: DataMessage| {
+            let out = project_data_message(&dm, &HashMap::new());
+            assert_eq!(out["viewOnce"], json!(true));
+            assert_eq!(out["viewOnceInvalid"], json!(true));
+        };
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            body: Some("nope".to_owned()),
+            attachments: vec![image_pointer.clone()],
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![image_pointer.clone(), image_pointer.clone()],
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![audio_pointer],
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![presage::proto::AttachmentPointer::default()],
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![image_pointer.clone()],
+            quote: Some(data_message::Quote::default()),
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![image_pointer.clone()],
+            sticker: Some(data_message::Sticker::default()),
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![image_pointer.clone()],
+            contact: vec![presage::proto::data_message::Contact::default()],
+            ..Default::default()
+        });
+        invalid(DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![image_pointer],
+            preview: vec![presage::proto::Preview::default()],
+            ..Default::default()
+        });
+
+        // 非 view-once 行：多附件/带正文不触发任何 viewOnce 键。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("plain".to_owned()),
+                attachments: vec![
+                    presage::proto::AttachmentPointer::default(),
+                    presage::proto::AttachmentPointer::default(),
+                ],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("viewOnce").is_none());
+        assert!(out.get("viewOnceInvalid").is_none());
+    }
+
+    /// 阅后即焚 E3：viewOnceOpen sync 投影 {senderAci, timestamp}（binary
+    /// 优先 string 兜底，官方 parse_sender_aci 同构）；senderAci 不可解析 =
+    /// warn-only 丢弃（None，零 stderr，compat §5 乱序兜底口径）；timestamp
+    /// 缺席投影 0 不丢弃。
+    #[test]
+    fn view_once_open_sync_projection_and_warn_only_drop() {
+        use presage::proto::sync_message::ViewOnceOpen;
+        let aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+
+        // binary+string 双写：binary 优先（官方 parse_sender_aci 同构）。
+        let out = project_view_once_open(&ViewOnceOpen {
+            sender_aci: Some(aci.to_owned()),
+            timestamp: Some(1_700_000_000_000),
+            sender_aci_binary: Some(uuid_bytes(aci)),
+        })
+        .expect("dual form parses");
+        assert_eq!(out["senderAci"], json!(aci));
+        assert_eq!(out["timestamp"], json!(1_700_000_000_000_u64));
+
+        // string-only / binary-only 两种线上形态都投影。
+        let out = project_view_once_open(&ViewOnceOpen {
+            sender_aci: Some(aci.to_owned()),
+            timestamp: Some(7),
+            sender_aci_binary: None,
+        })
+        .expect("string form parses");
+        assert_eq!(out["senderAci"], json!(aci));
+        let out = project_view_once_open(&ViewOnceOpen {
+            sender_aci: None,
+            timestamp: Some(8),
+            sender_aci_binary: Some(uuid_bytes(aci)),
+        })
+        .expect("binary form parses");
+        assert_eq!(out["senderAci"], json!(aci));
+
+        // 不可解析（binary 坏 + string 缺）：warn-only 丢弃。
+        assert!(project_view_once_open(&ViewOnceOpen {
+            sender_aci: None,
+            timestamp: Some(9),
+            sender_aci_binary: Some(vec![0xde, 0xad]),
+        })
+        .is_none());
+
+        // timestamp 缺席：投影 0，不丢弃。
+        let out = project_view_once_open(&ViewOnceOpen {
+            sender_aci: Some(aci.to_owned()),
+            timestamp: None,
+            sender_aci_binary: None,
+        })
+        .expect("missing timestamp still projects");
+        assert_eq!(out["timestamp"], json!(0));
     }
 
     /// ADR 0005 §S2：serde 数据面是 `RegistrationData` pub(crate) 字段（

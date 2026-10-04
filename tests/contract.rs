@@ -274,6 +274,13 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 sendViewOnceOpen：self-send 前置即内部失败（不触网）。
+    let (code, message) = engine.error_of(
+        "sendViewOnceOpen",
+        json!({ "account": "+15559990000", "senderAci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "timestamp": 42 }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -757,6 +764,126 @@ fn mutating_methods_log_dispatch_and_reply() {
         with_quote["params"]["sticker"]["packId"],
         json!("0123456789abcdef")
     );
+}
+
+/// 阅后即焚（E1-E4）：send 的 viewOnce 参数面逐形状 fail-closed + 合法面
+/// 成功 + 调度日志 viewOnce 键逐字保留；sendViewOnceOpen fake 形状成功 +
+/// 参数面 fail-closed（-32603，缺失/形状错不触网）。
+#[test]
+fn view_once_send_param_faces_and_send_view_once_open_contract() {
+    let dir = temp_dir("view-once");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let image = "data:image/jpeg;base64,aGVsbG8=";
+    let sender_aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+
+    // 合法面：viewOnce + 单 image 附件（无 body）直聊成功。
+    let ok = engine.request(
+        "send",
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image] }),
+    );
+    assert!(ok["result"]["timestamp"].is_u64(), "view-once send ok");
+
+    // 群组形态合法面成功（32B master key 标准 base64）。
+    let group_ok = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "viewOnce": true,
+            "attachments": [image]
+        }),
+    );
+    assert!(
+        group_ok["result"]["timestamp"].is_u64(),
+        "group view-once ok"
+    );
+
+    // viewOnce:false 显式回普通文本面（message 必带照旧）。
+    let plain = engine.request(
+        "send",
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": false, "message": "plain" }),
+    );
+    assert!(plain["result"]["timestamp"].is_u64());
+
+    // fail-closed 逐形状（官方 isValidTapToView 同构 + mentions 禁发）：
+    // 非布尔 / 带 body / 0 附件 / 2 附件 / audio 附件 / quote / preview /
+    // mentions / sticker。
+    let rejects = [
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": "yes", "attachments": [image] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "hi", "viewOnce": true, "attachments": [image] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image, image] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": ["data:audio/mp4;base64,aGVsbG8="] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image], "quoteTimestamp": 42, "quoteAuthor": "+15555550101" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image], "previewUrl": "https://example.com" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image], "mentions": [{ "number": "+15555550101", "start": 0, "length": 2 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "viewOnce": true, "attachments": [image], "sticker": { "packId": "0123456789abcdef", "packKey": "QUJDREVG", "stickerId": 7, "image": "data:image/webp;base64,aGVsbG8=" } }),
+    ];
+    for params in &rejects {
+        let response = engine.request("send", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "view-once rejects {params}"
+        );
+    }
+
+    // sendViewOnceOpen：fake 成功 {}；参数面缺失/形状错 fail-closed。
+    let opened = engine.request(
+        "sendViewOnceOpen",
+        json!({ "account": number, "senderAci": sender_aci, "timestamp": 42 }),
+    );
+    assert_eq!(opened["result"], json!({}));
+    let open_rejects = [
+        json!({ "senderAci": sender_aci, "timestamp": 42 }),
+        json!({ "account": number, "timestamp": 42 }),
+        json!({ "account": number, "senderAci": sender_aci }),
+        json!({ "account": number, "senderAci": sender_aci, "timestamp": "42" }),
+    ];
+    for params in &open_rejects {
+        let response = engine.request("sendViewOnceOpen", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendViewOnceOpen rejects {params}"
+        );
+    }
+
+    // 调度日志：viewOnce 键逐字保留；sendViewOnceOpen 带完整三元组。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let view_once_entry = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "send" && entry["params"].get("viewOnce") == Some(&json!(true))
+        })
+        .expect("view-once send logged");
+    assert_eq!(view_once_entry["params"]["viewOnce"], json!(true));
+    assert_eq!(
+        view_once_entry["params"]["attachments"],
+        json!([image]),
+        "single image attachment verbatim"
+    );
+    let open_entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendViewOnceOpen")
+        .expect("sendViewOnceOpen logged");
+    assert_eq!(open_entry["params"]["senderAci"], json!(sender_aci));
+    assert_eq!(open_entry["params"]["timestamp"], json!(42));
+    assert_eq!(open_entry["params"]["account"], json!(number));
 }
 
 #[test]

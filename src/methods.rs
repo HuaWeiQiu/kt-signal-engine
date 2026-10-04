@@ -244,9 +244,33 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
+            // 阅后即焚扩面（E1，官方 isViewOnce 同名直投）：布尔参数缺省
+            // false，非布尔 fail-closed。发送面 fail-closed 对齐官方
+            // isValidTapToView 同构（+ mentions 禁发，任务口径）：body 空 ∧
+            // 恰 1 附件 ∧ 无 quote/preview/mentions/sticker；附件 mediatype
+            // 必须 image|video（data URI 前缀初检 + 服务层解析后 spec 复核，
+            // fake 模式同口径 -32603）。
+            let view_once = match params.get("viewOnce") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return internal_error(id),
+            };
+            if view_once
+                && (!message.unwrap_or_default().is_empty()
+                    || attachments.len() != 1
+                    || quote.is_some()
+                    || preview.is_some()
+                    || !mentions.is_empty()
+                    || sticker.is_some()
+                    || attachments
+                        .first()
+                        .is_none_or(|uri| !has_image_or_video_mediatype(uri)))
+            {
+                return internal_error(id);
+            }
             match (account, message, group, recipients_of(params)) {
                 (Some(account), message, Some(group), _)
-                    if sticker.is_some() || message.is_some() =>
+                    if sticker.is_some() || message.is_some() || view_once =>
                 {
                     match service
                         .send_text_group(
@@ -258,6 +282,7 @@ async fn dispatch(
                             &mentions,
                             &attachments,
                             sticker.as_ref(),
+                            view_once,
                         )
                         .await
                     {
@@ -269,7 +294,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), message, None, Ok(recipients))
-                    if sticker.is_some() || message.is_some() =>
+                    if sticker.is_some() || message.is_some() || view_once =>
                 {
                     match service
                         .send_text(
@@ -281,6 +306,7 @@ async fn dispatch(
                             &mentions,
                             &attachments,
                             sticker.as_ref(),
+                            view_once,
                         )
                         .await
                     {
@@ -545,6 +571,29 @@ async fn dispatch(
                 (Some(account), Some(recipient), Some(Some(timestamps))) => {
                     match service
                         .send_receipt(account, recipient, &timestamps, kind)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        // sendViewOnceOpen（E4）：官方 syncViewOnceOpen 同构——向自己 ACI 发
+        // SyncMessage.ViewOnceOpen{senderAci, timestamp}（多设备同步「该阅后
+        // 即焚已被本机打开」，presage self-send 通路验证可行，compat §5）；
+        // 与 sendViewedReceipt（作者面 VIEWED 回执）双通道独立。senderAci
+        // 号码/UUID 双形态（reaction targetAuthor 同解析口径）。
+        "sendViewOnceOpen" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let sender = params.get("senderAci").and_then(Value::as_str);
+            let timestamp = params.get("timestamp").and_then(Value::as_u64);
+            match (account, sender, timestamp) {
+                (Some(account), Some(sender), Some(timestamp)) => {
+                    match service
+                        .send_view_once_open(account, sender, timestamp)
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
@@ -833,6 +882,16 @@ fn recipients_of(params: &serde_json::Map<String, Value>) -> Result<Vec<String>,
         None => Ok(Vec::new()),
         Some(_) => Err(()),
     }
+}
+
+/// 阅后即焚附件初检（E1）：data URI 的 mediatype 段必须 image/|video/ 前缀
+///（服务层对解析后的 spec 同规则复核；fake 模式服务早退，靠本检查保持
+/// -32603 同口径可契约测试）。
+fn has_image_or_video_mediatype(data_uri: &str) -> bool {
+    data_uri
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split(';').next())
+        .is_some_and(|mediatype| mediatype.starts_with("image/") || mediatype.starts_with("video/"))
 }
 
 fn internal_error(id: &Value) -> Value {

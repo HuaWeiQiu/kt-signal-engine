@@ -69,7 +69,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
 | `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}]}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
-| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined |
+| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
@@ -78,6 +78,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendUnpinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp}` | `{}` | 同 send | **P2 real**：官方 unpinMessage=28 |
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
 | `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
+| `sendViewOnceOpen` | `{account, senderAci(ACI/号码), timestamp(原消息 upstream 时间戳)}` | `{}` | 同 send；senderAci 不可解析/参数缺失或形状错 `-32603` | **P2 real（2026-10-04 阅后即焚扩面）**：官方 syncViewOnceOpen 同构——向自己 ACI 发 SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof viewOnceOpen=11，padded；多设备同步「该阅后即焚已被本机打开」），presage self-send 通路验证可行（§5，含钉定 rev 同内容二次转录重发怪癖）；与 sendViewedReceipt（作者面回执）双通道独立；fake：成功 `{}` |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 | `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
 | `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
@@ -98,8 +99,11 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   size?, width?, height?, caption?, isVoiceNote}`（≤32，元数据 only，
   字节永不下载）、`previews[] {url, title?, description?, image?}`（≤4）、
   `mentions[] {number, start, length}`（≤64，来自 bodyRanges）、
-  `viewOnce: true`。引用/反应作者号 contacts 命中投影 E.164，未命中保留
-  ACI 字符串。textStyles：本引擎钉定的 presage proto 版本无此面，不投影。
+  `viewOnce: true`；viewOnce 行跑官方 isValidTapToView 同构校验，非法补
+  `viewOnceInvalid: true`（2026-10-04，官方 isTapToViewInvalid 同位；引擎
+  metadata-only 只标记不擦除，§5）。引用/反应作者号 contacts 命中投影
+  E.164，未命中保留 ACI 字符串。textStyles：本引擎钉定的 presage proto
+  版本无此面，不投影。
 - `editMessage {targetSentTimestamp, dataMessage}`（直聊）。
 - `typingMessage {action: STARTED|STOPPED, timestamp}`。
 - `receiptMessage {timestamp[], when, isDelivery, isRead, isViewed}`
@@ -113,6 +117,13 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   only，2026-10-04）。
 - `syncMessage.sentMessage`：本机其他设备发出的直聊（timestamp/message/
   destinationNumber|destinationUuid + 同 dataMessage 控制面）。
+- `syncMessage.viewOnceOpen {senderAci, timestamp}`（2026-10-04，官方
+  content oneof viewOnceOpen=11 投影）：本机主设备/其他设备已打开某阅后
+  即焚消息，上层据此把 (senderAci, timestamp) 命中的行置 Viewed 并执行
+  字节焚毁；senderAci 解析 binary 优先 string 兜底（官方 parse_sender_aci
+  同构），不可解析整事件丢弃（乱序兜底 warn-only，§5）；timestamp 缺席
+  投影 0 不丢弃。「找不到目标行」的丢弃决策在 connector 消费面执行
+  （warn-only、不暂存，§5）。
 - 群组接收投影：dataMessage.groupV2 / sent 内群组带 `groupInfo {groupId}`
   （master key 标准 base64，signal-cli 同款；直聊不带该键）；群更新类消息
   （成员变更/权限面）仍跳过。call/story/null 体跳过；解密失败按事件丢弃。
@@ -214,6 +225,47 @@ P5 扩面差异（2026-10-04，贴纸包安装状态 Storage Service 同步）�
 - **v1 单通道**：不做 legacy `syncMessage.stickerPackOperation` 同步
   通道；Storage Service 是贴纸包安装状态唯一真相源，connector 侧以
   `getStickerPackSyncs`/`setStickerPackSync` 为准。
+
+阅后即焚扩面差异（2026-10-04，官方 view-once 对齐 E1-E4）：
+
+- **E2 只标记不擦除**：官方对非法 incoming 阅后即焚 = `isTapToViewInvalid`
+  标记 + `eraseMessageContents`（附件字节就地擦除）；引擎 metadata-only
+  （附件字节永不下载）无字节可擦——非法行只投影 `viewOnceInvalid: true`，
+  字节擦除责任在消费方（connector 落库面/端上）。官方对 sent（本机其他
+  设备发出）的阅后即焚发出即擦内容，引擎的 sent 同步投影同样只标记不擦。
+- **E2 校验面与官方 isValidTapToView 逐项同构**：body 空（官方 JS
+  `if (body)` 同口径，空串即合法）∧ 恰 1 附件 ∧ 媒体族 image|video ∧ 无
+  quote/sticker/contact/preview。媒体族判定官方为 Chrome 支持集枚举表
+  （avif/bmp/gif/jpeg/webp/png/apng/ico 系 + mp4/ogg/webm），引擎
+  metadata-only 无渲染面按 `image/*|video/*` 前缀族宽判（官方集外但手机端
+  合法的 video/quicktime 等不被误标 invalid）。mentions 官方校验面不含，
+  接收面同构不查；发送面（E1）比官方更严：mentions 亦禁发（-32603）。
+- **E1 不 bump requiredProtocolVersion**：官方发送侧对 isViewOnce 不抬
+  协议版本（requiredProtocolVersion 维持默认 0），收侧 requiredVersion>8
+  的 unsupported 判定与 view-once 无关——引擎构造面不设该字段，presage
+  send 面注入默认 0 = 官方初值。
+- **E3 乱序兜底 warn-only、不暂存**：官方收到 viewOnceOpen sync 先进程内
+  暂存（ViewOnceOpenSyncs map），迟到目标消息经 modifyTargetMessage 补
+  匹配；引擎 metadata-only 不持消息行，暂存面归 connector——引擎只投影：
+  senderAci 不可解析（binary 坏 + string 缺）的 sync 事件整体丢弃（零
+  stderr，以本节登记替代运行时告警），timestamp 缺席投影 0 不丢弃；
+  「找不到目标行」的丢弃决策由 connector 在消费投影时执行（warn-only，
+  不暂存不重放）。
+- **E4 presage self-send 验证结论：可行（不降级）**：presage
+  `Manager::send_message` 对自 ACI 发 SyncMessage 即官方
+  sendIndividualProto(ownAci) 同型线面（presage 上游 request_contacts 同
+  路径），sendViewOnceOpen 保留官方双通道语义；与 sendViewedReceipt（作者
+  面 VIEWED 回执）互相独立——官方 markViewOnceMessageViewed 对 incoming
+  先发 VIEWED 再发 ViewOnceOpen sync（桌面 VIEWED 有开关门控，引擎不管
+  开关，两通道都提供），收到 sync 的设备走 fromSync 路径不再外发。
+  已知怪癖（钉定 rev）：libsignal-service `MessageSender::send_message`
+  对「多设备 + 自发 SyncMessage」在首次发送后经 `needs_sync ||
+  is_multi_device` 转录分支追加一次同内容重发——每次 sendViewOnceOpen
+  其他设备会收到两条同内容 ViewOnceOpen 信封；接收端处理幂等（重复打开 =
+  已 viewed no-op），语义不受影响，不做硬绕。
+- **与 disappearing messages 完全独立**：阅后即焚面不读不写
+  expireTimer/expireTimerVersion，不触碰 DisappearingMode 状态；两类
+  「焚」互不赋值、互不触发。
 
 ## 6. fake 服务模式（仅测试）
 
