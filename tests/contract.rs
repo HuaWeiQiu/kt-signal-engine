@@ -374,6 +374,99 @@ fn conversation_pinned_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
+/// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
+/// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。
+#[test]
+fn sticker_pack_sync_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("sticker-sync-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let pack_id = "ae8fedafda4768fd3384d4b3b9db963d";
+    let pack_key = "U/Sqi5Xhwuda+rIyj+Z+ttev+81PUM1NqJ38Ml28c8o=";
+
+    // fake 读：空列表成功。
+    assert_eq!(
+        engine.request("getStickerPackSyncs", json!({ "account": "+15550000000" }))["result"],
+        json!({ "packs": [] })
+    );
+
+    // fake 写：合法 install 成功回写后列表（空）。
+    assert_eq!(
+        engine.request(
+            "setStickerPackSync",
+            json!({ "account": "+15550000000", "packId": pack_id, "packKey": pack_key, "installed": true }),
+        )["result"],
+        json!({ "packs": [] })
+    );
+
+    // uninstall：packKey 内容与 position 被忽略（墓碑形态两字段皆不写），
+    // 垃圾字符串照样成功。
+    assert_eq!(
+        engine.request(
+            "setStickerPackSync",
+            json!({ "account": "+15550000000", "packId": pack_id, "packKey": "garbage", "position": 3, "installed": false }),
+        )["result"],
+        json!({ "packs": [] })
+    );
+
+    // 缺 account / 缺 packId / 缺 installed → -32603。
+    let (code, _) = engine.error_of("getStickerPackSyncs", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("setStickerPackSync", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "packId": pack_id, "installed": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id }),
+    );
+    assert_eq!(code, -32603);
+
+    // packId 大写 hex → -32603（官方 [0-9a-f]{32} 仅小写）。
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id.to_uppercase(), "installed": true }),
+    );
+    assert_eq!(code, -32603);
+
+    // install 缺 packKey / 短 packKey / 非字符串 packKey → -32603。
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "installed": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "packKey": "short", "installed": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "packKey": 7, "installed": true }),
+    );
+    assert_eq!(code, -32603);
+
+    // position 形状错（超 u32 / 非数值；uninstall 同样 fail-closed）→ -32603。
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "packKey": pack_key, "position": 4294967296u64, "installed": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "packKey": pack_key, "position": "high", "installed": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setStickerPackSync",
+        json!({ "account": "+15550000000", "packId": pack_id, "position": true, "installed": false }),
+    );
+    assert_eq!(code, -32603);
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");

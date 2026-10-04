@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! 会话级置顶（Storage Service 同步，P4 扩面）。
+//! Storage Service 同步：会话级置顶（P4 扩面）+ 写面泛化（P5，支撑贴纸包
+//! 记录面 `storage_sticker`）。
 //!
 //! 真相源 = Storage Service 的 `AccountRecord.pinned_conversations`（数组序
 //! 即置顶顺序，无时间戳）。读面走 presage 上游 pub API（`StorageService::
@@ -17,6 +18,18 @@
 //! → `PUT v1/storage/`（WebAPI.preload.ts:831 storageModify 同路径）。
 //! 409 响应体含服务器当前 manifest → 采纳重读，按 conflictBackOff
 //! [1s,5s,30s]（storage.preload.ts:150）重放，连满 3 次放弃本轮。
+//!
+//! 写面泛化（P5）：`plan_record_writes` 支持多记录类别 upsert（Account=
+//! identifier type 4、StickerPack=type 6，换入新 key / 旧 key 进
+//! deleteKey / version+1 / source_device·record_ikm 透传），置顶面
+//! `plan_write` 收敛为其 Account 单记录薄壳，行为逐字节不变。
+//!
+//! 贴纸记录 proto 收敛点：钉定 presage rev 的 StorageService.proto 落后
+//! （无 STICKER_PACK=6/StickerPackRecord），该记录的 item 加解密无法走
+//! `StorageService::encrypt_item/decrypt_item`——本模块提供同构 shim
+//! （`encrypt_raw_item`/`decrypt_raw_item`/`read_raw_items`，派生与
+//! AES-GCM 形状按上游 storage_service.rs 文档化实现，双向交叉验证单测钉
+//! 定），上游 proto 补齐后整段替换。Account 面不受影响，仍走上游 pub API。
 //!
 //! 账号从未有过 storage 状态（manifest 404）：读 → 空列表；写 → 以
 //! version 1 + 最小 AccountRecord（只含 pinned）建初始 manifest——该分支
@@ -210,20 +223,57 @@ pub(crate) fn conflict_decision(retries_done: u32) -> ConflictDecision {
 }
 
 /// 账号目录（data_dir/accounts/lk-…）下的本地 manifest 状态文件。
+///
+/// P5 泛化：`sticker_item_keys` 记最近一次写成功 manifest 里全部
+/// STICKER_PACK=6 identifier（b64）。`None` = 本次写不感知该面（置顶面），
+/// 落盘沿用文件旧值；`Some` = 覆盖。旧格式文件（无 stickerItemKeys 键）
+/// 兼容读取为 `None`。服务器 manifest 为真相源，本文件仅测试/排查。
 pub(crate) struct ManifestState {
     pub(crate) version: u64,
     /// 上次写成功的 Account item id（16B raw，base64 存）。
     pub(crate) account_item_key: Option<String>,
+    /// STICKER_PACK item key 集（b64）；None = 沿用旧值。
+    pub(crate) sticker_item_keys: Option<Vec<String>>,
 }
 
 const MANIFEST_STATE_FILE: &str = "storage-manifest-state.json";
 
+/// 容错读本地状态（缺文件/坏 JSON/缺键 → 对应字段缺省；旧格式兼容）。
+pub(crate) fn load_manifest_state(account_dir: &Path) -> Option<ManifestState> {
+    let bytes = std::fs::read(account_dir.join(MANIFEST_STATE_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(ManifestState {
+        version: value.get("version").and_then(serde_json::Value::as_u64)?,
+        account_item_key: value
+            .get("accountItemKey")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        sticker_item_keys: value
+            .get("stickerItemKeys")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            }),
+    })
+}
+
 /// 写本地状态（best-effort：半写不可见，临时文件 + rename；格式为
-/// `{version, accountItemKey}`，读取方仅测试/排查，服务器 manifest 为真相源）。
+/// `{version, accountItemKey, stickerItemKeys}`，读取方仅测试/排查，
+/// 服务器 manifest 为真相源）。sticker_item_keys=None 时沿用文件旧值。
 pub(crate) fn save_manifest_state(account_dir: &Path, state: &ManifestState) {
+    let sticker_item_keys = state
+        .sticker_item_keys
+        .clone()
+        .or_else(|| load_manifest_state(account_dir).and_then(|loaded| loaded.sticker_item_keys))
+        .unwrap_or_default();
     let Ok(bytes) = serde_json::to_vec_pretty(&json!({
         "version": state.version,
         "accountItemKey": state.account_item_key,
+        "stickerItemKeys": sticker_item_keys,
     })) else {
         return;
     };
@@ -279,9 +329,140 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
         .map(|identifier| identifier.raw.clone())
 }
 
-/// WriteOperation 组装纯函数（官方 generateManifest+encryptManifest 语义
-/// 收敛点）：新 manifest（version+1、source_device、record_ikm 透传、
-/// identifiers=旧集合换 Account key）+ 新 item + 旧 Account key 删除。
+/// 写面记录类别（manifest identifier type：Account=4、StickerPack=6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageRecordKind {
+    Account,
+    StickerPack,
+}
+
+impl StorageRecordKind {
+    /// ManifestRecord.Identifier.Type wire 值。StickerPack=官方
+    /// SignalStorage.proto :54 STICKER_PACK=6（钉定 presage rev 的枚举缺
+    /// 该值，全程以 raw i32 读写，读面同口径识别）。
+    pub(crate) fn identifier_type(self) -> i32 {
+        match self {
+            Self::Account => manifest_record::identifier::Type::Account as i32,
+            Self::StickerPack => crate::service::storage_sticker::STICKER_PACK_IDENTIFIER_TYPE,
+        }
+    }
+}
+
+/// 一次写面的单条记录意图（官方 toXxxRecord + generateManifest 语义的
+/// 输入形状）：新 16B item id 换入 identifiers，`replaced_key`（同类型同
+/// 实体的旧 identifier raw）进 deleteKey。Account 恒单条：有旧 manifest
+/// 时调用方传其 Account key；StickerPack 按 packId 定位旧 key。
+pub(crate) struct RecordUpsert {
+    pub(crate) kind: StorageRecordKind,
+    pub(crate) new_key: Vec<u8>,
+    pub(crate) replaced_key: Option<Vec<u8>>,
+    pub(crate) payload: RecordPayload,
+}
+
+// 瞬态写计划值：构造即编码、不批量持有，变体尺寸差不值得 Box 化波及全部构造点。
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RecordPayload {
+    Account(AccountRecord),
+    StickerPack(crate::service::storage_sticker::StickerPackRecord),
+}
+
+/// plan_record_writes 的产出：WriteOperation + 明文 manifest（调用方投影
+/// 写后 identifiers / 登记本地状态用）。
+pub(crate) struct RecordWritePlan {
+    pub(crate) write_operation: WriteOperation,
+    pub(crate) new_version: u64,
+    pub(crate) manifest_record: ManifestRecord,
+}
+
+/// WriteOperation 组装泛化纯函数（官方 generateManifest+encryptManifest
+/// 语义收敛点）：新 manifest（version+1、source_device、record_ikm 透传、
+/// identifiers=旧集合按 upsert 换入换出）+ 全部新 item + 换出旧 key 删除。
+/// Account 换写清除全部 Account 标识（恒单条不变量）；StickerPack 仅清除
+/// replaced_key 对应标识（多包并存）。
+pub(crate) fn plan_record_writes(
+    previous: Option<&ManifestRecord>,
+    upserts: &[RecordUpsert],
+    source_device: u32,
+    storage_key: &StorageServiceKey,
+) -> RecordWritePlan {
+    let (next_version, mut identifiers, mut delete_keys, record_ikm) = match previous {
+        Some(manifest) => (
+            manifest.version + 1,
+            manifest.identifiers.clone(),
+            Vec::new(),
+            manifest.record_ikm.clone(),
+        ),
+        None => (1, Vec::new(), Vec::new(), Vec::new()),
+    };
+    let record_ikm_opt = if record_ikm.is_empty() {
+        None
+    } else {
+        Some(record_ikm.as_slice())
+    };
+    let mut insert_item = Vec::with_capacity(upserts.len());
+    for upsert in upserts {
+        match upsert.kind {
+            StorageRecordKind::Account => {
+                identifiers.retain(|identifier| {
+                    identifier.r#type() != manifest_record::identifier::Type::Account
+                });
+            }
+            StorageRecordKind::StickerPack => {
+                if let Some(old_key) = &upsert.replaced_key {
+                    identifiers.retain(|identifier| {
+                        !(identifier.r#type == upsert.kind.identifier_type()
+                            && &identifier.raw == old_key)
+                    });
+                }
+            }
+        }
+        if let Some(old_key) = &upsert.replaced_key {
+            delete_keys.push(old_key.clone());
+        }
+        identifiers.push(manifest_record::Identifier {
+            raw: upsert.new_key.clone(),
+            r#type: upsert.kind.identifier_type(),
+        });
+        let item = match &upsert.payload {
+            RecordPayload::Account(account) => StorageService::encrypt_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_record::Record::Account(account.clone())),
+                },
+                record_ikm_opt,
+            ),
+            RecordPayload::StickerPack(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &crate::service::storage_sticker::sticker_record_wire(record),
+                record_ikm_opt,
+            ),
+        };
+        insert_item.push(item);
+    }
+
+    let manifest_record = ManifestRecord {
+        version: next_version,
+        source_device,
+        identifiers,
+        record_ikm,
+    };
+    let manifest = StorageService::encrypt_manifest(storage_key, &manifest_record);
+    RecordWritePlan {
+        write_operation: WriteOperation {
+            manifest: Some(manifest),
+            insert_item,
+            delete_key: delete_keys,
+            clear_all: false,
+        },
+        new_version: next_version,
+        manifest_record,
+    }
+}
+
+/// WriteOperation 组装（Account 单记录，既有置顶面入口；`plan_record_
+/// writes` 的薄壳，行为与泛化前逐字节一致）。
 pub(crate) struct PlannedWrite {
     pub(crate) write_operation: WriteOperation,
     pub(crate) new_version: u64,
@@ -295,50 +476,24 @@ pub(crate) fn plan_write(
     new_key: Vec<u8>,
     storage_key: &StorageServiceKey,
 ) -> PlannedWrite {
-    let (next_version, mut identifiers, old_key, record_ikm) = match previous {
-        Some((manifest, old_key)) => (
-            manifest.version + 1,
-            manifest.identifiers.clone(),
-            Some(old_key),
-            manifest.record_ikm.clone(),
-        ),
-        None => (1, Vec::new(), None, Vec::new()),
+    let (manifest, replaced_key) = match previous {
+        Some((manifest, old_key)) => (Some(manifest), Some(old_key)),
+        None => (None, None),
     };
-    identifiers
-        .retain(|identifier| identifier.r#type() != manifest_record::identifier::Type::Account);
-    identifiers.push(manifest_record::Identifier {
-        raw: new_key.clone(),
-        r#type: manifest_record::identifier::Type::Account as i32,
-    });
-
-    let record_ikm_opt = if record_ikm.is_empty() {
-        None
-    } else {
-        Some(record_ikm.as_slice())
-    };
-    let new_item = StorageService::encrypt_item(
-        storage_key,
-        new_key.clone(),
-        &StorageRecord {
-            record: Some(storage_record::Record::Account(new_account_record.clone())),
-        },
-        record_ikm_opt,
-    );
-    let manifest_record = ManifestRecord {
-        version: next_version,
+    let plan = plan_record_writes(
+        manifest,
+        &[RecordUpsert {
+            kind: StorageRecordKind::Account,
+            new_key: new_key.clone(),
+            replaced_key,
+            payload: RecordPayload::Account(new_account_record.clone()),
+        }],
         source_device,
-        identifiers,
-        record_ikm,
-    };
-    let manifest = StorageService::encrypt_manifest(storage_key, &manifest_record);
+        storage_key,
+    );
     PlannedWrite {
-        write_operation: WriteOperation {
-            manifest: Some(manifest),
-            insert_item: vec![new_item],
-            delete_key: old_key.into_iter().collect(),
-            clear_all: false,
-        },
-        new_version: next_version,
+        write_operation: plan.write_operation,
+        new_version: plan.new_version,
         new_account_key: new_key,
     }
 }
@@ -387,6 +542,123 @@ pub(crate) async fn put_write_operation(
         }
         _ => Err(StorageSyncError::WriteFailed),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 贴纸记录面的 item 加解密 shim 与批量原样读取（钉定 presage rev 的
+// StorageService.proto 无 StickerPack=6，无法经 StorageService pub API 走；
+// 派生/AES-GCM 形状与上游 storage_service.rs 私有实现同构，双向交叉验证
+// 见 tests::raw_item_crypto_matches_upstream_api。上游 proto 补齐后整段替换）
+// ---------------------------------------------------------------------------
+
+/// item 密钥派生（上游 storage_service.rs item_key 同构）：modern =
+/// HKDF-SHA256(ikm=record_ikm, info="20240801_SIGNAL_STORAGE_SERVICE_ITEM_"
+/// || raw_id)；legacy（record_ikm 空）= HMAC-SHA256(storage_key,
+/// "Item_" + base64(raw_id))。
+fn storage_item_key(
+    storage_key: &StorageServiceKey,
+    raw_id: &[u8],
+    record_ikm: Option<&[u8]>,
+) -> [u8; 32] {
+    use hmac::{KeyInit as _, Mac as _};
+    const ITEM_KEY_INFO_PREFIX: &[u8] = b"20240801_SIGNAL_STORAGE_SERVICE_ITEM_";
+    match record_ikm {
+        Some(ikm) if !ikm.is_empty() => {
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, ikm);
+            let mut okm = [0u8; 32];
+            hk.expand_multi_info(&[ITEM_KEY_INFO_PREFIX, raw_id], &mut okm)
+                .expect("32-byte HKDF output is valid");
+            okm
+        }
+        _ => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw_id);
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&storage_key.inner)
+                .expect("HMAC accepts any key length");
+            mac.update(b"Item_");
+            mac.update(b64.as_bytes());
+            mac.finalize().into_bytes().into()
+        }
+    }
+}
+
+/// 任意明文 → StorageItem（blob = iv(12B) || ciphertext || tag(16B)，
+/// AES-256-GCM 无 AAD，上游 encrypt 同构）。
+pub(crate) fn encrypt_raw_item(
+    storage_key: &StorageServiceKey,
+    raw_id: Vec<u8>,
+    plaintext: &[u8],
+    record_ikm: Option<&[u8]>,
+) -> presage::libsignal_service::proto::StorageItem {
+    use aes_gcm::aead::Aead as _;
+    use aes_gcm::KeyInit as _;
+    use presage::libsignal_service::proto::StorageItem;
+    let key = storage_item_key(storage_key, &raw_id, record_ikm);
+    let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+    // 随机 12B IV（上游 encrypt 同构：OsRng 填充）。
+    let mut iv = [0u8; 12];
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = aes_gcm::Nonce::try_from(&iv[..]).expect("12-byte IV");
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .expect("AES-256-GCM encrypt infallible for valid key");
+    let mut value = iv.to_vec();
+    value.extend_from_slice(&ciphertext);
+    StorageItem { key: raw_id, value }
+}
+
+/// StorageItem → 任意明文（MAC 失败/截断 → Err，调用方按面语义处理）。
+pub(crate) fn decrypt_raw_item(
+    storage_key: &StorageServiceKey,
+    item: &presage::libsignal_service::proto::StorageItem,
+    record_ikm: Option<&[u8]>,
+) -> Result<Vec<u8>, ()> {
+    use aes_gcm::aead::Aead as _;
+    use aes_gcm::KeyInit as _;
+    if item.value.len() <= 12 {
+        return Err(());
+    }
+    let key = storage_item_key(storage_key, &item.key, record_ikm);
+    let (iv, ciphertext) = item.value.split_at(12);
+    let nonce = aes_gcm::Nonce::try_from(iv).map_err(|_| ())?;
+    let cipher = aes_gcm::Aes256Gcm::new((&key).into());
+    cipher.decrypt(&nonce, ciphertext).map_err(|_| ())
+}
+
+/// 批量原样读（上游 read_items 同端点同请求体，但不解密不投影——钉定
+/// presage rev 的 StorageRecord 缺 sticker arm，解出即丢内容；`PUT
+/// /v1/storage/read`，items 按服务器返回序，调用方按 key 定位）。
+pub(crate) async fn read_raw_items(
+    push: &PushService,
+    auth: presage::libsignal_service::push_service::HttpAuth,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<presage::libsignal_service::proto::StorageItem>, StorageSyncError> {
+    use presage::libsignal_service::proto::{ReadOperation, StorageItems};
+    use presage::libsignal_service::push_service::HttpAuthOverride;
+    use prost::Message as _;
+    let body = ReadOperation { read_key: keys };
+    let mut buf = Vec::with_capacity(body.encoded_len());
+    body.encode(&mut buf).expect("infallible encode into Vec");
+    let response = push
+        .request(
+            reqwest::Method::PUT,
+            Endpoint::storage("/v1/storage/read"),
+            HttpAuthOverride::Identified(auth),
+        )
+        .map_err(|_| StorageSyncError::ReadFailed)?
+        .header("Content-Type", "application/x-protobuf")
+        .body(buf)
+        .send()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)?;
+    if !response.status().is_success() {
+        return Err(StorageSyncError::ReadFailed);
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)?;
+    let items = StorageItems::decode(bytes.as_ref()).map_err(|_| StorageSyncError::ReadFailed)?;
+    Ok(items.items)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +859,8 @@ pub(crate) async fn write_pinned(
                             base64::engine::general_purpose::STANDARD
                                 .encode(&planned.new_account_key),
                         ),
+                        // 置顶面不感知贴纸面：沿用状态文件旧值。
+                        sticker_item_keys: None,
                     },
                 );
                 // 写成功后以本地写后面为准返回（官方 upload 成功语义）。
@@ -718,8 +992,8 @@ fn same_storage_identity(a: &PinnedConversation, b: &PinnedConversation) -> bool
 }
 
 /// `GET /v1/storage/auth` 换 short-lived 基本认证（上游
-/// StorageService::new 同款模式；写面 PUT 需要显式 auth 透传）。
-async fn storage_auth(
+/// StorageService::new 同款模式；写面 PUT 与贴纸面批量读需显式 auth 透传）。
+pub(crate) async fn storage_auth(
     push: &PushService,
 ) -> Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError> {
     use presage::libsignal_service::push_service::HttpAuthOverride;
@@ -944,6 +1218,7 @@ mod tests {
             &ManifestState {
                 version: 7,
                 account_item_key: Some("QUJD".to_owned()),
+                sticker_item_keys: None,
             },
         );
         let bytes = std::fs::read(root.join(MANIFEST_STATE_FILE)).expect("written");
@@ -958,6 +1233,7 @@ mod tests {
             &ManifestState {
                 version: 8,
                 account_item_key: None,
+                sticker_item_keys: None,
             },
         );
         let value: serde_json::Value =
@@ -966,6 +1242,76 @@ mod tests {
         assert_eq!(value["version"], 8);
         assert_eq!(value["accountItemKey"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 状态文件 P5 泛化：stickerItemKeys 写入/沿用/旧格式兼容读取。
+    #[test]
+    fn manifest_state_sticker_keys_and_legacy_format_compat() {
+        let root = std::env::temp_dir().join(format!(
+            "kt-engine-storage-state5-{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 旧格式（P4：无 stickerItemKeys 键）兼容读取。
+        std::fs::write(
+            root.join(MANIFEST_STATE_FILE),
+            br#"{"version": 3, "accountItemKey": "QUJD"}"#,
+        )
+        .unwrap();
+        let loaded = load_manifest_state(&root).expect("loads legacy format");
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.account_item_key.as_deref(), Some("QUJD"));
+        assert_eq!(loaded.sticker_item_keys, None);
+
+        // 置顶面写（sticker_item_keys=None）→ 沿用旧值（旧文件无值 → 空表）。
+        save_manifest_state(
+            &root,
+            &ManifestState {
+                version: 4,
+                account_item_key: Some("REVGSg==".to_owned()),
+                sticker_item_keys: None,
+            },
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(MANIFEST_STATE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(value["stickerItemKeys"], json!([]));
+
+        // 贴纸面写（Some）→ 覆盖；再置顶面写（None）→ 保留贴纸面列表。
+        save_manifest_state(
+            &root,
+            &ManifestState {
+                version: 5,
+                account_item_key: Some("REVGSg==".to_owned()),
+                sticker_item_keys: Some(vec!["AA==".to_owned(), "AQ==".to_owned()]),
+            },
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(MANIFEST_STATE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(value["stickerItemKeys"], json!(["AA==", "AQ=="]));
+        save_manifest_state(
+            &root,
+            &ManifestState {
+                version: 6,
+                account_item_key: Some("REVGSg==".to_owned()),
+                sticker_item_keys: None,
+            },
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(MANIFEST_STATE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(value["stickerItemKeys"], json!(["AA==", "AQ=="]));
+
+        // 坏 JSON / 缺文件 → None（容错读取）。
+        std::fs::write(root.join(MANIFEST_STATE_FILE), b"not json").unwrap();
+        assert!(load_manifest_state(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(load_manifest_state(&root).is_none());
     }
 
     /// AccountRecord 读-改-写保真：带多字段的 record bytes → decode → 只改
@@ -1117,5 +1463,185 @@ mod tests {
         assert!(record.given_name.is_empty());
         assert!(record.profile_key.is_empty());
         assert!(!record.read_receipts);
+    }
+
+    /// plan_record_writes 泛化：Account + StickerPack 混合 identifiers 的
+    /// 换入换出（type=6 raw i32）、deleteKey 按实体换出、record_ikm 透传、
+    /// 各 item 以对应路径解回。plan_write（Account 薄壳）行为由既有
+    /// plan_write_versions_and_deletes 钉定不变。
+    #[test]
+    fn plan_record_writes_mixed_account_and_sticker() {
+        use crate::service::storage_sticker::{sticker_record_of, StickerPackRecord};
+        use presage::libsignal_service::master_key::MasterKey;
+        let storage_key =
+            StorageServiceKey::from_master_key(&MasterKey::from_slice(&[3u8; 32]).expect("key"));
+        let old_manifest = ManifestRecord {
+            version: 4,
+            source_device: 2,
+            identifiers: vec![
+                manifest_record::Identifier {
+                    raw: vec![0x11u8; 16],
+                    r#type: manifest_record::identifier::Type::Contact as i32,
+                },
+                manifest_record::Identifier {
+                    raw: vec![0x22u8; 16],
+                    r#type: manifest_record::identifier::Type::Account as i32,
+                },
+                manifest_record::Identifier {
+                    raw: vec![0x44u8; 16],
+                    r#type: crate::service::storage_sticker::STICKER_PACK_IDENTIFIER_TYPE,
+                },
+            ],
+            record_ikm: vec![0x33u8; 32],
+        };
+        let sticker = StickerPackRecord {
+            pack_id: vec![7u8; 16],
+            pack_key: vec![8u8; 32],
+            position: 2,
+            deleted_at_timestamp: 0,
+        };
+        let planned = plan_record_writes(
+            Some(&old_manifest),
+            &[
+                RecordUpsert {
+                    kind: StorageRecordKind::Account,
+                    new_key: vec![0xbbu8; 16],
+                    replaced_key: Some(vec![0x22u8; 16]),
+                    payload: RecordPayload::Account(minimal_account_record(Vec::new())),
+                },
+                RecordUpsert {
+                    kind: StorageRecordKind::StickerPack,
+                    new_key: vec![0xccu8; 16],
+                    replaced_key: Some(vec![0x44u8; 16]),
+                    payload: RecordPayload::StickerPack(sticker.clone()),
+                },
+            ],
+            2,
+            &storage_key,
+        );
+        assert_eq!(planned.new_version, 5);
+        assert_eq!(
+            planned.write_operation.delete_key,
+            vec![vec![0x22u8; 16], vec![0x44u8; 16]]
+        );
+        let manifest_record = StorageService::decrypt_manifest(
+            &storage_key,
+            planned.write_operation.manifest.as_ref().expect("manifest"),
+        )
+        .expect("decrypts");
+        // Contact 保留、Account/Sticker 各换新、旧 key 消失、type=6 raw 透传。
+        assert_eq!(manifest_record.record_ikm, vec![0x33u8; 32]);
+        assert_eq!(manifest_record.identifiers.len(), 3);
+        let by_type = |raw: &[u8]| {
+            manifest_record
+                .identifiers
+                .iter()
+                .find(|identifier| identifier.raw == raw)
+                .map(|identifier| identifier.r#type)
+        };
+        assert_eq!(
+            by_type(&[0x11u8; 16]),
+            Some(manifest_record::identifier::Type::Contact as i32)
+        );
+        assert_eq!(
+            by_type(&[0xbbu8; 16]),
+            Some(manifest_record::identifier::Type::Account as i32)
+        );
+        assert_eq!(by_type(&[0xccu8; 16]), Some(6));
+        assert!(by_type(&[0x22u8; 16]).is_none());
+        assert!(by_type(&[0x44u8; 16]).is_none());
+
+        // insert items：[0] Account（上游解密路径）、[1] Sticker（本地 shim
+        // 解密路径 → tag=6 包裹解析还原）。
+        let account_item = StorageService::decrypt_item(
+            &storage_key,
+            &planned.write_operation.insert_item[0],
+            Some(&manifest_record.record_ikm),
+        )
+        .expect("decrypts");
+        assert!(account_record_of(&account_item).is_some());
+        let sticker_item = &planned.write_operation.insert_item[1];
+        let plaintext = decrypt_raw_item(
+            &storage_key,
+            sticker_item,
+            Some(&manifest_record.record_ikm),
+        )
+        .expect("decrypts");
+        assert_eq!(sticker_record_of(&plaintext), Some(sticker.clone()));
+        // 上游类型读同一条 item：tag=6 未知字段被跳过（旧 proto 读面行为）。
+        let upstream_view = StorageService::decrypt_item(
+            &storage_key,
+            sticker_item,
+            Some(&manifest_record.record_ikm),
+        )
+        .expect("decrypts");
+        assert!(upstream_view.record.is_none());
+
+        // 贴纸包首次写入（无 replaced key）→ 无 deleteKey 条目；无旧
+        // manifest → version 1。
+        let planned = plan_record_writes(
+            None,
+            &[RecordUpsert {
+                kind: StorageRecordKind::StickerPack,
+                new_key: vec![0xddu8; 16],
+                replaced_key: None,
+                payload: RecordPayload::StickerPack(sticker.clone()),
+            }],
+            2,
+            &storage_key,
+        );
+        assert_eq!(planned.new_version, 1);
+        assert!(planned.write_operation.delete_key.is_empty());
+        let manifest_record = StorageService::decrypt_manifest(
+            &storage_key,
+            planned.write_operation.manifest.as_ref().expect("manifest"),
+        )
+        .expect("decrypts");
+        assert_eq!(manifest_record.identifiers.len(), 1);
+        assert_eq!(manifest_record.identifiers[0].r#type, 6);
+        // legacy 路径（无 record_ikm）解回。
+        let plaintext =
+            decrypt_raw_item(&storage_key, &planned.write_operation.insert_item[0], None)
+                .expect("decrypts");
+        assert_eq!(sticker_record_of(&plaintext), Some(sticker));
+    }
+
+    /// 本地 item 加解密 shim 与上游 StorageService pub API 的派生一致性
+    /// （双向交叉钉定）：上游 encrypt_item 产出的 item 本地能解；本地加密
+    /// 的 Account 记录 item 上游能解回同记录。modern/legacy 两路径都钉。
+    #[test]
+    fn raw_item_crypto_matches_upstream_api() {
+        use presage::libsignal_service::master_key::MasterKey;
+        let storage_key =
+            StorageServiceKey::from_master_key(&MasterKey::from_slice(&[4u8; 32]).expect("key"));
+        let raw_id = vec![0xaau8; 16];
+        let record = StorageRecord {
+            record: Some(storage_record::Record::Account(minimal_account_record(
+                Vec::new(),
+            ))),
+        };
+        for record_ikm in [None, Some([0x55u8; 32].as_slice())] {
+            // 上游加密 → 本地解密：明文逐字节等于 record 编码。
+            let item =
+                StorageService::encrypt_item(&storage_key, raw_id.clone(), &record, record_ikm);
+            let plaintext = decrypt_raw_item(&storage_key, &item, record_ikm)
+                .expect("local decrypts upstream item");
+            assert_eq!(plaintext, record.encode_to_vec());
+            // 截断/MAC 失败 → Err。
+            let mut tampered = item.clone();
+            tampered.value.pop();
+            assert!(decrypt_raw_item(&storage_key, &tampered, record_ikm).is_err());
+
+            // 本地加密（明文 = record 编码）→ 上游解密：同记录还原。
+            let item = encrypt_raw_item(
+                &storage_key,
+                raw_id.clone(),
+                &record.encode_to_vec(),
+                record_ikm,
+            );
+            let back = StorageService::decrypt_item(&storage_key, &item, record_ikm)
+                .expect("upstream decrypts local item");
+            assert_eq!(back, record);
+        }
     }
 }

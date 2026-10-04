@@ -48,6 +48,17 @@ libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag =
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 thiserror = "2"
 
+# Storage Service 贴纸包记录面（storage_sticker）：钉定 presage rev 的
+# StorageService.proto 落后（无 STICKER_PACK=6/StickerPackRecord），该记录的
+# item 加解密无法走 StorageService::encrypt_item/decrypt_item，本地按上游
+# storage_service.rs 文档化的派生/AES-GCM 形状同构实现（交叉验证单测双向对
+# 齐上游 API，见 storage_sync.rs tests）。四者均为 RustCrypto 成员，许可
+# MIT/Apache-2.0；版本与 Cargo.lock 既有解析一致，不新增依赖图版本。
+aes-gcm = "0.11"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+
 [dev-dependencies]
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。

@@ -83,6 +83,8 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
 | `getPinnedConversations` | `{account}` | `{pinned: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；存储条目映射不出引擎口径的跳过不炸面） | 未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P4 real**：Storage Service manifest → Account item → `AccountRecord.pinned_conversations` 投影；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{pinned: []}` |
 | `setConversationPinned` | `{account, conversationId, kind: contact\|group\|legacyGroup, pinned(bool)}` | `{pinned: [...]}`（写后全量，同 getPinnedConversations 形状） | 云引用解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次/写面冲突重放中失败 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/未知 kind/未注册账号 `-32603` | **P4 real**：官方 upload 语义（读改写 AccountRecord 仅动 pinned 字段、prost round-trip 保真其余字段、新 16B item id、version+1/source_device/record_ikm 透传）+ `PUT v1/storage/` + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；写面为 presage 上游缺口自建薄封装（上游补齐后替换）；fake：成功回 `{pinned: []}` |
+| `getStickerPackSyncs` | `{account}` | `{packs: [{packId(hex 32 小写), packKey(base64 32B)\|null, position, deletedAtTimestampMs}]}`（存储序 = manifest STICKER identifiers 首现序；坏条目跳过不炸面；墓碑 packKey=null、带 deletedAtTimestampMs） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real**：Storage Service manifest → 全部 type=6 STICKER identifier 批量读 → StickerPackRecord 投影（记录面为 presage 上游 proto 缺口本地定义 + 加解密 shim，§5）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{packs: []}` |
+| `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -186,6 +188,32 @@ P4 扩面差异（2026-10-04，connector 1.36 契约对齐）：
   （本机号走注册数据、号码经 contacts、UUID 直通），group/legacy 按标准
   base64/原样字节往返；`ReleaseNotes` 等非引擎口径条目在增删时原样保留、
   在读投影中跳过。
+
+P5 扩面差异（2026-10-04，贴纸包安装状态 Storage Service 同步）：
+
+- **贴纸包记录面是 presage 上游 proto 缺口**：本仓钉定 rev 的
+  StorageService.proto 无 `STICKER_PACK=6` identifier 类型与
+  StickerPackRecord 定义（`storage_record::Record` oneof 只到 tag 9，
+  prost 解码跳过 tag 6），上游 read/decrypt 链路读不出贴纸记录。引擎
+  本地持有 StickerPackRecord prost 定义 + StorageRecord tag=6 线格式
+  镜像 + item 加解密 shim（与上游私有派生双向交叉验证钉定），读面以
+  `read_raw_items` 原样批量读；Account 面仍走上游 pub API。上游补齐
+  proto 后整段替换（单点 `service/storage_sticker.rs` + shim）。
+- **position 口径**：写面 `position` 缺省/null = 保持现位（无现位 =
+  本地最大 position + 1，首装即 0）；官方排序语义 = position 升序、
+  packId hex 字典序并列——读投影按存储序（manifest STICKER identifiers
+  首现序）原样输出，引擎层不重排，排序是消费方（connector/端上）职责。
+- **墓碑语义**：uninstall 不物理删除旧 record——写
+  `deletedAtTimestampMs` 墓碑（引擎时钟），packKey/position 皆不写
+  （官方 toStickerPackRecord 墓碑形态同构）；读投影墓碑条目
+  packKey=null 且保留位置，由 `deletedAtTimestampMs` 判定卸载态。
+- **跳过即登记（零 stderr 纪律）**：manifest 中映射不出的坏条目
+  （packId 空/安装态缺 packKey）读面静默跳过不炸面，不落任何日志
+  （stderr 安静 = connector watchdog 活性判据），以本节登记替代
+  运行时告警。
+- **v1 单通道**：不做 legacy `syncMessage.stickerPackOperation` 同步
+  通道；Storage Service 是贴纸包安装状态唯一真相源，connector 侧以
+  `getStickerPackSyncs`/`setStickerPackSync` 为准。
 
 ## 6. fake 服务模式（仅测试）
 

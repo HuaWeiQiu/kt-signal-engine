@@ -660,6 +660,73 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 贴纸包安装状态同步（Storage Service 真相源，带 account 参数，风格
+        // 对齐置顶面）：packId 解码/packKey 形状错走 -32603 fail-closed
+        //（置顶面参数处理先例，不占用结构化码）。
+        "getStickerPackSyncs" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.sticker_pack_syncs(account).await {
+                Ok(packs) => jsonrpc::success_response(id, sticker_sync_payload(&packs)),
+                // 账号参数不指向已链接账号：非 storage 面错误（结构化码只
+                // 覆盖 storage 链路），按引擎通用内部错误 fail-closed。
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "setStickerPackSync" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(pack_id) = params
+                .get("packId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::stickers::decode_pack_id)
+            else {
+                return internal_error(id);
+            };
+            let Some(installed) = params.get("installed").and_then(Value::as_bool) else {
+                return internal_error(id);
+            };
+            // 形状纪律（参数形状错一律 fail-closed，内容合法性按 installed
+            // 分流）：packKey 只能是 string|null|缺省；position 只能是数值
+            // |null|缺省且 ≤u32。
+            let pack_key_text = match params.get("packKey") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text.as_str()),
+                Some(_) => return internal_error(id),
+            };
+            let position = match params.get("position") {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64().and_then(|item| u32::try_from(item).ok()) {
+                    Some(item) => Some(item),
+                    None => return internal_error(id),
+                },
+            };
+            // installed=true 必须带有效 packKey（32 字节 base64）；
+            // installed=false 忽略 packKey 内容与 position（官方墓碑形态
+            // 两字段皆不写）。
+            let intent = if installed {
+                let Some(pack_key) =
+                    pack_key_text.and_then(crate::service::stickers::decode_pack_key)
+                else {
+                    return internal_error(id);
+                };
+                crate::service::storage_sticker::StickerPackWrite::Install {
+                    pack_id,
+                    pack_key,
+                    position,
+                }
+            } else {
+                crate::service::storage_sticker::StickerPackWrite::Uninstall { pack_id }
+            };
+            match service.set_sticker_pack_sync(account, intent).await {
+                Ok(packs) => jsonrpc::success_response(id, sticker_sync_payload(&packs)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
@@ -679,6 +746,28 @@ fn pinned_payload(entries: &[storage_sync::PinnedEntry]) -> Value {
                     "conversationId": id.id_string(),
                     "kind": id.kind(),
                 }))
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// 贴纸包同步返回体（getStickerPackSyncs / setStickerPackSync 共用形状）：
+/// 顺序 = 存储序（manifest STICKER identifiers 首现序）；packId 16B → 32 位
+/// 小写 hex、packKey 32B → 标准 base64（墓碑 → null）。
+fn sticker_sync_payload(packs: &[crate::service::storage_sticker::StickerPackSync]) -> Value {
+    use base64::Engine as _;
+    json!({
+        "packs": packs
+            .iter()
+            .map(|pack| {
+                json!({
+                    "packId": crate::service::hex_encode(&pack.pack_id),
+                    "packKey": pack.pack_key.as_ref().map(|key| {
+                        base64::engine::general_purpose::STANDARD.encode(key)
+                    }),
+                    "position": pack.position,
+                    "deletedAtTimestampMs": pack.deleted_at_timestamp_ms,
+                })
             })
             .collect::<Vec<_>>(),
     })

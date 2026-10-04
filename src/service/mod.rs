@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 use crate::state::EngineState;
 
 pub(crate) mod stickers;
+pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
@@ -197,8 +198,8 @@ pub(crate) fn hex_decode(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// packId hex 编码（接收投影官方序列化同构）。
-fn hex_encode(bytes: &[u8]) -> String {
+/// packId hex 编码（接收投影官方序列化同构；32 位小写）。
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -1213,6 +1214,33 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sync::write_pinned(&context, conversation, pinned).await
+    }
+
+    /// getStickerPackSyncs（P5 扩面）：读全部贴纸包安装状态（存储序 =
+    /// manifest STICKER identifiers 首现序；坏条目跳过不炸面）。
+    pub(crate) async fn sticker_pack_syncs(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<storage_sticker::StickerPackSync>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sticker::read_sticker_packs(&context).await
+    }
+
+    /// setStickerPackSync（P5 扩面）：安装/卸载写面（官方 toStickerPackRecord
+    /// 语义 + 409 采纳重放）；卸载墓碑时间戳 = 引擎时钟；返回写后云态投影。
+    pub(crate) async fn set_sticker_pack_sync(
+        self: &Arc<Self>,
+        account: &str,
+        intent: storage_sticker::StickerPackWrite,
+    ) -> Result<Vec<storage_sticker::StickerPackSync>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
     }
 }
 
