@@ -5,7 +5,9 @@
 //! 解密面全官方（`FramesReader`：HMAC-SHA256 尾验证 + AES-256-CBC + gzip +
 //! padding 剥离；`VarintDelimitedReader` varint 分帧），帧 proto 为自持生成代码
 //! （`crate::proto`，官方开源 schema）。逐帧流式转 receive-compatible 中间表示
-//! （NDJSON），O(1) 帧内存。v1 范围与跳过策略见 ADR 0005 §S2 设计定案。
+//! （NDJSON），O(1) 帧内存。v1 范围与跳过策略见 ADR 0005 §S2 设计定案；
+//! recipient 会话归属身份投影（aci/e164/masterKey，E5）按消费方 connector
+//! 契约 1.39（implementation-plan §4.38）的解析面逐字对齐。
 
 use std::io::Write;
 use std::path::Path;
@@ -147,12 +149,57 @@ fn recipient_record(r: &Recipient) -> serde_json::Value {
         Some(recipient::Destination::Self_(_)) => ("self", String::new()),
         _ => ("other", String::new()),
     };
-    serde_json::json!({
+    let mut record = serde_json::json!({
         "type": "recipient",
         "id": r.id,
         "kind": kind,
         "name": name,
-    })
+    });
+    project_recipient_identity(&mut record, r);
+    record
+}
+
+/// E5 会话归属身份投影（消费方 connector 契约 1.39 §4.38，形状逐字对齐其
+/// `recipient {id, kind, name, aci?, e164?, masterKey?}` 解析面）。proto 只
+/// 投影不发明：缺/畸形的身份一律省略键——connector 视为缺席，会话归属
+/// 失败由其如实计入 skippedChats，绝不投占位值。
+fn project_recipient_identity(record: &mut serde_json::Value, r: &Recipient) {
+    match &r.destination {
+        Some(recipient::Destination::Contact(c)) => {
+            if let Some(aci) = c.aci.as_deref().and_then(aci_string) {
+                record["aci"] = serde_json::Value::String(aci);
+            }
+            if let Some(e164) = c.e164.filter(|e164| *e164 > 0) {
+                record["e164"] = serde_json::json!(e164);
+            }
+        }
+        Some(recipient::Destination::Group(g)) => {
+            if let Some(master_key) = master_key_string(&g.master_key) {
+                record["masterKey"] = serde_json::Value::String(master_key);
+            }
+        }
+        // self：proto Self_ 只携带 avatar_color，无身份可投——connector 以
+        // 账号注册号码（engine-state.json registry 映射）作 self 会话归属。
+        _ => {}
+    }
+}
+
+/// proto Contact.aci（16 字节）→ 小写连字 UUID 串（connector is_uuid_shape
+/// 消费形状；引擎直接出规范小写形）。长度畸形的档案字节不可信 → 省略。
+fn aci_string(bytes: &[u8]) -> Option<String> {
+    Some(
+        presage::libsignal_service::prelude::Uuid::from_slice(bytes)
+            .ok()?
+            .to_string(),
+    )
+}
+
+/// 群 master key → 标准 base64：live 群会话投影 `groupInfo.groupId` /
+/// `listGroups` id 同形同值，connector 以该形作群 peer_key 与 live 行去重。
+/// 空 key 无身份可投影 → 省略。
+fn master_key_string(key: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    (!key.is_empty()).then(|| base64::engine::general_purpose::STANDARD.encode(key))
 }
 
 /// GroupAttributeBlob 的 oneof：title 场景取 `Title` 变体。
@@ -273,11 +320,20 @@ mod tests {
         chat_item::{IncomingMessageDetails, Item, PinDetails},
         file_pointer, frame,
         recipient::Destination,
-        BackupInfo, Contact, StandardMessage, Text,
+        BackupInfo, Contact, Group, StandardMessage, Text,
     };
+    use base64::Engine as _;
     use libsignal_message_backup::export::{
         aes_cbc_encrypt, gzip_compress, hmac_checksum, pad_gzipped_bucketed,
     };
+
+    /// 16 字节档案 aci → 小写连字 UUID「6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b」。
+    const CONTACT_ACI_BYTES: [u8; 16] = [
+        0x6e, 0x08, 0xf0, 0xb6, 0x1c, 0x2d, 0x4e, 0x5f, 0x8a, 0x9b, 0x0c, 0x1d, 0x2e, 0x3f, 0x4a,
+        0x5b,
+    ];
+    const CONTACT_E164: u64 = 15550000001;
+    const GROUP_MASTER_KEY_BYTES: [u8; 32] = [9u8; 32];
 
     fn varint(mut value: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -331,6 +387,17 @@ mod tests {
                 destination: Some(Destination::Contact(Contact {
                     system_given_name: "A".into(),
                     system_family_name: "B".into(),
+                    aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                    e164: Some(CONTACT_E164),
+                    ..Default::default()
+                })),
+            })),
+        });
+        let group_recipient = frame_bytes(&Frame {
+            item: Some(frame::Item::Recipient(Recipient {
+                id: 8,
+                destination: Some(Destination::Group(Group {
+                    master_key: GROUP_MASTER_KEY_BYTES.to_vec(),
                     ..Default::default()
                 })),
             })),
@@ -408,10 +475,18 @@ mod tests {
         // 未知帧 item（官方语义：跳过不报错）。
         let skipped = frame_bytes(&Frame { item: None });
 
-        let payload: Vec<u8> = [info, recipient, chat, item, pinned, skipped]
-            .into_iter()
-            .flatten()
-            .collect();
+        let payload: Vec<u8> = [
+            info,
+            recipient,
+            group_recipient,
+            chat,
+            item,
+            pinned,
+            skipped,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let archive = encrypt_archive(payload, &key);
         let dir = std::env::temp_dir().join("kt-engine-history-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -426,8 +501,8 @@ mod tests {
             stats,
             ExportStats {
                 backup_version: 1,
-                frames: 6,
-                recipients: 1,
+                frames: 7,
+                recipients: 2,
                 chats: 1,
                 messages: 2,
                 remote_deleted: 0,
@@ -441,17 +516,112 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
+        // E5：会话归属身份随帧投影（connector §4.38 消费形状）。
         assert_eq!(lines[0]["kind"], "contact");
         assert_eq!(lines[0]["name"], "A B");
-        assert_eq!(lines[2]["text"], "hello");
-        assert_eq!(lines[2]["direction"], "incoming");
-        assert_eq!(lines[2]["attachments"][0]["size"], 5);
-        assert_eq!(lines[2]["quote"]["text"], "quoted");
-        assert_eq!(lines[3]["pinnedAtTimestamp"], 300);
-        assert_eq!(lines[3]["direction"], "outgoing");
+        assert_eq!(lines[0]["aci"], "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b");
+        assert_eq!(lines[0]["e164"], CONTACT_E164);
+        assert!(lines[0]["e164"].is_u64(), "e164 以 JSON number 投影");
+        assert_eq!(lines[1]["kind"], "group",);
+        assert_eq!(
+            lines[1]["masterKey"],
+            base64::engine::general_purpose::STANDARD.encode(GROUP_MASTER_KEY_BYTES)
+        );
+        assert_eq!(lines[3]["text"], "hello");
+        assert_eq!(lines[3]["direction"], "incoming");
+        assert_eq!(lines[3]["attachments"][0]["size"], 5);
+        assert_eq!(lines[3]["quote"]["text"], "quoted");
+        assert_eq!(lines[4]["pinnedAtTimestamp"], 300);
+        assert_eq!(lines[4]["direction"], "outgoing");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// E5 三面钉投影：有身份（contact aci+e164 / group masterKey）/ 缺身份
+    /// （全键缺席）/ 畸形身份（aci 非 16B、e164=0 → 省略键不发明占位值）。
+    #[test]
+    fn recipient_identity_projection_faces() {
+        let with_identity = recipient_record(&Recipient {
+            id: 1,
+            destination: Some(Destination::Contact(Contact {
+                aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                e164: Some(CONTACT_E164),
+                ..Default::default()
+            })),
+        });
+        assert_eq!(with_identity["aci"], "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b");
+        assert_eq!(with_identity["e164"], CONTACT_E164);
+        assert!(
+            with_identity["e164"].is_u64(),
+            "JSON number，connector normalize_e164 双形态兼容"
+        );
+        let group = recipient_record(&Recipient {
+            id: 2,
+            destination: Some(Destination::Group(Group {
+                master_key: GROUP_MASTER_KEY_BYTES.to_vec(),
+                ..Default::default()
+            })),
+        });
+        assert_eq!(
+            group["masterKey"],
+            base64::engine::general_purpose::STANDARD.encode(GROUP_MASTER_KEY_BYTES)
+        );
+
+        // 缺身份：contact 无 aci/e164、group 空 master key、self（proto 只带
+        // avatar_color）、destination 未设（官方语义跳过不报错）——全部无身份键。
+        let missing: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "contact-no-identity",
+                recipient_record(&Recipient {
+                    id: 3,
+                    destination: Some(Destination::Contact(Contact::default())),
+                }),
+            ),
+            (
+                "empty-master-key",
+                recipient_record(&Recipient {
+                    id: 4,
+                    destination: Some(Destination::Group(Group::default())),
+                }),
+            ),
+            (
+                "self",
+                recipient_record(&Recipient {
+                    id: 5,
+                    destination: Some(Destination::Self_(crate::proto::Self_::default())),
+                }),
+            ),
+            (
+                "unset-destination",
+                recipient_record(&Recipient {
+                    id: 6,
+                    destination: None,
+                }),
+            ),
+        ];
+        for (name, record) in missing {
+            assert!(record.get("aci").is_none(), "{name}: aci 不得投影");
+            assert!(record.get("e164").is_none(), "{name}: e164 不得投影");
+            assert!(
+                record.get("masterKey").is_none(),
+                "{name}: masterKey 不得投影"
+            );
+            assert!(record.get("kind").is_some(), "{name}: 基础面仍在");
+        }
+
+        // 畸形身份：aci 非 16 字节、e164=0（E.164 不存在 0 号）→ 省略键，
+        // 不投占位值（connector 视作缺席，会话归属失败如实 skippedChats）。
+        let malformed = recipient_record(&Recipient {
+            id: 7,
+            destination: Some(Destination::Contact(Contact {
+                aci: Some(vec![0x11; 15]),
+                e164: Some(0),
+                ..Default::default()
+            })),
+        });
+        assert!(malformed.get("aci").is_none());
+        assert!(malformed.get("e164").is_none());
     }
 
     #[tokio::test]

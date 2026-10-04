@@ -267,6 +267,29 @@ P5 扩面差异（2026-10-04，贴纸包安装状态 Storage Service 同步）�
   expireTimer/expireTimerVersion，不触碰 DisappearingMode 状态；两类
   「焚」互不赋值、互不触发。
 
+backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connector
+契约 1.39，implementation-plan §4.38）：
+
+- **此前差异（本笔收敛为已补）**：S2（0eedc8c）NDJSON 导出的 recipient
+  只投 `{id, kind, name}`，未投会话归属身份 `aci`/`e164`/`masterKey`——
+  该缺口由 connector §4.38 登记（其消费面每账号导入全部会话如实计入
+  `skippedChats`）。本笔补齐后 connector 侧零改动即通：其解析宽容
+  （serde Value 探针式取字段，未知字段忽略；畸形行/超长行/未知类型计数
+  跳过不致命），身份字段有则消费、缺则该会话诚实 skip。
+- **投影口径（backup proto 只投影不发明）**：`aci` ← Contact.aci（proto
+  16 字节）→ 小写连字 UUID 串，长度畸形省略；`e164` ← Contact.e164
+  （proto u64）→ JSON number（connector normalize_e164 双形态兼容
+  number/string，引擎按 proto 原形投 number），0/缺席省略（不发明
+  `+0`）；`masterKey` ← Group.master_key → 标准 base64（与 live 群会话
+  `groupInfo.groupId`/`listGroups` id 同形同值，connector 以该形作群
+  peer_key 与 live 行按身份去重），空 key 省略。身份缺/畸形一律省略键：
+  connector 视作缺席，会话归属失败由其如实计入 `skippedChats`
+  （kind=other 的 call link/分发列表等本就不映射 connector 会话，v1
+  边界不变）。
+- **kind=self 无身份可投**：proto Self_ 只携带 avatar_color；connector
+  以账号注册号码（engine-state.json registry 号码→目录映射）作 self
+  会话归属与自发信源，档案无需重复携带身份。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
