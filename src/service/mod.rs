@@ -100,14 +100,81 @@ pub(crate) struct SendSticker {
     pub(crate) height: Option<u32>,
 }
 
-/// sendCallMessage 参数（通话消息面，KT 扩展方法）：opaque 字节已 base64
-/// 解码；引擎不解析 opaque 内容（Signal-RTC 层信令职责，透传）；urgency
-/// 缺省 Droppable（proto 同缺省语义）；destinationDeviceId 官方多设备
-/// 定向投递位，缺省不写。
+/// sendCallMessage 参数（通话消息面，KT 扩展方法）：modern 面走 opaque 字节
+/// （已 base64 解码；引擎不解析 opaque 内容，Signal-RTC 层信令职责，透传），
+/// urgency 缺省 Droppable（proto 同缺省语义）；legacy 面走 busy/hangup 帧族
+///（RingRTC 2.72.1 实证出向 busy/hangup 无 opaque 材料，官方 proto
+/// Busy{id}/Hangup{id,type,deviceId} 裸帧族，id 由调用方给正 u32）。两面互斥
+///（同帧同置 fail-closed）；destinationDeviceId 官方多设备定向投递位，缺省
+/// 不写。
 pub(crate) struct SendCallMessage {
-    pub(crate) data: Vec<u8>,
-    pub(crate) urgency: presage::proto::call_message::opaque::Urgency,
+    pub(crate) face: CallMessageFace,
     pub(crate) destination_device_id: Option<u32>,
+}
+
+/// sendCallMessage 的两面负载：modern = CallMessage{opaque{data, urgency}}；
+/// legacy = 官方 proto 裸帧（busy 位或 hangup 帧，无 opaque 字段）。
+pub(crate) enum CallMessageFace {
+    Opaque {
+        data: Vec<u8>,
+        urgency: presage::proto::call_message::opaque::Urgency,
+    },
+    LegacyBusy {
+        id: u64,
+    },
+    LegacyHangup {
+        id: u64,
+        kind: presage::proto::call_message::hangup::Type,
+        device_id: Option<u32>,
+    },
+}
+
+/// legacy call 帧面参数解析（sendCallMessage `legacy` 键，1.53 批）：官方
+/// proto Busy{id}/Hangup{id,type,deviceId} 裸帧族（无 opaque 字段，桌面
+/// callingMessageToProto busy={id}/hangup={id,type} 同款）。形状：
+/// `{kind:"busy", id:正数}` | `{kind:"hangup", id:正数, type?, deviceId?}`。
+/// hangup type 词汇投影收投影面（normal/accepted/declined/busy/
+/// needPermission），缺省 normal（proto HANGUP_NORMAL=0 缺省同语义）。
+/// 未知 kind / 形状错 / id≤0 / deviceId 超 u32 → None（fail-closed -32603）；
+/// 键缺席 → None 不报错（modern 面路径）。
+pub(crate) fn parse_legacy_call_face(value: Option<&Value>) -> Option<CallMessageFace> {
+    use presage::proto::call_message::hangup::Type as HangupType;
+    let value = value?;
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|id| *id > 0)?;
+    match kind {
+        "busy" => Some(CallMessageFace::LegacyBusy { id }),
+        "hangup" => {
+            let hangup_kind = match value.get("type") {
+                None | Some(Value::Null) => HangupType::HangupNormal,
+                Some(Value::String(text)) => match text.as_str() {
+                    "normal" => HangupType::HangupNormal,
+                    "accepted" => HangupType::HangupAccepted,
+                    "declined" => HangupType::HangupDeclined,
+                    "busy" => HangupType::HangupBusy,
+                    "needPermission" => HangupType::HangupNeedPermission,
+                    _ => return None,
+                },
+                Some(_) => return None,
+            };
+            let device_id = match value.get("deviceId") {
+                None | Some(Value::Null) => None,
+                Some(item) => item
+                    .as_u64()
+                    .and_then(|item| u32::try_from(item).ok())
+                    .map(Some)?,
+            };
+            Some(CallMessageFace::LegacyHangup {
+                id,
+                kind: hangup_kind,
+                device_id,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// callMessage.opaque.data 解码：标准 base64、非空（官方 Opaque.data 必有
@@ -998,15 +1065,20 @@ impl Service {
     }
 
     /// sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
-    /// 信封（CallMessage{opaque{data, urgency}}，destinationDeviceId 在场才
-    /// 写）。opaque 为 Signal-RTC 层信令负载，引擎不解析只透传（桌面
+    /// 信封。modern 面构造 CallMessage{opaque{data, urgency}}（destinationDeviceId
+    /// 在场才写）——opaque 为 Signal-RTC 层信令负载，引擎不解析只透传（桌面
     /// callingMessage 面同构：offer/answer/ice/hangup/busy 都封装在 opaque
-    /// 内）。收件人号码/UUID 双形态解析（send 系同口径）。发送面偏差（compat
-    /// §5 通话消息块登记）：官方 call 消息 online=true 不排队，presage
-    /// send_message 硬编码 online_only=false（上游 TODO issue #252）——引擎
-    /// 发出的 call 信封离线可排队，属可接受偏差；CallMessage 无 sent
-    /// transcript（上游 create_multi_device_sent_transcript_content 对
-    /// CallMessage 返回 None），本机其他设备不同步自发 call 记录。
+    /// 内）；legacy 面按官方 proto 裸帧族构造——`CallMessage{busy{id}}` /
+    /// `CallMessage{hangup{id, type, deviceId?}}`，无 opaque 字段（官方桌面
+    /// callingMessageToProto 同款：busy={id}、hangup={id,type}；RingRTC
+    /// 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7/0.14.8
+    /// CallManager.sendBusyViaSignal/sendHangupViaSignal 同构裸帧族）。收件人
+    /// 号码/UUID 双形态解析（send 系同口径）。发送面偏差（compat §5 通话消息
+    /// 块登记）：官方 call 消息 online=true 不排队，presage send_message 硬编码
+    /// online_only=false（上游 TODO issue #252）——引擎发出的 call 信封离线可
+    /// 排队，属可接受偏差；CallMessage 无 sent transcript（上游
+    /// create_multi_device_sent_transcript_content 对 CallMessage 返回 None），
+    /// 本机其他设备不同步自发 call 记录。
     pub(crate) async fn send_call_message(
         self: &Arc<Self>,
         account: &str,
@@ -1024,13 +1096,33 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         let timestamp = now_ms();
-        let body = presage::proto::CallMessage {
-            opaque: Some(presage::proto::call_message::Opaque {
-                data: Some(payload.data),
-                urgency: Some(payload.urgency as i32),
-            }),
-            destination_device_id: payload.destination_device_id,
-            ..presage::proto::CallMessage::default()
+        let body = match payload.face {
+            CallMessageFace::Opaque { data, urgency } => presage::proto::CallMessage {
+                opaque: Some(presage::proto::call_message::Opaque {
+                    data: Some(data),
+                    urgency: Some(urgency as i32),
+                }),
+                destination_device_id: payload.destination_device_id,
+                ..presage::proto::CallMessage::default()
+            },
+            CallMessageFace::LegacyBusy { id } => presage::proto::CallMessage {
+                busy: Some(presage::proto::call_message::Busy { id: Some(id) }),
+                destination_device_id: payload.destination_device_id,
+                ..presage::proto::CallMessage::default()
+            },
+            CallMessageFace::LegacyHangup {
+                id,
+                kind,
+                device_id,
+            } => presage::proto::CallMessage {
+                hangup: Some(presage::proto::call_message::Hangup {
+                    id: Some(id),
+                    r#type: Some(kind as i32),
+                    device_id,
+                }),
+                destination_device_id: payload.destination_device_id,
+                ..presage::proto::CallMessage::default()
+            },
         };
         manager
             .send_message(service_id, body, timestamp)
@@ -5061,7 +5153,8 @@ mod tests {
     }
 
     /// send 构造面：opaque data 非空 + urgency/destinationDeviceId 透传；
-    /// 解码面 fail-closed（非 base64 / 空负载）。
+    /// legacy 裸帧族按官方 proto 编码（busy 位 / hangup{id,type,deviceId}，
+    /// 无 opaque 字段）；解码面 fail-closed（非 base64 / 空负载）。
     #[test]
     fn call_message_send_payload_and_decode_faces() {
         use base64::Engine as _;
@@ -5077,14 +5170,177 @@ mod tests {
             "空串 base64 同为空负载拒绝"
         );
 
-        let payload = SendCallMessage {
+        let opaque = CallMessageFace::Opaque {
             data: b"payload".to_vec(),
             urgency: Urgency::HandleImmediately,
+        };
+        let payload = SendCallMessage {
+            face: opaque,
             destination_device_id: Some(4),
         };
-        assert_eq!(payload.data, b"payload".to_vec());
-        assert_eq!(payload.urgency, Urgency::HandleImmediately);
+        match &payload.face {
+            CallMessageFace::Opaque { data, urgency } => {
+                assert_eq!(data, &b"payload".to_vec());
+                assert_eq!(*urgency, Urgency::HandleImmediately);
+            }
+            _ => panic!("opaque face expected"),
+        }
         assert_eq!(payload.destination_device_id, Some(4));
+    }
+
+    /// legacy 裸帧族字节面（1.53 批）：busy/hangup 构造的 CallMessage 经
+    /// prost 标准编码，逐字节对照官方 proto 手编形状——busy = 字段5长度分隔
+    /// 内 id varint；hangup = 字段7长度分隔内 id/type/deviceId；两面都不含
+    /// opaque（字段10 缺席 = 无 opaque 材料，官方裸帧族 wire 语义）。
+    #[test]
+    fn legacy_call_faces_encode_official_proto_bytes() {
+        fn encode(body: presage::proto::CallMessage) -> Vec<u8> {
+            use prost::Message as _;
+            let mut buf = Vec::new();
+            body.encode(&mut buf).expect("proto encodes");
+            buf
+        }
+        fn varint(value: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut v = value;
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    return out;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        // busy{id: 0x0102030405060708}：字段5(tag 0x2a) + len 8 + id varint。
+        let busy_id = 0x0102_0304_0506_0708u64;
+        let busy = encode(presage::proto::CallMessage {
+            busy: Some(presage::proto::call_message::Busy { id: Some(busy_id) }),
+            ..Default::default()
+        });
+        let busy_expected = {
+            let mut inner = vec![0x08];
+            inner.extend(varint(busy_id));
+            let mut out = vec![0x2a, inner.len() as u8];
+            out.extend(inner);
+            out
+        };
+        assert_eq!(busy, busy_expected, "busy 裸帧 = 字段5{{id}}");
+
+        // hangup{id: 7, type: ACCEPTED(1), deviceId: 2}：字段7(tag 0x3a) +
+        // len + id(0x08) + type(0x10) + deviceId(0x18)。
+        let hangup = encode(presage::proto::CallMessage {
+            hangup: Some(presage::proto::call_message::Hangup {
+                id: Some(7),
+                r#type: Some(presage::proto::call_message::hangup::Type::HangupAccepted as i32),
+                device_id: Some(2),
+            }),
+            ..Default::default()
+        });
+        let hangup_expected = [0x3a, 0x06, 0x08, 0x07, 0x10, 0x01, 0x18, 0x02];
+        assert_eq!(
+            hangup, hangup_expected,
+            "hangup 裸帧 = 字段7{{id,type,deviceId}}"
+        );
+
+        // hangup 缺省面：type/type/deviceId 都缺席时不写内字段（proto3 缺省
+        // 不编码语义）——tag + len 0。
+        let bare_hangup = encode(presage::proto::CallMessage {
+            hangup: Some(presage::proto::call_message::Hangup {
+                id: None,
+                r#type: None,
+                device_id: None,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(bare_hangup, vec![0x3a, 0x00], "空 hangup 帧无内字段");
+
+        // 两面 wire 互斥：legacy 裸帧族不含 opaque 字段（字段10 tag 0x52
+        // 不在列），modern 面不含 busy/hangup 位。
+        let modern = encode(presage::proto::CallMessage {
+            opaque: Some(presage::proto::call_message::Opaque {
+                data: Some(b"x".to_vec()),
+                urgency: None,
+            }),
+            ..Default::default()
+        });
+        assert!(!busy.contains(&0x52u8), "busy 无 opaque 字段");
+        assert!(!hangup.contains(&0x52u8), "hangup 无 opaque 字段");
+        assert!(
+            !modern.contains(&0x2au8) && !modern.contains(&0x3au8),
+            "modern 无 busy/hangup 位"
+        );
+    }
+
+    /// legacy 参数面（parse_legacy_call_face）：官方形状接受、投影词汇收齐、
+    /// 形状错 fail-closed（未知 kind / id≤0 / id 缺席 / 非法 type / deviceId
+    /// 超 u32）；legacy 键缺席 = modern 面不受影响。
+    #[test]
+    fn legacy_call_face_params_gate() {
+        use crate::service::CallMessageFace;
+        use presage::proto::call_message::hangup::Type as HangupType;
+
+        let json = |v: Value| parse_legacy_call_face(Some(&v));
+
+        let busy = json(json!({"kind": "busy", "id": 7}));
+        assert!(matches!(busy, Some(CallMessageFace::LegacyBusy { id: 7 })));
+
+        let hangup = json(json!({"kind": "hangup", "id": 7, "type": "declined", "deviceId": 2}));
+        match hangup {
+            Some(CallMessageFace::LegacyHangup {
+                id,
+                kind,
+                device_id,
+            }) => {
+                assert_eq!(id, 7);
+                assert_eq!(kind, HangupType::HangupDeclined);
+                assert_eq!(device_id, Some(2));
+            }
+            _ => panic!("hangup face expected"),
+        }
+
+        // 缺省面：type 缺席 = normal，deviceId 缺席 = 不写。
+        let default_hangup = json(json!({"kind": "hangup", "id": 9}));
+        match default_hangup {
+            Some(CallMessageFace::LegacyHangup {
+                id,
+                kind,
+                device_id,
+            }) => {
+                assert_eq!(id, 9);
+                assert_eq!(kind, HangupType::HangupNormal);
+                assert_eq!(device_id, None);
+            }
+            _ => panic!("default hangup face expected"),
+        }
+
+        // fail-closed 面。
+        assert!(
+            json(json!({"kind": "offer", "id": 7})).is_none(),
+            "非 busy/hangup kind 拒绝"
+        );
+        assert!(json(json!({"kind": "busy"})).is_none(), "id 缺席拒绝");
+        assert!(
+            json(json!({"kind": "busy", "id": 0})).is_none(),
+            "id=0 拒绝"
+        );
+        assert!(
+            json(json!({"kind": "hangup", "id": 7, "type": "urgent"})).is_none(),
+            "非法 type 拒绝"
+        );
+        assert!(
+            json(json!({"kind": "hangup", "id": 7, "deviceId": u32::MAX as u64 + 1})).is_none(),
+            "deviceId 超 u32 拒绝"
+        );
+        assert!(
+            json(Value::String("busy".into())).is_none(),
+            "非对象形状拒绝"
+        );
+
+        // modern 面共存键：legacy 键缺席 = None（不报错、不误伤 modern 路径）。
+        assert!(parse_legacy_call_face(None).is_none());
     }
 
     /// 收投影全信封面：CallMessage 体 → receive 通知信封 callMessage 键；

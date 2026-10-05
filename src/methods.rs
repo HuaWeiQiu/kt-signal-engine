@@ -14,8 +14,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    storage_sync, storage_write, LinkError, SendMention, SendPreview, SendQuote, SendSticker,
-    Service, UserStatusError,
+    parse_legacy_call_face, storage_sync, storage_write, LinkError, SendMention, SendPreview,
+    SendQuote, SendSticker, Service, UserStatusError,
 };
 use crate::state::EngineState;
 
@@ -606,12 +606,16 @@ async fn dispatch(
         // sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
         // 信封。协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
         //（-32603）：recipient/data 缺失或形状错、data 非 base64/空、urgency
-        // 非法枚举、destinationDeviceId 超 u32。群组通话走 SFU 面明确不做
-        //（groupId 形态 fail-closed，compat §5 通话消息块）。
+        // 非法枚举、destinationDeviceId 超 u32、legacy/opacity 两面同置或都缺。
+        // legacy 面（1.53 批）：`legacy: {kind: "busy", id}` / `{kind: "hangup",
+        // id, type?, deviceId?}` 按官方 proto Busy{id}/Hangup{id,type,deviceId}
+        // 裸帧族构造（无 opaque 字段）。群组通话走 SFU 面明确不做（groupId
+        // 形态 fail-closed，compat §5 通话消息块）。
         "sendCallMessage" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
+            let legacy = parse_legacy_call_face(params.get("legacy"));
             let data = params
                 .get("data")
                 .and_then(Value::as_str)
@@ -639,15 +643,23 @@ async fn dispatch(
             if params.get("groupId").is_some() {
                 return internal_error(id);
             }
-            match (account, recipient, data, urgency, destination) {
-                (Some(account), Some(recipient), Some(data), Some(urgency), Some(destination)) => {
+            // 两面解析：modern（data）与 legacy 互斥——同置或都缺都 fail-closed
+            //（busy/hangup 官方裸帧无 opaque 字段，混面无官方语义）。
+            let face = match (data, legacy) {
+                (Some(data), None) => {
+                    urgency.map(|urgency| crate::service::CallMessageFace::Opaque { data, urgency })
+                }
+                (None, Some(legacy)) => Some(legacy),
+                _ => None,
+            };
+            match (account, recipient, face, destination) {
+                (Some(account), Some(recipient), Some(face), Some(destination)) => {
                     match service
                         .send_call_message(
                             account,
                             recipient,
                             crate::service::SendCallMessage {
-                                data,
-                                urgency,
+                                face,
                                 destination_device_id: destination,
                             },
                         )
