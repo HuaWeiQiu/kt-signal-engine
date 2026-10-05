@@ -290,7 +290,7 @@ async fn dispatch(
                             id,
                             json!({ "timestamp": timestamp, "results": results }),
                         ),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (Some(account), message, None, Ok(recipients))
@@ -314,7 +314,7 @@ async fn dispatch(
                             id,
                             json!({ "timestamp": timestamp, "results": results }),
                         ),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 // 空 account/message 或 recipient 形状非法：fail-closed。
@@ -333,7 +333,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (Some(account), Some(target), None, Ok(recipients)) => {
@@ -342,7 +342,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -386,7 +386,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (
@@ -402,7 +402,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -437,7 +437,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (
@@ -453,7 +453,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -472,7 +472,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (Some(account), Some(author), Some(target), None, Ok(recipients))
@@ -483,7 +483,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -504,7 +504,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -519,7 +519,7 @@ async fn dispatch(
                 (Some(account), Some(recipient), Some(name)) => {
                     match service.update_contact(account, recipient, name).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -534,13 +534,13 @@ async fn dispatch(
                 (Some(account), Some(stop), Some(group), _) => {
                     match service.send_typing_group(account, group, stop).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 (Some(account), Some(stop), None, Ok(recipients)) => {
                     match service.send_typing(account, &recipients, stop).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -574,7 +574,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -597,7 +597,7 @@ async fn dispatch(
                         .await
                     {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -642,7 +642,7 @@ async fn dispatch(
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
                         }
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),
@@ -1097,6 +1097,45 @@ async fn dispatch(
                 Err(()) => internal_error(id),
             }
         }
+        // 群终止（terminateGroup，KT 扩展方法）：协议上行面，落调度日志
+        //（send 系/reportSpam 同纪律）。groupId 必须 32B 标准 base64 群
+        // master key、缺 account/坏 groupId → 参数面 -32603 fail-closed；
+        // 服务器拒绝 → -1 GROUP_TERMINATE_FAILED + data.status 诚实透传；
+        // 网络面 → -1 STORAGE_UNAVAILABLE（STORAGE 族 retryable 语义）；
+        // fake 模式成功 {status:"terminated"}。
+        "terminateGroup" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let (Some(account), Some(master_key)) = (account, master_key) else {
+                return internal_error(id);
+            };
+            match service.terminate_group(account, master_key).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "terminated" })),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_TERMINATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
@@ -1259,4 +1298,17 @@ fn has_image_or_video_mediatype(data_uri: &str) -> bool {
 
 fn internal_error(id: &Value) -> Value {
     jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
+}
+
+/// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation
+/// terminated 位硬拒同语义）→ `-1` + `SEND_TARGET_TERMINATED`；其余（账号
+/// 不可达/内部失败）→ -32603 细节不外泄。
+fn send_error(id: &Value, error: crate::service::SendError) -> Value {
+    use crate::service::SendError;
+    match error {
+        SendError::TargetTerminated => {
+            jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_TERMINATED"))
+        }
+        SendError::UnknownAccount | SendError::Internal => internal_error(id),
+    }
 }

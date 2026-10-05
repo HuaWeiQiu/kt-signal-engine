@@ -704,6 +704,67 @@ fn report_spam_fake_shape_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// 群终止（terminateGroup，KT 扩展方法）：fake 模式成功投影
+/// `{status: "terminated"}`（落调度日志，协议上行面纪律）；参数面
+/// fail-closed（-32603：缺 account / 缺 groupId / groupId 非 base64 /
+/// 长度 ≠32 字节）；real 模式未注册账号折叠 -32603。
+#[test]
+fn terminate_group_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("terminate-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 32 字节群 master key 的标准 base64（44 字符，listGroups id 同源）。
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：成功 {status:"terminated"}（不触网）。
+    assert_eq!(
+        engine.request(
+            "terminateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id })
+        )["result"],
+        json!({ "status": "terminated" })
+    );
+
+    // 参数面 fail-closed 逐形状：缺 account / 缺 groupId / groupId 非
+    // base64 / groupId 长度 ≠32 字节 → -32603。
+    let rejects = [
+        json!({ "groupId": group_id }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!" }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("terminateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "terminateGroup rejects {params}"
+        );
+    }
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（置顶面同款，
+    // 细节不外泄）。
+    let real_dir = temp_dir("terminate-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "terminateGroup",
+        json!({ "account": "+15559990000", "groupId": group_id }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
+    // 调度日志：groupId 逐字保留（协议上行面纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "terminateGroup")
+        .expect("terminateGroup logged");
+    assert_eq!(entry["params"]["groupId"], json!(group_id));
+    assert_eq!(entry["params"]["account"], json!("+15550000000"));
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");

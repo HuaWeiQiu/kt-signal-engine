@@ -42,6 +42,7 @@ use crate::state::EngineState;
 
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
+pub(crate) mod groups;
 pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod stickers;
@@ -224,6 +225,9 @@ pub(crate) enum LinkError {
 pub(crate) enum SendError {
     /// 账号不在本引擎注册表中（连接器只对 listAccounts 结果发送，正常不到达）。
     UnknownAccount,
+    /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
+    /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
+    TargetTerminated,
     Internal,
 }
 
@@ -281,6 +285,8 @@ pub(crate) struct Service {
     pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
     /// 备份导出任务注册表（进程内存，backup_task 模块契约 §10.3）。
     backup_tasks: Arc<backup_task::BackupTaskRegistry>,
+    /// 已终止群登记表（进程内存，groups 模块：receive 投影 → send 面拦截）。
+    terminated_groups: groups::TerminatedGroups,
 }
 
 struct Inner {
@@ -306,6 +312,7 @@ impl Service {
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
             backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            terminated_groups: groups::TerminatedGroups::new(),
         })
     }
 
@@ -986,7 +993,9 @@ impl Service {
 
     /// listGroups：store 内已同步群组（本机所在群才会在库）。`isMember` 恒
     /// true（入库即成员；被移出群的本地残留清理 P3）；群组 id = master key
-    /// 标准 base64（signal-cli 同源，connector send 回传同 id）。
+    /// 标准 base64（signal-cli 同源，connector send 回传同 id）。`terminated`
+    /// 位 = 进程内终止登记（groups 模块；presage Group 模型无该字段，读面
+    /// 以登记表为准，compat §5 终止批登记）。
     pub(crate) async fn list_groups(
         self: &Arc<Self>,
         account: &str,
@@ -1024,6 +1033,7 @@ impl Service {
                 "name": group.title,
                 "isMember": true,
                 "members": members,
+                "terminated": self.terminated_groups.contains(&id),
             }));
         }
         Ok(out)
@@ -1155,8 +1165,9 @@ impl Service {
             .map_err(|_| SendError::Internal)
     }
 
-    /// 群组发送公共头：账号/群可解校验 + 时间戳统一此处取（fake 模式各方法
-    /// 自行早退，不走此处）。
+    /// 群组发送公共头：账号/群可解校验 + 终止面硬拒（官方
+    /// shouldSendToConversation terminated 位同语义——已终止群一律拒发）+
+    /// 时间戳统一此处取（fake 模式各方法自行早退，不走此处）。
     async fn open_group_sender(
         self: &Arc<Self>,
         account: &str,
@@ -1166,7 +1177,47 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         decode_group_id(group_id).ok_or(SendError::Internal)?;
+        if self.send_target_terminated(account, group_id).await {
+            return Err(SendError::TargetTerminated);
+        }
         Ok((manager, now_ms()))
+    }
+
+    /// 发送面终止判定：进程内登记表（本进程见过 terminated change/写面
+    /// 成功）先行；real 模式下服务器群态真值兜底（读面失败不阻塞发送面
+    /// ——网络故障不误伤既有群会话，终止真值以登记表 + 服务器裁决为准）。
+    async fn send_target_terminated(&self, account: &str, group_id: &str) -> bool {
+        if self.terminated_groups.contains(group_id) {
+            return true;
+        }
+        if !self.real {
+            return false;
+        }
+        let Some(master_key) = decode_group_id(group_id) else {
+            return false;
+        };
+        let Ok(context) = storage_context(self, account).await else {
+            return false;
+        };
+        matches!(
+            groups::fetch_group_state_for_send(&context, &master_key).await,
+            Some(true)
+        )
+    }
+
+    /// terminateGroup（群终止，KT 扩展方法）：幂等判定 → 群凭据 →
+    /// `PATCH v2/groups` 上传 terminate change → 本地登记。fake 模式成功
+    /// 形状桩（send 系同款纪律）。
+    pub(crate) async fn terminate_group(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+    ) -> Result<(), groups::TerminateError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        groups::terminate_group(&context, &self.terminated_groups, &master_key).await
     }
 
     /// getUserStatus：whoami 轻量鉴权探测（real 模式触网；fake 恒已注册）。
@@ -1485,6 +1536,9 @@ pub(crate) struct StorageContext {
     pub(crate) push: PushService,
     pub(crate) device_id: u32,
     pub(crate) account_dir: PathBuf,
+    /// 本机 ACI/PNI（UUID；群凭据 present 面，groups 模块消费，不入日志）。
+    pub(crate) aci_uuid: presage::libsignal_service::prelude::Uuid,
+    pub(crate) pni_uuid: presage::libsignal_service::prelude::Uuid,
 }
 
 /// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。
@@ -1536,6 +1590,8 @@ async fn storage_context(
         push,
         device_id: data.device_id.unwrap_or(1),
         account_dir,
+        aci_uuid: data.service_ids.aci,
+        pni_uuid: data.service_ids.pni,
     })
 }
 
@@ -1624,7 +1680,13 @@ async fn serve_account_stream(
                 Some(Received::DecryptionError(_)) => {}
                 Some(Received::Content(content)) => {
                     if let Some(notification) =
-                        project_content(number, manager.store(), &content).await
+                        project_content(
+                            number,
+                            manager.store(),
+                            &content,
+                            &service.terminated_groups,
+                        )
+                        .await
                     {
                         let _ = service.outbound.send(notification);
                     }
@@ -1648,6 +1710,7 @@ async fn project_content(
     account: &str,
     store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
+    terminated_groups: &groups::TerminatedGroups,
 ) -> Option<Value> {
     use presage::libsignal_service::content::ContentBody;
 
@@ -1758,11 +1821,73 @@ async fn project_content(
         | ContentBody::DecryptionErrorMessage(_) => return None,
     }
 
+    // 群终止投影放开（最小面）：群更新消息携带 terminated change →
+    // `group_terminated` 事件（{groupId, terminator?, timestamp}）；其余群
+    // 更新（成员变更/权限面等）本批继续跳过（compat §5 终止批边界登记）。
+    // 终止判定独立于 dataMessage 投影：既覆盖纯 change 信封（无正文）也覆盖
+    // 携带 change 的普通群消息；其他设备自己发起的终止（sent sync）同样落
+    // 事件并登记。登记表先行（写面事件后到达的乱序窗口由该表兜住发送拦截）。
+    if let Some((master_key, change)) = group_change_of(&content.body) {
+        if let Some(terminate) = groups::project_terminate_from_context(&master_key, change) {
+            terminated_groups.register(&terminate.group_id);
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": account,
+                    "envelope": {
+                        "timestamp": envelope_ts,
+                        "groupTerminated": {
+                            "groupId": terminate.group_id,
+                            "terminator": terminate.terminator,
+                            "timestamp": envelope_ts,
+                        },
+                    },
+                },
+            }));
+        }
+    }
+
     Some(json!({
         "jsonrpc": "2.0",
         "method": "receive",
         "params": { "account": account, "envelope": envelope },
     }))
+}
+
+/// 群更新消息的 change 密文提取（终止投影配套）：dataMessage / sent sync 内
+/// 群上下文（master key + group_change 密文）。缺 change / 缺 master key →
+/// None。
+fn group_change_of(body: &ContentBody) -> Option<(Vec<u8>, Option<&[u8]>)> {
+    match body {
+        ContentBody::DataMessage(DataMessage {
+            group_v2:
+                Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key),
+                    group_change,
+                    ..
+                }),
+            ..
+        }) => Some((master_key.clone(), group_change.as_deref())),
+        ContentBody::SynchronizeMessage(sync) => match sync.content.as_ref() {
+            Some(presage::proto::sync_message::Content::Sent(sent)) => {
+                match sent.message.as_ref() {
+                    Some(DataMessage {
+                        group_v2:
+                            Some(presage::proto::GroupContextV2 {
+                                master_key: Some(master_key),
+                                group_change,
+                                ..
+                            }),
+                        ..
+                    }) => Some((master_key.clone(), group_change.as_deref())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// E3：SyncMessage.ViewOnceOpen 投影 `{senderAci, timestamp}`。senderAci
@@ -2906,6 +3031,7 @@ mod tests {
     use presage::proto::attachment_pointer::Flags;
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
+    use prost::Message as _;
 
     #[test]
     fn orphan_store_sweep_removes_only_unreferenced_lk_dirs() {
@@ -3748,7 +3874,8 @@ mod tests {
             }),
             metadata(Some(server_guid)),
         );
-        let envelope = project_content("acct", &store, &content)
+        let registry = groups::TerminatedGroups::new();
+        let envelope = project_content("acct", &store, &content, &registry)
             .await
             .expect("dataMessage projects");
         let envelope = &envelope["params"]["envelope"];
@@ -3768,10 +3895,182 @@ mod tests {
             ContentBody::DataMessage(DataMessage::default()),
             metadata(None),
         );
-        let envelope = project_content("acct", &store, &content)
+        let envelope = project_content("acct", &store, &content, &registry)
             .await
             .expect("dataMessage projects");
         assert!(envelope.get("serverGuid").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 群终止投影放开（最小面）：dataMessage.groupV2 携带 terminated change
+    /// → 整信封替换为 `groupTerminated` 事件（{groupId, terminator,
+    /// timestamp}）并落登记表；非 terminated change（改标题等）→ 群更新消息
+    /// 照旧走普通投影（本批继续跳过面的现状不变：普通群消息带 groupInfo）；
+    /// sent sync 内终止 → 同事件（其他设备发起面）。
+    #[tokio::test]
+    async fn receive_projects_group_terminated_change_only() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::libsignal_service::zkgroup;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-term-proj-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1).expect("device"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        };
+
+        let master_key = [0x33u8; 32];
+        use base64::Engine as _;
+        let group_id = base64::engine::general_purpose::STANDARD.encode(master_key);
+        let secret_params =
+            presage::libsignal_service::zkgroup::groups::GroupSecretParams::derive_from_master_key(
+                presage::libsignal_service::zkgroup::groups::GroupMasterKey::new(master_key),
+            );
+        let editor = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(
+            "22222222-3333-4444-8555-666666666666",
+        )
+        .expect("editor aci");
+        let terminate_change = presage::proto::GroupChange {
+            actions: presage::proto::group_change::Actions {
+                source_user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id(editor.into()),
+                ),
+                group_id: secret_params.get_group_identifier().to_vec(),
+                version: 9,
+                terminate_group: Some(
+                    presage::proto::group_change::actions::TerminateGroupAction {},
+                ),
+                ..presage::proto::group_change::Actions::default()
+            }
+            .encode_to_vec(),
+            server_signature: Vec::new(),
+            change_epoch: groups::SUPPORTED_CHANGE_EPOCH,
+        };
+
+        // terminated change → 整信封替换为 groupTerminated 事件 + 登记。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(9),
+                    group_change: Some(terminate_change.encode_to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("terminate event projects");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
+        assert_eq!(
+            envelope["groupTerminated"]["terminator"],
+            json!("22222222-3333-4444-8555-666666666666")
+        );
+        assert_eq!(
+            envelope["groupTerminated"]["timestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert!(envelope.get("dataMessage").is_none(), "整信封替换");
+        assert!(registry.contains(&group_id), "send 面拦截登记");
+
+        // 非 terminated change（改标题）→ 群更新消息照旧走普通投影（groupInfo
+        // 面；终止投影不误伤）。
+        let mut randomness = [0u8; 32];
+        use rand::RngCore as _;
+        rand::rng().fill_bytes(&mut randomness);
+        let title_blob = presage::proto::GroupAttributeBlob {
+            content: Some(presage::proto::group_attribute_blob::Content::Title(
+                "renamed".to_owned(),
+            )),
+        }
+        .encode_to_vec();
+        let rename_change = presage::proto::GroupChange {
+            actions: presage::proto::group_change::Actions {
+                source_user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id(editor.into()),
+                ),
+                group_id: secret_params.get_group_identifier().to_vec(),
+                version: 10,
+                modify_title: Some(presage::proto::group_change::actions::ModifyTitleAction {
+                    title: secret_params.encrypt_blob_with_padding(randomness, &title_blob, 0),
+                }),
+                ..presage::proto::group_change::Actions::default()
+            }
+            .encode_to_vec(),
+            server_signature: Vec::new(),
+            change_epoch: groups::SUPPORTED_CHANGE_EPOCH,
+        };
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(10),
+                    group_change: Some(rename_change.encode_to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("group dataMessage projects");
+        let envelope = &notification["params"]["envelope"];
+        assert!(envelope.get("groupTerminated").is_none());
+        assert_eq!(
+            envelope["dataMessage"]["groupInfo"]["groupId"],
+            json!(group_id)
+        );
+
+        // sent sync 内终止（其他设备发起）→ 同事件面。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                content: Some(presage::proto::sync_message::Content::Sent(
+                    presage::proto::sync_message::Sent {
+                        timestamp: Some(1_700_000_000_002),
+                        message: Some(DataMessage {
+                            group_v2: Some(presage::proto::GroupContextV2 {
+                                master_key: Some(master_key.to_vec()),
+                                revision: Some(11),
+                                group_change: Some(terminate_change.encode_to_vec()),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..presage::proto::sync_message::Sent::default()
+                    },
+                )),
+                ..presage::proto::SyncMessage::with_padding(&mut rand::rng())
+            }),
+            metadata,
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("sent terminate projects");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }

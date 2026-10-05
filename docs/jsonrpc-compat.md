@@ -67,9 +67,9 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number}` | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number": …}]`；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
-| `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}]}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传） |
+| `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}], terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
-| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603` | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
+| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5） | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
@@ -96,6 +96,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
+| `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -146,6 +147,11 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 - 群组接收投影：dataMessage.groupV2 / sent 内群组带 `groupInfo {groupId}`
   （master key 标准 base64，signal-cli 同款；直聊不带该键）；群更新类消息
   （成员变更/权限面）仍跳过。call/story/null 体跳过；解密失败按事件丢弃。
+- `groupTerminated {groupId, terminator?, timestamp}`（2026-10-06，KT 扩展
+  批）：群更新消息内密文 GroupChange 含 terminated action 且 change epoch
+  ≤7 → 整信封替换为该事件（groupId = master key 标准 base64，terminator
+  = 编辑者 ACI 串；epoch >7 不处理，其余群更新消息照旧跳过）；命中同时
+  登记进程内终止表（send 面硬拒联动，§5 群终止批）。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -551,6 +557,48 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
   send 系/setExpirationTimer 同纪律），`getAvatar`/`setConversationBlocked`
   不落（读面/storage 状态面，置顶/贴纸面同纪律）。real 模式未注册账号
   一律 `-32603`（细节不外泄）。
+
+群终止批（2026-10-06，官方桌面 terminate-group 行为对齐，KT 扩展方法）：
+
+- **新方法 `terminateGroup`**：`{account, groupId}` → `{status:
+  "terminated"}`。协议载体 = GroupChange.Actions 特殊 action
+  `terminate_group`（`TerminateGroupAction {}`，官方 SUPPORTED_CHANGE_EPOCH
+  = 7）；version = 当前 revision + 1（饱和不回卷；revision 未知退化 0
+  继续，官方 `group.revision || 0` + 1 同口径）；上传 = `PATCH v2/groups`
+  （storage 服务 host，body = GroupChange.Actions protobuf，Content-Type
+  `application/x-protobuf`，官方 modifyGroup 同端点同形状）；群权限
+  （仅 admin 可终止）由服务器裁决。同值幂等：进程内终止表命中或服务器
+  群态 terminated 为真 → 不重复上传直接成功（setConversationBlocked
+  幂等纪律先例）。
+- **群凭据链是上游缺口自建等价实现**：官方 GroupsManager
+  get_authorization_for_today 绑定 SignalWebSocket（本引擎不开常驻群
+  ws），引擎以 zkgroup 公共 API 自建同语义链——`GET
+  v1/certificate/auth/group?redemptionStartSeconds=<今日 UTC 零点>&
+  redemptionEndSeconds=<+7 天>&pniAsServiceId=true`（本机凭据）→
+  camelCase JSON `{credentials: [{credential, redemptionTime}]}` →
+  AuthCredentialWithPniResponse receive → GroupSecretParams present →
+  basic auth `username = GroupPublicParams bincode hex`、
+  `password = presentation hex`（官方 GroupsManager.authorize 输出面同
+  构）。上游补独立凭据面后整段替换（单点 `service/groups.rs`）。
+- **发送联动面（send 硬拒）**：进程内终止表命中（real 模式另以服务器
+  群态兜底，读面失败不阻塞发送——网络故障不误伤既有群会话，终止真值
+  以登记表 + 服务器裁决为准）→ send 系全部群组形态返回
+  `SEND_TARGET_TERMINATED`（`-1` + message）；sendError 单点折叠（此前
+  send 系错误一律 `-32603` 内部失败的折叠面收拢为 helper，TargetTerminated
+  之外的枚举行为不变）。
+- **receive 联动面（groupTerminated 事件）**：dataMessage.groupV2 /
+  sent 内密文 group_change 经 `decrypt_group_change` 解出 terminated
+  action → 整信封替换为 `groupTerminated {groupId, terminator?,
+  timestamp}` 并登记终止表；change epoch >7 不处理（官方
+  isChangeEpochSupported 同语义：未知 epoch 的 change 含未知语义）；
+  非 terminated 的群更新消息照旧跳过（宁缺勿错）。
+- **已知边界**：① `presage::model::groups::Group` 无 terminated 字段
+  （上游模型缺口），读侧绕行 libsignal-service `decrypt_group` 投影；
+  ② 终止表进程内存、不跨重启——重启后 send 面由服务器群态读面兜底、
+  listGroups `terminated` 位同源；③ receive 只投 terminated change 事件，
+  其余群更新（成员/权限变更）继续跳过（群更新全投影另行立项）；
+  ④ groupTerminated 事件不带群名/成员快照（终止后服务器群态即不可读，
+  官方桌面终止后群视图同样只读墓碑）。
 
 ## 6. fake 服务模式（仅测试）
 

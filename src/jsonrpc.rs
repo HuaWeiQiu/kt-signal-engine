@@ -45,6 +45,9 @@ pub fn parse_line(buf: &[u8]) -> ParseOutcome {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// 可选 data 面（JSON-RPC error.data；方法按需透传结构化细节，如
+    /// terminateGroup 的服务器状态码）。None = data 键不在。
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -52,6 +55,15 @@ impl RpcError {
         Self {
             code,
             message: message.to_owned(),
+            data: None,
+        }
+    }
+
+    pub fn with_data(code: i64, message: &str, data: Value) -> Self {
+        Self {
+            code,
+            message: message.to_owned(),
+            data: Some(data),
         }
     }
 }
@@ -61,10 +73,16 @@ pub fn success_response(id: &Value, result: Value) -> Value {
 }
 
 pub fn error_response(id: &Value, error: &RpcError) -> Value {
+    let mut body = serde_json::json!({
+        "code": error.code, "message": error.message,
+    });
+    if let Some(data) = &error.data {
+        body["data"] = data.clone();
+    }
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": { "code": error.code, "message": error.message },
+        "error": body,
     })
 }
 
