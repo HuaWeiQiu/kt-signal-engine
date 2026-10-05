@@ -94,6 +94,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状，存储序） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；fake：成功回 `{blocked: []}` |
 | `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
+| `sendCallMessage` | `{account, recipient(单号码/ACI), data(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), destinationDeviceId?}`（1:1 only，groupId 形态 fail-closed——群组通话走 SFU 不在本面） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、destinationDeviceId 超 u32 或非数值、groupId 在场）/未注册账号 `-32603` | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封 `CallMessage{opaque{data,urgency}, destinationDeviceId?}`（Signal-RTC 层信令负载，引擎不解析只透传）；presage `send_message` 通路（online=false 偏差与 sent-transcript 缺席见 §5 通话消息块）；fake：成功 `{"timestamp":u64}`（落调度日志，协议上行面纪律） |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
@@ -146,12 +147,34 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   （warn-only、不暂存，§5）。
 - 群组接收投影：dataMessage.groupV2 / sent 内群组带 `groupInfo {groupId}`
   （master key 标准 base64，signal-cli 同款；直聊不带该键）；群更新类消息
-  （成员变更/权限面）仍跳过。call/story/null 体跳过；解密失败按事件丢弃。
+  （成员变更/权限面）仍跳过。story/null 体跳过；解密失败按事件丢弃。
 - `groupTerminated {groupId, terminator?, timestamp}`（2026-10-06，KT 扩展
   批）：群更新消息内密文 GroupChange 含 terminated action 且 change epoch
   ≤7 → 整信封替换为该事件（groupId = master key 标准 base64，terminator
   = 编辑者 ACI 串；epoch >7 不处理，其余群更新消息照旧跳过）；命中同时
   登记进程内终止表（send 面硬拒联动，§5 群终止批）。
+- `callMessage {opaque?(base64), urgency?("droppable"\|"handleImmediately",
+  缺席=droppable), destinationDeviceId?, offer?/answer?/iceUpdate?/busy?/
+  hangup?}`（2026-10-06 通话消息面，KT 扩展；官方 Content.callMessage=3
+  投影）：现行线面 opaque 信令负载 base64 透传（引擎不解析，Signal-RTC
+  职责）；offer/answer/iceUpdate（旧线面 1:1 信令，在场才投：offer
+  `{id, type? "audio"|"video", opaque?(base64)}`、answer
+  `{id, opaque?(base64)}`、iceUpdate `[{id, opaque?(base64)}]`、busy
+  `{id}`、hangup `{id, type? "normal"|"accepted"|"declined"|"busy"|
+  "needPermission", deviceId?}`）；空白 CallMessage（无可投影字段）整事件
+  丢弃（宁缺勿错）。
+- `syncMessage.callEvent {conversationId?, callId(字符串形态，官方
+  longToString 同构), timestamp, type?, direction?, event?}`（2026-10-06
+  通话消息面，官方 SyncMessage.callEvent=19 / 桌面 callEventSync 同位）：
+  本机其他设备/主设备的通话记录写入同步；type ∈ audio|video|group|ad-hoc
+  （UNKNOWN 不投）、direction ∈ incoming|outgoing、event ∈
+  accepted|not-accepted|delete|observed（枚举缺席或枚举外值键省略，proto3
+  未知值同缺省语义）；conversationId 按官方桌面
+  conversationPeerIdInBytesSchema 口径（16B = 直聊 ACI UUID 串、否则群 =
+  标准 base64；ad-hoc = 房间 id hex；空字节键省略）；callId 缺席 = 无记录
+  主键整事件丢弃（warn-only，零 stderr）。CallEvent 经 presage 落库
+  （registered.rs message_for_sync CallMessage/CallEvent 分支）——引擎
+  store 有行，connector 消费面按自身会话管线取用。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -599,6 +622,47 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
   其余群更新（成员/权限变更）继续跳过（群更新全投影另行立项）；
   ④ groupTerminated 事件不带群名/成员快照（终止后服务器群态即不可读，
   官方桌面终止后群视图同样只读墓碑）。
+
+通话消息面（2026-10-06 扩展批，KT 扩展方法）：
+
+- **`sendCallMessage`（1:1 通话信令外发）**：官方 Content.callMessage=3
+  信封 `CallMessage{opaque{data, urgency}, destinationDeviceId?}`。opaque
+  = Signal-RTC 层信令负载（现行桌面 offer/answer/ice/hangup/busy 全封装
+  在 opaque 内），**引擎不解析只透传**（base64 出入参，元数据面不动负
+  载字节）；urgency 缺省 droppable（proto「缺省按 DROPPABLE 处理」同语
+  义）；destinationDeviceId 官方多设备定向投递位，缺省不写。收件人号码/
+  UUID 双形态解析（send 系同口径）；返回信封 timestamp。**群组通话不
+  做**（groupId 形态 fail-closed）：群 call 走 SFU 通道（GroupCall 选
+  项 + CallLinkUpdate），与本面 1:1 Signal-RTC 信令完全异构，消费方提
+  出需求再立项。
+- **接收投影**：CallMessage 体 → 信封 `callMessage`（opaque base64 +
+  urgency + 旧线面 offer/answer/iceUpdate/busy/hangup 在场字段逐面投影，
+  proto 只投影不发明；空白 CallMessage 整事件丢弃）；SyncMessage.CallEvent
+  体 → `syncMessage.callEvent`（官方桌面 getCallEventForProto/
+  conversationPeerIdInBytesSchema 行为对齐：conversationId 16B→UUID 串、
+  群→标准 base64、ad-hoc→hex、空→省略；callId 字符串形态=官方
+  longToString 同构、缺席整事件丢弃 warn-only）。此前「call/story/null
+  体跳过」边界由本批放开 call 两面，story/null 维持跳过。
+- **发送通路偏差（登记）**：官方桌面 call 消息 online=true（不排队，
+  离线对端不收）；presage `Manager::send_message` 硬编码
+  `online_only=false`（上游 TODO issue #252）——引擎发出的 call 信封在
+  对端离线时会排队补投，属可接受偏差（信令面重复到达幂等），上游补
+  online 选项后跟进。**不能自建 MessageSender 绕行**：
+  `new_message_sender`/`identified_websocket`/credentials 均 pub(crate)
+  （引擎拿不到凭据），官方 online 面待上游 API 后替换。
+- **sent transcript 缺席（登记）**：CallMessage 无 sent transcript——
+  libsignal-service `create_multi_device_sent_transcript_content` 对
+  CallMessage 返回 None（presage 发送面 `if let Some` 守卫静默跳过），
+  本机其他设备不收自发 call 记录（官方桌面自发 call 的多设备同步走
+  CallEvent sync 通道，与 transcript 面独立）；不向 self 发 call
+  （self-send 走 message_to_self 分支对 CallMessage 报 NoMessagesToSend，
+  引擎无此调用形状）。**CallMessage/CallEvent 经 presage 接收面落库**
+  （registered.rs message_for_sync 两分支 Some(message)）——引擎 store
+  有行，与「消息内容不落引擎存储」边界的边界判例一致（信令/记录面元
+  数据，非聊天正文）。
+- **fake 纪律**：`sendCallMessage` 成功 `{"timestamp":u64}`，只落调度
+  日志不触网（send 系同款）；fake 模式任意账号成功早退（形状桩语义），
+  未注册账号错误面由 real 模式契约测试覆盖。
 
 ## 6. fake 服务模式（仅测试）
 

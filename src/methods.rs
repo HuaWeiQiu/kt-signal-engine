@@ -603,6 +603,65 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
+        // 信封。协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
+        //（-32603）：recipient/data 缺失或形状错、data 非 base64/空、urgency
+        // 非法枚举、destinationDeviceId 超 u32。群组通话走 SFU 面明确不做
+        //（groupId 形态 fail-closed，compat §5 通话消息块）。
+        "sendCallMessage" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let recipient = params.get("recipient").and_then(Value::as_str);
+            let data = params
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_call_data);
+            let urgency = match params.get("urgency") {
+                None | Some(Value::Null) => {
+                    Some(presage::proto::call_message::opaque::Urgency::Droppable)
+                }
+                Some(Value::String(text)) => match text.as_str() {
+                    "droppable" => Some(presage::proto::call_message::opaque::Urgency::Droppable),
+                    "handleImmediately" => {
+                        Some(presage::proto::call_message::opaque::Urgency::HandleImmediately)
+                    }
+                    _ => None,
+                },
+                Some(_) => None,
+            };
+            let destination = match params.get("destinationDeviceId") {
+                None | Some(Value::Null) => Some(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|item| u32::try_from(item).ok())
+                    .map(Some),
+            };
+            if params.get("groupId").is_some() {
+                return internal_error(id);
+            }
+            match (account, recipient, data, urgency, destination) {
+                (Some(account), Some(recipient), Some(data), Some(urgency), Some(destination)) => {
+                    match service
+                        .send_call_message(
+                            account,
+                            recipient,
+                            crate::service::SendCallMessage {
+                                data,
+                                urgency,
+                                destination_device_id: destination,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头）；
         // fake 模式恒已注册。
         "getUserStatus" => {

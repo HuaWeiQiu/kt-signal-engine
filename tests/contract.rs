@@ -295,6 +295,14 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 sendCallMessage：send 系同折叠（打开已注册 manager 前置
+    // 即内部失败，不触网；通话消息面 KT 扩展批）。
+    let (code, message) = engine.error_of(
+        "sendCallMessage",
+        json!({ "account": "+15559990000", "recipient": "+15555550101", "data": "c2lnbmFsLXJ0Yw==" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -1175,6 +1183,88 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
     assert_eq!(open_entry["params"]["senderAci"], json!(sender_aci));
     assert_eq!(open_entry["params"]["timestamp"], json!(42));
     assert_eq!(open_entry["params"]["account"], json!(number));
+}
+
+/// 通话消息面（sendCallMessage，KT 扩展批）：fake 形状成功 {"timestamp":u64}；
+/// 参数面 fail-closed 逐形状（-32603：account/recipient/data 缺失、data 非
+/// base64/空、urgency 非法/非字符串、destinationDeviceId 超 u32/非数值、
+/// groupId 形态禁入——群组通话走 SFU 不在本面）；协议上行面落调度日志。
+#[test]
+fn call_message_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("call-message");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let data = "c2lnbmFsLXJ0Yw=="; // base64("signal-rtc")
+
+    // fake 成功面：直聊单收件人 {"timestamp": u64}；urgency/destinationDeviceId
+    // 缺省（droppable/不定向）与显式同形。
+    for params in [
+        json!({ "account": number, "recipient": "+15555550101", "data": data }),
+        json!({ "account": number, "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "data": data, "urgency": "handleImmediately" }),
+        json!({ "account": number, "recipient": "+15555550101", "data": data, "urgency": "droppable", "destinationDeviceId": 2 }),
+    ] {
+        let ok = engine.request("sendCallMessage", params.clone());
+        assert!(
+            ok["result"]["timestamp"].is_u64(),
+            "fake sendCallMessage ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "recipient": "+15555550101", "data": data }),
+        json!({ "account": number, "data": data }),
+        json!({ "account": number, "recipient": "+15555550101" }),
+        json!({ "account": number, "recipient": "+15555550101", "data": "not@base64!" }),
+        json!({ "account": number, "recipient": "+15555550101", "data": "" }),
+        json!({ "account": number, "recipient": "+15555550101", "data": data, "urgency": "urgent" }),
+        json!({ "account": number, "recipient": "+15555550101", "data": data, "urgency": 1 }),
+        json!({ "account": number, "recipient": "+15555550101", "data": data, "destinationDeviceId": 4_294_967_296u64 }),
+        json!({ "account": number, "recipient": "+15555550101", "data": data, "destinationDeviceId": "2" }),
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "data": data }),
+    ];
+    for params in &rejects {
+        let response = engine.request("sendCallMessage", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendCallMessage rejects {params}"
+        );
+    }
+
+    // 调度日志：data/urgency/destinationDeviceId 逐字保留（协议上行面纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendCallMessage")
+        .expect("sendCallMessage logged");
+    assert_eq!(entry["params"]["data"], json!(data));
+    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
+    assert_eq!(entry["params"]["account"], json!(number));
+    let explicit = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "sendCallMessage"
+                && entry["params"].get("destinationDeviceId") == Some(&json!(2))
+        })
+        .expect("explicit urgency+device call logged");
+    assert_eq!(explicit["params"]["urgency"], json!("droppable"));
+    assert_eq!(explicit["params"]["destinationDeviceId"], json!(2));
 }
 
 /// setExpirationTimer（消失消息 E 批）：fake 形状成功 {"timestamp":u64}

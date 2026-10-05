@@ -99,6 +99,26 @@ pub(crate) struct SendSticker {
     pub(crate) height: Option<u32>,
 }
 
+/// sendCallMessage 参数（通话消息面，KT 扩展方法）：opaque 字节已 base64
+/// 解码；引擎不解析 opaque 内容（Signal-RTC 层信令职责，透传）；urgency
+/// 缺省 Droppable（proto 同缺省语义）；destinationDeviceId 官方多设备
+/// 定向投递位，缺省不写。
+pub(crate) struct SendCallMessage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) urgency: presage::proto::call_message::opaque::Urgency,
+    pub(crate) destination_device_id: Option<u32>,
+}
+
+/// callMessage.opaque.data 解码：标准 base64、非空（官方 Opaque.data 必有
+/// 信令负载；空负载无语义 fail-closed）。
+pub(crate) fn decode_call_data(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .ok()?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
 /// 附件条数上限：与接收投影 §4.13/compat receive 32 条同口径，超出
 /// fail-closed。
 const ATTACHMENT_MAX_COUNT: usize = 32;
@@ -958,6 +978,48 @@ impl Service {
         Ok(())
     }
 
+    /// sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
+    /// 信封（CallMessage{opaque{data, urgency}}，destinationDeviceId 在场才
+    /// 写）。opaque 为 Signal-RTC 层信令负载，引擎不解析只透传（桌面
+    /// callingMessage 面同构：offer/answer/ice/hangup/busy 都封装在 opaque
+    /// 内）。收件人号码/UUID 双形态解析（send 系同口径）。发送面偏差（compat
+    /// §5 通话消息块登记）：官方 call 消息 online=true 不排队，presage
+    /// send_message 硬编码 online_only=false（上游 TODO issue #252）——引擎
+    /// 发出的 call 信封离线可排队，属可接受偏差；CallMessage 无 sent
+    /// transcript（上游 create_multi_device_sent_transcript_content 对
+    /// CallMessage 返回 None），本机其他设备不同步自发 call 记录。
+    pub(crate) async fn send_call_message(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        payload: SendCallMessage,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let service_id = resolve_recipient(&manager, recipient)
+            .await
+            .ok_or(SendError::Internal)?;
+        let timestamp = now_ms();
+        let body = presage::proto::CallMessage {
+            opaque: Some(presage::proto::call_message::Opaque {
+                data: Some(payload.data),
+                urgency: Some(payload.urgency as i32),
+            }),
+            destination_device_id: payload.destination_device_id,
+            ..presage::proto::CallMessage::default()
+        };
+        manager
+            .send_message(service_id, body, timestamp)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(timestamp)
+    }
+
     /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
     /// profile 拆名面（givenName/familyName）presage Contact 未建模，P2+ 补。
     pub(crate) async fn list_contacts(
@@ -1703,7 +1765,8 @@ async fn serve_account_stream(
 /// 群组接收投影：dataMessage.groupV2 / sent 内群组投影 signal-cli 同款
 /// `groupInfo{groupId}`（connector 群会话管线既有形状）；群更新类消息
 /// （groupContext/groupChange 非空）v1 仍整体跳过（成员变更/权限面后续阶段）。
-/// call/story/null 体跳过。
+/// 通话消息面（2026-10-06 扩展批）：CallMessage 1:1 信令透投影 +
+/// SyncMessage.CallEvent 通话记录同步投影；story/null 体跳过。
 /// 形状钉定 signal-cli 0.14.8 JSON（connector implementation-plan §4.13/
 /// §4.19/§4.20），作者号字段在 contacts 命中时给 E.164，未命中给 ACI 字符串。
 async fn project_content(
@@ -1812,11 +1875,20 @@ async fn project_content(
                     let projection = project_view_once_open(open)?;
                     envelope["syncMessage"] = json!({ "viewOnceOpen": projection });
                 }
+                // 通话消息面（KT 扩展）：CallEvent 通话记录同步投影——本机
+                // 其他设备/主设备的 1:1 通话历史写入（官方
+                // callEventSync 同位，桌面 #handleCallEvent 行为对齐）。
+                Some(presage::proto::sync_message::Content::CallEvent(event)) => {
+                    let projection = project_call_event(event)?;
+                    envelope["syncMessage"] = json!({ "callEvent": projection });
+                }
                 _ => return None,
             }
         }
+        ContentBody::CallMessage(call) => {
+            envelope["callMessage"] = project_call_message(call)?;
+        }
         ContentBody::NullMessage(_)
-        | ContentBody::CallMessage(_)
         | ContentBody::StoryMessage(_)
         | ContentBody::DecryptionErrorMessage(_) => return None,
     }
@@ -1903,6 +1975,214 @@ fn project_view_once_open(open: &presage::proto::sync_message::ViewOnceOpen) -> 
             .service_id_string(),
         "timestamp": open.timestamp.unwrap_or(0),
     }))
+}
+
+/// CallMessage 1:1 信令投影（通话消息面，proto 只投影不发明）：opaque.data
+/// base64 + urgency（缺席 = Droppable 原样透出，官方 proto 缺省同语义）；
+/// offer/answer/iceUpdate/busy/hangup/destinationDeviceId 在场字段逐面
+/// 投影（旧线面信令）。空白 CallMessage（无可投影字段）= None 整事件丢弃
+/// （与群组 master key 缺席同款宁缺勿错）。
+fn project_call_message(call: &presage::proto::CallMessage) -> Option<Value> {
+    let mut out = match call.opaque.as_ref() {
+        Some(opaque) => {
+            use base64::Engine as _;
+            let mut value = json!({
+                "opaque": base64::engine::general_purpose::STANDARD
+                    .encode(opaque.data.as_deref().unwrap_or_default()),
+                "urgency": opaque_urgency_json(opaque.urgency),
+            });
+            if let Some(device_id) = call.destination_device_id {
+                value["destinationDeviceId"] = json!(device_id);
+            }
+            value
+        }
+        None => json!({}),
+    };
+    if let Some(offer) = call.offer.as_ref() {
+        let mut value = json!({ "id": offer.id.unwrap_or(0) });
+        if let Some(kind) = offer
+            .r#type
+            .and_then(|kind| presage::proto::call_message::offer::Type::try_from(kind).ok())
+        {
+            value["type"] = json!(offer_type_json(kind));
+        }
+        if let Some(bytes) = offer.opaque.as_deref() {
+            use base64::Engine as _;
+            value["opaque"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+        out["offer"] = value;
+    }
+    if let Some(answer) = call.answer.as_ref() {
+        let mut value = json!({ "id": answer.id.unwrap_or(0) });
+        if let Some(bytes) = answer.opaque.as_deref() {
+            use base64::Engine as _;
+            value["opaque"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+        out["answer"] = value;
+    }
+    if !call.ice_update.is_empty() {
+        out["iceUpdate"] = json!(call
+            .ice_update
+            .iter()
+            .map(|update| {
+                let mut value = json!({ "id": update.id.unwrap_or(0) });
+                if let Some(bytes) = update.opaque.as_deref() {
+                    use base64::Engine as _;
+                    value["opaque"] =
+                        json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+                }
+                value
+            })
+            .collect::<Vec<_>>());
+    }
+    if let Some(busy) = call.busy.as_ref() {
+        out["busy"] = json!({ "id": busy.id.unwrap_or(0) });
+    }
+    if let Some(hangup) = call.hangup.as_ref() {
+        let mut value = json!({ "id": hangup.id.unwrap_or(0) });
+        if let Some(kind) = hangup
+            .r#type
+            .and_then(|kind| presage::proto::call_message::hangup::Type::try_from(kind).ok())
+        {
+            value["type"] = json!(hangup_type_json(kind));
+        }
+        if let Some(device_id) = hangup.device_id {
+            value["deviceId"] = json!(device_id);
+        }
+        out["hangup"] = value;
+    }
+    // offer/answer/opaque 都缺席且无其他信令面：无语义空信封丢弃。
+    if out.as_object().is_some_and(|map| map.is_empty()) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Opaque.urgency → 投影串。缺席 = "droppable"（proto「缺省按 DROPPABLE
+/// 处理」注释同语义；投影显式化，不发明 null）；枚举外值原样缺省折叠。
+fn opaque_urgency_json(urgency: Option<i32>) -> &'static str {
+    match urgency
+        .and_then(|value| presage::proto::call_message::opaque::Urgency::try_from(value).ok())
+    {
+        Some(presage::proto::call_message::opaque::Urgency::HandleImmediately) => {
+            "handleImmediately"
+        }
+        _ => "droppable",
+    }
+}
+
+fn offer_type_json(kind: presage::proto::call_message::offer::Type) -> &'static str {
+    match kind {
+        presage::proto::call_message::offer::Type::OfferVideoCall => "video",
+        _ => "audio",
+    }
+}
+
+fn hangup_type_json(kind: presage::proto::call_message::hangup::Type) -> &'static str {
+    match kind {
+        presage::proto::call_message::hangup::Type::HangupAccepted => "accepted",
+        presage::proto::call_message::hangup::Type::HangupDeclined => "declined",
+        presage::proto::call_message::hangup::Type::HangupBusy => "busy",
+        presage::proto::call_message::hangup::Type::HangupNeedPermission => "needPermission",
+        _ => "normal",
+    }
+}
+
+/// CallEvent 通话记录同步投影（官方 getCallEventForProto 同构）：类型/
+/// 方向/事件枚举投影小写字符串；conversationId 按官方桌面
+/// conversationPeerIdInBytesSchema 口径（16B = UUID 串，否则标准 base64；
+/// ad-hoc 房间 id hex）；callId 官方投影字符串形态（longToString 同构，
+/// JS u64 安全面）。callId 缺席 = 无记录主键丢弃（warn-only，与
+/// viewOnceOpen senderAci 不可解析同纪律，零 stderr）。
+fn project_call_event(event: &presage::proto::sync_message::CallEvent) -> Option<Value> {
+    let call_id = event.call_id?;
+    use presage::proto::sync_message::call_event as event_enum;
+    let kind = event
+        .r#type
+        .and_then(|value| event_enum::Type::try_from(value).ok());
+    let direction = event
+        .direction
+        .and_then(|value| event_enum::Direction::try_from(value).ok());
+    let outcome = event
+        .event
+        .and_then(|value| event_enum::Event::try_from(value).ok());
+    let mut out = json!({
+        "callId": call_id.to_string(),
+        "timestamp": event.timestamp.unwrap_or(0),
+    });
+    if let Some(kind) = kind {
+        out["type"] = json!(call_event_type_json(kind));
+    }
+    if let Some(direction) = direction {
+        out["direction"] = json!(call_event_direction_json(direction));
+    }
+    if let Some(outcome) = outcome {
+        out["event"] = json!(call_event_outcome_json(outcome));
+    }
+    if let Some(bytes) = event.conversation_id.as_deref() {
+        if let Some(conversation_id) = call_event_conversation_id_json(bytes, kind) {
+            out["conversationId"] = json!(conversation_id);
+        }
+    }
+    Some(out)
+}
+
+fn call_event_type_json(kind: presage::proto::sync_message::call_event::Type) -> &'static str {
+    use presage::proto::sync_message::call_event::Type;
+    match kind {
+        Type::AudioCall => "audio",
+        Type::VideoCall => "video",
+        Type::GroupCall => "group",
+        Type::AdHocCall => "ad-hoc",
+        Type::UnknownType => "unknown",
+    }
+}
+
+fn call_event_direction_json(
+    direction: presage::proto::sync_message::call_event::Direction,
+) -> &'static str {
+    use presage::proto::sync_message::call_event::Direction;
+    match direction {
+        Direction::Outgoing => "outgoing",
+        Direction::Incoming => "incoming",
+        Direction::UnknownDirection => "unknown",
+    }
+}
+
+fn call_event_outcome_json(
+    outcome: presage::proto::sync_message::call_event::Event,
+) -> &'static str {
+    use presage::proto::sync_message::call_event::Event;
+    match outcome {
+        Event::Accepted => "accepted",
+        Event::NotAccepted => "not-accepted",
+        Event::Delete => "delete",
+        Event::Observed => "observed",
+        Event::UnknownEvent => "unknown",
+    }
+}
+
+/// CallEvent.conversationId → 会话标识（官方桌面同构）：ad-hoc = 房间 id
+/// hex（roomIdInBytesSchema 同构）；16B = 直聊 ACI UUID 串；否则群 = 标准
+/// base64。空字节无归属语义 → None（键省略，不发明空串）。
+fn call_event_conversation_id_json(
+    bytes: &[u8],
+    kind: Option<presage::proto::sync_message::call_event::Type>,
+) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    use presage::proto::sync_message::call_event::Type;
+    if kind == Some(Type::AdHocCall) {
+        return Some(hex_encode(bytes));
+    }
+    if bytes.len() == 16 {
+        if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+            return Some(uuid.to_string());
+        }
+    }
+    use base64::Engine as _;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 struct PeerDescription {
@@ -3028,6 +3308,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use presage::proto::attachment_pointer::Flags;
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
@@ -4080,5 +4361,353 @@ mod tests {
             .expect("uuid parses")
             .into_bytes()
             .to_vec()
+    }
+
+    /// 通话消息面（KT 扩展批）：CallMessage 收投影——opaque base64+urgency
+    /// （缺席=droppable）+ 旧线面 offer/answer/ice/hangup/busy/destinationDeviceId
+    /// 逐面投影；空 CallMessage 丢弃（宁缺勿错）。
+    #[test]
+    fn call_message_projection_faces() {
+        use base64::Engine as _;
+        use presage::proto::call_message as call;
+
+        // opaque 形态（现行线面）：data base64 + urgency 显式 handleImmediately
+        // + destinationDeviceId。
+        let out = project_call_message(&presage::proto::CallMessage {
+            opaque: Some(call::Opaque {
+                data: Some(b"signal-rtc".to_vec()),
+                urgency: Some(call::opaque::Urgency::HandleImmediately as i32),
+            }),
+            destination_device_id: Some(2),
+            ..Default::default()
+        })
+        .expect("opaque call projects");
+        assert_eq!(
+            out["opaque"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"signal-rtc"))
+        );
+        assert_eq!(out["urgency"], json!("handleImmediately"));
+        assert_eq!(out["destinationDeviceId"], json!(2));
+        assert!(out.get("offer").is_none());
+
+        // urgency 缺席 = droppable（proto 缺省语义显式化）；destinationDeviceId
+        // 缺席键不在。
+        let out = project_call_message(&presage::proto::CallMessage {
+            opaque: Some(call::Opaque {
+                data: Some(vec![1]),
+                urgency: None,
+            }),
+            ..Default::default()
+        })
+        .expect("default urgency projects");
+        assert_eq!(out["urgency"], json!("droppable"));
+        assert!(out.get("destinationDeviceId").is_none());
+        // 枚举外值折叠缺省（不炸面）。
+        let out = project_call_message(&presage::proto::CallMessage {
+            opaque: Some(call::Opaque {
+                data: Some(vec![1]),
+                urgency: Some(42),
+            }),
+            ..Default::default()
+        })
+        .expect("unknown urgency folds to droppable");
+        assert_eq!(out["urgency"], json!("droppable"));
+
+        // 旧线面：offer(audio)/answer/ice/hangup(declined)/busy 同一信封。
+        let out = project_call_message(&presage::proto::CallMessage {
+            offer: Some(call::Offer {
+                id: Some(11),
+                r#type: Some(call::offer::Type::OfferAudioCall as i32),
+                opaque: Some(vec![0xaa]),
+            }),
+            answer: Some(call::Answer {
+                id: Some(12),
+                opaque: Some(vec![0xbb]),
+            }),
+            ice_update: vec![call::IceUpdate {
+                id: Some(13),
+                opaque: Some(vec![0xcc]),
+            }],
+            busy: Some(call::Busy { id: Some(14) }),
+            hangup: Some(call::Hangup {
+                id: Some(15),
+                r#type: Some(call::hangup::Type::HangupDeclined as i32),
+                device_id: Some(3),
+            }),
+            ..Default::default()
+        })
+        .expect("legacy call projects");
+        assert_eq!(out["offer"]["id"], json!(11));
+        assert_eq!(out["offer"]["type"], json!("audio"));
+        assert_eq!(
+            out["offer"]["opaque"],
+            json!(base64::engine::general_purpose::STANDARD.encode([0xaa]))
+        );
+        assert_eq!(out["answer"]["id"], json!(12));
+        assert_eq!(out["iceUpdate"][0]["id"], json!(13));
+        assert_eq!(out["busy"]["id"], json!(14));
+        assert_eq!(out["hangup"]["id"], json!(15));
+        assert_eq!(out["hangup"]["type"], json!("declined"));
+        assert_eq!(out["hangup"]["deviceId"], json!(3));
+
+        // offer video 枚举与 hangup normal 投影。
+        let out = project_call_message(&presage::proto::CallMessage {
+            offer: Some(call::Offer {
+                id: Some(1),
+                r#type: Some(call::offer::Type::OfferVideoCall as i32),
+                opaque: None,
+            }),
+            ..Default::default()
+        })
+        .expect("video offer projects");
+        assert_eq!(out["offer"]["type"], json!("video"));
+        assert!(out["offer"].get("opaque").is_none());
+        let out = project_call_message(&presage::proto::CallMessage {
+            hangup: Some(call::Hangup {
+                id: Some(1),
+                r#type: Some(call::hangup::Type::HangupNormal as i32),
+                device_id: None,
+            }),
+            ..Default::default()
+        })
+        .expect("hangup projects");
+        assert_eq!(out["hangup"]["type"], json!("normal"));
+
+        // 空 CallMessage：无可投影字段整体丢弃。
+        assert!(project_call_message(&presage::proto::CallMessage::default()).is_none());
+    }
+
+    /// CallEvent sync 投影：枚举串（audio/incoming/accepted 等）+ callId
+    /// 字符串形态（官方 longToString 同构）+ conversationId 三口径（16B
+    /// UUID / 群 base64 / ad-hoc hex）；callId 缺席 = warn-only 丢弃；
+    /// conversationId 空字节键省略。
+    #[test]
+    fn call_event_sync_projection_faces() {
+        use base64::Engine as _;
+        use presage::proto::sync_message::{call_event, CallEvent};
+        let aci_bytes = uuid_bytes("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae");
+
+        // 直聊全字段：16B conversationId → UUID 串。
+        let out = project_call_event(&CallEvent {
+            conversation_id: Some(aci_bytes.clone()),
+            call_id: Some(1_700_000_000_123),
+            timestamp: Some(1_700_000_000_000),
+            r#type: Some(call_event::Type::AudioCall as i32),
+            direction: Some(call_event::Direction::Incoming as i32),
+            event: Some(call_event::Event::Accepted as i32),
+        })
+        .expect("call event projects");
+        assert_eq!(
+            out["conversationId"],
+            json!("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        assert_eq!(out["callId"], json!("1700000000123"));
+        assert_eq!(out["timestamp"], json!(1_700_000_000_000_u64));
+        assert_eq!(out["type"], json!("audio"));
+        assert_eq!(out["direction"], json!("incoming"));
+        assert_eq!(out["event"], json!("accepted"));
+
+        // 群（非 16B 字节）→ 标准 base64；枚举外值按 proto3 未知值语义
+        // 归缺省 UNKNOWN → 键省略（不发明串）。
+        let out = project_call_event(&CallEvent {
+            conversation_id: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            call_id: Some(7),
+            timestamp: None,
+            r#type: Some(call_event::Type::GroupCall as i32),
+            direction: Some(42),
+            event: Some(43),
+        })
+        .expect("group call event projects");
+        assert_eq!(
+            out["conversationId"],
+            json!(base64::engine::general_purpose::STANDARD.encode([0xde, 0xad, 0xbe, 0xef]))
+        );
+        assert_eq!(out["type"], json!("group"));
+        assert!(out.get("direction").is_none(), "枚举外值键省略");
+        assert!(out.get("event").is_none(), "枚举外值键省略");
+        assert_eq!(out["timestamp"], json!(0));
+
+        // ad-hoc：conversationId hex（官方 roomIdInBytesSchema 同构）。
+        let out = project_call_event(&CallEvent {
+            conversation_id: Some(vec![0x01, 0x02, 0x03]),
+            call_id: Some(8),
+            timestamp: Some(9),
+            r#type: Some(call_event::Type::AdHocCall as i32),
+            direction: Some(call_event::Direction::Outgoing as i32),
+            event: Some(call_event::Event::Observed as i32),
+        })
+        .expect("ad-hoc call event projects");
+        assert_eq!(out["conversationId"], json!("010203"));
+        assert_eq!(out["type"], json!("ad-hoc"));
+        assert_eq!(out["direction"], json!("outgoing"));
+        assert_eq!(out["event"], json!("observed"));
+
+        // 枚举缺席：键省略（不发明 unknown 串）。
+        let out = project_call_event(&CallEvent {
+            conversation_id: Some(aci_bytes.clone()),
+            call_id: Some(1),
+            timestamp: Some(2),
+            ..Default::default()
+        })
+        .expect("bare call event projects");
+        assert!(out.get("type").is_none());
+        assert!(out.get("direction").is_none());
+        assert!(out.get("event").is_none());
+
+        // conversationId 空字节：键省略（不发明空串/空 base64）。
+        let out = project_call_event(&CallEvent {
+            conversation_id: Some(Vec::new()),
+            call_id: Some(1),
+            ..Default::default()
+        })
+        .expect("empty conversation id omits key");
+        assert!(out.get("conversationId").is_none());
+
+        // callId 缺席：无记录主键，warn-only 整事件丢弃（零 stderr）。
+        assert!(project_call_event(&CallEvent {
+            conversation_id: Some(aci_bytes),
+            call_id: None,
+            ..Default::default()
+        })
+        .is_none());
+    }
+
+    /// send 构造面：opaque data 非空 + urgency/destinationDeviceId 透传；
+    /// 解码面 fail-closed（非 base64 / 空负载）。
+    #[test]
+    fn call_message_send_payload_and_decode_faces() {
+        use base64::Engine as _;
+        use presage::proto::call_message::opaque::Urgency;
+
+        let data = decode_call_data(&base64::engine::general_purpose::STANDARD.encode(b"payload"))
+            .expect("valid base64 decodes");
+        assert_eq!(data, b"payload".to_vec());
+        assert!(decode_call_data("not@base64!").is_none(), "非 base64 拒绝");
+        assert!(decode_call_data("").is_none(), "空负载拒绝");
+        assert!(
+            decode_call_data(&base64::engine::general_purpose::STANDARD.encode([])).is_none(),
+            "空串 base64 同为空负载拒绝"
+        );
+
+        let payload = SendCallMessage {
+            data: b"payload".to_vec(),
+            urgency: Urgency::HandleImmediately,
+            destination_device_id: Some(4),
+        };
+        assert_eq!(payload.data, b"payload".to_vec());
+        assert_eq!(payload.urgency, Urgency::HandleImmediately);
+        assert_eq!(payload.destination_device_id, Some(4));
+    }
+
+    /// 收投影全信封面：CallMessage 体 → receive 通知信封 callMessage 键；
+    /// CallEvent sync 体 → syncMessage.callEvent 键（投影函数经
+    /// project_content 接线防回归）。
+    #[tokio::test]
+    async fn call_faces_wire_into_receive_envelope() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::call_message as call;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-call-envelope-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let metadata = envelope_metadata();
+
+        // CallMessage：信封带 callMessage{opaque, urgency}。
+        let content = Content::from_body(
+            ContentBody::CallMessage(presage::proto::CallMessage {
+                opaque: Some(call::Opaque {
+                    data: Some(b"rtc".to_vec()),
+                    urgency: None,
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let registry = groups::TerminatedGroups::new();
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("call message projects to receive");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(
+            envelope["callMessage"]["opaque"],
+            json!(base64::engine::general_purpose::STANDARD.encode(b"rtc"))
+        );
+        assert_eq!(envelope["callMessage"]["urgency"], json!("droppable"));
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+
+        // CallEvent sync：信封带 syncMessage.callEvent。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                content: Some(presage::proto::sync_message::Content::CallEvent(
+                    presage::proto::sync_message::CallEvent {
+                        conversation_id: Some(uuid_bytes("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")),
+                        call_id: Some(42),
+                        timestamp: Some(43),
+                        r#type: Some(
+                            presage::proto::sync_message::call_event::Type::VideoCall as i32,
+                        ),
+                        direction: Some(
+                            presage::proto::sync_message::call_event::Direction::Outgoing as i32,
+                        ),
+                        event: Some(
+                            presage::proto::sync_message::call_event::Event::NotAccepted as i32,
+                        ),
+                    },
+                )),
+                ..presage::proto::SyncMessage::with_padding(&mut rng())
+            }),
+            metadata,
+        );
+        let registry = groups::TerminatedGroups::new();
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("call event sync projects to receive");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(
+            envelope["syncMessage"]["callEvent"]["conversationId"],
+            json!("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        assert_eq!(envelope["syncMessage"]["callEvent"]["callId"], json!("42"));
+        assert_eq!(envelope["syncMessage"]["callEvent"]["type"], json!("video"));
+        assert_eq!(
+            envelope["syncMessage"]["callEvent"]["direction"],
+            json!("outgoing")
+        );
+        assert_eq!(
+            envelope["syncMessage"]["callEvent"]["event"],
+            json!("not-accepted")
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    fn envelope_metadata() -> presage::libsignal_service::content::Metadata {
+        use presage::libsignal_service::content::Metadata;
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        }
     }
 }
