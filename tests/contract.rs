@@ -512,6 +512,198 @@ fn sticker_pack_sync_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// 头像下行（getAvatar，KT 扩展方法）：fake 模式可达「无头像」结构化错误
+/// 面（AVATAR_UNAVAILABLE，-1 + message 码位）；参数面 fail-closed -32603
+///（缺参/形状错/会话标识垃圾形状，细节不外泄）。
+#[test]
+fn avatar_fake_unavailable_and_param_fail_closed() {
+    let dir = temp_dir("avatar-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 合法参数（1:1 / 号码 / 群三形状同口径）→ AVATAR_UNAVAILABLE。
+    let conversation_ids = [
+        "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        "+15551234567",
+        // 32B master key 标准 base64（listGroups groupId 同口径，44 字符）。
+        "pqampqampqampqampqampqampqampqampqampqampqY=",
+    ];
+    for conversation_id in conversation_ids {
+        let (code, message) = engine.error_of(
+            "getAvatar",
+            json!({ "account": "+15550000000", "conversationId": conversation_id }),
+        );
+        assert_eq!((code, message.as_str()), (-1, "AVATAR_UNAVAILABLE"));
+    }
+
+    // 缺 account / 缺 conversationId / conversationId 垃圾形状 / account
+    // 非字符串 → -32603（参数面不占用结构化码）。
+    let (code, _) = engine.error_of("getAvatar", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getAvatar", json!({ "account": "+15550000000" }));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "getAvatar",
+        json!({ "account": "+15550000000", "conversationId": "contact:xyz" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "getAvatar",
+        json!({ "account": 7, "conversationId": "+15551234567" }),
+    );
+    assert_eq!(code, -32603);
+}
+
+/// 会话拉黑写面（setConversationBlocked，KT 扩展方法）：fake 模式成功回写
+/// 后 blocked 名单（空表）；参数面 fail-closed -32603（置顶面同款：kind
+/// 缺失/未知、blocked 非布尔，storage 四码只覆盖链路）。
+#[test]
+fn conversation_blocked_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("blocked-write-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 写：contact / group / legacyGroup 三 kind 同构成功面。
+    for kind in ["contact", "group", "legacyGroup"] {
+        assert_eq!(
+            engine.request(
+                "setConversationBlocked",
+                json!({ "account": "+15550000000", "conversationId": "x", "kind": kind, "blocked": true }),
+            )["result"],
+            json!({ "blocked": [] })
+        );
+    }
+
+    // 缺 account / 未知 kind / 缺 blocked / blocked 非布尔 → -32603。
+    let (code, _) = engine.error_of("setConversationBlocked", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationBlocked",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "bogus", "blocked": true }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationBlocked",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationBlocked",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact", "blocked": "yes" }),
+    );
+    assert_eq!(code, -32603);
+}
+
+/// 举报垃圾消息（reportSpam，KT 扩展方法）：fake 模式全量成功投影
+///（reported = 批大小 + failures 空表）；参数面 fail-closed -32603：缺
+/// targetAci / targetAci 非 UUID / serverGuids 缺失·非数组·空批·元素非
+/// UUID（urn:uuid: 形态同堵）/超官方单批上限 1000 / token 非字符串形状。
+#[test]
+fn report_spam_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("report-spam-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let guid_a = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+    let guid_b = "F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6";
+
+    // fake 合法批：大小写混合 serverGuids → reported = 2 + failures 空。
+    assert_eq!(
+        engine.request(
+            "reportSpam",
+            json!({
+                "account": "+15550000000",
+                "targetAci": "11111111-2222-4333-8444-555555555555",
+                "serverGuids": [guid_a, guid_b],
+            })
+        )["result"],
+        json!({ "reported": 2, "failures": [] })
+    );
+
+    // token 缺省/null 同成功形状；token 在场（string）同形状。
+    for token in [None, Some(Value::Null), Some(json!("report-token"))] {
+        let mut params = json!({
+            "account": "+15550000000",
+            "targetAci": "11111111-2222-4333-8444-555555555555",
+            "serverGuids": [guid_a],
+        });
+        if let Some(token) = token {
+            params["token"] = token;
+        }
+        assert_eq!(
+            engine.request("reportSpam", params)["result"],
+            json!({ "reported": 1, "failures": [] })
+        );
+    }
+
+    // 缺 targetAci / targetAci 非 UUID → -32603。
+    let (code, _) = engine.error_of("reportSpam", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "serverGuids": [guid_a] }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "targetAci": "not-a-uuid", "serverGuids": [guid_a] }),
+    );
+    assert_eq!(code, -32603);
+
+    // serverGuids 缺失 / 非数组 / 空批 / 元素非 UUID（含 urn:uuid: 与垃圾
+    // 串，防路径注入）→ -32603。
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "targetAci": "11111111-2222-4333-8444-555555555555" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "targetAci": "11111111-2222-4333-8444-555555555555", "serverGuids": "6a2cb17f" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "targetAci": "11111111-2222-4333-8444-555555555555", "serverGuids": [] }),
+    );
+    assert_eq!(code, -32603);
+    for bad_guid in ["garbage", "urn:uuid:6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"] {
+        let (code, _) = engine.error_of(
+            "reportSpam",
+            json!({ "account": "+15550000000", "targetAci": "11111111-2222-4333-8444-555555555555", "serverGuids": [bad_guid] }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // 元素非字符串（数字）→ -32603。
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({ "account": "+15550000000", "targetAci": "11111111-2222-4333-8444-555555555555", "serverGuids": [42] }),
+    );
+    assert_eq!(code, -32603);
+
+    // 超官方单批上限（1000，reportSpamJobQueue zod max 同源）→ -32603。
+    let oversized: Vec<String> = (0..1001)
+        .map(|index| format!("{index:08x}-0000-4000-8000-000000000000"))
+        .collect();
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({
+            "account": "+15550000000",
+            "targetAci": "11111111-2222-4333-8444-555555555555",
+            "serverGuids": oversized,
+        }),
+    );
+    assert_eq!(code, -32603);
+
+    // token 非字符串形状 → -32603。
+    let (code, _) = engine.error_of(
+        "reportSpam",
+        json!({
+            "account": "+15550000000",
+            "targetAci": "11111111-2222-4333-8444-555555555555",
+            "serverGuids": [guid_a],
+            "token": 42,
+        }),
+    );
+    assert_eq!(code, -32603);
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");

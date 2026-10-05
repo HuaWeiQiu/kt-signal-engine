@@ -957,6 +957,119 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 头像下行（getAvatar，KT 扩展方法）：1:1 与群统一入口，读面不落
+        // 调度日志（listContacts/getPinnedConversations 同纪律）。conversationId
+        // 形状在服务层分派（ServiceId/号码/群 master key），形状非法与账号
+        // 不可达同折叠 -32603（参数面 fail-closed，细节不外泄）；头像面错误
+        // 折叠结构化码（avatar_error，compat §4.36 同款 -1 + message 码位）。
+        "getAvatar" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let conversation_id = params.get("conversationId").and_then(Value::as_str);
+            match (account, conversation_id) {
+                (Some(account), Some(conversation_id)) => {
+                    match service.get_avatar(account, conversation_id).await {
+                        Ok(payload) => jsonrpc::success_response(
+                            id,
+                            json!({ "dataUri": payload.data_uri, "size": payload.size }),
+                        ),
+                        Err(error) => avatar_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        // 会话拉黑写面（setConversationBlocked，KT 扩展方法）：Storage
+        // Service 真相源，参数纪律与置顶面同款（kind 缺失/未知、blocked 非
+        // 布尔一律 fail-closed -32603，不占用结构化码）；返回写后全量
+        // blocked 名单（getBlockedConversations 同形状）。
+        "setConversationBlocked" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let conversation_id = params.get("conversationId").and_then(Value::as_str);
+            let kind = params.get("kind").and_then(Value::as_str);
+            let Some(blocked) = params.get("blocked").and_then(Value::as_bool) else {
+                return internal_error(id);
+            };
+            let Some(conversation) = conversation_of(conversation_id, kind) else {
+                return internal_error(id);
+            };
+            match service
+                .set_conversation_blocked(account, conversation, blocked)
+                .await
+            {
+                Ok(entries) => jsonrpc::success_response(id, blocked_payload(&entries)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        // 举报垃圾消息（reportSpam，KT 扩展方法）：协议上行面，落调度日志
+        //（send 系/setExpirationTimer 同纪律）。serverGuids 每项必须可解析
+        // UUID（fail-closed -32603，防路径注入）且单批 ≤1000（官方
+        // reportSpamJobQueue zod max(1000)）；空批 = 无意图调用 fail-closed
+        //（setAccountConfiguration 零可写字段先例）。token 只能是
+        // string|null|缺省；部分失败诚实投影（failures 逐条带状态码）。
+        "reportSpam" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let target_aci = params.get("targetAci").and_then(Value::as_str).and_then(
+                presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string,
+            );
+            let token = match params.get("token") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text.as_str()),
+                Some(_) => return internal_error(id),
+            };
+            let server_guids = match params.get("serverGuids") {
+                Some(Value::Array(entries)) => {
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry
+                            .as_str()
+                            .and_then(crate::service::report::normalize_server_guid)
+                        {
+                            Some(guid) => parsed.push(guid),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                _ => return internal_error(id),
+            };
+            if server_guids.is_empty()
+                || server_guids.len() > crate::service::report::REPORT_SPAM_MAX_GUIDS
+            {
+                return internal_error(id);
+            }
+            match (account, target_aci) {
+                (Some(account), Some(target_aci)) => {
+                    match service
+                        .report_spam(account, target_aci, server_guids, token.map(str::to_owned))
+                        .await
+                    {
+                        Ok(outcome) => jsonrpc::success_response(
+                            id,
+                            json!({
+                                "reported": outcome.reported,
+                                "failures": outcome.failures.iter().map(|failure| {
+                                    json!({
+                                        "serverGuid": failure.server_guid,
+                                        "status": failure.status,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            }),
+                        ),
+                        Err(crate::service::report::ReportSpamError::UnknownAccount) => {
+                            internal_error(id)
+                        }
+                        Err(crate::service::report::ReportSpamError::AllFailed) => {
+                            jsonrpc::error_response(id, &RpcError::new(-1, "REPORT_SPAM_FAILED"))
+                        }
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // 备份导出消费面（compat §3/§5「备份导出消费面」注册块 + 契约
         // §10.4）：参数面 fail-closed -32603（缺 account/未注册/fake 账号/
         // AEP 缺失）；结构化码 -1 + message 码位（契约 §10.7，connector 契约
@@ -1085,6 +1198,22 @@ fn sticker_error(id: &Value, error: crate::service::stickers::StickerError) -> V
         crate::service::stickers::StickerError::Fetch => (-1, "STICKER_PACK_FETCH_FAILED"),
         crate::service::stickers::StickerError::Malformed => (-1, "STICKER_PACK_MALFORMED"),
         crate::service::stickers::StickerError::ImageTooLarge => (-1, "STICKER_IMAGE_TOO_LARGE"),
+    };
+    jsonrpc::error_response(id, &RpcError::new(code, message))
+}
+
+/// 头像面错误 → JSON-RPC 错误码（-1 + message 码位，置顶/贴纸面白名单
+/// 风格）：参数不指向可达目标（UnknownAccount/UnknownConversation）→
+/// -32603（非头像面，细节不外泄）；无头像（未同步 profile_key/对端或群未
+/// 设头像/服务器 403/404）→ AVATAR_UNAVAILABLE；网络/下载/解密失败 →
+/// AVATAR_FETCH_FAILED；超 10MB 帽 → AVATAR_TOO_LARGE。
+fn avatar_error(id: &Value, error: crate::service::avatar::AvatarError) -> Value {
+    let (code, message) = match error {
+        crate::service::avatar::AvatarError::UnknownAccount => (-32603, "Internal error"),
+        crate::service::avatar::AvatarError::UnknownConversation => (-32603, "Internal error"),
+        crate::service::avatar::AvatarError::Unavailable => (-1, "AVATAR_UNAVAILABLE"),
+        crate::service::avatar::AvatarError::FetchFailed => (-1, "AVATAR_FETCH_FAILED"),
+        crate::service::avatar::AvatarError::TooLarge => (-1, "AVATAR_TOO_LARGE"),
     };
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }

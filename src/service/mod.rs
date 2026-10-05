@@ -40,8 +40,10 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 
 use crate::state::EngineState;
 
+pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod profile;
+pub(crate) mod report;
 pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
@@ -1356,6 +1358,22 @@ impl Service {
         storage_sync::write_pinned(&context, conversation, pinned).await
     }
 
+    /// setConversationBlocked（拉黑写面）：官方写语义（读改写目标会话
+    /// 记录，仅动 blocked 位 + blockedAtTimestamp）+ 409 冲突重放；返回
+    /// 写后全量 blocked 名单（存储序，与置顶面同构）。fake 模式空表桩。
+    pub(crate) async fn set_conversation_blocked(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: storage_sync::EngineConversationId,
+        blocked: bool,
+    ) -> Result<Vec<storage_sync::EngineConversationId>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::write_blocked(&context, &conversation, blocked, now_ms()).await
+    }
+
     /// getStickerPackSyncs（P5 扩面）：读全部贴纸包安装状态（存储序 =
     /// manifest STICKER identifiers 首现序；坏条目跳过不炸面）。
     pub(crate) async fn sticker_pack_syncs(
@@ -1427,6 +1445,36 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sync::write_universal_expire_timer(&context, expiration_seconds).await
+    }
+
+    /// getAvatar（头像下行，KT 扩展方法）：1:1 与群统一入口，presage 官方
+    /// 头像下行 API（缓存/CDN/解密/入库），fake 模式可达「无头像」错误面。
+    pub(crate) async fn get_avatar(
+        self: &Arc<Self>,
+        account: &str,
+        conversation_id: &str,
+    ) -> Result<avatar::AvatarPayload, avatar::AvatarError> {
+        avatar::get_avatar(self, account, conversation_id).await
+    }
+
+    /// reportSpam（举报，KT 扩展方法）：官方 v1/messages/report 逐条 POST
+    /// （本机凭据 basic auth），部分失败收敛（全部失败才报错）；fake 模式
+    /// 全量成功形状桩（send 系同款纪律）。
+    pub(crate) async fn report_spam(
+        self: &Arc<Self>,
+        account: &str,
+        sender_aci: ServiceId,
+        server_guids: Vec<String>,
+        token: Option<String>,
+    ) -> Result<report::ReportOutcome, report::ReportSpamError> {
+        if !self.real {
+            return Ok(report::ReportOutcome {
+                reported: server_guids.len(),
+                failures: Vec::new(),
+            });
+        }
+        let context = storage_context(self, account).await?;
+        report::report_spam(&context, &sender_aci, &server_guids, token.as_deref()).await
     }
 }
 
@@ -1609,6 +1657,13 @@ async fn project_content(
         "sourceDevice": u32::from(content.metadata.sender_device),
         "timestamp": envelope_ts,
     });
+    // 举报面（reportSpam 批）：server_guid = 信封公共位（服务器为该条消息
+    // 分配的 UUID，举报 API 的路径参数；proto 只投影不发明，缺席键不在）。
+    // envelope 级 reportSpamToken 经 presage Content 转换丢弃（Metadata 不
+    // 携带），token 不在本投影——compat §5 reportSpam 块登记。
+    if let Some(server_guid) = content.metadata.server_guid.as_ref() {
+        envelope["serverGuid"] = json!(server_guid.to_string());
+    }
     if let Some(peer) = describe_peer(store, &content.metadata.sender).await {
         if let Some(number) = peer.number {
             envelope["sourceNumber"] = json!(number);
@@ -2746,7 +2801,7 @@ async fn resolve_recipient(
     Some(ServiceId::Aci(contact.uuid.into()))
 }
 
-async fn find_contact_by_number(
+pub(crate) async fn find_contact_by_number(
     manager: &Manager<SqliteStore, Registered>,
     number: &str,
 ) -> Option<presage::model::contacts::Contact> {
@@ -3642,6 +3697,83 @@ mod tests {
             serde_json::from_str(&round.to_string()).expect("re-deserializes");
         let round2: Value = serde_json::to_value(&data2).expect("re-serializes");
         assert_eq!(round2, value);
+    }
+
+    /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid
+    /// 在场 → 信封带 serverGuid（UUID 串形态）；缺席 → 键不在（proto 只投影
+    /// 不发明）；token 不透投影（presage Content 转换丢弃 envelope 级
+    /// reportSpamToken，compat §5 reportSpam 块登记的已知边界）。基础信封位
+    /// （sourceUuid/sourceDevice/timestamp）同批防回归。
+    #[tokio::test]
+    async fn receive_envelope_projects_server_guid_when_present() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-server-guid-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |server_guid| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid,
+        };
+        let server_guid = presage::libsignal_service::prelude::Uuid::parse_str(
+            "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+        )
+        .expect("server guid");
+
+        // 在场：信封带 serverGuid（字符串形态）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("hello".to_owned()),
+                ..Default::default()
+            }),
+            metadata(Some(server_guid)),
+        );
+        let envelope = project_content("acct", &store, &content)
+            .await
+            .expect("dataMessage projects");
+        let envelope = &envelope["params"]["envelope"];
+        assert_eq!(
+            envelope["serverGuid"],
+            json!("f81d4fae-7dec-11d0-a765-00a0c91e6bf6")
+        );
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(envelope["sourceDevice"], json!(1));
+        assert_eq!(envelope["timestamp"], json!(1_700_000_000_000_u64));
+
+        // 缺席：键不在（不发明 null/空串）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata(None),
+        );
+        let envelope = project_content("acct", &store, &content)
+            .await
+            .expect("dataMessage projects");
+        assert!(envelope.get("serverGuid").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     fn uuid_bytes(text: &str) -> Vec<u8> {

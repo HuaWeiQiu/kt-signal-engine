@@ -353,11 +353,15 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
         .map(|identifier| identifier.raw.clone())
 }
 
-/// 写面记录类别（manifest identifier type：Account=4、StickerPack=6）。
+/// 写面记录类别（manifest identifier type：Account=4、StickerPack=6、
+/// Contact=1、GroupV1=2、GroupV2=3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageRecordKind {
     Account,
     StickerPack,
+    Contact,
+    GroupV1,
+    GroupV2,
 }
 
 impl StorageRecordKind {
@@ -368,6 +372,9 @@ impl StorageRecordKind {
         match self {
             Self::Account => manifest_record::identifier::Type::Account as i32,
             Self::StickerPack => crate::service::storage_sticker::STICKER_PACK_IDENTIFIER_TYPE,
+            Self::Contact => manifest_record::identifier::Type::Contact as i32,
+            Self::GroupV1 => manifest_record::identifier::Type::Groupv1 as i32,
+            Self::GroupV2 => manifest_record::identifier::Type::Groupv2 as i32,
         }
     }
 }
@@ -388,6 +395,11 @@ pub(crate) struct RecordUpsert {
 pub(crate) enum RecordPayload {
     Account(AccountRecord),
     StickerPack(crate::service::storage_sticker::StickerPackRecord),
+    /// 拉黑写面三类记录（官方 vendored proto 完整字段面，decode→mutate→
+    /// encode 保真；与 Account 同一加解密 shim 通道）。
+    Contact(storage_proto::ContactRecord),
+    GroupV1(storage_proto::GroupV1Record),
+    GroupV2(storage_proto::GroupV2Record),
 }
 
 /// plan_record_writes 的产出：WriteOperation + 明文 manifest（调用方投影
@@ -431,7 +443,12 @@ pub(crate) fn plan_record_writes(
                     identifier.r#type() != manifest_record::identifier::Type::Account
                 });
             }
-            StorageRecordKind::StickerPack => {
+            // 多条并存类别（贴纸包/联系人/GV1/GV2）：仅清除 replaced_key
+            // 对应标识（同类型同实体的旧 identifier 进 deleteKey）。
+            StorageRecordKind::StickerPack
+            | StorageRecordKind::Contact
+            | StorageRecordKind::GroupV1
+            | StorageRecordKind::GroupV2 => {
                 if let Some(old_key) = &upsert.replaced_key {
                     identifiers.retain(|identifier| {
                         !(identifier.r#type == upsert.kind.identifier_type()
@@ -450,7 +467,8 @@ pub(crate) fn plan_record_writes(
         let item = match &upsert.payload {
             // Account 载荷用官方 vendored proto 编码（完整字段面），经本地
             // item 加解密 shim 上行（与上游 encrypt_item 派生一致，交叉
-            // 验证单测钉定）；StickerPack 同 shim（上游 proto 缺该记录）。
+            // 验证单测钉定）；StickerPack 同 shim（上游 proto 缺该记录）；
+            // Contact/GV1/GV2 同 shim（拉黑写面，vendored 完整字段面保真）。
             RecordPayload::Account(account) => encrypt_raw_item(
                 storage_key,
                 upsert.new_key.clone(),
@@ -466,6 +484,39 @@ pub(crate) fn plan_record_writes(
                 storage_key,
                 upsert.new_key.clone(),
                 &crate::service::storage_sticker::sticker_record_wire(record),
+                record_ikm_opt,
+            ),
+            RecordPayload::Contact(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::Contact(
+                        record.clone(),
+                    )),
+                }
+                .encode_to_vec(),
+                record_ikm_opt,
+            ),
+            RecordPayload::GroupV1(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::GroupV1(
+                        record.clone(),
+                    )),
+                }
+                .encode_to_vec(),
+                record_ikm_opt,
+            ),
+            RecordPayload::GroupV2(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::GroupV2(
+                        record.clone(),
+                    )),
+                }
+                .encode_to_vec(),
                 record_ikm_opt,
             ),
         };
@@ -903,6 +954,410 @@ pub(crate) async fn read_blocked_conversations(
     read_blocked_ids(&context.push, &storage_key, &manifest).await
 }
 
+// ---------------------------------------------------------------------------
+// 拉黑写面（setConversationBlocked，官方 storageRecordOps 行为对齐不抄码：
+// 逐会话记录 blocked 位 + blockedAt；解除 = blocked=false；纯拉黑不删会话；
+// 多设备/手机经 storage sync 收敛，无 SyncMessage.Blocked 通道——compat §5）
+// ---------------------------------------------------------------------------
+
+/// 会话明文记录 → 引擎会话标识（不看 blocked 位；Contact/GV1/GV2 三类参
+/// 与，写面定位目标用；标识口径与 `blocked_conversation_of` 读投影同构）。
+fn conversation_record_of(plaintext: &[u8]) -> Option<EngineConversationId> {
+    let record = storage_proto::StorageRecord::decode(plaintext)
+        .ok()?
+        .record?;
+    match record {
+        storage_proto::storage_record::Record::Contact(contact) => contact_engine_id(&contact),
+        storage_proto::storage_record::Record::GroupV1(group) if !group.id.is_empty() => Some(
+            EngineConversationId::LegacyGroup(String::from_utf8_lossy(&group.id).into_owned()),
+        ),
+        storage_proto::storage_record::Record::GroupV2(group) if !group.master_key.is_empty() => {
+            Some(EngineConversationId::Group(
+                base64::engine::general_purpose::STANDARD.encode(&group.master_key),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// 单条明文记录拉黑位翻面（decode→mutate 只动 blocked 面，encode 保真其余
+/// 字段）：置 blocked=true 时写 blockedAtTimestamp=now（首次拉黑时刻；已拉
+/// 黑不重写=保住他端时刻，含 0=未知原样保留），解除清零（blocked=false +
+/// blockedAt=0）。GV1 无时间戳字段（官方 proto 同构）。意图已满足 →
+/// None（幂等无写）。解码失败 → ReadFailed（目标在云上但读不出）。
+fn flip_blocked(
+    plaintext: &[u8],
+    blocked: bool,
+    now_ms: u64,
+) -> Result<Option<(StorageRecordKind, RecordPayload)>, StorageSyncError> {
+    use storage_proto::storage_record::Record as WireRecord;
+    let record = storage_proto::StorageRecord::decode(plaintext)
+        .ok()
+        .and_then(|decoded| decoded.record)
+        .ok_or(StorageSyncError::ReadFailed)?;
+    Ok(match record {
+        WireRecord::Contact(contact) => contact_with_blocked(&contact, blocked, now_ms)
+            .map(|updated| (StorageRecordKind::Contact, RecordPayload::Contact(updated))),
+        WireRecord::GroupV1(group) => group_v1_with_blocked(&group, blocked)
+            .map(|updated| (StorageRecordKind::GroupV1, RecordPayload::GroupV1(updated))),
+        WireRecord::GroupV2(group) => group_v2_with_blocked(&group, blocked, now_ms)
+            .map(|updated| (StorageRecordKind::GroupV2, RecordPayload::GroupV2(updated))),
+        _ => return Err(StorageSyncError::ReadFailed),
+    })
+}
+
+/// ContactRecord 拉黑位翻面：返回 None = 意图已满足（幂等无写）。
+fn contact_with_blocked(
+    record: &storage_proto::ContactRecord,
+    blocked: bool,
+    now_ms: u64,
+) -> Option<storage_proto::ContactRecord> {
+    if blocked && record.blocked {
+        return None;
+    }
+    if !blocked && !record.blocked && record.blocked_at_timestamp == 0 {
+        return None;
+    }
+    let mut updated = record.clone();
+    updated.blocked = blocked;
+    updated.blocked_at_timestamp = match blocked {
+        // 已拉黑保留原时刻（不重写他端时钟）；首次拉黑 = 引擎时钟。
+        true if record.blocked => record.blocked_at_timestamp,
+        true => now_ms,
+        false => 0,
+    };
+    Some(updated)
+}
+
+/// GroupV1Record 拉黑位翻面（无 blockedAtTimestamp 字段）。
+fn group_v1_with_blocked(
+    record: &storage_proto::GroupV1Record,
+    blocked: bool,
+) -> Option<storage_proto::GroupV1Record> {
+    (record.blocked != blocked).then(|| {
+        let mut updated = record.clone();
+        updated.blocked = blocked;
+        updated
+    })
+}
+
+/// GroupV2Record 拉黑位翻面（blockedAtTimestamp 语义同 ContactRecord）。
+fn group_v2_with_blocked(
+    record: &storage_proto::GroupV2Record,
+    blocked: bool,
+    now_ms: u64,
+) -> Option<storage_proto::GroupV2Record> {
+    if blocked && record.blocked {
+        return None;
+    }
+    if !blocked && !record.blocked && record.blocked_at_timestamp == 0 {
+        return None;
+    }
+    let mut updated = record.clone();
+    updated.blocked = blocked;
+    updated.blocked_at_timestamp = match blocked {
+        true if record.blocked => record.blocked_at_timestamp,
+        true => now_ms,
+        false => 0,
+    };
+    Some(updated)
+}
+
+/// 云上无目标记录时的新建面（官方 toContactRecord/toGroupVxRecord 最小同
+/// 构：标识 + blocked 面，e164 号码命中面可得则写）：blocked=false = 无可
+/// 解除 → None（幂等无写）；contact 解析失败 → ConversationNotResolved。
+async fn fresh_blocked_record(
+    context: &StorageContext,
+    target: &EngineConversationId,
+    canonical: &EngineConversationId,
+    blocked: bool,
+    now_ms: u64,
+) -> Result<Option<(StorageRecordKind, RecordPayload)>, StorageSyncError> {
+    if !blocked {
+        return Ok(None);
+    }
+    Ok(Some(match target {
+        EngineConversationId::Contact(_) => {
+            let (service_id, e164) = resolve_contact_identity(context, target)
+                .await
+                .ok_or(StorageSyncError::ConversationNotResolved)?;
+            (
+                StorageRecordKind::Contact,
+                RecordPayload::Contact(storage_proto::ContactRecord {
+                    aci: service_id.service_id_string(),
+                    aci_binary: service_id.service_id_binary(),
+                    e164: e164.unwrap_or_default(),
+                    blocked: true,
+                    blocked_at_timestamp: now_ms,
+                    ..storage_proto::ContactRecord::default()
+                }),
+            )
+        }
+        EngineConversationId::Group(_) => (
+            StorageRecordKind::GroupV2,
+            RecordPayload::GroupV2(storage_proto::GroupV2Record {
+                master_key: engine_group_to_master_key(canonical)?,
+                blocked: true,
+                blocked_at_timestamp: now_ms,
+                ..storage_proto::GroupV2Record::default()
+            }),
+        ),
+        EngineConversationId::LegacyGroup(_) => (
+            StorageRecordKind::GroupV1,
+            RecordPayload::GroupV1(storage_proto::GroupV1Record {
+                id: engine_legacy_to_bytes(canonical)?,
+                blocked: true,
+                ..storage_proto::GroupV1Record::default()
+            }),
+        ),
+    }))
+}
+
+/// 写面目标解析：引擎会话标识 → 云上记录口径的规范标识（contact → ACI
+/// uuid 串；group → master key 标准 base64；legacy → id bytes 文本）。解析
+/// 失败 fail-closed（不发请求）。
+async fn blocked_target_canonical(
+    context: &StorageContext,
+    target: &EngineConversationId,
+) -> Result<EngineConversationId, StorageSyncError> {
+    match target {
+        EngineConversationId::Contact(_) => {
+            let (service_id, _) = resolve_contact_identity(context, target)
+                .await
+                .ok_or(StorageSyncError::ConversationNotResolved)?;
+            Ok(EngineConversationId::Contact(
+                service_id.service_id_string(),
+            ))
+        }
+        EngineConversationId::Group(_) => Ok(EngineConversationId::Group(
+            base64::engine::general_purpose::STANDARD.encode(engine_group_to_master_key(target)?),
+        )),
+        EngineConversationId::LegacyGroup(_) => Ok(EngineConversationId::LegacyGroup(
+            String::from_utf8_lossy(&engine_legacy_to_bytes(target)?).into_owned(),
+        )),
+    }
+}
+
+/// 批量原样读全部 Contact/GV1/GV2 item（写面定位/重放用；manifest 404 →
+/// 空；坏条目跳过不炸面，读面同纪律）。
+struct ConversationItem {
+    key: Vec<u8>,
+    plaintext: Vec<u8>,
+}
+
+async fn read_conversation_items(
+    push: &PushService,
+    storage_key: &StorageServiceKey,
+    manifest: Option<&ManifestRecord>,
+) -> Result<Vec<ConversationItem>, StorageSyncError> {
+    let Some(manifest) = manifest else {
+        return Ok(Vec::new());
+    };
+    let keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            matches!(
+                identifier.r#type(),
+                manifest_record::identifier::Type::Contact
+                    | manifest_record::identifier::Type::Groupv1
+                    | manifest_record::identifier::Type::Groupv2
+            )
+        })
+        .map(|identifier| identifier.raw.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let record_ikm = if manifest.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest.record_ikm.as_slice())
+    };
+    let auth = storage_auth(push).await?;
+    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(item) = items.iter().find(|item| item.key == key) else {
+            continue;
+        };
+        let Ok(plaintext) = decrypt_raw_item(storage_key, item, record_ikm) else {
+            continue;
+        };
+        out.push(ConversationItem { key, plaintext });
+    }
+    Ok(out)
+}
+
+/// blocked 名单投影（明文批次 → 读面同构投影）。
+fn project_blocked(items: &[ConversationItem]) -> Vec<EngineConversationId> {
+    items
+        .iter()
+        .filter_map(|item| blocked_conversation_of(&item.plaintext))
+        .collect()
+}
+
+/// 写后 blocked 名单投影（官方 upload 成功语义 = 本地写后面为准）：被换写
+/// 的目标条目按写后状态计入，其余条目沿用本轮读取态（存储序）。
+fn project_blocked_after(
+    items: &[ConversationItem],
+    replaced_key: Option<&[u8]>,
+    canonical: &EngineConversationId,
+    target_blocked: bool,
+) -> Vec<EngineConversationId> {
+    let mut out: Vec<EngineConversationId> = items
+        .iter()
+        .filter(|item| replaced_key.is_none_or(|key| item.key != key))
+        .filter_map(|item| blocked_conversation_of(&item.plaintext))
+        .collect();
+    if target_blocked && !out.contains(canonical) {
+        out.push(canonical.clone());
+    }
+    out
+}
+
+/// 拉黑写面编排（官方 upload 语义）：本地意图解析（fail-closed，不发请求）
+/// → 逐 item 读改写（decode→mutate→encode 保真，仅动 blocked 面）→ 新 16B
+/// item id 重加密 → WriteOperation version+1 → `PUT v1/storage/` → 409 采纳
+/// 重放（conflictBackOff 3 次）。manifest 404 + blocked=true → master key
+/// 播种 + version 1 最小 AccountRecord 与目标记录同批首写（compat §5 分支）；
+/// manifest 404 + blocked=false = 无可解除，幂等成功不播种。同值幂等无写。
+pub(crate) async fn write_blocked(
+    context: &StorageContext,
+    target: &EngineConversationId,
+    blocked: bool,
+    now_ms: u64,
+) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+    let canonical = blocked_target_canonical(context, target).await?;
+    let master_key = match context
+        .store
+        .fetch_master_key()
+        .await
+        .map_err(|_| StorageSyncError::WriteFailed)?
+    {
+        Some(key) => key,
+        None => {
+            if !blocked {
+                // 无 storage 状态且要解除：云上无任何记录，无可解除（诚实
+                // 幂等，不播种不建 manifest）。
+                return Ok(Vec::new());
+            }
+            let generated = MasterKey::generate(&mut rand::rng());
+            context
+                .store
+                .store_master_key(Some(&generated))
+                .await
+                .map_err(|_| StorageSyncError::WriteFailed)?;
+            generated
+        }
+    };
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let storage = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await?;
+    let mut manifest: Option<ManifestRecord> = match storage.manifest().await {
+        Ok(record) => {
+            // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
+            if account_item_key_of(&record).is_none() {
+                return Err(StorageSyncError::WriteFailed);
+            }
+            Some(record)
+        }
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
+        Err(_) => return Err(StorageSyncError::Unavailable),
+    };
+
+    // 冲突重放循环：每轮从「当前服务器状态 + 本地意图」重建 WriteOperation。
+    let mut retries: u32 = 0;
+    loop {
+        let items = read_conversation_items(&context.push, &storage_key, manifest.as_ref()).await?;
+        let found = items
+            .iter()
+            .find(|item| conversation_record_of(&item.plaintext).as_ref() == Some(&canonical));
+        let mutation = match found {
+            Some(item) => flip_blocked(&item.plaintext, blocked, now_ms)?,
+            None => fresh_blocked_record(context, target, &canonical, blocked, now_ms).await?,
+        };
+        let Some((kind, payload)) = mutation else {
+            // 幂等（同值）/ 无可解除：返回当前 blocked 名单（存储序）。
+            return Ok(project_blocked(&items));
+        };
+        let replaced_key = found.map(|item| item.key.clone());
+
+        // 首写分支播种 Account（仅 manifest 404）；其余写不动 Account item。
+        let mut upserts: Vec<RecordUpsert> = Vec::with_capacity(2);
+        let mut seeded_account_key: Option<Vec<u8>> = None;
+        let previous = match &manifest {
+            Some(record) => Some(record),
+            None => {
+                let key = new_item_key();
+                seeded_account_key = Some(key.clone());
+                upserts.push(RecordUpsert {
+                    kind: StorageRecordKind::Account,
+                    new_key: key,
+                    replaced_key: None,
+                    payload: RecordPayload::Account(minimal_account_record(Vec::new())),
+                });
+                None
+            }
+        };
+        let new_key = new_item_key();
+        upserts.push(RecordUpsert {
+            kind,
+            new_key: new_key.clone(),
+            replaced_key: replaced_key.clone(),
+            payload,
+        });
+        let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
+
+        let auth = storage_auth(&context.push).await?;
+        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+            PutOutcome {
+                conflict_manifest: None,
+            } => {
+                let account_key =
+                    seeded_account_key.or_else(|| manifest.as_ref().and_then(account_item_key_of));
+                save_manifest_state(
+                    &context.account_dir,
+                    &ManifestState {
+                        version: planned.new_version,
+                        account_item_key: account_key
+                            .map(|key| base64::engine::general_purpose::STANDARD.encode(key)),
+                        // 拉黑面不感知贴纸面：沿用状态文件旧值。
+                        sticker_item_keys: None,
+                    },
+                );
+                return Ok(project_blocked_after(
+                    &items,
+                    replaced_key.as_deref(),
+                    &canonical,
+                    blocked,
+                ));
+            }
+            PutOutcome {
+                conflict_manifest: Some(server_manifest),
+            } => match conflict_decision(retries) {
+                ConflictDecision::GiveUp => return Err(StorageSyncError::WriteFailed),
+                ConflictDecision::Retry { delay_ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    retries += 1;
+                    // 采纳服务器 manifest（官方 409 语义）；下轮整体重读重放
+                    //（读失败归 WriteFailed：写意图未落地）。
+                    let decrypted =
+                        StorageService::decrypt_manifest(&storage_key, &server_manifest)
+                            .map_err(|_| StorageSyncError::WriteFailed)?;
+                    if account_item_key_of(&decrypted).is_none() {
+                        return Err(StorageSyncError::WriteFailed);
+                    }
+                    manifest = Some(decrypted);
+                }
+            },
+        }
+    }
+}
+
 /// 账号记录写编排通用骨架（write_pinned 收敛出的共用面，账号级设置批
 /// setAccountConfiguration / setUniversalExpireTimer 复用）：seed master
 /// key → manifest 读取（404 → 最小 AccountRecord 首写分支）→ mutate 回调
@@ -1197,34 +1652,38 @@ pub(crate) async fn write_account_configuration(
     .map(|_| ())
 }
 
-/// contact 会话 → serviceId 字符串（ACI 优先）：UUID 形状直通 → 本机号走
-/// 注册数据 → contacts 数字位匹配（listContacts 同源数据）。
-async fn resolve_contact_service_id(
+/// contact 会话 → (ServiceId, e164?)（ACI 优先）：UUID 形状直通 → 本机号
+/// 走注册数据 → contacts 数字位匹配（listContacts 同源数据）。e164 在号码
+/// 命中面可得（拉黑写面新建 ContactRecord 的 e164 字段用；服务 id 命中面
+/// 引擎不反查号码，None 诚实缺席）。
+pub(crate) async fn resolve_contact_identity(
     context: &StorageContext,
     target: &EngineConversationId,
-) -> Option<String> {
+) -> Option<(
+    presage::libsignal_service::protocol::ServiceId,
+    Option<String>,
+)> {
     let EngineConversationId::Contact(text) = target else {
         return None;
     };
-    if presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(text).is_some()
+    if let Some(service_id) =
+        presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(text)
     {
-        return Some(text.clone());
+        return Some((service_id, None));
     }
     let want: String = text.chars().filter(char::is_ascii_digit).collect();
     if want.is_empty() {
         return None;
     }
-    // 本机号：置顶自己（Note to Self）。
+    // 本机号：置顶/拉黑自己（Note to Self）。
     if let Ok(Some(data)) = context.store.load_registration_data().await {
-        let own_digits: String = crate::service::e164_string(&data.phone_number)
-            .chars()
-            .filter(char::is_ascii_digit)
-            .collect();
+        let own_e164 = crate::service::e164_string(&data.phone_number);
+        let own_digits: String = own_e164.chars().filter(char::is_ascii_digit).collect();
         if own_digits == want {
-            return Some(
-                presage::libsignal_service::protocol::ServiceId::Aci(data.service_ids.aci.into())
-                    .service_id_string(),
-            );
+            return Some((
+                presage::libsignal_service::protocol::ServiceId::Aci(data.service_ids.aci.into()),
+                Some(own_e164),
+            ));
         }
     }
     let contacts = context.store.contacts().await.ok()?;
@@ -1235,14 +1694,29 @@ async fn resolve_contact_service_id(
             .collect::<String>()
     };
     contacts.filter_map(Result::ok).find_map(|contact| {
-        let matches = contact
+        let e164 = contact
             .phone_number
             .as_ref()
-            .map(crate::service::e164_string)
-            .map(digits_of)
+            .map(crate::service::e164_string);
+        let matches = e164
+            .as_ref()
+            .map(|phone| digits_of(phone.clone()))
             .is_some_and(|digits| digits == want);
-        matches.then_some(contact.uuid.to_string())
+        matches.then_some((
+            presage::libsignal_service::protocol::ServiceId::Aci(contact.uuid.into()),
+            e164,
+        ))
     })
+}
+
+/// contact 会话 → serviceId 字符串（ACI 优先）：置顶面入口（
+/// `resolve_contact_identity` 薄壳，行为不变）。
+async fn resolve_contact_service_id(
+    context: &StorageContext,
+    target: &EngineConversationId,
+) -> Option<String> {
+    let (service_id, _) = resolve_contact_identity(context, target).await?;
+    Some(service_id.service_id_string())
 }
 
 /// stored 面增删（保序）：与引擎面纯函数同语义，但保留非引擎口径条目
@@ -1524,6 +1998,171 @@ mod tests {
         );
         assert_eq!(blocked_conversation_of(&[0xff, 0xff, 0xff]), None);
         assert_eq!(blocked_conversation_of(&[]), None);
+    }
+
+    /// 拉黑位翻面纯函数（flip_blocked / contact_with_blocked /
+    /// group_v1_with_blocked / group_v2_with_blocked）：置拉黑写
+    /// blockedAt=now、已拉黑幂等不重写他端时刻、解除清零、GV1 无时间戳
+    /// 字段；非三类记录/垃圾 bytes → ReadFailed。
+    #[test]
+    fn flip_blocked_faces_idempotent_and_timestamp_semantics() {
+        use prost::Message as _;
+        use storage_proto::{ContactRecord, GroupV1Record, GroupV2Record};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let contact_wire = |blocked: bool, blocked_at: u64| {
+            storage_proto::StorageRecord {
+                record: Some(storage_proto::storage_record::Record::Contact(
+                    ContactRecord {
+                        blocked,
+                        blocked_at_timestamp: blocked_at,
+                        given_name: "Given".to_owned(),
+                        ..Default::default()
+                    },
+                )),
+            }
+            .encode_to_vec()
+        };
+
+        // 未拉黑 → 拉黑：blocked=true + blockedAt=now，given_name 保真。
+        let Some((kind, RecordPayload::Contact(updated))) =
+            flip_blocked(&contact_wire(false, 0), true, NOW).expect("flips")
+        else {
+            panic!("contact arm");
+        };
+        assert_eq!(kind, StorageRecordKind::Contact);
+        assert!(updated.blocked);
+        assert_eq!(updated.blocked_at_timestamp, NOW);
+        assert_eq!(updated.given_name, "Given");
+
+        // 已拉黑（含历史时刻）再拉黑 → None（幂等，不重写他端时刻）。
+        assert!(flip_blocked(&contact_wire(true, 123), true, NOW)
+            .expect("decodes")
+            .is_none());
+
+        // 拉黑 → 解除：blocked=false + blockedAt 清零。
+        let Some((_, RecordPayload::Contact(lifted))) =
+            flip_blocked(&contact_wire(true, 123), false, NOW).expect("flips")
+        else {
+            panic!("contact arm");
+        };
+        assert!(!lifted.blocked);
+        assert_eq!(lifted.blocked_at_timestamp, 0);
+
+        // 未拉黑再解除 → None（幂等）。
+        assert!(flip_blocked(&contact_wire(false, 0), false, NOW)
+            .expect("decodes")
+            .is_none());
+
+        // GV2 同 contact 时间戳语义；GV1 无时间戳字段，仅翻位。
+        let group_v2_wire = |blocked: bool, blocked_at: u64| {
+            storage_proto::StorageRecord {
+                record: Some(storage_proto::storage_record::Record::GroupV2(
+                    GroupV2Record {
+                        blocked,
+                        blocked_at_timestamp: blocked_at,
+                        master_key: vec![9u8; 32],
+                        ..Default::default()
+                    },
+                )),
+            }
+            .encode_to_vec()
+        };
+        let Some((StorageRecordKind::GroupV2, RecordPayload::GroupV2(group))) =
+            flip_blocked(&group_v2_wire(false, 0), true, NOW).expect("flips")
+        else {
+            panic!("group arm");
+        };
+        assert!(group.blocked);
+        assert_eq!(group.blocked_at_timestamp, NOW);
+        assert!(flip_blocked(&group_v2_wire(true, 5), true, NOW)
+            .expect("decodes")
+            .is_none());
+
+        let legacy_wire = storage_proto::StorageRecord {
+            record: Some(storage_proto::storage_record::Record::GroupV1(
+                GroupV1Record {
+                    blocked: false,
+                    id: b"old-group-id".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        }
+        .encode_to_vec();
+        let Some((StorageRecordKind::GroupV1, RecordPayload::GroupV1(legacy))) =
+            flip_blocked(&legacy_wire, true, NOW).expect("flips")
+        else {
+            panic!("legacy arm");
+        };
+        assert!(legacy.blocked);
+        assert_eq!(legacy.id, b"old-group-id".to_vec());
+
+        // 非三类记录（Account）/垃圾 bytes → ReadFailed（目标在云上但读不出）。
+        let account_wire = storage_proto::StorageRecord {
+            record: Some(storage_proto::storage_record::Record::Account(
+                AccountRecord::default(),
+            )),
+        }
+        .encode_to_vec();
+        assert!(matches!(
+            flip_blocked(&account_wire, true, NOW),
+            Err(StorageSyncError::ReadFailed)
+        ));
+        assert!(matches!(
+            flip_blocked(&[0xff, 0xff, 0xff], true, NOW),
+            Err(StorageSyncError::ReadFailed)
+        ));
+    }
+
+    /// 写后 blocked 名单投影（project_blocked_after）：被换写条目按写后
+    /// 状态计入（replaced_key 剔除旧态）、目标置拉黑缺席则补尾（存储序）、
+    /// 解除（false）不追加。
+    #[test]
+    fn project_blocked_after_swaps_target_and_appends() {
+        let aci_a = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let aci_b = "11111111-2222-4333-8444-555555555555";
+        let contact_item = |aci: &str| ConversationItem {
+            key: vec![aci.as_bytes().first().copied().unwrap_or(b'x')],
+            plaintext: storage_proto::StorageRecord {
+                record: Some(storage_proto::storage_record::Record::Contact(
+                    storage_proto::ContactRecord {
+                        blocked: true,
+                        aci: aci.to_owned(),
+                        ..Default::default()
+                    },
+                )),
+            }
+            .encode_to_vec(),
+        };
+        let items = vec![contact_item(aci_a), contact_item(aci_b)];
+        let target =
+            EngineConversationId::Contact("99999999-8888-4777-8666-555555555555".to_owned());
+
+        // 目标不在名单：置拉黑写后补尾（存储序 = 先既有后目标）。
+        assert_eq!(
+            project_blocked_after(&items, Some(b"9"), &target, true),
+            vec![
+                EngineConversationId::Contact(aci_a.to_owned()),
+                EngineConversationId::Contact(aci_b.to_owned()),
+                target.clone(),
+            ]
+        );
+
+        // 解除（false）：不追加，名单只剩既有条目。
+        assert_eq!(
+            project_blocked_after(&items, None, &target, false),
+            vec![
+                EngineConversationId::Contact(aci_a.to_owned()),
+                EngineConversationId::Contact(aci_b.to_owned()),
+            ]
+        );
+
+        // replaced_key 命中既有条目：旧态剔除（目标换写态由上方补尾位）。
+        let replaced = items[0].key.clone();
+        assert_eq!(
+            project_blocked_after(&items, Some(&replaced), &target, true),
+            vec![EngineConversationId::Contact(aci_b.to_owned()), target,]
+        );
     }
 
     /// contact 反投影：ACI 字符串 → serviceIdBinary 往返；无 service_id

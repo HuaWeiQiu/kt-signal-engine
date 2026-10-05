@@ -90,6 +90,9 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{}` | 头像上行（profile PUT/CDN POST）失败 `STORAGE_WRITE_FAILED`；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{}` |
 | `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；条目形状与置顶面同构；v1 不含 blockedAtTimestamp） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
+| `getAvatar` | `{account, conversationId}`（形状分派：ACI/PNI ServiceId UUID 直通、手机号文本（E.164/裸数字）经 contacts 反查、群 = master key 标准 base64（listGroups id 同源）；三者皆不中 `-32603`） | `{dataUri, size}`（data URI = `data:<mime>;base64,<payload>`，MIME 魔数嗅探、未识别回退 `application/octet-stream`；size = 原始字节数） | 参数缺失/会话标识形状非法/未注册账号 `-32603`（参数面不占用结构化码）；无头像（未同步 profile_key/对端或群未设头像/服务器 403/404）→ `AVATAR_UNAVAILABLE`；网络/下载/解密失败 → `AVATAR_FETCH_FAILED`；超 10MB 帽 → `AVATAR_TOO_LARGE`（均 `-1` + message 码位） | **2026-10-06 real（KT 扩展）**：1:1 走 presage `retrieve_profile_avatar_by_uuid`（profileKey = presage store `profile_key(service_id)`，contacts 同步随行落库；未同步 → 诚实「无头像」）；群走 presage `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密）；缓存/CDN/解密/入库由 presage 承担；10MB 帽照 presage 注释口径，超出 fail-closed；fake：`AVATAR_UNAVAILABLE`（不落调度日志，读面纪律） |
+| `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状，存储序） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；fake：成功回 `{blocked: []}` |
+| `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
@@ -100,6 +103,10 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 
 - 信封公共位：`sourceUuid`（ACI service id 字符串）、`sourceDevice`、
   `timestamp`；contacts 命中时附 `sourceNumber`（E.164）与 `sourceName`。
+  `serverGuid`（2026-10-06，reportSpam 面配套）：服务器为该条消息分配的
+  UUID（举报 API 的路径参数），信封元数据公共位，有值才投（proto 只投影
+  不发明）；envelope 级 reportSpamToken 经 presage Content 转换丢弃
+  （Metadata 不携带），不在投影（§5 reportSpam 块）。
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
@@ -486,6 +493,64 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
   connector 会话计时器面已在其自身链路处理；二期随 Chat.expireTimerMs 帧
   面一起开）；附件/引用/回应/编辑等富体面不在工件行集（§6.2 后续批），
   由 connector 侧逐因计数（其契约 §4.46）。
+
+头像下行 / 拉黑写面 / 举报（2026-10-06 扩展批，KT 扩展方法）：
+
+- **`getAvatar`（1:1 与群统一入口）**：会话标识按形状分派（ACI/PNI
+  ServiceId UUID 直通 → 手机号文本 contacts 反查 → 32B 标准 base64 群
+  master key；三者皆不中 fail-closed `-32603`）。下行 = presage 官方头像
+  API：1:1 `retrieve_profile_avatar_by_uuid`（profileKey 取 presage store
+  `profile_key(service_id)`——contacts 同步随行落库，未同步过 → 诚实
+  `AVATAR_UNAVAILABLE`「无头像」，不做 CDSI 反查）、群
+  `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密，
+  master key 与 listGroups id 同源）。403/404 = 无头像（官方 1:1
+  未 accept 会话不下载头像同语义）折叠 `AVATAR_UNAVAILABLE`；其余错误
+  （网络/解密/存储）`AVATAR_FETCH_FAILED`；尺寸帽 10MB（presage 注释
+  口径，Signal Android 分配量级）超出 `AVATAR_TOO_LARGE`。出参 data URI
+  + 字节数：MIME 魔数嗅探（官方 sniffImageMimeType 同表），未识别回退
+  `application/octet-stream`（官方桌面头像落盘不标 MIME；引擎 data URI
+  必须给类型，不猜 image/*）。
+- **`setConversationBlocked`（blocked 位写语义）**：官方桌面
+  storageRecordOps 同语义——置拉黑写 `blockedAtTimestamp` = 引擎时钟
+  （首次拉黑时刻）；已拉黑再拉黑幂等无写（**不重写他端时刻**，含 0=未知
+  原样保留）；解除 = `blocked=false` + 时刻清零；GV1 无时间戳字段（官方
+  proto 同构）仅翻位。写面复用置顶面骨架：decode→mutate 仅动 blocked
+  面（vendored proto 字段保真）→ 新 16B item id 重加密 → version+1 →
+  PUT → 409 响应体采纳重放；返回写后全量 blocked 名单（存储序，与
+  getBlockedConversations 同形状）。目标云上无记录：blocked=true → 新建
+  最小记录（标识 + blocked 面，e164 命中面可得则写；manifest 404 时
+  master key 播种 + version 1 最小 AccountRecord 同批首写）；blocked=false
+  → 无可解除，幂等成功不播种不建 manifest。**纯拉黑不删会话**：不动消息
+  面/会话行（官方桌面同语义，拉黑只置位不清数据）。
+- **拉黑面遗留（明确不在本批）**：`SyncMessage.Blocked` self-send（本机
+  拉黑名单变更向自有其他设备同步的独立通道）不实现——Storage Service
+  blocked 位写面已是官方桌面现行真相源（多设备经 storage sync 收敛），
+  Blocked sync 消息是其 legacy 补充通道；消费方提出需求再立项。
+- **`reportSpam`（逐条举报）**：官方桌面同款 REST——`POST
+  v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求，JSON body
+  `{token}`（envelope 级 reportSpamToken 透传；缺省序列化为 `{}`，官方
+  jsonData 同构）；本机凭据 basic auth（put_profile 同通道）。**单批上限
+  1000**：对齐官方 reportSpamJobQueue 入参 zod `serverGuids.max(1000)`
+  （早期「256 或按行评审」提案作废，取官方现行常量）。**部分失败诚实
+  面**：单条 4xx/5xx 记状态码、传输层失败无状态码（缺席键不在，不发明
+  0），至少一条成功即返回 `{reported, failures}`，全部失败才整体
+  `-1 REPORT_SPAM_FAILED`（不掩盖部分成功）。serverGuid 参数面每项必须
+  可解析 UUID 且经长度（36/32）+ hex 字符白名单预检（`parse_str` 本身
+  接受 urn:uuid:/花括号形态，预检堵住）后归一为小写连字形态入路径——
+  防路径注入 fail-closed；`serverGuids` 空批 = 无意图调用 `-32603`（
+  setAccountConfiguration 零可写字段先例）。
+- **receive 投影配套**：信封公共位加 `serverGuid`（Metadata.server_guid
+  有值才投；proto 只投影不发明）。**已知边界（token 不透投影）**：
+  envelope 级 `reportSpamToken` 经 presage Content 转换丢弃（Metadata
+  仅携带 server_guid），引擎收投影无 token 可透——调用方举报时可自选
+  透传 token 参数，token 从 receive 面拿不到（上游 Metadata 升版携带后
+  再接，不发明）。
+- **fake 纪律**：`getAvatar` → `AVATAR_UNAVAILABLE`、
+  `setConversationBlocked` → `{blocked: []}`、`reportSpam` → 全量成功
+  `{reported: N, failures: []}`。调度日志：`reportSpam` 落（协议上行面，
+  send 系/setExpirationTimer 同纪律），`getAvatar`/`setConversationBlocked`
+  不落（读面/storage 状态面，置顶/贴纸面同纪律）。real 模式未注册账号
+  一律 `-32603`（细节不外泄）。
 
 ## 6. fake 服务模式（仅测试）
 

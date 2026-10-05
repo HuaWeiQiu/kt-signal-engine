@@ -1780,6 +1780,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "cbc",
+ "chrono",
  "ctr 0.10.1",
  "flate2",
  "futures",

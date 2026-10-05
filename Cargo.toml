@@ -81,3 +81,6 @@ ctr = "0.10.1"
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false, features = ["test-util"] }
+# 测试专用（receive 投影单测构造 Metadata 时间戳）：presage 传递依赖同版，
+# MIT/Apache-2.0，不进运行时依赖图。
+chrono = "0.4"
