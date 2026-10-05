@@ -5,19 +5,28 @@
 //!
 //! 真相源 = Storage Service 的 `AccountRecord.pinned_conversations`（数组序
 //! 即置顶顺序，无时间戳）。读面走 presage 上游 pub API（`StorageService::
-//! manifest`/`read_items`）；写面是上游缺口（libsignal-service-rs 只有读），
-//! 自建薄封装收敛在本模块 `put_write_operation` 单点，上游补齐后整段替换。
+//! manifest`）；写面是上游缺口（libsignal-service-rs 只有读），自建薄封装
+//! 收敛在本模块 `put_write_operation` 单点，上游补齐后整段替换。
+//!
+//! **记录载荷 proto = 官方 vendored**（`crate::proto::storage`，字段保真
+//! 加固）：钉定 presage rev 的 StorageService.proto 只定义到 AccountRecord
+//! field 51，官方现行已用到 field 60——Account/Contact 等记录的 decode→
+//! mutate→encode 一律走 vendored 完整字段面 + 本模块 item 加解密 shim
+//! （`read_account_record`/`account_record_of_wire`/`encrypt_raw_item`），
+//! 否则每次置顶/贴纸/账号设置写都会把手机侧 52-60 的未知字段静默清零
+//! （`tests::account_record_fields_52_to_60_survive_engine_write_path`
+//! 字段保真铁面）。manifest/WriteOperation 面形状完整，仍走 presage 类型。
 //!
 //! 官方写语义（Signal-Desktop `ts/services/storage.preload.ts` 行为对齐，
 //! 不抄码）：读 manifest → 读 Account item → **只在服务器返回的
-//! AccountRecord 上原地改 pinned 字段**（prost decode→mutate→encode
-//! round-trip 天然保真其余 30+ 字段；绝禁止从零构造 AccountRecord，会清空
-//! 用户其他设备账号设置）→ `encrypt_item`（新 16B 随机 id）+
-//! `encrypt_manifest`（version+1，source_device=本设备 device_id，
-//! record_ikm 原样透传）→ `WriteOperation{manifest, insertItem, deleteKey}`
-//! → `PUT v1/storage/`（WebAPI.preload.ts:831 storageModify 同路径）。
-//! 409 响应体含服务器当前 manifest → 采纳重读，按 conflictBackOff
-//! [1s,5s,30s]（storage.preload.ts:150）重放，连满 3 次放弃本轮。
+//! AccountRecord 上原地改 pinned 字段**（decode→mutate→encode round-trip
+//! 保真其余字段；绝禁止从零构造 AccountRecord，会清空用户其他设备账号
+//! 设置）→ `encrypt_item`（新 16B 随机 id）+ `encrypt_manifest`（version+1，
+//! source_device=本设备 device_id，record_ikm 原样透传）→
+//! `WriteOperation{manifest, insertItem, deleteKey}` → `PUT v1/storage/`
+//! （WebAPI.preload.ts:831 storageModify 同路径）。409 响应体含服务器当前
+//! manifest → 采纳重读，按 conflictBackOff [1s,5s,30s]
+//! （storage.preload.ts:150）重放，连满 3 次放弃本轮。
 //!
 //! 写面泛化（P5）：`plan_record_writes` 支持多记录类别 upsert（Account=
 //! identifier type 4、StickerPack=type 6，换入新 key / 旧 key 进
@@ -43,15 +52,21 @@ use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
 use presage::libsignal_service::prelude::PushService;
 use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::proto::manifest_record;
-use presage::libsignal_service::proto::{
-    account_record, storage_record, AccountRecord, ManifestRecord, StorageManifest, StorageRecord,
-    WriteOperation,
-};
+use presage::libsignal_service::proto::{ManifestRecord, StorageManifest, WriteOperation};
 use presage::libsignal_service::{StorageService, StorageServiceError};
-use presage::proto::account_record::PinnedConversation;
 use presage::store::{ContentsStore, StateStore};
+use prost::Message as _;
 use rand::RngCore;
 use serde_json::json;
+
+use crate::proto::storage::{self as storage_proto, AccountRecord, StorageRecord};
+// 记录载荷面（AccountRecord/PinnedConversation/StorageRecord）一律走官方
+// vendored proto（crate::proto/storage.rs）——钉定 presage rev 的同源 proto
+// 只定义到 AccountRecord field 51，直接用会把官方现行 52-60 字段在每次
+// storage 写时静默清零（字段保真铁面测试钉定）。manifest/WriteOperation 面
+// 仍走 presage 类型（形状完整）。
+use crate::proto::storage::account_record::{self, PinnedConversation};
+use crate::service::StorageContext;
 
 /// 409 冲突重试上限：官方 conflictBackOff 序列长度（[1s,5s,30s]，storage
 /// preload.ts:150），连满放弃本轮返回错误。
@@ -312,12 +327,19 @@ pub(crate) fn account_record_with_pinned(
     updated
 }
 
-/// 从 StorageRecord 提取 AccountRecord（非 Account 记录 → None）。
+/// 从（官方 vendored）StorageRecord 提取 AccountRecord（非 Account 记录 →
+/// None）。
 pub(crate) fn account_record_of(record: &StorageRecord) -> Option<&AccountRecord> {
     match record.record.as_ref()? {
-        storage_record::Record::Account(account) => Some(account),
+        storage_proto::storage_record::Record::Account(account) => Some(account),
         _ => None,
     }
+}
+
+/// Account item 明文 bytes → AccountRecord（解码失败/非 Account 记录 →
+/// None；读面统一入口，字段面 = 官方 vendored proto）。
+pub(crate) fn account_record_of_wire(plaintext: &[u8]) -> Option<AccountRecord> {
+    account_record_of(&StorageRecord::decode(plaintext).ok()?).cloned()
 }
 
 /// manifest identifiers 中 Account 记录的 raw key。
@@ -424,12 +446,18 @@ pub(crate) fn plan_record_writes(
             r#type: upsert.kind.identifier_type(),
         });
         let item = match &upsert.payload {
-            RecordPayload::Account(account) => StorageService::encrypt_item(
+            // Account 载荷用官方 vendored proto 编码（完整字段面），经本地
+            // item 加解密 shim 上行（与上游 encrypt_item 派生一致，交叉
+            // 验证单测钉定）；StickerPack 同 shim（上游 proto 缺该记录）。
+            RecordPayload::Account(account) => encrypt_raw_item(
                 storage_key,
                 upsert.new_key.clone(),
                 &StorageRecord {
-                    record: Some(storage_record::Record::Account(account.clone())),
-                },
+                    record: Some(storage_proto::storage_record::Record::Account(
+                        account.clone(),
+                    )),
+                }
+                .encode_to_vec(),
                 record_ikm_opt,
             ),
             RecordPayload::StickerPack(record) => encrypt_raw_item(
@@ -665,8 +693,6 @@ pub(crate) async fn read_raw_items(
 // 读/写面编排（Service 调用入口；网络面，不做网络测试）
 // ---------------------------------------------------------------------------
 
-use crate::service::StorageContext;
-
 /// Storage Service 句柄（上游 pub API；auth 换取在 `StorageService::new`
 /// 内部完成，与上游 storage_service.rs:103-128 同一模式）。
 pub(crate) async fn open_storage_service(
@@ -676,6 +702,31 @@ pub(crate) async fn open_storage_service(
     StorageService::new(push, storage_key)
         .await
         .map_err(|_| StorageSyncError::Unavailable)
+}
+
+/// Account item 原样读取（`PUT /v1/storage/read`，storage_auth 显式换取）
+/// → 本地 shim 解密 → 官方 vendored proto 解码（字段保真读面；不经 presage
+/// `read_items`——其解出类型缺 AccountRecord 52-60 字段面，读即丢失）。
+/// manifest 无 Account 标识或服务器缺 item → None；解密/解码失败 →
+/// ReadFailed。
+pub(crate) async fn read_account_record(
+    push: &PushService,
+    storage_key: &StorageServiceKey,
+    manifest: &ManifestRecord,
+) -> Result<Option<AccountRecord>, StorageSyncError> {
+    let Some(key) = account_item_key_of(manifest) else {
+        return Ok(None);
+    };
+    let ikm = manifest.record_ikm.as_slice();
+    let record_ikm = if ikm.is_empty() { None } else { Some(ikm) };
+    let auth = storage_auth(push).await?;
+    let items = read_raw_items(push, auth, vec![key]).await?;
+    let Some(item) = items.into_iter().next() else {
+        return Ok(None);
+    };
+    let plaintext = decrypt_raw_item(storage_key, &item, record_ikm)
+        .map_err(|_| StorageSyncError::ReadFailed)?;
+    Ok(account_record_of_wire(&plaintext))
 }
 
 /// 读面编排：master key → manifest → Account item → 引擎会话标识投影
@@ -693,6 +744,7 @@ pub(crate) async fn read_pinned(
     else {
         return Ok(Vec::new());
     };
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
     let storage = open_storage_service(
         context.push.clone(),
         StorageServiceKey::from_master_key(&master_key),
@@ -705,17 +757,11 @@ pub(crate) async fn read_pinned(
         }
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
-    let Some(account_key) = account_item_key_of(&manifest) else {
-        return Ok(Vec::new());
+    let account = match read_account_record(&context.push, &storage_key, &manifest).await? {
+        Some(account) => account,
+        None => return Ok(Vec::new()),
     };
-    let records = storage
-        .read_items(vec![account_key], Some(&manifest.record_ikm))
-        .await
-        .map_err(|_| StorageSyncError::ReadFailed)?;
-    let Some(account) = records.iter().find_map(account_record_of) else {
-        return Ok(Vec::new());
-    };
-    Ok(project_pinned(account))
+    Ok(project_pinned(&account))
 }
 
 fn project_pinned(account: &AccountRecord) -> Vec<PinnedEntry> {
@@ -792,21 +838,18 @@ pub(crate) async fn write_pinned(
 
     // manifest 404（从未有过 storage 状态）：以 version 1 + 最小
     // AccountRecord（只含 pinned）建初始 manifest（compat §5 登记分支）。
+    // Account item 读面走官方 vendored proto（read_account_record，字段
+    // 保真）；读失败归 WriteFailed（写意图未落地）。
     let (manifest, account) = match storage.manifest().await {
         Ok(manifest) => {
-            let Some(account_key) = account_item_key_of(&manifest) else {
+            if account_item_key_of(&manifest).is_none() {
                 return Err(StorageSyncError::WriteFailed);
-            };
-            let records = storage
-                .read_items(vec![account_key.clone()], Some(&manifest.record_ikm))
+            }
+            let account = read_account_record(&context.push, &storage_key, &manifest)
                 .await
-                .map_err(|_| StorageSyncError::WriteFailed)?;
-            let account = records
-                .iter()
-                .find_map(account_record_of)
-                .cloned()
+                .map_err(|_| StorageSyncError::WriteFailed)?
                 .ok_or(StorageSyncError::WriteFailed)?;
-            Ok((Some((manifest, account_key)), account))
+            Ok((Some(manifest), account))
         }
         Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
             Ok((None, minimal_account_record(Vec::new())))
@@ -839,7 +882,7 @@ pub(crate) async fn write_pinned(
         let planned = plan_write(
             current_manifest
                 .as_ref()
-                .map(|(manifest, _)| (manifest, account_item_key_of(manifest).unwrap_or_default())),
+                .map(|manifest| (manifest, account_item_key_of(manifest).unwrap_or_default())),
             &updated,
             context.device_id,
             new_item_key(),
@@ -879,19 +922,15 @@ pub(crate) async fn write_pinned(
                     let decrypted =
                         StorageService::decrypt_manifest(&storage_key, &server_manifest)
                             .map_err(|_| StorageSyncError::WriteFailed)?;
-                    let account_key = account_item_key_of(&decrypted)
-                        .ok_or(StorageSyncError::WriteFailed)?
-                        .clone();
-                    let records = storage
-                        .read_items(vec![account_key.clone()], Some(&decrypted.record_ikm))
-                        .await
-                        .map_err(|_| StorageSyncError::WriteFailed)?;
-                    let server_account = records
-                        .iter()
-                        .find_map(account_record_of)
-                        .cloned()
-                        .ok_or(StorageSyncError::WriteFailed)?;
-                    current = (Some((decrypted, account_key)), server_account);
+                    if account_item_key_of(&decrypted).is_none() {
+                        return Err(StorageSyncError::WriteFailed);
+                    }
+                    let server_account =
+                        read_account_record(&context.push, &storage_key, &decrypted)
+                            .await
+                            .map_err(|_| StorageSyncError::WriteFailed)?
+                            .ok_or(StorageSyncError::WriteFailed)?;
+                    current = (Some(decrypted), server_account);
                 }
             },
         }
@@ -1383,6 +1422,116 @@ mod tests {
         assert_eq!(restored.encode_to_vec(), encoded);
     }
 
+    /// 字段保真铁面（官方 vendored proto，src/proto/storage.rs）：官方现行
+    /// AccountRecord 已用到 field 60，钉定 presage rev 的同源 proto 只定义到
+    /// field 51——引擎写路径（Account item 明文 decode→只改 pinned→encode）
+    /// 必须保活 52-60 的全部官方字段，否则每次置顶/贴纸/账号设置写都会把
+    /// 手机侧这些账号设置静默清零。
+    #[test]
+    fn account_record_fields_52_to_60_survive_engine_write_path() {
+        use crate::proto::storage::{account_record as off_account, AccountRecord as Official};
+        use crate::proto::storage::{storage_record as off_storage, StorageRecord as OfficialWrap};
+        use presage::libsignal_service::master_key::MasterKey;
+
+        use prost::Message as _;
+        let original = Official {
+            // 既有字段面（1-51 抽样）一并钉定，防修复把旧字段改丢。
+            profile_key: vec![1u8; 32],
+            given_name: "Given".to_owned(),
+            read_receipts: true,
+            typing_indicators: true,
+            phone_number_sharing_mode: 2,
+            universal_expire_timer: 86_400,
+            username: "kt.01".to_owned(),
+            pinned_conversations: vec![crate::proto::storage::account_record::PinnedConversation {
+                identifier: Some(
+                    crate::proto::storage::account_record::pinned_conversation::Identifier::GroupMasterKey(
+                        vec![1u8; 32],
+                    ),
+                ),
+            }],
+            // 官方现行 52-60 全字段（field 51 之后新增的账号设置面）。
+            release_notes_chat_blocked_at: Some(1_720_000_000_000),
+            unread_badge_type: off_account::UnreadBadgeType::UnreadChats as i32,
+            include_muted_chats_in_badge: crate::proto::storage::OptionalBool::Enabled as i32,
+            reaction_notifications: crate::proto::storage::OptionalBool::Disabled as i32,
+            notify_for_calls_if_muted: crate::proto::storage::OptionalBool::Enabled as i32,
+            notify_for_mentions_if_muted: crate::proto::storage::OptionalBool::Disabled as i32,
+            notify_for_replies_if_muted: crate::proto::storage::OptionalBool::Enabled as i32,
+            show_unread_reminders: crate::proto::storage::OptionalBool::Disabled as i32,
+            notify_when_contact_joins: crate::proto::storage::OptionalBool::Enabled as i32,
+            ..Official::default()
+        };
+        let wire = OfficialWrap {
+            record: Some(off_storage::Record::Account(original.clone())),
+        }
+        .encode_to_vec();
+
+        // 引擎生产链（read→mutate→plan_write→decrypt 回读，与 write_pinned
+        // 同构）：只改 pinned（Group 换 Group），其余字段经 vendored proto
+        // 全链保活——修复前走 presage 类型面，52-60 在 decode 即被剥除。
+        let read_back = account_record_of_wire(&wire).expect("account item decodes");
+        let updated =
+            account_record_with_pinned(&read_back, vec![group_pinned([2u8; 32].as_slice())]);
+        let storage_key =
+            StorageServiceKey::from_master_key(&MasterKey::from_slice(&[3u8; 32]).expect("key"));
+        let planned = plan_write(None, &updated, 2, vec![0xaau8; 16], &storage_key);
+        let rewritten =
+            decrypt_raw_item(&storage_key, &planned.write_operation.insert_item[0], None)
+                .expect("decrypts");
+
+        // 用官方 vendored proto 回读，逐字段断言 52-60 保活。
+        let back = match OfficialWrap::decode(rewritten.as_slice())
+            .expect("rewritten decodes")
+            .record
+            .expect("record arm")
+        {
+            off_storage::Record::Account(account) => account,
+            _ => panic!("account arm"),
+        };
+        assert_eq!(back.profile_key, original.profile_key);
+        assert_eq!(back.given_name, original.given_name);
+        assert!(back.read_receipts);
+        assert!(back.typing_indicators);
+        assert_eq!(back.phone_number_sharing_mode, 2);
+        assert_eq!(back.universal_expire_timer, 86_400);
+        assert_eq!(back.username, original.username);
+        assert_eq!(back.pinned_conversations.len(), 1);
+        match back.pinned_conversations[0].identifier.as_ref() {
+            Some(off_account::pinned_conversation::Identifier::GroupMasterKey(key)) => {
+                assert_eq!(key, &vec![2u8; 32]);
+            }
+            _ => panic!("group master key arm"),
+        }
+        assert_eq!(
+            back.release_notes_chat_blocked_at,
+            original.release_notes_chat_blocked_at
+        );
+        assert_eq!(back.unread_badge_type, original.unread_badge_type);
+        assert_eq!(
+            back.include_muted_chats_in_badge,
+            original.include_muted_chats_in_badge
+        );
+        assert_eq!(back.reaction_notifications, original.reaction_notifications);
+        assert_eq!(
+            back.notify_for_calls_if_muted,
+            original.notify_for_calls_if_muted
+        );
+        assert_eq!(
+            back.notify_for_mentions_if_muted,
+            original.notify_for_mentions_if_muted
+        );
+        assert_eq!(
+            back.notify_for_replies_if_muted,
+            original.notify_for_replies_if_muted
+        );
+        assert_eq!(back.show_unread_reminders, original.show_unread_reminders);
+        assert_eq!(
+            back.notify_when_contact_joins,
+            original.notify_when_contact_joins
+        );
+    }
+
     /// plan_write：首写（无旧 manifest）→ version 1、无 deleteKey；次写 →
     /// version 递增、旧 Account key 进 deleteKey、record_ikm 透传。
     #[test]
@@ -1406,10 +1555,16 @@ mod tests {
         assert_eq!(manifest_record.source_device, 2);
         assert_eq!(manifest_record.identifiers.len(), 1);
         assert_eq!(manifest_record.identifiers[0].raw, vec![0xaau8; 16]);
-        // 新 item 能用同 storage key 解回（legacy 路径，无 record_ikm）。
+        // 新 item 能解回（legacy 路径，无 record_ikm）：本地 shim 解出官方
+        // vendored proto 记录；上游类型也解同一条 item（写面与上游读兼容）。
         let item = &planned.write_operation.insert_item[0];
-        let back = StorageService::decrypt_item(&storage_key, item, None).expect("decrypts");
-        assert!(account_record_of(&back).is_some());
+        let plaintext = decrypt_raw_item(&storage_key, item, None).expect("decrypts");
+        assert!(account_record_of_wire(&plaintext).is_some());
+        let upstream = StorageService::decrypt_item(&storage_key, item, None).expect("decrypts");
+        assert!(matches!(
+            upstream.record,
+            Some(presage::libsignal_service::proto::storage_record::Record::Account(_))
+        ));
 
         // 次写分支：旧 manifest 换 Account key，record_ikm 透传。
         let old_manifest = ManifestRecord {
@@ -1447,12 +1602,18 @@ mod tests {
             .identifiers
             .iter()
             .all(|identifier| identifier.raw != vec![0x22u8; 16]));
-        // modern 路径：新 item 以 record_ikm 解回。
+        // modern 路径：新 item 以 record_ikm 解回（本地 shim + 上游双验）。
         let item = &planned.write_operation.insert_item[0];
-        let back =
+        let plaintext = decrypt_raw_item(&storage_key, item, Some(&manifest_record.record_ikm))
+            .expect("decrypts");
+        assert!(account_record_of_wire(&plaintext).is_some());
+        let upstream =
             StorageService::decrypt_item(&storage_key, item, Some(&manifest_record.record_ikm))
                 .expect("decrypts");
-        assert!(account_record_of(&back).is_some());
+        assert!(matches!(
+            upstream.record,
+            Some(presage::libsignal_service::proto::storage_record::Record::Account(_))
+        ));
     }
 
     /// minimal_account_record：仅 pinned，其余默认。
@@ -1551,15 +1712,27 @@ mod tests {
         assert!(by_type(&[0x22u8; 16]).is_none());
         assert!(by_type(&[0x44u8; 16]).is_none());
 
-        // insert items：[0] Account（上游解密路径）、[1] Sticker（本地 shim
-        // 解密路径 → tag=6 包裹解析还原）。
-        let account_item = StorageService::decrypt_item(
+        // insert items：[0] Account（本地 shim 解密路径，官方 vendored proto
+        // 字段面；上游类型解同一条 item 验证写面兼容——tag 4 Account arm
+        // 命中）、[1] Sticker（本地 shim 解密路径 → tag=6 包裹解析还原）。
+        let account_item = &planned.write_operation.insert_item[0];
+        let account_plaintext = decrypt_raw_item(
             &storage_key,
-            &planned.write_operation.insert_item[0],
+            account_item,
             Some(&manifest_record.record_ikm),
         )
         .expect("decrypts");
-        assert!(account_record_of(&account_item).is_some());
+        assert!(account_record_of_wire(&account_plaintext).is_some());
+        let upstream_account = StorageService::decrypt_item(
+            &storage_key,
+            account_item,
+            Some(&manifest_record.record_ikm),
+        )
+        .expect("decrypts");
+        assert!(matches!(
+            upstream_account.record,
+            Some(presage::libsignal_service::proto::storage_record::Record::Account(_))
+        ));
         let sticker_item = &planned.write_operation.insert_item[1];
         let plaintext = decrypt_raw_item(
             &storage_key,
@@ -1609,16 +1782,20 @@ mod tests {
     /// 本地 item 加解密 shim 与上游 StorageService pub API 的派生一致性
     /// （双向交叉钉定）：上游 encrypt_item 产出的 item 本地能解；本地加密
     /// 的 Account 记录 item 上游能解回同记录。modern/legacy 两路径都钉。
+    /// 上游侧显式用 presage 类型（形状面完整）；vendored 编码字节与上游
+    /// 读面的兼容性由 plan_write 系测试另钉。
     #[test]
     fn raw_item_crypto_matches_upstream_api() {
         use presage::libsignal_service::master_key::MasterKey;
+        use presage::libsignal_service::proto::storage_record as upstream_storage_record;
+        use presage::libsignal_service::proto::StorageRecord as UpstreamStorageRecord;
         let storage_key =
             StorageServiceKey::from_master_key(&MasterKey::from_slice(&[4u8; 32]).expect("key"));
         let raw_id = vec![0xaau8; 16];
-        let record = StorageRecord {
-            record: Some(storage_record::Record::Account(minimal_account_record(
-                Vec::new(),
-            ))),
+        let record = UpstreamStorageRecord {
+            record: Some(upstream_storage_record::Record::Account(
+                presage::libsignal_service::proto::AccountRecord::default(),
+            )),
         };
         for record_ikm in [None, Some([0x55u8; 32].as_slice())] {
             // 上游加密 → 本地解密：明文逐字节等于 record 编码。
