@@ -25,9 +25,8 @@ mod proto;
 mod service;
 mod state;
 
-// Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，调用方接线
-// 在 connector 消费批落地，本批先以单测门禁交付（契约 §7 裁定）。
-#[allow(dead_code)]
+// Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，装配链由
+// 消费批任务层（service::backup_task，契约 §10.3/§10.4）接线。
 mod backup;
 
 use std::io::Read;

@@ -91,6 +91,8 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；条目形状与置顶面同构；v1 不含 blockedAtTimestamp） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
+| `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
+| `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -452,6 +454,38 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
   manifest（无写序问题）。
 - **fake 纪律**：fake 模式恒 `{blocked: []}` 不触网不落调度日志；real 模
   式未注册账号 → storage 上下文打不开折叠 `-32603`（置顶面同款）。
+
+备份导出消费面（2026-10-05，connector 契约 1.47 §4.46；引擎契约
+docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界）：
+
+- **新方法 `backup.export` / `backup.exportStatus`**（独立扩展方法，非
+  signal-cli 兼容面）：文件工件交接——connector 把消息面导出为
+  `backup-export-input.ndjson` 写入引擎按账号目录（与 backup5
+  `history-import.ndjson` 同目录对称），`backup.export` 启动引擎后台任务
+  （专用 OS 线程）读工件→帧序状态机→官方 §5 快照；`backup.exportStatus`
+  轮询状态与快照清单。
+- **接收管线活性**：导出在专用线程执行（装配链纯同步、全 `Send` 输入，
+  备份导出契约 §10.3），LocalSet 上的接收管线与 dispatch 全程不被阻塞；
+  AEP 读取（presage，非 Send 面）在 start 阶段 LocalSet 内完成，派生密钥
+  字节独占移交线程。活性由引擎测试锁定。
+- **工件删除硬边界**（engine AGENTS.md 消息内容不落引擎存储）：任务离开
+  running（成功或任何失败）即删输入工件；start 阶段首行非法同步拒收时
+  当场删除；崩溃残留由 `exportStatus.artifactPresent` 如实报告、下次导出
+  终态删除。快照（密文）引擎不自删，清单在 `snapshots` 报告，清理归
+  connector（保留最近一次，导出前清旧）。
+- **密钥边界**：AEP 从 presage store kv 读、在引擎内派生即用即弃；任何
+  RPC 不返回密钥材料（Android 端用自己的 AEP 现场恢复，备份导出契约
+  §10.5/§9 调研 6）。`media_root_backup_key` 每导出随机 32B（§10.5，附件
+  批重审）。
+- **结构化错误码 5 枚**（`-1` + message 码位）：
+  `BACKUP_EXPORT_ALREADY_RUNNING`/`BACKUP_ARTIFACT_MISSING`/
+  `BACKUP_ARTIFACT_INVALID`/`BACKUP_SNAPSHOT_EXISTS`/`BACKUP_IO_FAILED`
+  （备份导出契约 §10.7，含 retryable 映射计划；connector 白名单登记归其
+  二期）。参数面（缺 account/未注册/fake/AEP 缺失）一律 `-32603`。
+- **v1 裁剪**：chat 行不带计时器字段（frames.rs chat() 一期不扩展，
+  connector 会话计时器面已在其自身链路处理；二期随 Chat.expireTimerMs 帧
+  面一起开）；附件/引用/回应/编辑等富体面不在工件行集（§6.2 后续批），
+  由 connector 侧逐因计数（其契约 §4.46）。
 
 ## 6. fake 服务模式（仅测试）
 

@@ -319,7 +319,11 @@ impl FrameSequencer {
         ))
     }
 
-    /// Group recipient（masterKey 去重，自动分配 id）。
+    /// Group recipient（masterKey 去重，自动分配 id）。snapshot 必带最小
+    /// 合法面：官方 validator 对缺席 snapshot 硬错（`MissingSnapshot`），
+    /// 空字符串 avatarUrl/零 version/空 members 均为合法缺省（官方
+    /// group.rs 验收面）——引擎无群元数据真相源（契约 §6.1 MVP 裁剪），
+    /// 投影为「无已知元数据的占位群」。
     pub fn group_recipient(
         &mut self,
         master_key: [u8; 32],
@@ -343,6 +347,10 @@ impl FrameSequencer {
                     id,
                     destination: Some(proto::recipient::Destination::Group(proto::Group {
                         master_key: master_key.to_vec(),
+                        snapshot: Some(proto::group::GroupSnapshot {
+                            avatar_url: String::new(),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     })),
                 })),

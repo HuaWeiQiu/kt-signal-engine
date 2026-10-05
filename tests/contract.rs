@@ -1204,6 +1204,49 @@ fn read_only_stubs_and_user_status_shapes() {
     assert_eq!(status["result"], json!({ "isRegistered": true }));
 }
 
+/// 备份导出消费面（compat §5 注册块 + 契约 §10.4/§10.7）：参数面一律
+/// fail-closed -32603（缺 account / 未注册 / fake 账号）；结构化码 -1 需要
+/// 真工件与真 presage 材料，由 backup_task 单元测试覆盖；backup.* 命名
+/// 空间外动词仍 -32601。
+#[test]
+fn backup_export_param_faces_fail_closed() {
+    // real 模式：缺 account 与未注册账号，两方法都 -32603。
+    let dir = temp_dir("backup-export-faces");
+    let mut engine = Engine::spawn(&dir);
+    let (code, message) = engine.error_of("backup.export", json!({}));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    let (code, message) = engine.error_of("backup.exportStatus", json!({}));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    let (code, _) = engine.error_of("backup.export", json!({ "account": "+15550000000" }));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("backup.exportStatus", json!({ "account": "+15550000000" }));
+    assert_eq!(code, -32603);
+
+    // fake 模式链接出的账号：backup.export 无真 AEP/工件可读，同样
+    // -32603（fake 账号不进入真导出任务）。
+    let fake_dir = temp_dir("backup-export-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    let started = fake_engine.request("startLink", json!({}));
+    let uri = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let finished = fake_engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    let (code, message) = fake_engine.error_of("backup.export", json!({ "account": number }));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
+    // backup.* 命名空间内未注册动词与任意未知方法同面。
+    let (code, message) = engine.error_of("backup.exportX", json!({ "account": "+15550000000" }));
+    assert_eq!((code, message.as_str()), (-32601, "Method not found"));
+}
+
 #[test]
 fn unknown_method_is_rejected_32601() {
     let dir = temp_dir("unknown-method");

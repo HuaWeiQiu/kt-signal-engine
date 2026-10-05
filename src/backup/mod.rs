@@ -7,16 +7,27 @@
 //! Rust API（契约 §7），无 store/state 依赖：调用方注入账号材料与消息内容，
 //! 引擎即用即弃、不落任何存储。
 
+mod artifact;
 mod container;
 mod export;
 mod frames;
 mod keys;
 
-/// 导出面错误（目录编排层；容器/帧序错误原样透传）。
+/// connector 消费批任务层（`service::backup_task`）的输入面。
+pub(crate) use artifact::{assemble, validate_first_line, ARTIFACT_FILE_NAME};
+pub(crate) use export::{export_local_backup, LocalBackupParams};
+pub(crate) use keys::derive_keys;
+
+#[cfg(test)]
+pub(crate) use keys::tests_official_keys;
+
+/// 导出面错误（目录编排层；容器/帧序/工件错误原样透传）。
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
     #[error(transparent)]
     FrameSequence(#[from] frames::FrameSequenceError),
+    #[error(transparent)]
+    Artifact(#[from] artifact::ArtifactError),
     #[error("snapshot directory already exists: {0}")]
     SnapshotExists(std::path::PathBuf),
     #[error("backup container io error: {0}")]

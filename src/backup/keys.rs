@@ -22,6 +22,9 @@ pub const METADATA_KEY_LEN: usize = 32;
 /// 一套完整的本地备份密钥材料（内存持有，导出完成即弃，不落任何存储）。
 #[derive(Debug)]
 pub struct BackupKeys {
+    /// 根密钥（恢复批的 backupId 重派生/校验面需要）；导出链只用派生产物。
+    // 恢复端对齐面，恢复批接线后摘除（当前仅测试使用）。
+    #[allow(dead_code)]
     pub backup_key: BackupKey,
     pub backup_id: BackupId,
     pub message_key: MessageBackupKey,

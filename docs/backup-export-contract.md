@@ -1,6 +1,7 @@
 # Android 本地备份导出契约（引擎批②，官方 v2 本地归档格式）
 
-状态：MVP 契约基线（先文档后代码）｜ 依据：ADR 0001/0002/0005 ｜ 取证日期 2026-10-05
+状态：MVP 契约基线（先文档后代码）＋消费批一期接线（§10，2026-10-05）｜
+依据：ADR 0001/0002/0005 ｜ 取证日期 2026-10-05
 
 本文件固化引擎侧「官方 Android 备份格式导出」的格式契约、MVP 帧集裁定、
 流式导出面 API 形状与验收分层。**硬验收目标：Android 端可恢复**（真机导入，
@@ -130,7 +131,7 @@ pad     = padded_length(gzip长度) - gzip长度    [libsignal v0.99.0::padded_l
 | `AccountData` | profileKey、givenName/familyName、bioText/bioEmoji；**settings 必带最小合法面**（libsignal validator 实测硬校验：settings 缺失= `MissingSettings`，phone sharing/sent media quality/app theme/calls use less data 四枚举 UNKNOWN=硬错）——引擎帧序状态机缺省补 NOBODY / HIGH / SYSTEM / WIFI_AND_MOBILE_DATA（Signal-Android 对应默认值），已带 settings 时未设置的同款补默认 | 官方 `AccountDataArchiveProcessor.export` + libsignal v0.99.0 `backup/account_data.rs` 硬校验口径（本批 validator 抽验实证） |
 | `Recipient{self}` | 恰一个（validator 强制 `MissingSelfRecipient`/去重） | libsignal v0.99.0 CompletionError |
 | `Recipient{contact}` | aci(16B)/e164/profileKey/profile 名；aci/e164/pni/username 去重（validator） | 同上 + 官方 ContactArchiveExporter 字段面 |
-| `Recipient{group}` | masterKey（去重） | 同上 |
+| `Recipient{group}` | masterKey（去重）；**snapshot 必带最小合法面**（消费批 validator 实证：缺席=硬错 `MissingSnapshot`）——引擎无群元数据真相源（§6.2 群全量面不做），状态机投影为空 avatarUrl/零 version/空 members 的占位快照（官方 group.rs 验收面全绿） | 同上 + libsignal v0.99.0 `backup/recipient/group.rs` 硬校验口径 |
 | `Chat` | id、recipientId（引用已登记 Recipient）、expireTimerMs/expireTimerVersion（有则带） | 官方 ChatArchiveExporter |
 | `ChatItem{standardMessage}` | text.body；directional：`Incoming{dateReceived,read}` / `Outgoing{dateReceived}`；authorId（self 用 Self recipient id）；dateSent | 官方 ChatItemArchiveExporter 最小面 |
 | `ChatFolder{all}` | ALL folder 一帧（validator 空集容忍、Android 端缺省自动补；带上以贴近官方档案并通过 validator） | BackupRepository.import 兜底 + validator |
@@ -159,6 +160,8 @@ JSON-RPC 一次性携带全量消息违反流式边界，逐条注入需要跨�
 两者都属 connector 契约演进面（ADR 0002：兼容层封顶，新能力走独立扩展方法 +
 契约版本），在 connector 消费批立项时按消费形状共同定形；本批先交付纯函数
 库面（单测门禁），避免单方面发明 IPC 契约后返工。
+（消费批一期的定形结论见 §10：文件工件交接 + `backup.export`/
+`backup.exportStatus`。）
 
 ```rust
 // src/backup/keys.rs —— 密钥派生（官方 pub API 薄封装）
@@ -232,3 +235,217 @@ pub fn export_local_backup(dir: &Path, params: &LocalBackupParams,
 4. 导入成功（无 FK 异常/无 hasInvalidBackupVersion），会话列表与文本消息
    可见，自发/收信方向正确。
 5. 附件/引用消息缺失按 §6.2 边界预期（无崩溃、缺省呈现）。
+
+### 真机验收补充调研（2026-10-05，消费批一期落档；官方依据逐条给出）
+
+6. **AEP 同源校验实操步骤**（官方依据：Signal-Android
+   `AppRegistrationStorageController.kt`，main 现行——`verifyLocalBackupKey(
+   backupUri, aep)` = `LocalArchiver.canDecryptMainArchive(
+   SnapshotFileSystem(context, backupDir), aep.deriveMessageBackupKey())`，
+   即**恢复端用自己持有的 AEP 现场派生 message backup key 试解 main**，密钥
+   不同源唯一表现 = `IncorrectCredential`；恢复成功后
+   `SignalStore.account.restoreAccountEntropyPool(aep)`——官方注释明言「输入
+   的恢复密钥能解用户所选备份，故它总成为该账号的 AEP」）。实操步骤：
+   ① 引擎所在桌面与真机为同一账号的链接关系（AEP 链接时经 provisioning
+   同步，引擎从 presage store kv 读到的就是手机派发的那份——同源由链接协议
+   保证）；② 真机进入注册流的「Restore or Transfer Account」→「From Signal
+   Backups」（官方 support「Signal Secure Backups」#9708267671322 载明入口）；
+   ③ 选目录（SAF；`scanLocalBackupFolder` 自动认 `SignalBackups` 子目录）→
+   ④ 输入恢复密钥（64 字符）或同机未清数据时用本机 AEP →
+   `canDecryptMainArchive` 通过即同源证明；失败形态只有 IncorrectCredential
+   （密钥不同源）与 Error（导入层问题），无第三态。
+7. **非 SVR 场景 AEP 一致性**（官方依据同上文件）：AEP 与 SVR 是两个独立
+   体系——`commitRegistrationData` 里 PIN/SVR 分支（`SvrRepository.
+   onRegistrationComplete`）与 AEP 落库（`applyAccountEntropyPool`）互不依
+   赖；链接设备路径 `setAccountEntropyPoolFromPrimaryDevice` 直接采用主设备
+   派发的 AEP，无需 SVR。真机重注册（清数据+同号短信）且无 PIN 时，旧 AEP
+   服务器侧不可恢复，官方唯一入口是**手动输入 64 字符恢复密钥**（恢复密钥
+   即 AEP；`restoreLocalBackupV2` 采纳输入密钥为账号 AEP）。结论：非 SVR
+   真机验收必须走「同机未清数据（本机 AEP 原生在位）」或「原设备官方 UI 展
+   示恢复密钥后手动输入」两种形态之一；引擎侧纪律不变——备份密钥不离开引擎
+   进程（§7/§10.5），恢复密钥由用户经官方 UI 通道自持。
+8. **备份文件送达真机方式**（官方依据：support「Android On-device
+   Backups」#10066926526362——「Move the backup folder onto the internal
+   storage of the device you'd like to restore to. Install Signal to enter
+   the registration flow. This is where the restore option will be
+   presented.」；`scanLocalBackupFolder` 实现：选中的目录含 `SignalBackups`
+   子目录则自动下沉；V2 快照目录名必须逐字匹配
+   `signal-backup-yyyy-MM-dd-HH-mm-ss`，**且父层必须存在 `files` 目录**，
+   否则 V2 快照不被列出）。官方路径即「用户把整个快照目录拷入手机内部存储
+   → 注册流选目录」，无推送通道；本引擎 MVP 导出形态（含空 `files/` 目录、
+   官方同名规则 UTC 目录名）与该扫描面完全兼容。送达介质（USB/网盘/直通
+   目录）官方未限定。
+
+## 10. 消费接线（connector 消费批一期，2026-10-05）
+
+本节固化 connector 消费批一期的接线裁定（契约先行，随后引擎实现批落地）。
+§7 的「IPC 形状留给消费批共定」由此收敛。
+
+### 10.1 IPC 形状裁定
+
+**文件工件交接 + 引擎后台任务 + connector 轮询**：
+
+```text
+connector（store 真相源）
+   │ ①把消息面导出为 ndjson 工件，写入引擎按账号的数据目录
+   ▼
+backup-export-input.ndjson（过渡性工件，§10.2）
+   │ ②connector 调 backup.export 启动；引擎后台任务读工件→建帧→落快照
+   ▼
+SignalBackups/signal-backup-<ts>/（快照，官方 §5 形态）
+   │ ③connector 轮询 backup.exportStatus；终态后经 backups.exportFile.*
+   ▼   三连把 metadata/main 取回（connector 契约 1.47 §4.46 计划）
+kt-desktop / Android 真机
+```
+
+理由：①备份模块刻意零 store 依赖（§7），消息真相源在 connector sqlite，
+引擎侧无从直读；②引擎 JSON-RPC 单行帽 1 MiB（compat §1），内联全量消息
+RPC 不可行；③文件工件有 backup5 `history-import.ndjson` 先例（引擎出方向、
+connector 消费，connector 契约 §4.38），本批是同一通道的反方向，先例形状
+（存在性判定 + 诚实计数 + 轮询状态面）整套复用。
+
+### 10.2 输入工件（过渡性，硬边界）
+
+- **路径**：`<data-dir>/<account-rel>/backup-export-input.ndjson`。
+  `<account-rel>` = engine-state.json 注册表里该号码的 `dir`（即 presage
+  store 目录 `accounts/lk-<hex>`，compat §1）。与 backup5 出方向的
+  `history-import.ndjson` 同目录（connector 契约 §4.38 同一解析路径），
+  connector 两侧用同一注册表映射定位。
+- **过渡性（硬边界，engine AGENTS.md:33-34）**：工件是 connector 写入的
+  明文聊天内容，引擎不持久化——**导出任务离开 running 态（成功或任何失败）
+  时引擎必须删除工件**；start 阶段同步拒收（工件缺失/首行非法/任务已在跑）
+  时：非法工件（首行不可解析为 account）当场删除，缺失/已在跑无工件可删。
+  任务仍在 running 或引擎进程崩溃中断时工件暂存，`backup.exportStatus` 以
+  `artifactPresent` 如实报告，下一次导出尝试终态时删除。快照目录不在本条
+  约束内（快照是密文，生命周期归 connector，§10.6）。
+- **行格式**（D3）：一行一个 JSON 对象，`type` 判别字段；首行必须且仅一行
+  account；16B 字段 = 32 位小写 hex、32B 字段 = 64 位小写 hex；对象内未列
+  出的键一律拒收（fail-closed，引擎不发明字段、不静默忽略）。引用规则：
+  连接器自选 `u64 ≥ 1` 作行引用 id（contact/group 的 `id`、chat 的 `id`），
+  `0` 保留 = 引擎 self recipient（不可声明为 id）；被引用行必须先于引用行
+  （帧序状态机强制，违反即任务失败）。
+
+| type | 字段（? = 可选） | 对应引擎输入 |
+|---|---|---|
+| `account` | `profileKey`(hex64 必填)、`givenName`?、`familyName`?、`bioText`?、`bioEmoji`? | `account_data(AccountData)`；**必须为首行且仅一行** |
+| `contact` | `id`(u64≥1)、`aci`?(hex32)、`pni`?(hex32)、`e164`?(u64≠0)、`username`?、`profileKey`?(hex64)、`givenName`?、`familyName`?、`registration`?("registered"\|"unregistered"；**缺省 = "registered"**——官方 validator 对缺席 registration 硬错 `ContactRegistrationUnknown`) | `contact_recipient(Contact)`；aci/pni/e164 至少一项；givenName/familyName → `profileGivenName`/`profileFamilyName`（Contact 无 bio 字段，bio 只属于 account 行）；`unregistered` 由引擎盖 `unregisteredTimestamp = backup_time_ms`（官方 validator 对 NotRegistered 的非零时间戳口径） |
+| `group` | `id`(u64≥1)、`masterKey`(hex64 必填) | `group_recipient(master_key)` |
+| `chat` | `id`(u64≥1)、`recipient`(引用已声明 contact/group id 或 0=self) | `chat(recipient_id)` |
+| `chat_item` | `chat`(引用已声明 chat id)、`author`(引用已声明 contact id 或 0=self；group 不能作 author——官方 v2 归档群消息署名到个人，帧序状态机 `InvalidChatAuthor` 拒绝)、`dateSent`(u64 ms)、`direction`("incoming"\|"outgoing")、`dateReceived`(u64 ms 两方向都必填)、`read`?(bool，仅 incoming 有意义，缺省 false)、`body`(非空 str，≤128 KiB) | `chat_item_text(chat_id, author_id, date_sent_ms, direction, body)` |
+| `all_chat_folder` | （无字段） | `all_chat_folder()`；可省略——缺省时引擎收尾自动补一帧（validator 通过面，§6.1），出现则恰一次 |
+
+- self recipient 不是行类型：引擎在 account 行之后自动发出（恰一次、id=1，
+  frames.rs 常量）。chat 的 `recipient: 0` 即 Note to Self。
+- **引擎侧永不静默丢行**：未知 type、顺序违规、引用未声明、id 重复、id=0
+  声明、hex 非法、body 空/超长、JSON 非法——一律任务失败
+  `BACKUP_ARTIFACT_INVALID`（§10.7）。跳行决策只属于 connector 建工件时
+  （其契约 §4.46 逐因计数），引擎只做「全部成帧或整体失败」。
+- **帽值**（写死，两端文档与实现一致；超帽 fail-closed 同上）：
+
+| 帽 | 值 | 依据 |
+|---|---|---|
+| 单行字节（含换行前） | 1 MiB = 1,048,576 B | 128 KiB body 的 JSON 转义最坏膨胀（~6×）后仍有余量；与引擎 JSON-RPC 行帽同量级 |
+| 总行数 | 4,000,000 行 | connector store 有界保留（2000 行/会话 ×8 会话帽 ×冗余系数）之上的纯 fail-closed 闸 |
+| 工件总字节 | 2 GiB = 2,147,483,648 B | 同上， runaway 文件熔断 |
+| chat_item body | 128 KiB = 131,072 B | frames.rs validator 前置（§7 API） |
+| chat/contact/group id | u64，可声明域 ≥1；0 保留 self | §10.2 引用规则 |
+| exportStatus 快照清单 | ≤32 条，新→旧 | 响应有界 |
+
+### 10.3 任务模型与执行机制（含接收管线活性）
+
+- **每账号同时至多一个导出任务**：重复 `backup.export` → 结构化错误
+  `BACKUP_EXPORT_ALREADY_RUNNING`（§10.7）。任务注册表 = 引擎进程内存
+  （HashMap<account, record>），**不落盘、不跨进程重启**——引擎重启后状态
+  归 `idle`，快照仍在盘上（exportStatus 照实报告清单），半途工件按 §10.2
+  处理。
+- **状态机**：`running → completed | failed`（start 校验失败不留状态，同步
+  回错）。`idle` = 本进程无该账号任务记录。
+- **执行机制裁定：专用 OS 线程（`std::thread`）跑导出，密钥派生在
+  LocalSet**。依据：
+  1. 备份装配链（读工件 → `MainStreamWriter` → `export_local_backup`）是
+     纯同步阻塞代码（§7 无 store/state/async 依赖），在 LocalSet 上直跑会
+     饿死同一线程上的接收管线与请求 dispatch——**导出不得阻塞接收管线是
+     硬要求**。
+  2. 装配链全部输入是 `Send` 数据：`BackupKeys` = 纯字节数组聚合
+     （`BackupKey([u8;32])`/`BackupId([u8;16])`/`MessageBackupKey{[u8;32],
+     [u8;32]}`，libsignal v0.99.0 定义面），工件路径/参数/统计句柄均为
+     `Send` 标准类型——整个任务闭包 `Send + 'static`，可安全移出 LocalSet。
+     presage 的非 Send 面（Manager/接收流）只在 start 阶段的 AEP 读取用到，
+     在 LocalSet 内完成（`fetch_account_entropy_pool` + registration data
+     读回），派生出的密钥字节独占移交线程。
+  3. 不用 `tokio::task::spawn_blocking`：任务完成通知走共享状态
+     （exportStatus 轮询语义，无 async 唤醒需求），专用线程免运行时池耦合，
+     与「备份模块零 tokio 依赖」的分层一致（线程体只触 std + backup 模块）。
+  4. **活性证据**：导出期间接收管线（spawn_local 于同一 LocalSet）与请求
+     dispatch 不被阻塞——由引擎测试锁定（任务启动后 LocalSet 上的独立任务
+     持续推进、注册表状态自 `running` 起可被并发轮询直至终态）。
+
+### 10.4 RPC 面（独立扩展方法，compat §3/§5 同步登记）
+
+- `backup.export`：params `{account}`。start 校验（顺序）：账号已注册（注册
+  表有 store 目录；fake/未注册 `-32603`）→ 工件存在（缺
+  `BACKUP_ARTIFACT_MISSING`）→ 首行可解析为合法 account 行（否则删工件 +
+  `BACKUP_ARTIFACT_INVALID`）→ AEP 可读（presage store kv；缺 `-32603`，
+  导出不可为）→ 无在跑任务（`BACKUP_EXPORT_ALREADY_RUNNING`）。成功即后台
+  执行，回 `{"status": "started"}`。
+- `backup.exportStatus`：params `{account}`。result：
+
+```json
+{
+  "account": "<echo>",
+  "state": "idle|running|completed|failed",
+  "artifactPresent": false,
+  "startedAtMs": 0, "finishedAtMs": 0,
+  "lines": 0, "frames": 0,
+  "snapshot": {"name": "signal-backup-…", "mainBytes": 0, "frames": 0},
+  "error": "BACKUP_ARTIFACT_INVALID",
+  "snapshots": [{"name": "…", "mainBytes": 0, "frames": 0}]
+}
+```
+
+  `lines`/`frames`/`snapshot`/`error`/时间戳仅在状态有对应物时出现（诚实
+  缺席，不发明 0）；`snapshot.frames` 仅本进程任务产出的快照已知帧数，历史
+  快照只报 `name`/`mainBytes`（不重读密文）。`snapshots` = 快照根目录清单
+  （`signal-backup-*` 非 `-tmp`，新→旧，≤32 条），**引擎只报告不清理**
+  （§10.6）。未注册账号 `-32603`（其他账号域方法同口径）。
+- 两方法均不落调度日志、不产 stderr（贴纸/置顶面同款纪律）。
+
+### 10.5 密钥边界
+
+- AEP 从 presage store kv 读（`fetch_account_entropy_pool`），ACI 从
+  registration data 读，`derive_keys`（§3）在 start 阶段 LocalSet 内完成；
+  `keys.rs` 的显式注入钩子（`LocalBackupParams.keys`）保留——测试与后续
+  批可不经 presage 供给。
+- **备份密钥绝不离开引擎进程**：任何 RPC 不返回密钥材料；导出只交付文件，
+  Android 端用自己的 AEP 现场恢复（§9 补充调研 6）。密钥不落日志不落盘
+  （§7 纪律延续），线程即用即弃。
+- `media_root_backup_key`：引擎无既定持久来源，**每导出随机生成 32B** 并
+  在此登记。MVP `files/` 为空（§5），无媒体解密影响；**未来附件批必须重
+  审**（官方语义是账号恒定值，随链接 provisioning 的 linkedDeviceData 分发
+  ——Signal-Android `applyAccountData`；届时改为随工件携带或持久化）。
+
+### 10.6 快照生命周期
+
+- **清理所有权 = connector**（履行 §5/`export_local_backup` 预留）：引擎
+  除删除输入工件（§10.2）外不自删任何快照。策略：**保留最近一次快照，
+  connector 在下次导出启动前清理更旧的快照**（含异常残留的 `-tmp` 目录——
+  引擎失败路径已自清，崩溃残留由 connector 兜底）。
+- 引擎在 `backup.exportStatus.snapshots` 报告清单（目录名/main 字节数/
+  已知帧数）供 connector 决策；同秒两次导出会触发 `SnapshotExists`
+  fail-closed（§7），由 connector 清理后重试，引擎不覆盖旧快照。
+
+### 10.7 结构化错误码（connector 契约 1.47 §4.46 白名单计划对齐）
+
+全部 `-1` + message 码位（§4.32/§4.33 既有形状，connector 逐字入白名单；
+白名单登记归 connector 二期）：
+
+| 码 | 面 | retryable（connector 映射计划） |
+|---|---|---|
+| `BACKUP_EXPORT_ALREADY_RUNNING` | start：该账号任务在跑；先轮询 exportStatus | false |
+| `BACKUP_ARTIFACT_MISSING` | start：工件不存在（connector 先建工件） | false |
+| `BACKUP_ARTIFACT_INVALID` | start 首行非法（工件当场删除）/运行中任何行级或帧序违规（§10.2 永不静默丢行） | false |
+| `BACKUP_SNAPSHOT_EXISTS` | 运行：同秒快照目录冲突（§10.6，清理后重试） | true |
+| `BACKUP_IO_FAILED` | 运行：文件系统失败 | true |
+
+参数面（缺 `account`、未注册/fake 账号、AEP 缺失）不占用结构化码，一律
+`-32603` fail-closed（置顶/贴纸面先例）。

@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 
 use crate::state::EngineState;
 
+pub(crate) mod backup_task;
 pub(crate) mod profile;
 pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
@@ -276,6 +277,8 @@ pub(crate) struct Service {
     inner: AsyncMutex<Inner>,
     /// 运行中的接收管线（账号 → 停机旗），delete 时通知退出。
     pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
+    /// 备份导出任务注册表（进程内存，backup_task 模块契约 §10.3）。
+    backup_tasks: Arc<backup_task::BackupTaskRegistry>,
 }
 
 struct Inner {
@@ -300,6 +303,7 @@ impl Service {
                 fake_pending_uri: None,
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
+            backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 

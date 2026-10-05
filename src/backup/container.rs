@@ -108,6 +108,7 @@ impl<W: Write> CbcMacWriter<W> {
         }
         self.encrypt_and_emit()?;
         let tag = self.mac.finalize().into_bytes();
+        debug_assert_eq!(tag.len(), HMAC_LEN, "SHA-256 tag is 32 bytes");
         self.out.write_all(&tag[..])?;
         Ok(self.out)
     }

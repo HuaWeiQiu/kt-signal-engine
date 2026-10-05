@@ -87,6 +87,8 @@ pub fn write_metadata<W: Write>(mut w: W, keys: &BackupKeys) -> Result<(), Backu
 
 /// metadata `encryptedId` 解密回 `BackupId`（CTR 对称，恢复端同款操作；
 /// 官方 `LocalArchiver.decryptBackupId` 对齐面）。
+// 恢复端对齐面，恢复批接线后摘除（当前仅测试使用）。
+#[allow(dead_code)]
 pub fn decrypt_backup_id(iv: &[u8], encrypted_id: &[u8], keys: &BackupKeys) -> [u8; 16] {
     let mut iv_block = [0u8; 16];
     let n = iv.len().min(METADATA_IV_LEN);
@@ -138,10 +140,15 @@ impl<W: Write> MainStreamWriter<W> {
     }
 
     /// 帧序状态机直通面（本层未封装的帧型走这里）。
+    // 恢复端对齐面，恢复批接线后摘除（当前仅测试使用）。
+    #[allow(dead_code)]
     pub fn sequencer(&mut self) -> &mut FrameSequencer {
         &mut self.sequencer
     }
 
+    /// 原始帧直写面（绕过状态机的逃生口，仅限测试注入违规帧证明 fail-closed）。
+    // 恢复端对齐面，恢复批接线后摘除（当前仅测试使用）。
+    #[allow(dead_code)]
     pub fn emit(&mut self, frame: proto::Frame) -> Result<(), BackupError> {
         self.write_encoded(&encode(&frame))
     }

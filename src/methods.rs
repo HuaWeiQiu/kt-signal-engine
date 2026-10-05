@@ -957,6 +957,33 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 备份导出消费面（compat §3/§5「备份导出消费面」注册块 + 契约
+        // §10.4）：参数面 fail-closed -32603（缺 account/未注册/fake 账号/
+        // AEP 缺失）；结构化码 -1 + message 码位（契约 §10.7，connector 契约
+        // 1.47 §4.46 白名单计划逐字）。两方法均不落调度日志、不产 stderr。
+        "backup.export" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.backup_export(account).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "started" })),
+                Err(crate::service::backup_task::BackupExportRejection::Structured(code)) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, code))
+                }
+                Err(crate::service::backup_task::BackupExportRejection::Internal) => {
+                    internal_error(id)
+                }
+            }
+        }
+        "backup.exportStatus" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.backup_export_status(account).await {
+                Ok(payload) => jsonrpc::success_response(id, payload),
+                Err(()) => internal_error(id),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
