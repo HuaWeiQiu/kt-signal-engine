@@ -87,7 +87,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `getStickerPackSyncs` | `{account}` | `{packs: [{packId(hex 32 小写), packKey(base64 32B)\|null, position, deletedAtTimestampMs}]}`（存储序 = manifest STICKER identifiers 首现序；坏条目跳过不炸面；墓碑 packKey=null、带 deletedAtTimestampMs） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real**：Storage Service manifest → 全部 type=6 STICKER identifier 批量读 → StickerPackRecord 投影（记录面为 presage 上游 proto 缺口本地定义 + 加解密 shim，§5）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{packs: []}` |
 | `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
 | `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
-| `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{}` | 头像上行（profile PUT/CDN POST）失败 `STORAGE_WRITE_FAILED`；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{}` |
+| `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；字节预算 UTF-8：given/family 各 ≤128B、about ≤512B、emoji ≤32B，超限 `-32603`；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{"status":"saved"}` | 头像上行（profile PUT/CDN POST）失败 `-1 PROFILE_UPLOAD_FAILED`（data `{retryable:true, textSaved}`——textSaved=true 如实呈现文字面已提交的部分成功）；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串或超字节预算、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）+ 对齐批②（2026-10-06 形状/错误/预算面，详见 §5）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{"status":"saved"}`，不落调度日志 |
 | `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；条目形状与置顶面同构；v1 不含 blockedAtTimestamp） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
 | `getAvatar` | `{account, conversationId}`（形状分派：ACI/PNI ServiceId UUID 直通、手机号文本（E.164/裸数字）经 contacts 反查、群 = master key 标准 base64（listGroups id 同源）；三者皆不中 `-32603`） | `{dataUri, size}`（data URI = `data:<mime>;base64,<payload>`，MIME 魔数嗅探、未识别回退 `application/octet-stream`；size = 原始字节数） | 参数缺失/会话标识形状非法/未注册账号 `-32603`（参数面不占用结构化码）；无头像（未同步 profile_key/对端或群未设头像/服务器 403/404）→ `AVATAR_UNAVAILABLE`；网络/下载/解密失败 → `AVATAR_FETCH_FAILED`；超 10MB 帽 → `AVATAR_TOO_LARGE`（均 `-1` + message 码位） | **2026-10-06 real（KT 扩展）**：1:1 走 presage `retrieve_profile_avatar_by_uuid`（profileKey = presage store `profile_key(service_id)`，contacts 同步随行落库；未同步 → 诚实「无头像」）；群走 presage `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密）；缓存/CDN/解密/入库由 presage 承担；10MB 帽照 presage 注释口径，超出 fail-closed；fake：`AVATAR_UNAVAILABLE`（不落调度日志，读面纪律） |
@@ -476,6 +476,60 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
   入图）。
 - **fake 成功面**：fake 模式 `setProfile` 成功 `{}`，不落调度日志（置顶/
   贴纸/账号设置面同款纪律）。
+
+个人资料写面·对齐批②（2026-10-06，connector 契约 1.46 §4.45 对齐）：
+
+- **背景与裁定**：setProfile 实现本体（官方 updateProfile 等价 + 头像上行
+  薄封装）2026-10-05 已落地（上一块）；本批对齐 connector 契约 1.46 的
+  三处形状/错误面差异，并补字节预算闸。connector 形状实查以其
+  docs/implementation-plan.md §4.45 为准（`givenName` required、可选
+  `familyName`/`about`/`emoji`/`avatar`——参数名是 `emoji` 非
+  `aboutEmoji`，引擎面与本批前实现一致）。
+- **result 形状**：`{}` → `{"status":"saved"}`（connector 契约字面同形；
+  `status` 键为引擎/connector 双侧稳定判定位）。
+- **头像上行错误面**：`STORAGE_WRITE_FAILED` → `-1 PROFILE_UPLOAD_FAILED`，
+  data `{retryable: true, textSaved: bool}`。语义可区分（卡在头像链而非
+  storage 记录面）且与 connector 声明的 retryable=true 对齐；不占用
+  connector 结构化码白名单之外的位（`-1` + message 码位，AVATAR 族同款）。
+- **部分成功语义（诚实呈现）**：写序 = server 面文字先落（官方
+  writeProfile 同序：putProfile 在 uploadAvatar 之前）→ 头像加密/CDN
+  上行 → storage 面。头像链任一步失败返回 PROFILE_UPLOAD_FAILED：
+  - Replace（data URI）：文字面已提交 → `textSaved: true`；多设备收敛为
+    文字面新值 + 头像旧值（官方客户端同态，无撕裂）；本机 storage 面未
+    同步，重试成功后补齐。
+  - Remove（null）：`avatar:false` PUT 失败 → `textSaved: false`（文字面
+    亦未提交——remove 分支的 profile 写与头像清除是同一次 PUT）。
+  - Retain（缺省）：不走头像链，失败仍归 storage 四码/presage 错误面。
+- **文字面字节预算（mirror connector §4.45）**：UTF-8 字节数 given ≤128、
+  family ≤128、about ≤512、emoji ≤32（官方桌面 ProfileEditor.dom.tsx
+  `maxBytes: 128` / bio `maxByteCount: 512` / emoji 仓内绑定 32 同源），
+  超预算参数面 `-32603` fail-closed（不触网）。多字节字符按字节数判定。
+- **头像协议形状裁定（avatar_form 不采用）**：任务参照的官方
+  ProfileAvatarUploadHelper「avatar_form PUT multipart → avatarUrlPath」
+  是 Android 新链；本仓行为锚（本地 Signal-Desktop checkout v8.31
+  writeProfile/putProfile/uploadAvatar 实查）与钉定栈（presage 33dd149
+  `update_profile` → libsignal-service 9e6c08b `write_profile`）均是经典
+  链（PUT /v1/profile avatar:true/sameAvatar → 响应上传属性 → CDN0
+  multipart POST → path=响应 key）。对齐以锚内实查为准：维持经典链
+  （avatarUrlPath 等价物 = 上行属性 `key`，storage 面 avatarUrlPath 字段
+  语义不变）；Android avatar_form 链待栈/桌面锚实际切换时按 §5 惯例另批。
+- **钉定栈 pub 面结论（33dd149 / 9e6c08b 实查）**：文字面 pub API 在用
+  （presage `Manager::update_profile`，retain_avatar=true 通路）；头像面
+  上游双层缺口维持（presage `upload_versioned_profile` NewAvatar 分支
+  `unimplemented!()`、libsignal-service `write_profile` 上传响应错解
+  String——真实响应是七字段对象），自建薄封装继续；替换条件 = 上游补面
+  （AvatarUploadAttributes 解析 + NewAvatar 上行），届时整段替换。
+- **receive 投影边界（登记不做）**：本机 setProfile 后官方多设备镜像经
+  syncMessage.profileKeyUpdate；钉定 rev 的 `SyncMessage.Content` oneof
+  无该变体（实查生成 prost：仅 contacts/blocked/configuration/keys 等），
+  引擎 receive 投影无从投影——其他设备的资料镜像（profile 变更收投影）
+  另行立项，本批边界。
+- **测试面**：单测 116→118（+2：文字预算逐键 128/129、512/513、32/33 与
+  多字节按字节判定；UploadFailed text_saved 两态编码面）；契约 23→24
+  （+1：调度零头像字节——fake 模式 setProfile 全程不触网不落盘，数据目录
+  文本工件扫不到 data URI/base64 形；调度日志不落条目纪律原测试扩形状）；
+  fake 成功形状三形态更新为 `{"status":"saved"}`，参数面新增三个预算超限
+  形状，real 模式补未注册账号 setProfile 不触网折叠。
 
 会话拉黑只读面（2026-10-05）：
 

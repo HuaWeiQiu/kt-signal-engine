@@ -41,6 +41,14 @@ use super::StorageContext;
 /// 头像单次上行上限（官方 AvatarHelper 10MB 同量级；超出 fail-closed）。
 pub(crate) const AVATAR_MAX_BYTES: usize = 10 * 1024 * 1024;
 
+/// 文字面字节预算（UTF-8 字节数，与 connector 契约 1.46 §4.45 逐字同源：
+/// 官方桌面 ProfileEditor.dom.tsx `maxBytes: 128`（两个名字件）/ bio
+/// `maxByteCount: 512` / emoji 仓内绑定 32——超预算参数面 fail-closed）。
+pub(crate) const GIVEN_NAME_MAX_BYTES: usize = 128;
+pub(crate) const FAMILY_NAME_MAX_BYTES: usize = 128;
+pub(crate) const ABOUT_MAX_BYTES: usize = 512;
+pub(crate) const EMOJI_MAX_BYTES: usize = 32;
+
 /// 头像意图（setProfile avatar 参数面）。
 pub(crate) enum AvatarIntent {
     /// 缺省：保留现有头像（文字面走 presage retain_avatar 通路）。
@@ -61,18 +69,43 @@ pub(crate) struct ProfileUpdate {
     pub(crate) avatar: AvatarIntent,
 }
 
-/// setProfile 错误面：storage 链路四码复用（compat §4.33，头像上行失败归
-/// `STORAGE_WRITE_FAILED`——写意图未完整落地；不新增结构化码）。参数形状
-/// 错误在 methods.rs 解析面 fail-closed（-32603），不进本错误面。
+/// setProfile 错误面：storage 链路四码复用（compat §4.33）；头像上行失败
+/// 独立 `PROFILE_UPLOAD_FAILED`（`-1`，data.retryable=true——与 storage 族
+/// 同为可重试网络面，但语义可区分：写意图卡在头像链而非 storage 记录面；
+/// data.textSaved=true 如实呈现文字面已提交的部分成功）。
 #[derive(Debug)]
 pub(crate) enum ProfileError {
     Storage(storage_sync::StorageSyncError),
+    /// 头像上行链失败（属性校验/CDN POST/网络）。文字面（server profile
+    /// 写）已提交成功时 `text_saved=true`——部分成功诚实呈现（storage 面
+    /// 同步未执行，多设备以文字面新值、头像旧值收敛，无撕裂）。
+    UploadFailed {
+        text_saved: bool,
+    },
 }
 
 impl From<storage_sync::StorageSyncError> for ProfileError {
     fn from(value: storage_sync::StorageSyncError) -> Self {
         ProfileError::Storage(value)
     }
+}
+
+/// 文字面字节预算闸（UTF-8 字节数，connector 契约 1.46 同口径）：超预算
+/// fail-closed。givenName 非空校验在 methods.rs 解析面（空串同样拒）。
+pub(crate) fn text_budget_ok(update: &ProfileUpdate) -> bool {
+    update.given_name.len() <= GIVEN_NAME_MAX_BYTES
+        && update
+            .family_name
+            .as_ref()
+            .is_none_or(|text| text.len() <= FAMILY_NAME_MAX_BYTES)
+        && update
+            .about
+            .as_ref()
+            .is_none_or(|text| text.len() <= ABOUT_MAX_BYTES)
+        && update
+            .emoji
+            .as_ref()
+            .is_none_or(|text| text.len() <= EMOJI_MAX_BYTES)
 }
 
 /// 头像 data URI 解析（fail-closed）：`data:image/*;base64,<payload>`，
@@ -304,6 +337,10 @@ pub(crate) async fn set_profile(
     context: &StorageContext,
     update: ProfileUpdate,
 ) -> Result<(), ProfileError> {
+    debug_assert!(
+        text_budget_ok(&update),
+        "text budget enforced at the params face"
+    );
     let data = context
         .store
         .load_registration_data()
@@ -330,15 +367,24 @@ pub(crate) async fn set_profile(
             None
         }
         AvatarIntent::Remove => {
-            put_profile(&context.push, &profile_key, aci, &update, false).await?;
+            put_profile(&context.push, &profile_key, aci, &update, false)
+                .await
+                .map_err(|_| ProfileError::UploadFailed { text_saved: false })?;
             Some(String::new())
         }
         AvatarIntent::Replace { bytes } => {
+            // 文字面（server profile 写）先落，头像链失败时如实呈现
+            // text_saved=true（官方 writeProfile 同序：putProfile 在
+            // uploadAvatar 之前）。
             let attrs = put_profile(&context.push, &profile_key, aci, &update, true)
-                .await?
+                .await
+                .map_err(|_| ProfileError::UploadFailed { text_saved: true })?
                 .expect("avatar=true response carries upload attributes");
             let encrypted = encrypt_avatar(&profile_key, bytes);
-            Some(post_avatar_to_cdn(attrs, &encrypted).await?)
+            let key = post_avatar_to_cdn(attrs, &encrypted)
+                .await
+                .map_err(|_| ProfileError::UploadFailed { text_saved: true })?;
+            Some(key)
         }
     };
 
@@ -466,5 +512,98 @@ mod tests {
         assert!(parse_avatar_data_uri(&format!("data:image/png;base64,{big_payload}")).is_none());
         // 非 data URI。
         assert!(parse_avatar_data_uri("https://example.invalid/a.png").is_none());
+    }
+
+    fn update_with(
+        given: &str,
+        family: Option<&str>,
+        about: Option<&str>,
+        emoji: Option<&str>,
+    ) -> ProfileUpdate {
+        ProfileUpdate {
+            given_name: given.to_owned(),
+            family_name: family.map(str::to_owned),
+            about: about.map(str::to_owned),
+            emoji: emoji.map(str::to_owned),
+            avatar: AvatarIntent::Retain,
+        }
+    }
+
+    /// 文字面字节预算闸（connector 契约 1.46 同口径）：UTF-8 字节数逐键
+    /// 判定——given 128 合法 /129 拒、family 128/129、about 512/513、
+    /// emoji 32/33、多字节字符按字节算（43 个 3B 汉字 = 129B 拒）。
+    #[test]
+    fn text_budget_ladder_per_key() {
+        let max_given = "g".repeat(GIVEN_NAME_MAX_BYTES);
+        let over_given = "g".repeat(GIVEN_NAME_MAX_BYTES + 1);
+        assert!(text_budget_ok(&update_with(&max_given, None, None, None)));
+        assert!(!text_budget_ok(&update_with(&over_given, None, None, None)));
+
+        let max_family = "f".repeat(FAMILY_NAME_MAX_BYTES);
+        let over_family = "f".repeat(FAMILY_NAME_MAX_BYTES + 1);
+        assert!(text_budget_ok(&update_with(
+            "g",
+            Some(&max_family),
+            None,
+            None
+        )));
+        assert!(!text_budget_ok(&update_with(
+            "g",
+            Some(&over_family),
+            None,
+            None
+        )));
+
+        let max_about = "a".repeat(ABOUT_MAX_BYTES);
+        let over_about = "a".repeat(ABOUT_MAX_BYTES + 1);
+        assert!(text_budget_ok(&update_with(
+            "g",
+            None,
+            Some(&max_about),
+            None
+        )));
+        assert!(!text_budget_ok(&update_with(
+            "g",
+            None,
+            Some(&over_about),
+            None
+        )));
+
+        let max_emoji = "e".repeat(EMOJI_MAX_BYTES);
+        let over_emoji = "e".repeat(EMOJI_MAX_BYTES + 1);
+        assert!(text_budget_ok(&update_with(
+            "g",
+            None,
+            None,
+            Some(&max_emoji)
+        )));
+        assert!(!text_budget_ok(&update_with(
+            "g",
+            None,
+            None,
+            Some(&over_emoji)
+        )));
+
+        // 字节数非字符数：3 字节 UTF-8（汉字）43 个 = 129 字节，字符数 43
+        // 远小于各预算——按字节 fail-closed。
+        let multibyte = "名".repeat(43);
+        assert_eq!(multibyte.len(), 129);
+        assert!(!text_budget_ok(&update_with(&multibyte, None, None, None)));
+    }
+
+    /// 部分成功语义的编码面：UploadFailed携带 text_saved 标志（Replace 分支
+    /// = true、Remove 分支 = false），错误类型本身不携带头像字节。
+    #[test]
+    fn upload_failed_carries_partial_success_flag() {
+        let error = ProfileError::UploadFailed { text_saved: true };
+        let ProfileError::UploadFailed { text_saved } = error else {
+            panic!("UploadFailed expected");
+        };
+        assert!(text_saved);
+        let error = ProfileError::UploadFailed { text_saved: false };
+        let ProfileError::UploadFailed { text_saved } = error else {
+            panic!("UploadFailed expected");
+        };
+        assert!(!text_saved);
     }
 }

@@ -303,6 +303,14 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 setProfile：注册数据前置即内部失败（不触网；个人资料
+    // 写面）。
+    let (code, message) = engine.error_of(
+        "setProfile",
+        json!({ "account": "+15559990000", "givenName": "KT" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -1481,10 +1489,12 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
     }
 }
 
-/// setProfile（P5 扩面，官方 updateProfile 等价）：fake 形状成功 `{}`（文字
-/// 面/头像 data URI/null 三态）+ 参数面 fail-closed 逐形状（-32603：缺
-/// account、givenName 缺/空/非字符串、可选文本字段非字符串、avatar 非图
-/// 像 data URI/非字符串——不触网）。
+/// setProfile（个人资料写面，官方 updateProfile 等价）：fake 形状成功
+/// `{"status":"saved"}`（文字面/头像 data URI/null 三态）+ 参数面
+/// fail-closed 逐形状（-32603：缺 account、givenName 缺/空/非字符串、可选
+/// 文本字段非字符串、字节预算超限（given 129B/about 513B/emoji 33B）、
+/// avatar 非图像 data URI/非字符串——不触网）+ fake 纪律：不落调度日志，
+/// 零头像/密文字节外泄。
 #[test]
 fn set_profile_fake_shapes_and_param_fail_closed() {
     use base64::Engine as _;
@@ -1506,30 +1516,32 @@ fn set_profile_fake_shapes_and_param_fail_closed() {
         base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake")
     );
 
-    // fake 成功面：{}（文字面/换新头像/移除头像三形态）。
+    // fake 成功面：{"status":"saved"}（文字面/换新头像/移除头像三形态）。
     assert_eq!(
         engine.request(
             "setProfile",
             json!({ "account": number, "givenName": "KT", "familyName": "Agent", "about": "hi", "emoji": "🤖" }),
         )["result"],
-        json!({})
+        json!({ "status": "saved" })
     );
     assert_eq!(
         engine.request(
             "setProfile",
             json!({ "account": number, "givenName": "KT", "avatar": avatar }),
         )["result"],
-        json!({})
+        json!({ "status": "saved" })
     );
     assert_eq!(
         engine.request(
             "setProfile",
             json!({ "account": number, "givenName": "KT", "avatar": null }),
         )["result"],
-        json!({})
+        json!({ "status": "saved" })
     );
 
-    // 参数面 fail-closed 逐形状。
+    // 参数面 fail-closed 逐形状（含字节预算：129/513/33 字节各键超限）。
+    let max_ok = "g".repeat(128);
+    let over = |n: usize, ch: char| ch.to_string().repeat(n);
     let rejects = [
         json!({ "givenName": "KT" }),
         json!({ "account": number }),
@@ -1538,7 +1550,10 @@ fn set_profile_fake_shapes_and_param_fail_closed() {
         json!({ "account": number, "givenName": "KT", "familyName": 7 }),
         json!({ "account": number, "givenName": "KT", "about": [] }),
         json!({ "account": number, "givenName": "KT", "emoji": true }),
-        json!({ "account": number, "givenName": "KT", "avatar": "data:text/plain;base64,aGk=" }),
+        json!({ "account": number, "givenName": "KT", "familyName": over(129, 'f') }),
+        json!({ "account": number, "givenName": "KT", "about": over(513, 'a') }),
+        json!({ "account": number, "givenName": "KT", "emoji": over(33, 'e') }),
+        json!({ "account": number, "givenName": max_ok, "avatar": "data:text/plain;base64,aGk=" }),
         json!({ "account": number, "givenName": "KT", "avatar": "data:image/png,notbase64payload" }),
         json!({ "account": number, "givenName": "KT", "avatar": "https://example.invalid/a.png" }),
         json!({ "account": number, "givenName": "KT", "avatar": 7 }),
@@ -1550,6 +1565,57 @@ fn set_profile_fake_shapes_and_param_fail_closed() {
             "setProfile rejects {params}"
         );
     }
+
+    // fake 纪律：不落调度日志；头像 data URI（含 base64 载荷）零字节进日志。
+    let log_path = dir.join("engine-send-log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "setProfile must not write dispatch log entries"
+    );
+}
+#[test]
+fn set_profile_avatar_uri_never_reaches_log() {
+    use base64::Engine as _;
+    let dir = temp_dir("set-profile-log");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let avatar_bytes = b"\x89PNG-fake-avatar-payload";
+    let avatar = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(avatar_bytes)
+    );
+    let response = engine.request(
+        "setProfile",
+        json!({ "account": number, "givenName": "KT", "avatar": avatar }),
+    );
+    assert_eq!(response["result"], json!({ "status": "saved" }));
+
+    // 零头像字节纪律：数据目录全部文本工件扫不到 data URI 载荷与 base64
+    // 形（fake 模式不上行不落盘，日志面同样零字节）。
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&dir).expect("data dir readable") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !text.contains("aVBORw0KGgo") && !text.contains("data:image"),
+                "avatar bytes leaked into {}",
+                path.display()
+            );
+            scanned += 1;
+        }
+    }
+    assert!(scanned >= 1, "no files scanned in data dir");
 }
 
 /// setUniversalExpireTimer（P5 扩面，官方 universal timer 写面）：fake 形状

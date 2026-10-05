@@ -931,8 +931,10 @@ async fn dispatch(
             }
         }
         // 个人资料编辑（官方 updateProfile 等价，带 account 参数）：文字面
-        // 全量写（givenName 必填非空），avatar 三态（缺省=保留、data URI=
-        // 换新、null=移除）；形状错 fail-closed -32603（置顶面参数处理先例）。
+        // 全量写（givenName 必填非空，字节预算 mirror connector 契约 1.46：
+        // given/family 各 ≤128B、about ≤512B、emoji ≤32B，超预算 fail-closed），
+        // avatar 三态（缺省=保留、data URI=换新、null=移除）；形状错
+        // fail-closed -32603（置顶面参数处理先例）。
         "setProfile" => {
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
@@ -970,25 +972,35 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
-            match service
-                .set_profile(
-                    account,
-                    crate::service::profile::ProfileUpdate {
-                        given_name: given_name.to_owned(),
-                        family_name,
-                        about,
-                        emoji,
-                        avatar,
-                    },
-                )
-                .await
-            {
-                Ok(()) => jsonrpc::success_response(id, json!({})),
+            let update = crate::service::profile::ProfileUpdate {
+                given_name: given_name.to_owned(),
+                family_name,
+                about,
+                emoji,
+                avatar,
+            };
+            if !crate::service::profile::text_budget_ok(&update) {
+                return internal_error(id);
+            }
+            match service.set_profile(account, update).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "saved" })),
                 Err(crate::service::profile::ProfileError::Storage(
                     storage_sync::StorageSyncError::UnknownAccount,
                 )) => internal_error(id),
                 Err(crate::service::profile::ProfileError::Storage(error)) => {
                     storage_error(id, &error)
+                }
+                // 头像链失败：PROFILE_UPLOAD_FAILED（-1，retryable=true），
+                // 文字面已提交时 data.textSaved=true（部分成功诚实呈现）。
+                Err(crate::service::profile::ProfileError::UploadFailed { text_saved }) => {
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "PROFILE_UPLOAD_FAILED",
+                            json!({ "retryable": true, "textSaved": text_saved }),
+                        ),
+                    )
                 }
             }
         }
