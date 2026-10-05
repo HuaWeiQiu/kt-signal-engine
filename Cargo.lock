@@ -1775,9 +1775,13 @@ dependencies = [
 name = "kt-signal-engine"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.3",
  "aes-gcm",
  "base64 0.22.1",
  "bincode",
+ "cbc",
+ "ctr 0.10.1",
+ "flate2",
  "futures",
  "hkdf",
  "hmac",

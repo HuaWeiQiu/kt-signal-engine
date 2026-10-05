@@ -25,6 +25,11 @@ mod proto;
 mod service;
 mod state;
 
+// Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，调用方接线
+// 在 connector 消费批落地，本批先以单测门禁交付（契约 §7 裁定）。
+#[allow(dead_code)]
+mod backup;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;

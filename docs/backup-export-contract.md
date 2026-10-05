@@ -127,7 +127,7 @@ pad     = padded_length(gzip长度) - gzip长度    [libsignal v0.99.0::padded_l
 | 帧 | 内容 | 依据 |
 |---|---|---|
 | `BackupInfo`（首帧） | version=1、backupTimeMs、mediaRootBackupKey(32B)、currentAppVersion/firstAppVersion | 官方 export 首帧；version≤1 硬校验 |
-| `AccountData` | profileKey、givenName/familyName、bioText/bioEmoji；settings 面不带（proto3 缺省，导入端 settings==null 分支容忍） | 官方 `AccountDataArchiveProcessor.export`；最小可恢复 |
+| `AccountData` | profileKey、givenName/familyName、bioText/bioEmoji；**settings 必带最小合法面**（libsignal validator 实测硬校验：settings 缺失= `MissingSettings`，phone sharing/sent media quality/app theme/calls use less data 四枚举 UNKNOWN=硬错）——引擎帧序状态机缺省补 NOBODY / HIGH / SYSTEM / WIFI_AND_MOBILE_DATA（Signal-Android 对应默认值），已带 settings 时未设置的同款补默认 | 官方 `AccountDataArchiveProcessor.export` + libsignal v0.99.0 `backup/account_data.rs` 硬校验口径（本批 validator 抽验实证） |
 | `Recipient{self}` | 恰一个（validator 强制 `MissingSelfRecipient`/去重） | libsignal v0.99.0 CompletionError |
 | `Recipient{contact}` | aci(16B)/e164/profileKey/profile 名；aci/e164/pni/username 去重（validator） | 同上 + 官方 ContactArchiveExporter 字段面 |
 | `Recipient{group}` | masterKey（去重） | 同上 |
@@ -163,27 +163,39 @@ JSON-RPC 一次性携带全量消息违反流式边界，逐条注入需要跨�
 ```rust
 // src/backup/keys.rs —— 密钥派生（官方 pub API 薄封装）
 pub struct BackupKeys { /* backup_key/backup_id/message_key(hmac,aes)/metadata_key */ }
-pub fn derive_keys(aep: &AccountEntropyPool, aci: Aci) -> BackupKeys;
+pub fn derive_keys(aep: &AccountEntropyPool, aci: &Aci) -> BackupKeys;
 
 // src/backup/container.rs —— 加密容器（流式，O(1) 帧内存）
 pub struct BackupStreamWriter<W: Write> { … }
 impl<W: Write> BackupStreamWriter<W> {
-    pub fn new(w: W, message_key: &MessageBackupKey) -> Self;      // 随机 IV + 写 IV 进 MAC
-    pub fn write_varint_frame(&mut self, encoded: &[u8]) -> io::Result<()>;
-    pub fn finish(self) -> io::Result<()>;                          // gzip finish → pad → PKCS7 → HMAC 尾
+    pub fn new(w: W, message_key: &MessageBackupKey) -> io::Result<Self>;  // 随机 IV + 写 IV 进 MAC
+    pub fn write_frame(&mut self, encoded: &[u8]) -> io::Result<()>;       // varint32(len) ‖ Frame
+    pub fn finish(self) -> io::Result<W>;   // gzip finish → pad → PKCS7 → HMAC 尾，还底层写面
 }
 
-// src/backup/frames.rs —— 帧构造 + 帧序状态机（引用完整性闸）
-pub struct FrameSequencer { … }   // BackupInfo→AccountData→Recipient*→Chat*→ChatFolder/ChatItem*
+// src/backup/frames.rs —— 帧构造 + 帧序状态机（引用完整性闸；违规 fail-closed）
+pub struct FrameSequencer { … }   // BackupInfo→AccountData→Recipient*→Chat*→ChatItem*/ChatFolder
 impl FrameSequencer {
-    pub fn backup_info/…/self_recipient/contact_recipient/group_recipient/chat/chat_item_text/all_chat_folder(…);
-    pub fn encode_next(&mut self) -> Option<Vec<u8>>;   // 违规 fail-closed
+    pub fn new(backup_info: proto::BackupInfo) -> Self;
+    pub fn backup_info(&mut self) -> Result<proto::BackupInfo, FrameSequenceError>;  // 恰一次
+    pub fn account_data(&mut self, account: proto::AccountData) -> Result<proto::Frame, _>;
+    pub fn self_recipient(&mut self) -> Result<(u64, proto::Frame), _>;              // id=1 恰一次
+    pub fn contact_recipient(&mut self, Contact) -> Result<(u64, proto::Frame), _>;  // id 自 2 递增
+    pub fn group_recipient(&mut self, master_key: [u8; 32]) -> Result<(u64, proto::Frame), _>;
+    pub fn chat(&mut self, recipient_id: u64) -> Result<(u64, proto::Frame), _>;
+    pub fn chat_item_text(&mut self, …) -> Result<proto::Frame, _>;
+    pub fn all_chat_folder(&mut self) -> Result<proto::Frame, _>;
 }
 
 // src/backup/export.rs —— 目录编排（metadata + main 两文件 + tmp→rename）
-pub struct LocalBackupParams { /* aep 或 BackupKeys、aci、backup_time_ms、media_root_backup_key、app_version */ }
-pub trait ChatSource { /* 调用方注入：逐会话逐消息迭代（内存注入，引擎零存储） */ }
-pub async fn export_local_backup(dir: &Path, params: LocalBackupParams, source: ChatSource) -> Result<ExportReport, BackupError>;
+pub struct LocalBackupParams { /* keys: BackupKeys、backup_time_ms、media_root_backup_key(32B)、app_version */ }
+pub struct MainStreamWriter<W: Write> { /* sequencer + BackupStreamWriter 合体，产出帧即写即计 */ }
+pub fn write_metadata<W: Write>(w: W, keys: &BackupKeys) -> Result<(), BackupError>;  // CTR32BE(iv‖0u32be)
+pub fn write_main_stream<W: Write>(w: W, params: &LocalBackupParams, seed: impl FnOnce(&mut MainStreamWriter<W>) -> Result<(), BackupError>)
+    -> Result<(W, MainStreamStats), BackupError>;
+pub fn export_local_backup(dir: &Path, params: &LocalBackupParams,
+    seed: impl FnOnce(&mut MainStreamWriter<BufWriter<File>>) -> Result<(), BackupError>)
+    -> Result<ExportReport, BackupError>;   // 同步函数（无 store/state/async 依赖）；final 已存在 → SnapshotExists fail-closed
 ```
 
 - **不落库边界**：导出模块无任何 store/state 写入；消息内容只经内存进帧、
