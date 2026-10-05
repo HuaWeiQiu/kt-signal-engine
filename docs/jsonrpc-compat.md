@@ -86,6 +86,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setConversationPinned` | `{account, conversationId, kind: contact\|group\|legacyGroup, pinned(bool)}` | `{pinned: [...]}`（写后全量，同 getPinnedConversations 形状） | 云引用解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次/写面冲突重放中失败 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/未知 kind/未注册账号 `-32603` | **P4 real**：官方 upload 语义（读改写 AccountRecord 仅动 pinned 字段、prost round-trip 保真其余字段、新 16B item id、version+1/source_device/record_ikm 透传）+ `PUT v1/storage/` + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；写面为 presage 上游缺口自建薄封装（上游补齐后替换）；fake：成功回 `{pinned: []}` |
 | `getStickerPackSyncs` | `{account}` | `{packs: [{packId(hex 32 小写), packKey(base64 32B)\|null, position, deletedAtTimestampMs}]}`（存储序 = manifest STICKER identifiers 首现序；坏条目跳过不炸面；墓碑 packKey=null、带 deletedAtTimestampMs） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real**：Storage Service manifest → 全部 type=6 STICKER identifier 批量读 → StickerPackRecord 投影（记录面为 presage 上游 proto 缺口本地定义 + 加解密 shim，§5）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{packs: []}` |
 | `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
+| `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
@@ -357,6 +358,26 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
 - **fake 成功面**：fake 模式 `setExpirationTimer` 成功
   `{"timestamp":u64}`，只落调度日志不触网（fake 开关仅 IPC 契约测试用，
   §6）。
+
+账号级设置写面（2026-10-05，官方 updateConfiguration 等价）：
+
+- **新方法 `setAccountConfiguration`**：账号级 `readReceipts`/
+  `typingIndicators`/`phoneNumberSharingMode`（`"everybody"`=1/`"nobody"`=2，
+  桌面 v8.31 与 Android 现行枚举一致；旧 CONTACTS_ONLY 已从官方 proto
+  移除，参数不收）/`unlistedPhoneNumber` → Storage Service AccountRecord
+  写面。真相源单点 = AccountRecord，无额外同步广播（其他设备经 storage
+  sync 收敛）——与 `setExpirationTimer`（会话级、要广播）的本质差异。
+- **写编排骨架通用化**：置顶面 `write_pinned` 的 seed master key →
+  manifest 读取（404 → 最小 AccountRecord 首写分支）→ mutate →
+  plan_write → PUT → 409 采纳重放骨架收敛为 `update_account_record`
+  通用编排，置顶/账号设置共用（mutate 回调 None = 幂等无写直接成功）；
+  置顶面行为逐字节不变。提供字段已全部满足 → 幂等无写（不 PUT 不
+  bump version）。
+- **只写提供的字段**：读改写仅覆写提供的键，其余账号设置（含 52-60
+  通知面）原样——① vendored 官方 proto 是该写面的字段保真前提（钉定
+  presage rev 类型面 decode 即丢 52-60）。零可写字段（只有 account）
+  的调用 fail-closed `-32603`（不静默 no-op）。fake 模式成功 `{}`，
+  不落调度日志（置顶/贴纸面同款纪律）。
 
 ## 6. fake 服务模式（仅测试）
 

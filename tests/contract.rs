@@ -964,6 +964,71 @@ fn set_expiration_timer_fake_shape_and_param_fail_closed() {
     assert_eq!(entry["params"]["expirationInSeconds"], json!(86_400));
 }
 
+/// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：fake
+/// 形状成功 `{}`（只写提供字段的三形态）+ 参数面 fail-closed 逐形状
+/// （-32603：缺 account、布尔字段非布尔、phoneNumberSharingMode 非法/
+/// 非字符串、零可写字段——不触网）。
+#[test]
+fn set_account_configuration_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("account-config");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake 成功面：{}（回执开关双写）。
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "readReceipts": true, "typingIndicators": false }),
+        )["result"],
+        json!({})
+    );
+    // 手机号可见性两形态 + unlisted。
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "phoneNumberSharingMode": "everybody", "unlistedPhoneNumber": true }),
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "phoneNumberSharingMode": "nobody" }),
+        )["result"],
+        json!({})
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "readReceipts": true }),
+        json!({ "account": number, "readReceipts": "yes" }),
+        json!({ "account": number, "typingIndicators": 1 }),
+        json!({ "account": number, "unlistedPhoneNumber": "false" }),
+        json!({ "account": number, "phoneNumberSharingMode": "contactsOnly" }),
+        json!({ "account": number, "phoneNumberSharingMode": "" }),
+        json!({ "account": number, "phoneNumberSharingMode": 1 }),
+        json!({ "account": number }),
+        json!({}),
+    ];
+    for params in &rejects {
+        let response = engine.request("setAccountConfiguration", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "setAccountConfiguration rejects {params}"
+        );
+    }
+}
+
 #[test]
 fn read_only_stubs_and_user_status_shapes() {
     let dir = temp_dir("read-only");

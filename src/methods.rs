@@ -805,6 +805,60 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 账号级设置（官方 updateConfiguration 等价，Storage Service 真相源，
+        // 带 account 参数，风格对齐置顶/贴纸面）：只写提供的字段；形状错
+        // fail-closed -32603（置顶面参数处理先例，不占用结构化码）。
+        "setAccountConfiguration" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let read_receipts = match optional_bool(params.get("readReceipts")) {
+                Some(value) => value,
+                None => return internal_error(id),
+            };
+            let typing_indicators = match optional_bool(params.get("typingIndicators")) {
+                Some(value) => value,
+                None => return internal_error(id),
+            };
+            let phone_number_sharing_mode = match params.get("phoneNumberSharingMode") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => {
+                    match storage_sync::phone_number_sharing_mode_of(text) {
+                        Some(mode) => Some(mode),
+                        None => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            let unlisted_phone_number = match optional_bool(params.get("unlistedPhoneNumber")) {
+                Some(value) => value,
+                None => return internal_error(id),
+            };
+            // 零可写字段 = 无意图调用，fail-closed（不静默 no-op）。
+            if read_receipts.is_none()
+                && typing_indicators.is_none()
+                && phone_number_sharing_mode.is_none()
+                && unlisted_phone_number.is_none()
+            {
+                return internal_error(id);
+            }
+            match service
+                .set_account_configuration(
+                    account,
+                    storage_sync::AccountConfigurationUpdate {
+                        read_receipts,
+                        typing_indicators,
+                        phone_number_sharing_mode,
+                        unlisted_phone_number,
+                    },
+                )
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
@@ -849,6 +903,16 @@ fn sticker_sync_payload(packs: &[crate::service::storage_sticker::StickerPackSyn
             })
             .collect::<Vec<_>>(),
     })
+}
+
+/// 可选布尔参数（setAccountConfiguration 面）：缺省/null = 不写该字段；
+/// 非布尔形状 = None 外层（fail-closed）。
+fn optional_bool(value: Option<&Value>) -> Option<Option<bool>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Bool(v)) => Some(Some(*v)),
+        Some(_) => None,
+    }
 }
 
 /// conversationId + kind → 引擎会话标识（未知 kind fail-closed）。

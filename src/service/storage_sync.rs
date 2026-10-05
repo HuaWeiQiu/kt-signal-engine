@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Storage Service 同步：会话级置顶（P4 扩面）+ 写面泛化（P5，支撑贴纸包
-//! 记录面 `storage_sticker`）。
+//! 记录面 `storage_sticker` 与账号级设置写面 `setAccountConfiguration`/
+//! `setUniversalExpireTimer`，共用 `update_account_record` 编排骨架）。
 //!
 //! 真相源 = Storage Service 的 `AccountRecord.pinned_conversations`（数组序
 //! 即置顶顺序，无时间戳）。读面走 presage 上游 pub API（`StorageService::
@@ -775,13 +776,15 @@ fn project_pinned(account: &AccountRecord) -> Vec<PinnedEntry> {
         .collect()
 }
 
-/// 写面编排（官方 upload 语义）：读 manifest + Account item → 原地改
-/// pinned → encrypt（新 id）→ PUT → 409 采纳重放（conflictBackOff 3 次）。
-pub(crate) async fn write_pinned(
+/// 账号记录写编排通用骨架（write_pinned 收敛出的共用面，账号级设置批
+/// setAccountConfiguration / setUniversalExpireTimer 复用）：seed master
+/// key → manifest 读取（404 → 最小 AccountRecord 首写分支）→ mutate 回调
+/// （None = 意图已满足，幂等无写直接返回现状）→ plan_write → PUT → 409
+/// 采纳重放（conflictBackOff 3 次）。返回写后（或未变的）AccountRecord。
+pub(crate) async fn update_account_record(
     context: &StorageContext,
-    target: EngineConversationId,
-    pinned: bool,
-) -> Result<Vec<PinnedEntry>, StorageSyncError> {
+    mutate: impl Fn(&AccountRecord) -> Option<AccountRecord>,
+) -> Result<AccountRecord, StorageSyncError> {
     // master key 缺失 = 从未有过 storage 状态（compat §5 首写分支前半）：
     // 生成并落库，随后以 version 1 + 最小 AccountRecord 建初始 manifest。
     // 手机侧并发首建的竞争由 409 采纳重放兜底（服务器 manifest 为准）。
@@ -811,35 +814,10 @@ pub(crate) async fn write_pinned(
     )
     .await?;
 
-    // 本地意图先解析（解析失败 fail-closed，不发请求）：
-    // contact → serviceId（ACI 优先，本机号走注册数据）；group → master key。
-    let new_pinned_proto: PinnedConversation = match &target {
-        EngineConversationId::Contact(_) => {
-            let service_id = resolve_contact_service_id(context, &target)
-                .await
-                .ok_or(StorageSyncError::ConversationNotResolved)?;
-            engine_to_storage(&target, Some(&service_id))?
-        }
-        EngineConversationId::Group(_) => PinnedConversation {
-            identifier: Some(
-                account_record::pinned_conversation::Identifier::GroupMasterKey(
-                    engine_group_to_master_key(&target)?,
-                ),
-            ),
-        },
-        EngineConversationId::LegacyGroup(_) => PinnedConversation {
-            identifier: Some(
-                account_record::pinned_conversation::Identifier::LegacyGroupId(
-                    engine_legacy_to_bytes(&target)?,
-                ),
-            ),
-        },
-    };
-
     // manifest 404（从未有过 storage 状态）：以 version 1 + 最小
-    // AccountRecord（只含 pinned）建初始 manifest（compat §5 登记分支）。
-    // Account item 读面走官方 vendored proto（read_account_record，字段
-    // 保真）；读失败归 WriteFailed（写意图未落地）。
+    // AccountRecord 建初始 manifest（compat §5 登记分支）。Account item
+    // 读面走官方 vendored proto（read_account_record，字段保真）；读失败
+    // 归 WriteFailed（写意图未落地）。
     let (manifest, account) = match storage.manifest().await {
         Ok(manifest) => {
             if account_item_key_of(&manifest).is_none() {
@@ -863,21 +841,10 @@ pub(crate) async fn write_pinned(
     let mut current = (manifest, account);
     loop {
         let (current_manifest, current_account) = (&current.0, &current.1);
-        let updated_list = if pinned {
-            pinned_add_stored(&current_account.pinned_conversations, &new_pinned_proto)
-        } else {
-            pinned_remove_stored(&current_account.pinned_conversations, &new_pinned_proto)
+        let Some(updated) = mutate(current_account) else {
+            // 意图已满足（幂等）：无写面，返回现状。
+            return Ok(current_account.clone());
         };
-        if updated_list.len() == current_account.pinned_conversations.len()
-            && updated_list
-                .iter()
-                .zip(current_account.pinned_conversations.iter())
-                .all(|(left, right)| same_storage_identity(left, right))
-        {
-            // 意图已满足（pinned=false 幂等 / 已在列表）：无写面，返回现状。
-            return Ok(project_pinned(current_account));
-        }
-        let updated = account_record_with_pinned(current_account, updated_list);
 
         let planned = plan_write(
             current_manifest
@@ -902,12 +869,12 @@ pub(crate) async fn write_pinned(
                             base64::engine::general_purpose::STANDARD
                                 .encode(&planned.new_account_key),
                         ),
-                        // 置顶面不感知贴纸面：沿用状态文件旧值。
+                        // 置顶/设置面不感知贴纸面：沿用状态文件旧值。
                         sticker_item_keys: None,
                     },
                 );
                 // 写成功后以本地写后面为准返回（官方 upload 成功语义）。
-                return Ok(project_pinned(&updated));
+                return Ok(updated);
             }
             PutOutcome {
                 conflict_manifest: Some(server_manifest),
@@ -935,6 +902,126 @@ pub(crate) async fn write_pinned(
             },
         }
     }
+}
+
+/// 写面编排（官方 upload 语义）：本地意图解析（fail-closed，不发请求）→
+/// update_account_record 通用骨架（原地改 pinned → encrypt 新 id → PUT →
+/// 409 采纳重放）→ 引擎会话标识投影。
+pub(crate) async fn write_pinned(
+    context: &StorageContext,
+    target: EngineConversationId,
+    pinned: bool,
+) -> Result<Vec<PinnedEntry>, StorageSyncError> {
+    // 本地意图先解析（解析失败 fail-closed，不发请求）：
+    // contact → serviceId（ACI 优先，本机号走注册数据）；group → master key。
+    let new_pinned_proto: PinnedConversation = match &target {
+        EngineConversationId::Contact(_) => {
+            let service_id = resolve_contact_service_id(context, &target)
+                .await
+                .ok_or(StorageSyncError::ConversationNotResolved)?;
+            engine_to_storage(&target, Some(&service_id))?
+        }
+        EngineConversationId::Group(_) => PinnedConversation {
+            identifier: Some(
+                account_record::pinned_conversation::Identifier::GroupMasterKey(
+                    engine_group_to_master_key(&target)?,
+                ),
+            ),
+        },
+        EngineConversationId::LegacyGroup(_) => PinnedConversation {
+            identifier: Some(
+                account_record::pinned_conversation::Identifier::LegacyGroupId(
+                    engine_legacy_to_bytes(&target)?,
+                ),
+            ),
+        },
+    };
+    let updated = update_account_record(context, |account| {
+        let updated_list = if pinned {
+            pinned_add_stored(&account.pinned_conversations, &new_pinned_proto)
+        } else {
+            pinned_remove_stored(&account.pinned_conversations, &new_pinned_proto)
+        };
+        let unchanged = updated_list.len() == account.pinned_conversations.len()
+            && updated_list
+                .iter()
+                .zip(account.pinned_conversations.iter())
+                .all(|(left, right)| same_storage_identity(left, right));
+        (!unchanged).then(|| account_record_with_pinned(account, updated_list))
+    })
+    .await?;
+    Ok(project_pinned(&updated))
+}
+
+/// API 字符串 → 官方 PhoneNumberSharingMode 数值（setAccountConfiguration
+/// 参数面）：everybody=1 / nobody=2（官方 Android/桌面现行枚举一致，桌面
+/// v8.31 同值；旧 CONTACTS_ONLY 已从官方 proto 移除，不收）。
+pub(crate) fn phone_number_sharing_mode_of(text: &str) -> Option<i32> {
+    match text {
+        "everybody" => Some(account_record::PhoneNumberSharingMode::Everybody as i32),
+        "nobody" => Some(account_record::PhoneNumberSharingMode::Nobody as i32),
+        _ => None,
+    }
+}
+
+/// 账号级设置写意图（setAccountConfiguration）：只写提供的字段。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccountConfigurationUpdate {
+    pub(crate) read_receipts: Option<bool>,
+    pub(crate) typing_indicators: Option<bool>,
+    /// PhoneNumberSharingMode 数值（`phone_number_sharing_mode_of` 出）。
+    pub(crate) phone_number_sharing_mode: Option<i32>,
+    pub(crate) unlisted_phone_number: Option<bool>,
+}
+
+/// AccountRecord 读-改-写保真核心（设置面）：只覆写提供的字段，其余字段
+/// 原样（字段保真铁面同款 decode→mutate→encode）；全部提供字段已满足 →
+/// None（幂等无写）。
+pub(crate) fn account_record_with_configuration(
+    record: &AccountRecord,
+    update: &AccountConfigurationUpdate,
+) -> Option<AccountRecord> {
+    let AccountConfigurationUpdate {
+        read_receipts,
+        typing_indicators,
+        phone_number_sharing_mode,
+        unlisted_phone_number,
+    } = update;
+    let mut updated = record.clone();
+    let mut changed = false;
+    if let Some(value) = read_receipts {
+        changed |= updated.read_receipts != *value;
+        updated.read_receipts = *value;
+    }
+    if let Some(value) = typing_indicators {
+        changed |= updated.typing_indicators != *value;
+        updated.typing_indicators = *value;
+    }
+    if let Some(value) = phone_number_sharing_mode {
+        changed |= updated.phone_number_sharing_mode != *value;
+        updated.phone_number_sharing_mode = *value;
+    }
+    if let Some(value) = unlisted_phone_number {
+        changed |= updated.unlisted_phone_number != *value;
+        updated.unlisted_phone_number = *value;
+    }
+    changed.then_some(updated)
+}
+
+/// 账号级设置写面（setAccountConfiguration）：update_account_record 通用
+/// 骨架 + 设置面 mutate。官方 updateConfiguration 等价——真相源 =
+/// AccountRecord 的 readReceipts(6)/typingIndicators(8)/
+/// phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供的
+/// 字段，其余账号设置原样（字段保真铁面同款链路）。
+pub(crate) async fn write_account_configuration(
+    context: &StorageContext,
+    update: AccountConfigurationUpdate,
+) -> Result<(), StorageSyncError> {
+    update_account_record(context, |account| {
+        account_record_with_configuration(account, &update)
+    })
+    .await
+    .map(|_| ())
 }
 
 /// contact 会话 → serviceId 字符串（ACI 优先）：UUID 形状直通 → 本机号走
@@ -1530,6 +1617,91 @@ mod tests {
             back.notify_when_contact_joins,
             original.notify_when_contact_joins
         );
+    }
+
+    /// 设置面 mutate（setAccountConfiguration）：只写提供字段，其余字段
+    /// （含 52-60 与 pinned）原样；提供字段已全部满足 → None（幂等无写）；
+    /// PhoneNumberSharingMode 参数映射（everybody=1/nobody=2，桌面/Android
+    /// 现行枚举一致，旧 CONTACTS_ONLY 不收）。
+    #[test]
+    fn account_record_configuration_writes_only_provided_fields() {
+        use crate::proto::storage::account_record as off_account;
+        use crate::proto::storage::AccountRecord as Official;
+        use crate::proto::storage::OptionalBool as OffOptionalBool;
+
+        let everybody = off_account::PhoneNumberSharingMode::Everybody as i32;
+        let nobody = off_account::PhoneNumberSharingMode::Nobody as i32;
+        let base = Official {
+            given_name: "Given".to_owned(),
+            read_receipts: false,
+            typing_indicators: false,
+            phone_number_sharing_mode: everybody,
+            unlisted_phone_number: false,
+            universal_expire_timer: 86_400,
+            username: "kt.01".to_owned(),
+            story_view_receipts_enabled: OffOptionalBool::Enabled as i32,
+            release_notes_chat_blocked_at: Some(1_720_000_000_000),
+            pinned_conversations: vec![crate::proto::storage::account_record::PinnedConversation {
+                identifier: Some(
+                    crate::proto::storage::account_record::pinned_conversation::Identifier::GroupMasterKey(
+                        vec![1u8; 32],
+                    ),
+                ),
+            }],
+            ..Official::default()
+        };
+
+        // 只写两个开关：手机号可见性/名字/universal timer/52-60/pinned 原样。
+        let update = AccountConfigurationUpdate {
+            read_receipts: Some(true),
+            typing_indicators: Some(true),
+            ..AccountConfigurationUpdate::default()
+        };
+        let updated = account_record_with_configuration(&base, &update).expect("changes");
+        assert!(updated.read_receipts);
+        assert!(updated.typing_indicators);
+        assert_eq!(updated.phone_number_sharing_mode, everybody);
+        assert!(!updated.unlisted_phone_number);
+        assert_eq!(updated.given_name, "Given");
+        assert_eq!(updated.universal_expire_timer, 86_400);
+        assert_eq!(updated.username, "kt.01");
+        assert_eq!(
+            updated.release_notes_chat_blocked_at,
+            Some(1_720_000_000_000)
+        );
+        assert_eq!(
+            updated.story_view_receipts_enabled,
+            OffOptionalBool::Enabled as i32
+        );
+        assert_eq!(updated.pinned_conversations.len(), 1);
+
+        // 手机号可见性：sharing mode → nobody + unlisted=true；未提供的
+        // 开关字段不动。
+        let update = AccountConfigurationUpdate {
+            phone_number_sharing_mode: Some(nobody),
+            unlisted_phone_number: Some(true),
+            ..AccountConfigurationUpdate::default()
+        };
+        let updated = account_record_with_configuration(&base, &update).expect("changes");
+        assert_eq!(updated.phone_number_sharing_mode, nobody);
+        assert!(updated.unlisted_phone_number);
+        assert!(!updated.read_receipts);
+        assert!(!updated.typing_indicators);
+
+        // 幂等：提供字段与现状全等 → None（无写面）。
+        let same = AccountConfigurationUpdate {
+            read_receipts: Some(false),
+            typing_indicators: Some(false),
+            phone_number_sharing_mode: Some(everybody),
+            unlisted_phone_number: Some(false),
+        };
+        assert!(account_record_with_configuration(&base, &same).is_none());
+
+        // 参数面映射：官方枚举数值 + 未知字符串不收。
+        assert_eq!(phone_number_sharing_mode_of("everybody"), Some(everybody));
+        assert_eq!(phone_number_sharing_mode_of("nobody"), Some(nobody));
+        assert_eq!(phone_number_sharing_mode_of("contactsOnly"), None);
+        assert_eq!(phone_number_sharing_mode_of(""), None);
     }
 
     /// plan_write：首写（无旧 manifest）→ version 1、无 deleteKey；次写 →

@@ -1363,6 +1363,22 @@ impl Service {
         let context = storage_context(self, account).await?;
         storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
     }
+
+    /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：
+    /// 账号级 readReceipts/typingIndicators/手机号可见性 → Storage Service
+    /// AccountRecord 写面（读改写仅动提供字段）+ 409 采纳重放；全部提供
+    /// 字段已满足 → 幂等无写直接成功。
+    pub(crate) async fn set_account_configuration(
+        self: &Arc<Self>,
+        account: &str,
+        update: storage_sync::AccountConfigurationUpdate,
+    ) -> Result<(), storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::write_account_configuration(&context, update).await
+    }
 }
 
 /// storage 面共用上下文：已注册账号的 store + 手工构造凭据的 PushService
