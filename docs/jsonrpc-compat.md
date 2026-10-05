@@ -98,6 +98,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
+| `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration}`（本批只收 expiration 一个参数族，0=关闭；expiration 缺席 = 无操作整拒，不静默 no-op） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration 缺席·null·字符串·负数·小数·超 u32）`-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；fake：成功 `{status: "sent"}`（落调度日志，协议上行面纪律） |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -175,6 +176,14 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   主键整事件丢弃（warn-only，零 stderr）。CallEvent 经 presage 落库
   （registered.rs message_for_sync CallMessage/CallEvent 分支）——引擎
   store 有行，connector 消费面按自身会话管线取用。
+- `groupUpdated {groupId, revision, expireTimerSeconds, editor?}`
+  （2026-10-06，KT 扩展批群 expiration）：群更新消息内密文 GroupChange 含
+  expiration_timer action（`modify_disappearing_message_timer`，field 12）
+  且 change epoch ≤7 → 整信封替换为该事件（groupId = master key 标准
+  base64，revision = change version，expireTimerSeconds = 解密 blob 的
+  disappearingMessagesDuration 秒数、0 = 关闭，editor = 编辑者 ACI 串）；
+  epoch >7 / 非 expiration change 不处理，其余群更新消息照旧跳过（宁缺
+  勿错，全投影另行立项，§5 群 expiration 批）。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -663,6 +672,50 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
 - **fake 纪律**：`sendCallMessage` 成功 `{"timestamp":u64}`，只落调度
   日志不触网（send 系同款）；fake 模式任意账号成功早退（形状桩语义），
   未注册账号错误面由 real 模式契约测试覆盖。
+
+群 expiration 批（2026-10-06，官方桌面 buildDisappearingMessagesTimerChange
+行为对齐，KT 扩展方法；connector 契约 1.45 §4.44 `conversations.setExpireTimer`
+群形态的本引擎面债务批）：
+
+- **新方法 `updateGroup {expiration}`**：`{account, groupId, expiration}`
+  → `{status: "sent"}`（群族成功答同纪律）。协议载体 = GroupChange.Actions
+  `modify_disappearing_message_timer`（`ModifyDisappearingMessageTimerAction
+  { timer = 1 }`，field 12——编号依据 = 本仓钉定 libsignal-service-rs
+  rev 9e6c08b 的 `protobuf/Groups.proto` 实查，官方 storageservice
+  Groups.proto 同源同号，未发明）；timer = 加密
+  `GroupAttributeBlob { disappearingMessagesDuration = 3 (uint32 秒，
+  0 = 关闭) }`（官方桌面 toGroupActionsParams + buildDisappearingMessages
+  TimerChange 同形状：blob 明文 protobuf → `encrypt_blob_with_padding(
+  randomness, blob, 0)` = 桌面 encryptGroupBlob 同构）；expiration=0 =
+  关闭（桌面 UI off 档同语义，线面 duration 0 原样入 blob 不转缺席）。
+- **复用③b（群终止批）骨架**：群态读面取当前 revision（`GET v1/groups/`
+  + decrypt_group，网络失败退化 0 继续写交服务器裁决，terminate 面同
+  口径；其余读面错误上抛）→ version = revision + 1 饱和不回卷 → 群凭据
+  basic auth → `PATCH v2/groups` 上传（同端点同 Content-Type）→ 成功。
+  **不做同值幂等折叠**：群 revision 每次变更 +1 是官方写面语义，timer
+  同值再写同样推进 revision 并广播，交服务器与成员侧收敛。
+- **admin 权限服务器裁决**：非 admin 上传 → 403（GROUP_UPDATE_FAILED
+  data.status=403）；409 = revision 竞争需重拉群态；401 凭据无效；
+  400 形状被拒。错误族与 terminateGroup 同枚举同口径（TerminateError：
+  UnknownAccount/UnknownGroup → -32603，Failed → -1 +
+  GROUP_UPDATE_FAILED + data.status，Unavailable → -1 +
+  STORAGE_UNAVAILABLE）。
+- **receive 投影最小放开**：dataMessage.groupV2 / sent 内密文
+  group_change 经 `decrypt_group_change` 解出 expiration_timer action →
+  整信封替换为 `groupUpdated {groupId, revision, expireTimerSeconds,
+  editor?}`（expireTimerSeconds = 明文 duration，0 = 关闭——解密侧
+  `GroupChange::Timer` 的 `Option<Timer>` 对 0 duration 归一 None，投影
+  `unwrap_or(0)` 还原，两端同语义）；change epoch >7 不处理；terminated
+  优先（两投影同走 group_change 密文，内容互斥由 change 类型定，terminate
+  命中即返回）；非 expiration 的群更新消息照旧跳过（宁缺勿错，全投影
+  另行立项）。connector 消费面另行：桌面 timer 镜像走其既有
+  conversation.changed 管线，本批不定义 connector 消费形状。
+- **边界（本批红线）**：updateGroup 其余参数族（成员/权限/头像/名称/
+  描述/邀请链接等，connector 契约 1.45 §4.44 全集）**不收**——本批只有
+  expiration，防止与既有群管理面打架；expiration 缺席 = 无操作整拒
+  `-32603`（不静默 no-op，零可写字段先例）。不做群 timer 幂等（见上）。
+  fake 模式成功 `{status: "sent"}`，落调度日志（协议上行面，
+  terminateGroup 同纪律）。
 
 ## 6. fake 服务模式（仅测试）
 

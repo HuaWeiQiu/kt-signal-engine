@@ -1195,6 +1195,57 @@ async fn dispatch(
                 }
             }
         }
+        // 群消失计时器（updateGroup {expiration}，KT 扩展方法）：协议上行
+        // 面，落调度日志（terminateGroup 同纪律）。本批只收 expiration 一个
+        // 参数族（0 = 关闭；其余 updateGroup 参数族——成员/权限/头像/名称
+        // ——不收，compat §5 expiration 批边界）；expiration 缺席 = 无操作
+        // 整拒 -32603（不静默 no-op），非 u32 形状（负数/小数/超界/字符串）
+        // 同 -32603 fail-closed；groupId/account 纪律与 terminateGroup 同款；
+        // 服务器拒绝 → -1 GROUP_UPDATE_FAILED + data.status 诚实透传；网络
+        // 面 → -1 STORAGE_UNAVAILABLE；fake 模式成功 {status:"sent"}（群族
+        // 成功答同 connector 契约 1.45 纪律）。
+        "updateGroup" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let expiration = params
+                .get("expiration")
+                .and_then(Value::as_u64)
+                .and_then(|seconds| u32::try_from(seconds).ok());
+            let (Some(account), Some(master_key), Some(expiration)) =
+                (account, master_key, expiration)
+            else {
+                return internal_error(id);
+            };
+            match service
+                .update_group_expiration(account, master_key, expiration)
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_UPDATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),

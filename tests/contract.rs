@@ -773,6 +773,85 @@ fn terminate_group_fake_shape_and_param_fail_closed() {
     assert_eq!(entry["params"]["account"], json!("+15550000000"));
 }
 
+/// 群消失计时器（updateGroup {expiration}，KT 扩展方法）：fake 模式成功
+/// 投影 `{status: "sent"}`（落调度日志，协议上行面纪律，groupId 逐字保留）；
+/// 参数面 fail-closed（-32603：缺 account / 缺 groupId / groupId 非 base64
+/// / 长度 ≠32 字节 / expiration 缺席（无操作整拒）/ expiration 非 u32 形状
+/// ——负数、小数、超界、字符串）；real 模式未注册账号折叠 -32603。
+#[test]
+fn update_group_expiration_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 32 字节群 master key 的标准 base64（44 字符，listGroups id 同源）。
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：设值与 0=关闭同形成功 {status:"sent"}（不触网）。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "expiration": 86_400 })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "expiration": 0 })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状（expiration 缺席 = 无操作整拒）。
+    let rejects = [
+        json!({ "groupId": group_id, "expiration": 3600 }),
+        json!({ "account": "+15550000000", "expiration": 3600 }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "expiration": 3600 }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG", "expiration": 3600 }),
+        json!({ "account": "+15550000000", "groupId": group_id }),
+        json!({ "account": "+15550000000", "groupId": group_id, "expiration": null }),
+        json!({ "account": "+15550000000", "groupId": group_id, "expiration": "3600" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "expiration": -1 }),
+        json!({ "account": "+15550000000", "groupId": group_id, "expiration": 1.5 }),
+        json!({ "account": "+15550000000", "groupId": group_id, "expiration": 4_294_967_296_u64 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：groupId 逐字保留（协议上行面纪律；被拒的调用同样落日志
+    // ——记录的是派发，mutating 面同款——成功两条 + 拒绝十条 = 12 行）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let set_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(set_entries.len(), 12, "成功两条 + 拒绝十条均落日志");
+    assert_eq!(set_entries[0]["params"]["groupId"], json!(group_id));
+    assert_eq!(set_entries[0]["params"]["expiration"], json!(86_400));
+    assert_eq!(set_entries[0]["params"]["account"], json!("+15550000000"));
+    assert_eq!(set_entries[1]["params"]["groupId"], json!(group_id));
+    assert_eq!(set_entries[1]["params"]["expiration"], json!(0));
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（terminateGroup
+    // 同款，细节不外泄）。
+    let real_dir = temp_dir("update-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({ "account": "+15559990000", "groupId": group_id, "expiration": 3600 }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");

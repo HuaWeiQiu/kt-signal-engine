@@ -1282,6 +1282,23 @@ impl Service {
         groups::terminate_group(&context, &self.terminated_groups, &master_key).await
     }
 
+    /// updateGroup {expiration}（群消失计时器，KT 扩展方法）：群态读面
+    /// （revision 面失败退化 0）→ 群凭据 → `PATCH v2/groups` 上传 expiration
+    /// change（modify_disappearing_message_timer action，0 = 关闭）。fake
+    /// 模式成功形状桩（terminateGroup 同款纪律）。
+    pub(crate) async fn update_group_expiration(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+        expiration_secs: u32,
+    ) -> Result<(), groups::TerminateError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        groups::update_group_expiration(&context, &master_key, expiration_secs).await
+    }
+
     /// getUserStatus：whoami 轻量鉴权探测（real 模式触网；fake 恒已注册）。
     /// 仅 401 判解绑——网络等其他失败按内部失败，不误报解绑态。
     pub(crate) async fn get_user_status(
@@ -1893,12 +1910,15 @@ async fn project_content(
         | ContentBody::DecryptionErrorMessage(_) => return None,
     }
 
-    // 群终止投影放开（最小面）：群更新消息携带 terminated change →
-    // `group_terminated` 事件（{groupId, terminator?, timestamp}）；其余群
-    // 更新（成员变更/权限面等）本批继续跳过（compat §5 终止批边界登记）。
-    // 终止判定独立于 dataMessage 投影：既覆盖纯 change 信封（无正文）也覆盖
-    // 携带 change 的普通群消息；其他设备自己发起的终止（sent sync）同样落
-    // 事件并登记。登记表先行（写面事件后到达的乱序窗口由该表兜住发送拦截）。
+    // 群变更投影放开（最小面）：群更新消息携带 terminated change →
+    // `groupTerminated` 事件（{groupId, terminator?, timestamp}）；携带
+    // expiration_timer change → `groupUpdated` 事件（{groupId, revision,
+    // expireTimerSeconds, editor?}，expireTimerSeconds=0 = 关闭）；其余群
+    // 更新（成员变更/权限面等）本批继续跳过（compat §5 终止批 + expiration
+    // 批边界登记，全投影另行立项）。投影独立于 dataMessage 投影：既覆盖纯
+    // change 信封（无正文）也覆盖携带 change 的普通群消息；其他设备自己发
+    // 起的变更（sent sync）同样落事件。终止登记表先行（写面事件后到达的
+    // 乱序窗口由该表兜住发送拦截）。
     if let Some((master_key, change)) = group_change_of(&content.body) {
         if let Some(terminate) = groups::project_terminate_from_context(&master_key, change) {
             terminated_groups.register(&terminate.group_id);
@@ -1913,6 +1933,24 @@ async fn project_content(
                             "groupId": terminate.group_id,
                             "terminator": terminate.terminator,
                             "timestamp": envelope_ts,
+                        },
+                    },
+                },
+            }));
+        }
+        if let Some(expiration) = groups::project_expiration_from_context(&master_key, change) {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": account,
+                    "envelope": {
+                        "timestamp": envelope_ts,
+                        "groupUpdated": {
+                            "groupId": expiration.group_id,
+                            "revision": expiration.revision,
+                            "expireTimerSeconds": expiration.expire_timer_seconds,
+                            "editor": expiration.editor,
                         },
                     },
                 },
@@ -4352,6 +4390,217 @@ mod tests {
             .expect("sent terminate projects");
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 群 expiration 投影放开（updateGroup 批最小面）：dataMessage.groupV2
+    /// 携带 expiration_timer change → 整信封替换为 `groupUpdated` 事件
+    ///（{groupId, revision, expireTimerSeconds, editor}，0 = 关闭）且不登记
+    /// 终止表；非 expiration change（改标题等）→ 群更新消息照旧走普通投影
+    ///（本批继续跳过面的现状不变）；terminated 优先（同信封两 change 不
+    /// 可能——proto3 Actions 单消息类型各一，两投影互斥由 change 内容定）。
+    #[tokio::test]
+    async fn receive_projects_group_expiration_change_only() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::libsignal_service::zkgroup;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-exp-proj-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1).expect("device"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        };
+
+        let master_key = [0x55u8; 32];
+        use base64::Engine as _;
+        let group_id = base64::engine::general_purpose::STANDARD.encode(master_key);
+        let secret_params =
+            presage::libsignal_service::zkgroup::groups::GroupSecretParams::derive_from_master_key(
+                presage::libsignal_service::zkgroup::groups::GroupMasterKey::new(master_key),
+            );
+        let editor = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(
+            "33333333-4444-4555-9666-777777777777",
+        )
+        .expect("editor aci");
+        let expiration_change = |version: u32, duration: u32| {
+            let mut randomness = [0u8; 32];
+            use rand::RngCore as _;
+            rand::rng().fill_bytes(&mut randomness);
+            let blob = presage::proto::GroupAttributeBlob {
+                content: Some(
+                    presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(
+                        duration,
+                    ),
+                ),
+            }
+            .encode_to_vec();
+            presage::proto::GroupChange {
+                actions: presage::proto::group_change::Actions {
+                    source_user_id: zkgroup::serialize(
+                        &secret_params.encrypt_service_id(editor.into()),
+                    ),
+                    group_id: secret_params.get_group_identifier().to_vec(),
+                    version,
+                    modify_disappearing_message_timer: Some(
+                        presage::proto::group_change::actions::ModifyDisappearingMessageTimerAction {
+                            timer: secret_params.encrypt_blob_with_padding(randomness, &blob, 0),
+                        },
+                    ),
+                    ..presage::proto::group_change::Actions::default()
+                }
+                .encode_to_vec(),
+                server_signature: Vec::new(),
+                change_epoch: groups::SUPPORTED_CHANGE_EPOCH,
+            }
+        };
+
+        // expiration change → 整信封替换为 groupUpdated 事件（revision =
+        // change version、明文秒数、编辑者 ACI），终止表不动。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(5),
+                    group_change: Some(expiration_change(5, 86_400).encode_to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("expiration event projects");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(envelope["groupUpdated"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupUpdated"]["revision"], json!(5));
+        assert_eq!(
+            envelope["groupUpdated"]["expireTimerSeconds"],
+            json!(86_400)
+        );
+        assert_eq!(
+            envelope["groupUpdated"]["editor"],
+            json!("33333333-4444-4555-9666-777777777777")
+        );
+        assert!(envelope.get("dataMessage").is_none(), "整信封替换");
+        assert!(!registry.contains(&group_id), "expiration 不登记终止表");
+
+        // timer = 0（关闭）→ expireTimerSeconds 投影 0（关闭语义不吞）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(6),
+                    group_change: Some(expiration_change(6, 0).encode_to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("timer-off event projects");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(envelope["groupUpdated"]["revision"], json!(6));
+        assert_eq!(envelope["groupUpdated"]["expireTimerSeconds"], json!(0));
+
+        // 非 expiration change（改标题）→ 群更新消息照旧走普通投影（groupInfo
+        // 面；expiration 投影不误伤）。
+        let mut randomness = [0u8; 32];
+        use rand::RngCore as _;
+        rand::rng().fill_bytes(&mut randomness);
+        let title_blob = presage::proto::GroupAttributeBlob {
+            content: Some(presage::proto::group_attribute_blob::Content::Title(
+                "renamed".to_owned(),
+            )),
+        }
+        .encode_to_vec();
+        let rename_change = presage::proto::GroupChange {
+            actions: presage::proto::group_change::Actions {
+                source_user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id(editor.into()),
+                ),
+                group_id: secret_params.get_group_identifier().to_vec(),
+                version: 10,
+                modify_title: Some(presage::proto::group_change::actions::ModifyTitleAction {
+                    title: secret_params.encrypt_blob_with_padding(randomness, &title_blob, 0),
+                }),
+                ..presage::proto::group_change::Actions::default()
+            }
+            .encode_to_vec(),
+            server_signature: Vec::new(),
+            change_epoch: groups::SUPPORTED_CHANGE_EPOCH,
+        };
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(10),
+                    group_change: Some(rename_change.encode_to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("group dataMessage projects");
+        let envelope = &notification["params"]["envelope"];
+        assert!(envelope.get("groupUpdated").is_none());
+        assert_eq!(
+            envelope["dataMessage"]["groupInfo"]["groupId"],
+            json!(group_id)
+        );
+
+        // sent sync 内 expiration（本机其他设备设置）→ 同事件面。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                content: Some(presage::proto::sync_message::Content::Sent(
+                    presage::proto::sync_message::Sent {
+                        timestamp: Some(1_700_000_000_002),
+                        message: Some(DataMessage {
+                            group_v2: Some(presage::proto::GroupContextV2 {
+                                master_key: Some(master_key.to_vec()),
+                                revision: Some(11),
+                                group_change: Some(expiration_change(11, 3600).encode_to_vec()),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..presage::proto::sync_message::Sent::default()
+                    },
+                )),
+                ..presage::proto::SyncMessage::with_padding(&mut rand::rng())
+            }),
+            metadata,
+        );
+        let notification = project_content("acct", &store, &content, &registry)
+            .await
+            .expect("sent expiration projects");
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(envelope["groupUpdated"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupUpdated"]["revision"], json!(11));
+        assert_eq!(envelope["groupUpdated"]["expireTimerSeconds"], json!(3600));
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }
