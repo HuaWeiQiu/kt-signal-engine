@@ -1395,6 +1395,21 @@ impl Service {
         let context = storage_context(self, account).await?;
         profile::set_profile(&context, update).await
     }
+
+    /// setUniversalExpireTimer（P5 扩面，官方 universal timer 写面）：账户级
+    /// 默认消失消息计时器 → Storage Service AccountRecord.universalExpireTimer
+    /// (17) 写面；同值幂等无写。
+    pub(crate) async fn set_universal_expire_timer(
+        self: &Arc<Self>,
+        account: &str,
+        expiration_seconds: u32,
+    ) -> Result<(), storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::write_universal_expire_timer(&context, expiration_seconds).await
+    }
 }
 
 /// storage 面共用上下文：已注册账号的 store + 手工构造凭据的 PushService

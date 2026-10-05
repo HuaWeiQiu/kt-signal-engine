@@ -921,6 +921,30 @@ async fn dispatch(
                 }
             }
         }
+        // 账户级默认消失消息计时器（官方 universal timer 写面，Storage
+        // Service 真相源，带 account 参数）：AccountRecord.universalExpireTimer
+        // =17，0=关闭；参数形状错 fail-closed -32603（setExpirationTimer
+        // timer 参数同款纪律）。
+        "setUniversalExpireTimer" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(expiration_seconds) = params
+                .get("expirationInSeconds")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                return internal_error(id);
+            };
+            match service
+                .set_universal_expire_timer(account, expiration_seconds)
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),

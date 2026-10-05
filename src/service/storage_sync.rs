@@ -1025,6 +1025,35 @@ pub(crate) fn account_record_with_profile(
     updated
 }
 
+/// AccountRecord 读-改-写保真核心（universal timer 面，setUniversalExpireTimer）：
+/// 只覆写 universalExpireTimer(17)；同值 → None（幂等无写）。
+pub(crate) fn account_record_with_universal_expire_timer(
+    record: &AccountRecord,
+    expiration_seconds: u32,
+) -> Option<AccountRecord> {
+    (record.universal_expire_timer != expiration_seconds).then(|| {
+        let mut updated = record.clone();
+        updated.universal_expire_timer = expiration_seconds;
+        updated
+    })
+}
+
+/// universal timer 写面（setUniversalExpireTimer，官方 universalTimer 等价）：
+/// 账户级默认消失消息计时器 → AccountRecord.universalExpireTimer(17)（
+/// 0=关闭），update_account_record 骨架（409 采纳重放；同值幂等无写）。
+/// 账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备
+/// 经 storage sync 收敛。
+pub(crate) async fn write_universal_expire_timer(
+    context: &StorageContext,
+    expiration_seconds: u32,
+) -> Result<(), StorageSyncError> {
+    update_account_record(context, |account| {
+        account_record_with_universal_expire_timer(account, expiration_seconds)
+    })
+    .await
+    .map(|_| ())
+}
+
 /// 账号级设置写面（setAccountConfiguration）：update_account_record 通用
 /// 骨架 + 设置面 mutate。官方 updateConfiguration 等价——真相源 =
 /// AccountRecord 的 readReceipts(6)/typingIndicators(8)/
@@ -1719,6 +1748,50 @@ mod tests {
         assert_eq!(phone_number_sharing_mode_of("nobody"), Some(nobody));
         assert_eq!(phone_number_sharing_mode_of("contactsOnly"), None);
         assert_eq!(phone_number_sharing_mode_of(""), None);
+    }
+
+    /// universal timer mutate（setUniversalExpireTimer）：只覆写
+    /// universalExpireTimer(17)，其余字段（含 52-60/pinned）原样；同值 →
+    /// None（幂等无写）。
+    #[test]
+    fn account_record_universal_expire_timer_writes_only_the_field() {
+        use crate::proto::storage::account_record as off_account;
+        use crate::proto::storage::AccountRecord as Official;
+        use crate::proto::storage::OptionalBool as OffOptionalBool;
+
+        let base = Official {
+            universal_expire_timer: 0,
+            read_receipts: true,
+            release_notes_chat_blocked_at: Some(1_720_000_000_000),
+            story_view_receipts_enabled: OffOptionalBool::Enabled as i32,
+            pinned_conversations: vec![crate::proto::storage::account_record::PinnedConversation {
+                identifier: Some(
+                    off_account::pinned_conversation::Identifier::GroupMasterKey(vec![1u8; 32]),
+                ),
+            }],
+            ..Official::default()
+        };
+
+        let updated = account_record_with_universal_expire_timer(&base, 86_400).expect("changes");
+        assert_eq!(updated.universal_expire_timer, 86_400);
+        assert!(updated.read_receipts);
+        assert_eq!(
+            updated.release_notes_chat_blocked_at,
+            Some(1_720_000_000_000)
+        );
+        assert_eq!(
+            updated.story_view_receipts_enabled,
+            OffOptionalBool::Enabled as i32
+        );
+        assert_eq!(updated.pinned_conversations.len(), 1);
+
+        // 0=关闭（写 0 也是合法变更面）。
+        let updated = account_record_with_universal_expire_timer(&updated, 0)
+            .expect("0 is a valid change (off)");
+        assert_eq!(updated.universal_expire_timer, 0);
+
+        // 幂等：同值 → None。
+        assert!(account_record_with_universal_expire_timer(&base, 0).is_none());
     }
 
     /// plan_write：首写（无旧 manifest）→ version 1、无 deleteKey；次写 →

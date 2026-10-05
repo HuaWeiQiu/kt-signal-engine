@@ -1100,6 +1100,59 @@ fn set_profile_fake_shapes_and_param_fail_closed() {
     }
 }
 
+/// setUniversalExpireTimer（P5 扩面，官方 universal timer 写面）：fake 形状
+/// 成功 `{}`（0=关闭同形）+ 参数面 fail-closed 逐形状（-32603：缺 account/
+/// expirationInSeconds、timer 字符串/负数/小数/超 u32——不触网）。
+#[test]
+fn set_universal_expire_timer_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("universal-timer");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake 成功面：{}（设值与 0=关闭两形态）。
+    assert_eq!(
+        engine.request(
+            "setUniversalExpireTimer",
+            json!({ "account": number, "expirationInSeconds": 86_400 }),
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "setUniversalExpireTimer",
+            json!({ "account": number, "expirationInSeconds": 0 }),
+        )["result"],
+        json!({})
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "expirationInSeconds": 60 }),
+        json!({ "account": number }),
+        json!({ "account": number, "expirationInSeconds": "60" }),
+        json!({ "account": number, "expirationInSeconds": -1 }),
+        json!({ "account": number, "expirationInSeconds": 1.5 }),
+        json!({ "account": number, "expirationInSeconds": 4_294_967_296_u64 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("setUniversalExpireTimer", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "setUniversalExpireTimer rejects {params}"
+        );
+    }
+}
+
 #[test]
 fn read_only_stubs_and_user_status_shapes() {
     let dir = temp_dir("read-only");

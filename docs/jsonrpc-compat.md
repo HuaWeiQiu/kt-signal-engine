@@ -88,6 +88,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
 | `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
 | `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{}` | 头像上行（profile PUT/CDN POST）失败 `STORAGE_WRITE_FAILED`；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{}` |
+| `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
@@ -344,13 +345,20 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
   `updaterAci` ← updater_aci 16 字节 → 小写连字 UUID，缺席/畸形省略键）；
   其余 update 类型维持整行跳过（skippedItems 可见）。connector 拿去做
   system 行（会话归属 + 新 timer 值 + 0=关闭语义）。
-- **universal timer（账户级默认计时器）本批不可达（只调研不实现）**：
-  钉定 rev 的 StorageService.proto ContactRecord 止于 field 27 无
-  expireTimer、AccountRecord 无 universal timer 字段；presage store 无
-  账户级计时器读写面；backup proto
+- **universal timer（账户级默认计时器）——勘误（2026-10-05，P5 落地）**：
+  本块初版结论「AccountRecord 无 universal timer 字段、引擎栈无 live 读写
+  面本批不可达」是**错误结论**，两处事实纠正：①钉定 presage rev 与官方
+  StorageService.proto 的 AccountRecord **均有** `universalExpireTimer`
+  （field 17，uint32 秒，0=关闭），E 批调研时误判缺位；②「写面不可达」
+  随 storage 写面泛化闭合——账号设置批的 `update_account_record` 编排
+  骨架（seed master key → manifest 读取 → 读改写 → PUT → 409 采纳重放）
+  即 universal timer 的 live 写面。落地：`setUniversalExpireTimer`
+  {account, expirationInSeconds} → `{}`（0=关闭；同值幂等无写；真相源
+  单点无广播，会话级计时器才广播 expiration-update；§3 行）。原调研仍
+  成立的部分：presage store 无账户级计时器独立读写面（写面走 storage，
+  不经 presage store）；backup proto
   `AccountSettings.universal_expire_timer_seconds`（field 7，0=无）仅
-  档案只读、导出不投 Account 帧——引擎栈无 live 读写面，等上游升版
-  或单独立项。
+  档案只读、导出不投 Account 帧。
 - **边界（立项红线）**：不做群计时器设置（群计时器走群组更新面另行
   立项）；不做 DAR；出站普通消息不加 expireTimer 字段（per-message
   携带会话计时器是收侧兼容语义，引擎不主动扩散）；不 bump
