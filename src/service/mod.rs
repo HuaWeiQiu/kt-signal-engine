@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 
 use crate::state::EngineState;
 
+pub(crate) mod profile;
 pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
@@ -1378,6 +1379,21 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sync::write_account_configuration(&context, update).await
+    }
+
+    /// setProfile（P5 扩面，官方 updateProfile 等价）：名字/关于/emoji +
+    /// 头像（缺省保留/data URI 换新/null 移除）server 面写 + storage 面
+    /// AccountRecord 名字与头像 path 同步。
+    pub(crate) async fn set_profile(
+        self: &Arc<Self>,
+        account: &str,
+        update: profile::ProfileUpdate,
+    ) -> Result<(), profile::ProfileError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        profile::set_profile(&context, update).await
     }
 }
 

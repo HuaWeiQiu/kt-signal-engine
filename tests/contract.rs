@@ -1029,6 +1029,77 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
     }
 }
 
+/// setProfile（P5 扩面，官方 updateProfile 等价）：fake 形状成功 `{}`（文字
+/// 面/头像 data URI/null 三态）+ 参数面 fail-closed 逐形状（-32603：缺
+/// account、givenName 缺/空/非字符串、可选文本字段非字符串、avatar 非图
+/// 像 data URI/非字符串——不触网）。
+#[test]
+fn set_profile_fake_shapes_and_param_fail_closed() {
+    use base64::Engine as _;
+    let dir = temp_dir("set-profile");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let avatar = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake")
+    );
+
+    // fake 成功面：{}（文字面/换新头像/移除头像三形态）。
+    assert_eq!(
+        engine.request(
+            "setProfile",
+            json!({ "account": number, "givenName": "KT", "familyName": "Agent", "about": "hi", "emoji": "🤖" }),
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "setProfile",
+            json!({ "account": number, "givenName": "KT", "avatar": avatar }),
+        )["result"],
+        json!({})
+    );
+    assert_eq!(
+        engine.request(
+            "setProfile",
+            json!({ "account": number, "givenName": "KT", "avatar": null }),
+        )["result"],
+        json!({})
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "givenName": "KT" }),
+        json!({ "account": number }),
+        json!({ "account": number, "givenName": "" }),
+        json!({ "account": number, "givenName": 7 }),
+        json!({ "account": number, "givenName": "KT", "familyName": 7 }),
+        json!({ "account": number, "givenName": "KT", "about": [] }),
+        json!({ "account": number, "givenName": "KT", "emoji": true }),
+        json!({ "account": number, "givenName": "KT", "avatar": "data:text/plain;base64,aGk=" }),
+        json!({ "account": number, "givenName": "KT", "avatar": "data:image/png,notbase64payload" }),
+        json!({ "account": number, "givenName": "KT", "avatar": "https://example.invalid/a.png" }),
+        json!({ "account": number, "givenName": "KT", "avatar": 7 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("setProfile", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "setProfile rejects {params}"
+        );
+    }
+}
+
 #[test]
 fn read_only_stubs_and_user_status_shapes() {
     let dir = temp_dir("read-only");

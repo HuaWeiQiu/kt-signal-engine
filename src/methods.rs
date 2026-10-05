@@ -859,6 +859,68 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 个人资料编辑（官方 updateProfile 等价，带 account 参数）：文字面
+        // 全量写（givenName 必填非空），avatar 三态（缺省=保留、data URI=
+        // 换新、null=移除）；形状错 fail-closed -32603（置顶面参数处理先例）。
+        "setProfile" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(given_name) = params.get("givenName").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            if given_name.is_empty() {
+                return internal_error(id);
+            }
+            let optional_text = |key: &str| match params.get(key) {
+                None | Some(Value::Null) => Some(None),
+                Some(Value::String(text)) => Some(Some(text.to_owned())),
+                Some(_) => None,
+            };
+            let Some(family_name) = optional_text("familyName") else {
+                return internal_error(id);
+            };
+            let Some(about) = optional_text("about") else {
+                return internal_error(id);
+            };
+            let Some(emoji) = optional_text("emoji") else {
+                return internal_error(id);
+            };
+            let avatar = match params.get("avatar") {
+                None => crate::service::profile::AvatarIntent::Retain,
+                Some(Value::Null) => crate::service::profile::AvatarIntent::Remove,
+                Some(Value::String(uri)) => {
+                    match crate::service::profile::parse_avatar_data_uri(uri) {
+                        Some((_, bytes)) => {
+                            crate::service::profile::AvatarIntent::Replace { bytes }
+                        }
+                        None => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            match service
+                .set_profile(
+                    account,
+                    crate::service::profile::ProfileUpdate {
+                        given_name: given_name.to_owned(),
+                        family_name,
+                        about,
+                        emoji,
+                        avatar,
+                    },
+                )
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                Err(crate::service::profile::ProfileError::Storage(
+                    storage_sync::StorageSyncError::UnknownAccount,
+                )) => internal_error(id),
+                Err(crate::service::profile::ProfileError::Storage(error)) => {
+                    storage_error(id, &error)
+                }
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),

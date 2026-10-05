@@ -1008,6 +1008,23 @@ pub(crate) fn account_record_with_configuration(
     changed.then_some(updated)
 }
 
+/// AccountRecord 读-改-写保真核心（个人资料面，setProfile）：只覆写名字
+/// 与头像 path（avatar_url_path=None = 保留现状），其余字段原样。
+pub(crate) fn account_record_with_profile(
+    record: &AccountRecord,
+    given_name: &str,
+    family_name: Option<&str>,
+    avatar_url_path: Option<&str>,
+) -> AccountRecord {
+    let mut updated = record.clone();
+    updated.given_name = given_name.to_owned();
+    updated.family_name = family_name.unwrap_or_default().to_owned();
+    if let Some(path) = avatar_url_path {
+        updated.avatar_url_path = path.to_owned();
+    }
+    updated
+}
+
 /// 账号级设置写面（setAccountConfiguration）：update_account_record 通用
 /// 骨架 + 设置面 mutate。官方 updateConfiguration 等价——真相源 =
 /// AccountRecord 的 readReceipts(6)/typingIndicators(8)/
