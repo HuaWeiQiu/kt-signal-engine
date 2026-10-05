@@ -1758,7 +1758,7 @@ async fn serve_account_stream(
                 // 解密失败按事件丢弃（零日志；会话重置治理 P2）。
                 Some(Received::DecryptionError(_)) => {}
                 Some(Received::Content(content)) => {
-                    if let Some(notification) =
+                    for notification in
                         project_content(
                             number,
                             manager.store(),
@@ -1784,14 +1784,18 @@ async fn serve_account_stream(
 /// （groupContext/groupChange 非空）v1 仍整体跳过（成员变更/权限面后续阶段）。
 /// 通话消息面（2026-10-06 扩展批）：CallMessage 1:1 信令透投影 +
 /// SyncMessage.CallEvent 通话记录同步投影；story/null 体跳过。
+/// profileKeyUpdate 批（2026-10-06）：DataMessage.profileKey 按发送方 ACI
+/// 落库 + contactProfileUpdated 事件（详见函数内与 compat §5）。
 /// 形状钉定 signal-cli 0.14.8 JSON（connector implementation-plan §4.13/
 /// §4.19/§4.20），作者号字段在 contacts 命中时给 E.164，未命中给 ACI 字符串。
+/// 返回通知向量（可空：群终止/群更新事件可能替换/追加普通投影；调用方
+/// 逐条外发）。
 async fn project_content(
     account: &str,
     store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
     terminated_groups: &groups::TerminatedGroups,
-) -> Option<Value> {
+) -> Vec<Value> {
     use presage::libsignal_service::content::ContentBody;
 
     let envelope_ts = content.metadata.client_timestamp.timestamp_millis().max(0) as u64;
@@ -1816,13 +1820,37 @@ async fn project_content(
         }
     }
 
+    // profileKeyUpdate 批（compat §5）：DataMessage.profileKey = 发送方随行
+    // 的当前 profile key（改资料/首聊采集两形态）。官方行为：按 sender ACI
+    // 存储后再决定消息面走向；key 与已存相同 = 无事件（幂等闸，官方
+    // hasChanged 门同构）。
+    let profile_key_update = receive_profile_key(store, content).await;
+
     match &content.body {
         ContentBody::DataMessage(data_message) => {
+            // PROFILE_KEY_UPDATE=4 在场 = 该行是资料键更新行（官方桌面收侧
+            // 对该行清 body/attachments、只走 profile key 事件面）→ 整信封
+            // 替换为 contactProfileUpdated 事件（key 已在上面落库）。
+            if is_profile_key_update_row(data_message) {
+                if let Some(aci) = profile_key_update {
+                    return vec![contact_profile_updated_notification(
+                        account,
+                        envelope_ts,
+                        &content.metadata.sender,
+                        &aci,
+                    )];
+                }
+                // key 面（缺席/非法长度/存储失败）没落地 → 不发明事件也不
+                // 投影更新行（宁缺勿错，群终止投影同口径）。
+                return Vec::new();
+            }
             let numbers = resolve_author_numbers(store, data_message).await;
             envelope["dataMessage"] = project_data_message(data_message, &numbers);
         }
         ContentBody::EditMessage(edit) => {
-            let data_message = edit.data_message.as_ref()?;
+            let Some(data_message) = edit.data_message.as_ref() else {
+                return Vec::new();
+            };
             let numbers = resolve_author_numbers(store, data_message).await;
             let dm = project_data_message(data_message, &numbers);
             envelope["editMessage"] = json!({
@@ -1862,7 +1890,9 @@ async fn project_content(
             // 等其他面 P2+）。
             match sync.content.as_ref() {
                 Some(presage::proto::sync_message::Content::Sent(sent)) => {
-                    let data_message = sent.message.as_ref()?;
+                    let Some(data_message) = sent.message.as_ref() else {
+                        return Vec::new();
+                    };
                     let numbers = resolve_author_numbers(store, data_message).await;
                     let mut sent_json = project_data_message(data_message, &numbers);
                     sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
@@ -1889,25 +1919,32 @@ async fn project_content(
                 // ——本机主设备/其他设备已打开某阅后即焚消息，上层据此把对应
                 // 行置 Viewed 并执行字节焚毁。
                 Some(presage::proto::sync_message::Content::ViewOnceOpen(open)) => {
-                    let projection = project_view_once_open(open)?;
+                    let Some(projection) = project_view_once_open(open) else {
+                        return Vec::new();
+                    };
                     envelope["syncMessage"] = json!({ "viewOnceOpen": projection });
                 }
                 // 通话消息面（KT 扩展）：CallEvent 通话记录同步投影——本机
                 // 其他设备/主设备的 1:1 通话历史写入（官方
                 // callEventSync 同位，桌面 #handleCallEvent 行为对齐）。
                 Some(presage::proto::sync_message::Content::CallEvent(event)) => {
-                    let projection = project_call_event(event)?;
+                    let Some(projection) = project_call_event(event) else {
+                        return Vec::new();
+                    };
                     envelope["syncMessage"] = json!({ "callEvent": projection });
                 }
-                _ => return None,
+                _ => return Vec::new(),
             }
         }
         ContentBody::CallMessage(call) => {
-            envelope["callMessage"] = project_call_message(call)?;
+            let Some(projection) = project_call_message(call) else {
+                return Vec::new();
+            };
+            envelope["callMessage"] = projection;
         }
         ContentBody::NullMessage(_)
         | ContentBody::StoryMessage(_)
-        | ContentBody::DecryptionErrorMessage(_) => return None,
+        | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
     }
 
     // 群变更投影放开（最小面）：群更新消息携带 terminated change →
@@ -1922,7 +1959,7 @@ async fn project_content(
     if let Some((master_key, change)) = group_change_of(&content.body) {
         if let Some(terminate) = groups::project_terminate_from_context(&master_key, change) {
             terminated_groups.register(&terminate.group_id);
-            return Some(json!({
+            return vec![json!({
                 "jsonrpc": "2.0",
                 "method": "receive",
                 "params": {
@@ -1936,10 +1973,10 @@ async fn project_content(
                         },
                     },
                 },
-            }));
+            })];
         }
         if let Some(expiration) = groups::project_expiration_from_context(&master_key, change) {
-            return Some(json!({
+            return vec![json!({
                 "jsonrpc": "2.0",
                 "method": "receive",
                 "params": {
@@ -1954,15 +1991,105 @@ async fn project_content(
                         },
                     },
                 },
-            }));
+            })];
         }
     }
 
-    Some(json!({
+    let mut notifications = Vec::new();
+    if let Some(aci) = profile_key_update {
+        // 无 flag 采集形态：普通消息照常投影（正文不吞），key 落库与事件
+        // 静默并行——事件挂载零新增投影键（官方桌面 harvest 态同款）。
+        notifications.push(contact_profile_updated_notification(
+            account,
+            envelope_ts,
+            &content.metadata.sender,
+            &aci,
+        ));
+    }
+    notifications.push(json!({
         "jsonrpc": "2.0",
         "method": "receive",
         "params": { "account": account, "envelope": envelope },
-    }))
+    }));
+    notifications
+}
+
+/// DataMessage 资料键更新行判定：官方 flag 位 PROFILE_KEY_UPDATE=4（钉定
+/// rev proto 实名）。官方桌面 flagCount 断言（≤1 个 flag 位）在此不复制
+/// ——引擎只读不 enforce（expiration flag 同口径）。
+fn is_profile_key_update_row(data_message: &presage::proto::DataMessage) -> bool {
+    use presage::proto::data_message::Flags;
+    data_message
+        .flags
+        .is_some_and(|flags| flags & Flags::ProfileKeyUpdate as u32 != 0)
+}
+
+/// receive 链 profile key 落库（profileKeyUpdate 批主体）：DataMessage 内
+/// 携带 profile_key（bytes）时按发送方 ACI 落 presage store 既有
+/// profile_keys 位（contacts 同步随行落库的同一位，不发明存储），返回
+/// 「需要通知的 ACI」——32 字节合法且与已存值不同（首次/换 key）才 Some，
+/// 幂等闸（同 key 重复收 = no-op，官方 hasChanged 门同构）；空 bytes/
+/// 长度非法（协议定长 32B）fail-closed 丢弃不崩；store 错误静默（receive
+/// 面零 stderr 纪律，下条消息重试自然收敛）。群内/sent sync 不处理
+/// （profile key 是 1:1 作者面语义，见 compat §5 本批边界）。
+async fn receive_profile_key(
+    store: &SqliteStore,
+    content: &presage::libsignal_service::content::Content,
+) -> Option<presage::libsignal_service::prelude::Uuid> {
+    let ContentBody::DataMessage(data_message) = &content.body else {
+        return None;
+    };
+    let bytes = data_message.profile_key.as_deref()?;
+    // 协议定长 32 字节：非法长度 fail-closed 丢弃（不崩不发明）。
+    let Ok(key) = <[u8; 32]>::try_from(bytes) else {
+        return None;
+    };
+    let key = presage::libsignal_service::zkgroup::profiles::ProfileKey::create(key);
+    let sender = content.metadata.sender;
+    let ServiceId::Aci(_) = sender else {
+        return None;
+    };
+    let existing = store
+        .profile_key(&sender)
+        .await
+        .ok()
+        .flatten()
+        .map(|existing| existing.bytes);
+    if existing == Some(key.bytes) {
+        return None;
+    }
+    // upsert_profile_key 是 &mut 面（trait 纪律）：SqliteStore 是连接池句柄
+    // （Clone 语义，proj 开头 open 的同库同池），本函数就近克隆写入。
+    let mut writable = store.clone();
+    writable
+        .upsert_profile_key(&sender.raw_uuid(), key)
+        .await
+        .ok()?;
+    Some(sender.raw_uuid())
+}
+
+/// contactProfileUpdated 事件（profileKeyUpdate 批消费面）：profile key
+/// 首次落库/换 key 后通知连接器——实际 profile/头像重取由消费方经既有
+/// getAvatar 面按需拉取（引擎不持 profile 缓存）。密钥材料不出引擎：事件
+/// 只带 aci（= 发送方 ACI，与 sourceUuid 同值）。
+fn contact_profile_updated_notification(
+    account: &str,
+    timestamp: u64,
+    sender: &ServiceId,
+    aci: &presage::libsignal_service::prelude::Uuid,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "account": account,
+            "envelope": {
+                "timestamp": timestamp,
+                "sourceUuid": sender.service_id_string(),
+                "contactProfileUpdated": { "aci": aci.to_string() },
+            },
+        },
+    })
 }
 
 /// 群更新消息的 change 密文提取（终止投影配套）：dataMessage / sent sync 内
@@ -3352,6 +3479,14 @@ mod tests {
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
     use prost::Message as _;
 
+    /// project_content 现返通知向量：契约测试形状 = 恰一条投影，取首条
+    /// （多通知形状由本批 profileKeyUpdate 面单测覆盖）。
+    #[track_caller]
+    fn pop_unwrap(notifications: Vec<Value>, message: &str) -> Value {
+        assert_eq!(notifications.len(), 1, "{message}: expected single");
+        notifications.into_iter().next().expect("single")
+    }
+
     #[test]
     fn orphan_store_sweep_removes_only_unreferenced_lk_dirs() {
         let root = std::env::temp_dir().join(format!(
@@ -4194,9 +4329,10 @@ mod tests {
             metadata(Some(server_guid)),
         );
         let registry = groups::TerminatedGroups::new();
-        let envelope = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("dataMessage projects");
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        );
         let envelope = &envelope["params"]["envelope"];
         assert_eq!(
             envelope["serverGuid"],
@@ -4214,9 +4350,10 @@ mod tests {
             ContentBody::DataMessage(DataMessage::default()),
             metadata(None),
         );
-        let envelope = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("dataMessage projects");
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        );
         assert!(envelope.get("serverGuid").is_none());
 
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -4300,9 +4437,10 @@ mod tests {
             }),
             metadata.clone(),
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("terminate event projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "terminate event projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
         assert_eq!(
@@ -4354,9 +4492,10 @@ mod tests {
             }),
             metadata.clone(),
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("group dataMessage projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "group dataMessage projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert!(envelope.get("groupTerminated").is_none());
         assert_eq!(
@@ -4385,9 +4524,10 @@ mod tests {
             }),
             metadata,
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("sent terminate projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent terminate projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
 
@@ -4489,9 +4629,10 @@ mod tests {
             }),
             metadata.clone(),
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("expiration event projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "expiration event projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupUpdated"]["groupId"], json!(group_id));
         assert_eq!(envelope["groupUpdated"]["revision"], json!(5));
@@ -4518,9 +4659,10 @@ mod tests {
             }),
             metadata.clone(),
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("timer-off event projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "timer-off event projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupUpdated"]["revision"], json!(6));
         assert_eq!(envelope["groupUpdated"]["expireTimerSeconds"], json!(0));
@@ -4563,9 +4705,10 @@ mod tests {
             }),
             metadata.clone(),
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("group dataMessage projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "group dataMessage projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert!(envelope.get("groupUpdated").is_none());
         assert_eq!(
@@ -4594,9 +4737,10 @@ mod tests {
             }),
             metadata,
         );
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("sent expiration projects");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent expiration projects",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(envelope["groupUpdated"]["groupId"], json!(group_id));
         assert_eq!(envelope["groupUpdated"]["revision"], json!(11));
@@ -4875,9 +5019,10 @@ mod tests {
             metadata.clone(),
         );
         let registry = groups::TerminatedGroups::new();
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("call message projects to receive");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "call message projects to receive",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(
             envelope["callMessage"]["opaque"],
@@ -4913,9 +5058,10 @@ mod tests {
             metadata,
         );
         let registry = groups::TerminatedGroups::new();
-        let notification = project_content("acct", &store, &content, &registry)
-            .await
-            .expect("call event sync projects to receive");
+        let notification = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "call event sync projects to receive",
+        );
         let envelope = &notification["params"]["envelope"];
         assert_eq!(
             envelope["syncMessage"]["callEvent"]["conversationId"],
@@ -4958,5 +5104,227 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
         }
+    }
+
+    /// profileKeyUpdate 批（compat §5）：合法 32 字节 key 按发送方 ACI 落
+    /// presage store profile_keys 位 + contactProfileUpdated 事件；幂等闸
+    /// （同 key 重复收 = 无事件无写）；换 key（48 字节错值、合法 32B 新值）
+    /// 再落库再事件；非法长度 fail-closed 丢弃（普通投影照常、无事件、
+    /// store 无写）；无 profileKey 消息零影响；PROFILE_KEY_UPDATE flag 行
+    /// = 事件整信封替换（不进普通投影）；sent sync 不处理。
+    #[tokio::test]
+    async fn receive_profile_key_update_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+
+        let store_dir =
+            std::env::temp_dir().join(format!("kt-engine-pku-{:016x}", mix_seed_step(mix_seed())));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender_aci = "11111111-2222-4333-8444-555555555555";
+
+        // 合法 32 字节：落库 + 事件（采集形态：普通投影并行不吞）。
+        let key_a = ProfileKey::create([0x11u8; 32]);
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("hello".to_owned()),
+                profile_key: Some(key_a.bytes.to_vec()),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 2, "harvest: event + normal投影");
+        let event = &notifications[0]["params"]["envelope"];
+        assert_eq!(event["contactProfileUpdated"]["aci"], json!(sender_aci));
+        assert_eq!(event["sourceUuid"], json!(sender_aci));
+        let normal = &notifications[1]["params"]["envelope"];
+        assert_eq!(normal["dataMessage"]["message"], json!("hello"));
+        assert!(normal.get("contactProfileUpdated").is_none());
+        assert_eq!(
+            store
+                .profile_key(&ServiceId::parse_from_service_id_string(sender_aci).expect("aci"))
+                .await
+                .expect("store read")
+                .expect("key persisted")
+                .bytes,
+            key_a.bytes
+        );
+
+        // 幂等：同 key 重复收 → 只有普通投影，无事件无重写。
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "idempotent: normal only");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+
+        // 换 key：合法 32B 新值 → 再落库再事件。
+        let key_b = ProfileKey::create([0x22u8; 32]);
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                profile_key: Some(key_b.bytes.to_vec()),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 2, "rotate: event + normal投影");
+        assert_eq!(
+            notifications[0]["params"]["envelope"]["contactProfileUpdated"]["aci"],
+            json!(sender_aci)
+        );
+        assert_eq!(
+            store
+                .profile_key(&ServiceId::parse_from_service_id_string(sender_aci).expect("aci"))
+                .await
+                .expect("store read")
+                .expect("key persisted")
+                .bytes,
+            key_b.bytes
+        );
+
+        // 非法长度（31B）fail-closed：无事件、store 维持旧值、普通投影照常。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("still normal".to_owned()),
+                profile_key: Some(vec![0x33u8; 31]),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "invalid length: normal only");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+        assert_eq!(
+            notifications[0]["params"]["envelope"]["dataMessage"]["message"],
+            json!("still normal")
+        );
+        assert_eq!(
+            store
+                .profile_key(&ServiceId::parse_from_service_id_string(sender_aci).expect("aci"))
+                .await
+                .expect("store read")
+                .expect("key unchanged")
+                .bytes,
+            key_b.bytes
+        );
+
+        // 空 bytes：同 fail-closed 面（官方 hasProfileKey 分支同口径）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                profile_key: Some(Vec::new()),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "empty key: normal only");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+
+        // PROFILE_KEY_UPDATE flag 行：事件整信封替换，不进普通投影。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("flagged".to_owned()),
+                profile_key: Some(key_a.bytes.to_vec()),
+                flags: Some(data_message::Flags::ProfileKeyUpdate as u32),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "flagged: single event");
+        let envelope = &notifications[0]["params"]["envelope"];
+        assert_eq!(envelope["contactProfileUpdated"]["aci"], json!(sender_aci));
+        assert!(envelope.get("dataMessage").is_none());
+
+        // 同 key 的 flag 行（换回旧值触发事件；再收一次 = 幂等：无事件且
+        // 更新行本身无可投影正文 → 零通知，官方 hasChanged 门 no-op 同果）。
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert!(notifications.is_empty(), "flagged idempotent: no event");
+
+        // sent sync（本机其他设备镜像）不处理：无事件、store 不动。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                content: Some(presage::proto::sync_message::Content::Sent(
+                    presage::proto::sync_message::Sent {
+                        message: Some(DataMessage {
+                            profile_key: Some([0x44u8; 32].to_vec()),
+                            ..Default::default()
+                        }),
+                        ..presage::proto::sync_message::Sent::default()
+                    },
+                )),
+                ..presage::proto::SyncMessage::with_padding(&mut rng())
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "sent sync: normal only");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+        assert_ne!(
+            store
+                .profile_key(&ServiceId::parse_from_service_id_string(sender_aci).expect("aci"))
+                .await
+                .expect("store read")
+                .expect("key unchanged")
+                .bytes,
+            [0x44u8; 32]
+        );
+
+        // 无 profileKey 消息零影响：单投影、无事件（既有面防回归）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("plain".to_owned()),
+                ..Default::default()
+            }),
+            envelope_metadata(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "plain: single投影");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// PNI 发送方不处理（profile key 是 1:1 ACI 作者面语义，compat §5 本批
+    /// 边界④）：非法发送面不落库不事件，普通投影照常。
+    #[tokio::test]
+    async fn receive_profile_key_skips_pni_sender() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-pku-pni-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let mut metadata = envelope_metadata();
+        metadata.sender =
+            ServiceId::parse_from_service_id_string("PNI:11111111-2222-4333-8444-555555555555")
+                .expect("pni");
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                profile_key: Some(ProfileKey::create([0x55u8; 32]).bytes.to_vec()),
+                ..Default::default()
+            }),
+            metadata,
+        );
+        let notifications = project_content("acct", &store, &content, &registry).await;
+        assert_eq!(notifications.len(), 1, "pni sender: normal only");
+        assert!(notifications[0]["params"]["envelope"]
+            .get("contactProfileUpdated")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

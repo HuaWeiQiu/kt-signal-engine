@@ -771,6 +771,57 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
   fake 模式成功 `{status: "sent"}`，落调度日志（协议上行面，
   terminateGroup 同纪律）。
 
+receive 链 profileKeyUpdate 批（2026-10-06，官方桌面 profileKeyUpdate /
+profileKeyHarvest 行为对齐；setProfile 写面批（main 8eabf67）登记的
+receive 面债务批）：
+
+- **背景**：DataMessage.profileKey（field 6）是发送方随行的「本条消息
+  作者当前 profile key」——对端改资料（新 key 版本）或首次私聊（key 采集）
+  都经该位送达；profile key 是解对方 profile（含头像）的凭据，没存它
+  getAvatar 的 1:1 面永远 `AVATAR_UNAVAILABLE`。setProfile 批只做了本机
+  写面，receive 链对该字段无处理（投影层不读，静默丢弃）——本端联系人
+  profile 身份验证面（safety number 变化感知/资料指纹刷新）不收敛。
+- **解析层落点勘定**：钉定 presage rev 33dd149 的 proto 已携带该字段
+  （生成 prost `DataMessage.profile_key: Option<Vec<u8>>`，tag 6，
+  libsignal-service 9e6c08b 实查），presage Content 转换不丢——丢弃点在
+  引擎投影层（`project_content`/`project_data_message` 不读该字段）。
+  本批在投影层接入，无需动 vendored proto。
+- **官方行为锚（Signal-Desktop v8.31，MessageReceiver.preload.ts
+  handleDataMessage + background onProfileKey，行为对齐不抄码）**：
+  ① 带 profileKey 的 1:1 DataMessage 一律先按 sender ACI 存储（官方
+  `hasProfileKey` 分支，PROFILE_KEY_UPDATE flag 在场 = "profileKeyUpdate"
+  事件、不在场 = "profileKeyHarvest" 事件，两态同存储行为）；② flag
+  PROFILE_KEY_UPDATE=4 在场时消息体不进普通投影（官方对该行清 body/
+  attachments，只走 profile key 事件）；③ key 与已存值相同 → 不触发
+  profile 刷新（官方 `hasChanged` 门）；④ key 变化 → 触发该联系人
+  profile 重取。
+- **引擎落地（最小面）**：`project_content` 收侧从 DataMessage 提取
+  profile_key（bytes）→ fail-closed 校验（协议定长 32 字节：缺席/空
+  bytes 不处理；长度非法丢弃该字段并继续普通投影，不崩不发明）→ 按发送
+  方 ACI（Metadata.sender）经 presage store 既有 profile key 位落库
+  （`ContentsStore::upsert_profile_key`，presage sqlite `profile_keys`
+  表 = contacts 同步随行落库的同一位，不发明新存储）→ 幂等闸：与已存
+  key（`profile_key(service_id)`）逐字节相同则不再动；不同/首次 → 落库
+  并挂 `contactProfileUpdated` 事件通知（连接器消费面），实际 profile
+  重取由消费方经既有 getAvatar 面按需拉取（引擎不持 profile 缓存，刷新
+  调度留既有机制，compat §5 惯例）。
+- **投影差异**：① flag PROFILE_KEY_UPDATE=4 在场的 1:1 信封整事件替换
+  为 `contactProfileUpdated`（对齐官方「不进普通消息面」——该行无用户
+  可见正文）；② 无 flag 的普通消息携带 profileKey（采集形态）→ 照常
+  走普通投影（正文不吞），profile key 落库与事件挂载静默并行；③ 群内
+  带该字段不处理（profile key 是 1:1 作者面语义，群成员 key 面走群组
+  更新，另行立项）；④ sent sync（本机其他设备发出的镜像）不处理（自己
+  的 key 面归本机写面 setProfile）；⑤ 事件面形状
+  `{method: "receive", params: {account, envelope: {timestamp,
+  sourceUuid, contactProfileUpdated: {aci}}}}`——aci = 事件主体即发送方
+  ACI（UUID 串，与 sourceUuid 同值，连接器免二次解析；不投 key 字节，
+  密钥材料不出引擎存储面）。存储失败（store 错误）静默忽略不炸投影
+  （receive 面零 stderr 纪律，下次消息重试自然收敛）。
+- **边界（本批红线）**：不动 setProfile 写面；不做 CDSI 号码反查（与
+  getAvatar 同口径）；不做 profile 主动重取调度器（presage 栈无后台
+  profile 刷新任务面，消费方按需拉取）；不动 vendored proto。协议栈无
+  读写面的能力不顺手做。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
