@@ -8,6 +8,16 @@
 //! （NDJSON），O(1) 帧内存。v1 范围与跳过策略见 ADR 0005 §S2 设计定案；
 //! recipient 会话归属身份投影（aci/e164/masterKey，E5）按消费方 connector
 //! 契约 1.39（implementation-plan §4.38）的解析面逐字对齐。
+//!
+//! 附件指针面（H3 附件媒体字节 v2，方案 C ①；消费方 connector 契约 1.55
+//! §4.38）：v1 把 `FilePointer.LocatorInfo` 三件套全丢（metadata-only），
+//! 官方导入后能看媒体靠的恰是这个指针（transfer archive 容器里没有媒体
+//! 字节，见 docs/2026-10-06-attachment-media-bytes-v2-research.md §0）。
+//! v2 = 投影扩面：locator（key/cdnKey/cdnNumber/uploadTimestamp/
+//! integrity(digest|plaintextHash)）+ clientUuid/宽高/caption/blurHash/
+//! incrementalMac+chunkSize 随行导出；`key` 是附件解密钥，属只经内存/
+//! 工件中转的传输材料，引擎任何持久层不留存。wire 面契约记录在
+//! docs/jsonrpc-compat.md §5「附件指针投影面」。
 
 use std::io::Write;
 use std::path::Path;
@@ -188,6 +198,11 @@ fn project_recipient_identity(record: &mut serde_json::Value, r: &Recipient) {
 /// proto Contact.aci（16 字节）→ 小写连字 UUID 串（connector is_uuid_shape
 /// 消费形状；引擎直接出规范小写形）。长度畸形的档案字节不可信 → 省略。
 fn aci_string(bytes: &[u8]) -> Option<String> {
+    uuid_string(bytes)
+}
+
+/// 16 字节 → 小写连字 UUID 串；长度畸形的档案字节不可信 → None。
+fn uuid_string(bytes: &[u8]) -> Option<String> {
     Some(
         presage::libsignal_service::prelude::Uuid::from_slice(bytes)
             .ok()?
@@ -228,8 +243,10 @@ fn chat_record(c: &Chat) -> serde_json::Value {
     record
 }
 
-/// v1 中间表示：text + 附件 metadata（不下载字节）+ quote + 远端删除。
-/// 返回 `None` = 跳过（计数可见）。
+/// v2 中间表示：text + 附件 pointer-complete 投影（locator 面 +
+/// clientUuid/宽高/caption/blurHash/incrementalMac，见
+/// `project_pointer_common`；字节本身不在档案内，下载归 connector）+
+/// quote + 远端删除。返回 `None` = 跳过（计数可见）。
 fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
     let direction = match item.directional_details.as_ref()? {
         chat_item::DirectionalDetails::Incoming(_) => "incoming",
@@ -324,6 +341,118 @@ fn timer_change_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> 
     }
 }
 
+/// 附件/文件指针投影公共面（H3 附件媒体字节 v2，方案 C ①）：v1 只有
+/// contentType/fileName/flag/size（metadata-only，locator 全丢——connector
+/// 无从下载）；v2 扩成 pointer-complete。官方消费面锚点：Signal-Desktop
+/// `convertFilePointerToAttachment`（ts/services/backups/util/
+/// filePointers.preload.ts:51-168，AGPL 只读参照零拷贝）——把 locator 三件套
+/// 映射为常规附件下载器输入 key/digest|plaintextHash/cdnKey/cdnNumber/
+/// uploadTimestamp；`isDownloadableFromTransitTier`（ts/util/Attachment.std.ts
+/// :806-825）四件齐即可走 transit CDN。
+///
+/// 投影口径（proto 只投影不发明，缺/空一律省略键）：
+/// - `width`/`height`：Some 原样透出（Some(0) 也是档案陈述）；`caption`/
+///   `blurHash`：非空才投（空串零信息量）；`incrementalMac`+`chunkSize`
+///   同进同退（官方 :84-87 两者齐备才保留；mac = 标准 base64）。
+/// - `locator` 对象（官方属性名同形）：`key` ← LocatorInfo.key 标准 base64
+///   （附件解密钥——NDJSON 行是引擎↔connector 工件传输材料，只经内存/工件
+///   中转，引擎任何持久层不留存）；`cdnKey`/`cdnNumber` ← transit_cdn_key/
+///   transit_cdn_number（Some(0) 是合法 CDN0，原样投）；`uploadTimestamp` ←
+///   transit_tier_upload_timestamp（0 无意义，官方 falsy 同款省略）；
+///   `plaintextHash` ← integrity_check PlaintextHash（小写 hex，官方
+///   Bytes.toHex 同形）/ `digest` ← EncryptedDigest（标准 base64，官方同形），
+///   oneof 二选一。mediaTierCdnNumber/localKey 实有但本批不投：不在 H3
+///   字段清单、connector 无媒体 tier 消费面（付费备份长期兜底属后续批），
+///   见 docs/jsonrpc-compat.md §5 附件指针面块的登记。
+/// - locator 三件套全空（官方 Locator::Invalid = 附件已不可取）→ 整个
+///   `locator` 键缺席；`size` 维持 v1 顶层位（connector v1 消费形状不变）。
+fn project_pointer_common(record: &mut serde_json::Value, pointer: &FilePointer) {
+    use base64::Engine as _;
+    if let Some(locator) = &pointer.locator_info {
+        record["size"] = serde_json::json!(locator.size);
+    }
+    if let Some(width) = pointer.width {
+        record["width"] = serde_json::json!(width);
+    }
+    if let Some(height) = pointer.height {
+        record["height"] = serde_json::json!(height);
+    }
+    if let Some(caption) = pointer.caption.as_deref().filter(|text| !text.is_empty()) {
+        record["caption"] = serde_json::Value::String(caption.to_string());
+    }
+    if let Some(blur_hash) = pointer.blur_hash.as_deref().filter(|text| !text.is_empty()) {
+        record["blurHash"] = serde_json::Value::String(blur_hash.to_string());
+    }
+    if let (Some(mac), Some(chunk_size)) =
+        (&pointer.incremental_mac, pointer.incremental_mac_chunk_size)
+    {
+        if !mac.is_empty() && chunk_size > 0 {
+            record["incrementalMac"] =
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mac));
+            record["chunkSize"] = serde_json::json!(chunk_size);
+        }
+    }
+    let Some(locator) = &pointer.locator_info else {
+        return;
+    };
+    let mut face = serde_json::Map::new();
+    if !locator.key.is_empty() {
+        face.insert(
+            "key".into(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&locator.key),
+            ),
+        );
+    }
+    if let Some(cdn_key) = locator
+        .transit_cdn_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        face.insert(
+            "cdnKey".into(),
+            serde_json::Value::String(cdn_key.to_string()),
+        );
+    }
+    if let Some(cdn_number) = locator.transit_cdn_number {
+        face.insert("cdnNumber".into(), serde_json::json!(cdn_number));
+    }
+    if let Some(timestamp) = locator.transit_tier_upload_timestamp.filter(|ts| *ts > 0) {
+        face.insert("uploadTimestamp".into(), serde_json::json!(timestamp));
+    }
+    match &locator.integrity_check {
+        Some(crate::proto::file_pointer::locator_info::IntegrityCheck::PlaintextHash(hash))
+            if !hash.is_empty() =>
+        {
+            face.insert(
+                "plaintextHash".into(),
+                serde_json::Value::String(hex_string(hash)),
+            );
+        }
+        Some(crate::proto::file_pointer::locator_info::IntegrityCheck::EncryptedDigest(digest))
+            if !digest.is_empty() =>
+        {
+            face.insert(
+                "digest".into(),
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(digest)),
+            );
+        }
+        _ => {}
+    }
+    if !face.is_empty() {
+        record["locator"] = serde_json::Value::Object(face);
+    }
+}
+
+/// 字节串小写 hex（官方 Bytes.toHex 同形，plaintextHash 投影用）。
+fn hex_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn attachment_record(attachment: &crate::proto::MessageAttachment) -> Option<serde_json::Value> {
     let pointer: &FilePointer = attachment.pointer.as_ref()?;
     let mut record = serde_json::json!({
@@ -331,21 +460,23 @@ fn attachment_record(attachment: &crate::proto::MessageAttachment) -> Option<ser
         "fileName": pointer.file_name,
         "flag": attachment.flag,
     });
-    if let Some(locator) = &pointer.locator_info {
-        record["size"] = serde_json::json!(locator.size);
+    project_pointer_common(&mut record, pointer);
+    // clientUuid ← MessageAttachment.client_uuid（官方 bytesToUuid 同形：
+    // 小写连字 UUID）；畸形长度省略键。
+    if let Some(uuid) = attachment.client_uuid.as_deref().and_then(uuid_string) {
+        record["clientUuid"] = serde_json::Value::String(uuid);
     }
     Some(record)
 }
 
-/// metadata-only：只取文件名/类型/大小等描述字段，绝不取密钥与 locator。
+/// longText 等裸 FilePointer 行：同名公共面（clientUuid 只在
+/// MessageAttachment 上，此处无此键）。
 fn file_pointer_record(pointer: &FilePointer) -> serde_json::Value {
     let mut record = serde_json::json!({
         "contentType": pointer.content_type,
         "fileName": pointer.file_name,
     });
-    if let Some(locator) = &pointer.locator_info {
-        record["size"] = serde_json::json!(locator.size);
-    }
+    project_pointer_common(&mut record, pointer);
     record
 }
 
@@ -885,6 +1016,181 @@ mod tests {
         let without = message_record(&item(Some(0), None)).expect("行");
         assert!(without.get("expireStartDate").is_none());
         assert!(without.get("expiresInMs").is_none());
+    }
+
+    /// H3 v2（方案 C ①）附件指针投影三形态：完整 transit locator（key/
+    /// cdnKey/cdnNumber(0 合法)/uploadTimestamp/digest|plaintextHash/
+    /// incrementalMac+chunkSize/宽高/caption/blurHash/clientUuid）/ 部分
+    /// locator（缺 transit 指针只有 integrity → 只有对应键）/ Invalid（无
+    /// locator_info 或 key 空、integrity 空 → locator 键缺席，v1 基础面
+    /// 仍在）。mediaTierCdnNumber/localKey 实有不投（本批裁定，见
+    /// `project_pointer_common` 文档）。
+    #[test]
+    fn attachment_pointer_projection_faces() {
+        use crate::proto::{file_pointer::locator_info::IntegrityCheck, MessageAttachment};
+
+        let full = attachment_record(&MessageAttachment {
+            pointer: Some(FilePointer {
+                content_type: Some("image/png".into()),
+                file_name: Some("pic.png".into()),
+                width: Some(640),
+                height: Some(480),
+                caption: Some("a caption".into()),
+                blur_hash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".into()),
+                incremental_mac: Some(vec![1, 2, 3, 4]),
+                incremental_mac_chunk_size: Some(8192),
+                locator_info: Some(file_pointer::LocatorInfo {
+                    key: vec![0xABu8; 32],
+                    size: 1234,
+                    transit_cdn_key: Some("abcd-1234".into()),
+                    transit_cdn_number: Some(0),
+                    transit_tier_upload_timestamp: Some(1_700_000_000_000),
+                    integrity_check: Some(IntegrityCheck::PlaintextHash(vec![0x0f; 32])),
+                    ..Default::default()
+                }),
+            }),
+            flag: 1,
+            was_downloaded: true,
+            client_uuid: Some(vec![
+                0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1,
+                0xe2, 0xf3,
+            ]),
+        })
+        .expect("完整形态是行");
+        assert_eq!(full["size"], 1234, "size 维持 v1 顶层位");
+        assert_eq!(full["width"], 640);
+        assert_eq!(full["height"], 480);
+        assert_eq!(full["caption"], "a caption");
+        assert_eq!(full["blurHash"], "LEHV6nWB2yk8pyo0adR*.7kCMdnj");
+        assert_eq!(full["flag"], 1);
+        assert_eq!(
+            full["clientUuid"], "0a1b2c3d-4e5f-6a7b-8c9d-aebfc0d1e2f3",
+            "官方 bytesToUuid 同形小写连字"
+        );
+        // locator 面：key/cdnKey base64，cdnNumber=0 是合法 CDN0，plaintext
+        // hash 走 hex（官方 Bytes.toHex 同形）。
+        assert_eq!(
+            full["locator"]["key"],
+            base64::engine::general_purpose::STANDARD.encode([0xABu8; 32])
+        );
+        assert_eq!(full["locator"]["cdnKey"], "abcd-1234");
+        assert_eq!(full["locator"]["cdnNumber"], 0);
+        assert_eq!(full["locator"]["uploadTimestamp"], 1_700_000_000_000_u64);
+        assert_eq!(full["locator"]["plaintextHash"], "0f".repeat(32));
+        assert!(
+            full["locator"].get("digest").is_none(),
+            "oneof 只投命中的 arm"
+        );
+        // incrementalMac + chunkSize 同进同退（官方 :84-87 两者齐备才保留）。
+        assert_eq!(
+            full["incrementalMac"],
+            base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4])
+        );
+        assert_eq!(full["chunkSize"], 8192);
+        // 实有不投字段（mediaTierCdnNumber/localKey）不得以任何形态出现。
+        assert!(full["locator"].get("mediaTierCdnNumber").is_none());
+        assert!(full["locator"].get("localKey").is_none());
+
+        // digest arm（EncryptedDigest：发送方原始附件、未下载过的形态）。
+        let encrypted = attachment_record(&MessageAttachment {
+            pointer: Some(FilePointer {
+                content_type: Some("video/mp4".into()),
+                locator_info: Some(file_pointer::LocatorInfo {
+                    key: vec![7u8; 32],
+                    size: 42,
+                    transit_cdn_key: Some("k".into()),
+                    transit_cdn_number: Some(3),
+                    integrity_check: Some(IntegrityCheck::EncryptedDigest(vec![0xEE; 16])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("digest 形态是行");
+        assert_eq!(
+            encrypted["locator"]["digest"],
+            base64::engine::general_purpose::STANDARD.encode([0xEE; 16]),
+            "digest 标准 base64（官方 Bytes.toBase64 同形）"
+        );
+        assert!(encrypted["locator"].get("plaintextHash").is_none());
+        assert!(
+            encrypted.get("uploadTimestamp").is_none()
+                && encrypted["locator"].get("uploadTimestamp").is_none(),
+            "uploadTimestamp 缺席省略键"
+        );
+
+        // 部分 locator：有 key + plaintextHash 但 transit 指针缺席（本机
+        // 下载过的官方形态）——只有存在的键，不发明占位值。
+        let partial = file_pointer_record(&FilePointer {
+            content_type: Some("application/pdf".into()),
+            file_name: Some("doc.pdf".into()),
+            locator_info: Some(file_pointer::LocatorInfo {
+                key: vec![1u8; 32],
+                size: 99,
+                integrity_check: Some(IntegrityCheck::PlaintextHash(vec![0x7f; 32])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(partial["size"], 99);
+        assert_eq!(
+            partial["locator"]["key"],
+            base64::engine::general_purpose::STANDARD.encode([1u8; 32])
+        );
+        assert_eq!(partial["locator"]["plaintextHash"], "7f".repeat(32));
+        for absent in ["cdnKey", "cdnNumber", "uploadTimestamp", "digest"] {
+            assert!(
+                partial["locator"].get(absent).is_none(),
+                "{absent} 不得占位"
+            );
+        }
+
+        // 官方 Locator::Invalid 两形态：locator_info 整体缺席；key 空 +
+        // integrity 空（proto3 默认形态）——locator 键缺席，v1 基础面仍在。
+        let invalid_pointer = file_pointer_record(&FilePointer {
+            content_type: Some("application/octet-stream".into()),
+            file_name: Some("gone.bin".into()),
+            ..Default::default()
+        });
+        assert!(invalid_pointer.get("locator").is_none());
+        assert!(invalid_pointer.get("size").is_none());
+        assert_eq!(invalid_pointer["contentType"], "application/octet-stream");
+        let empty_locator = attachment_record(&MessageAttachment {
+            pointer: Some(FilePointer {
+                content_type: Some("image/webp".into()),
+                file_name: Some("sticker.webp".into()),
+                locator_info: Some(file_pointer::LocatorInfo::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("空 locator 形态是行");
+        assert!(
+            empty_locator.get("locator").is_none(),
+            "三件套全空 = Invalid"
+        );
+        // size 维持 v1 行为：locator_info 在场即投（0 原样透出，官方
+        // `size ?? 0` 同口径的诚实零——空附件合法，proto 注释明示）。
+        assert_eq!(empty_locator["size"], 0);
+        assert_eq!(empty_locator["fileName"], "sticker.webp");
+
+        // 畸形面：clientUuid 非 16B → 省略键；incrementalMac 只有一半
+        // （缺 chunkSize）→ 两个键都不投（同进同退）。
+        let malformed = attachment_record(&MessageAttachment {
+            pointer: Some(FilePointer {
+                content_type: Some("text/plain".into()),
+                incremental_mac: Some(vec![9; 8]),
+                ..Default::default()
+            }),
+            client_uuid: Some(vec![0x11; 15]),
+            ..Default::default()
+        })
+        .expect("畸形形态是行");
+        assert!(malformed.get("clientUuid").is_none());
+        assert!(malformed.get("incrementalMac").is_none());
+        assert!(malformed.get("chunkSize").is_none());
+        assert!(malformed["locator"].is_null());
     }
 
     #[tokio::test]

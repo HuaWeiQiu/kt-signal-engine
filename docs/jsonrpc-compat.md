@@ -349,6 +349,46 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
   以账号注册号码（engine-state.json registry 号码→目录映射）作 self
   会话归属与自发信源，档案无需重复携带身份。
 
+附件指针投影面（2026-10-06，H3 附件媒体字节 v2 方案 C ①；消费方
+connector 契约 1.55 §4.38；调研全文
+docs/2026-10-06-attachment-media-bytes-v2-research.md）：
+
+- **NDJSON wire 契约批裁定（密钥敏感性）**：`locator.key` 是附件解密钥，
+  属只经内存/工件文件中转的传输材料——与 v1 已透传的 contentType/size
+  同级，引擎任何持久层不留存（export 是流式 O(1) 帧内存，NDJSON 工件由
+  connector 消费后按其纪律处置）；connector 侧下载后落其附件存储，
+  locator 不长驻引擎盘。transfer archive 容器内无媒体字节（官方桌面
+  导入消费面无第二段可读，调研 §0/§1.2），媒体可取回性完全取决于本
+  指针面的导出——v1 全丢是「metadata-only」与官方的真实差距。
+- **投影面（v2，`attachment_record`/`file_pointer_record` 共用
+  `project_pointer_common`；proto 只投影不发明，缺/空一律省略键）**：
+  在 v1 基础面（contentType/fileName/flag/size）上扩：
+  `width`/`height`（Some 原样，Some(0) 也是档案陈述）；`caption`/
+  `blurHash`（非空才投）；`incrementalMac`+`chunkSize` 同进同退（mac
+  标准 base64，官方 filePointers.preload.ts:84-87 两者齐备才保留同构）；
+  `clientUuid`（MessageAttachment.client_uuid 16B → 小写连字 UUID，官方
+  bytesToUuid 同形，畸形长度省略）。`locator` 对象（键名与官方
+  `convertFilePointerToAttachment`（ts/services/backups/util/
+  filePointers.preload.ts:51-168，AGPL 只读参照零拷贝）产出的附件属性
+  同形）：`key` ← LocatorInfo.key 标准 base64；`cdnKey`/`cdnNumber` ←
+  transit_cdn_key/transit_cdn_number（cdnNumber=0 是合法 CDN0 原样投）；
+  `uploadTimestamp` ← transit_tier_upload_timestamp（0 缺省省略，官方
+  falsy 同款）；`digest` ← integrity_check EncryptedDigest（标准
+  base64，官方同形）/`plaintextHash` ← PlaintextHash（小写 hex，官方
+  Bytes.toHex 同形），oneof 二选一只投命中 arm。`size` 维持 v1 顶层位
+  不挪嵌套（connector v1 消费形状不变）。下载资格判定口径 = 官方
+  `isDownloadableFromTransitTier`（ts/util/Attachment.std.ts:806-825）：
+  key + integrity + cdnKey + cdnNumber 四件齐。
+- **实有但不投（本批裁定，不发明）**：`media_tier_cdn_number`（付费备份
+  media tier 定位）与 `local_key`（本地备份加密钥）——不在 H3 字段清单，
+  connector 无媒体 tier / 本地备份消费面，投了无人消费；媒体 tier 长期
+  兜底属后续批（调研 §2 方案 C 编排）。
+- **官方 Locator::Invalid 形态 = `locator` 键缺席**：locator_info 整体
+  缺席，或 key 空 + integrity 空（官方 libsignal `LocatorInfo` 校验器
+  backup/file.rs:100-177：key 非空 ⇔ transit 或 plaintextHash 至少其一
+  非空；空 locator 合法 = 附件已不可取）——此时消息行照出、附件只有
+  v1 基础面，connector 侧如实降级为不可下载占位（官方同款「点按重试」）。
+
 消失消息 E 批（2026-10-05，1:1 计时器设置 + 接收/导出投影）：
 
 - **`setExpirationTimer` 语义对位（signal-cli `Manager.setExpirationTimer`，
