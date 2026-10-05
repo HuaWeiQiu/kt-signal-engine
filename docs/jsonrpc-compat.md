@@ -89,6 +89,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
 | `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{}` | 头像上行（profile PUT/CDN POST）失败 `STORAGE_WRITE_FAILED`；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{}` |
 | `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
+| `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；条目形状与置顶面同构；v1 不含 blockedAtTimestamp） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
@@ -428,6 +429,29 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
   入图）。
 - **fake 成功面**：fake 模式 `setProfile` 成功 `{}`，不落调度日志（置顶/
   贴纸/账号设置面同款纪律）。
+
+会话拉黑只读面（2026-10-05）：
+
+- **新方法 `getBlockedConversations`**：`{account}` → `{blocked: [...]}`。
+  真相源 = Storage Service 独立 Contact/GroupV1/GroupV2 记录的 `blocked`
+  位（ContactRecord=9、GroupV1Record=2、GroupV2Record=2，① vendored 官方
+  proto 字段保真读面）——拉黑状态不经 AccountRecord，与置顶面（账号记录
+  内嵌数组）的存储形态本质不同，故读面走「manifest 全部三类 identifier
+  批量原样读」（`read_raw_items` 复用，type=1/2/3 presage 枚举直判），
+  不开新模块。条目形状与置顶面同构（`conversationId` + `kind`），contact
+  口径与 `storage_to_engine` 对齐（aciBinary 16B → UUID 串优先、字符串
+  形态直通、e164 跳过）。
+- **投影口径**：group = master key 标准 base64（send groupId 口径）、
+  legacyGroup = legacy id bytes（从 UTF-8 lossy）、contact = ACI UUID 串
+  （listContacts uuid 同源）。存储序 = manifest identifiers 首现序。坏条
+  目（服务器缺 item/解密 MAC 失败/proto 解码失败/标识映射不出）单条跳过
+  零 stderr（daemon 静默纪律，与贴纸批量读同款），不炸整面。
+- **v1 裁剪**：不投 `blockedAtTimestamp`（官方 ContactRecord=27/
+  GroupV2Record=13 有该字段）——连接器消费面 v1 只需名单本身，时间戳面
+  留待消费方提出再扩（不发明用途）。只读面：不落本地 store、不动
+  manifest（无写序问题）。
+- **fake 纪律**：fake 模式恒 `{blocked: []}` 不触网不落调度日志；real 模
+  式未注册账号 → storage 上下文打不开折叠 `-32603`（置顶面同款）。
 
 ## 6. fake 服务模式（仅测试）
 

@@ -738,6 +738,18 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 会话拉黑只读面（Storage Service 真相源，带 account 参数）：参数
+        // 纪律与置顶面同款（fail-closed -32603，storage 四码只覆盖链路）。
+        "getBlockedConversations" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.blocked_conversations(account).await {
+                Ok(entries) => jsonrpc::success_response(id, blocked_payload(&entries)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 贴纸包安装状态同步（Storage Service 真相源，带 account 参数，风格
         // 对齐置顶面）：packId 解码/packKey 形状错走 -32603 fail-closed
         //（置顶面参数处理先例，不占用结构化码）。
@@ -964,6 +976,22 @@ fn pinned_payload(entries: &[storage_sync::PinnedEntry]) -> Value {
                     "conversationId": id.id_string(),
                     "kind": id.kind(),
                 }))
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// 拉黑返回体（getBlockedConversations）：顺序 = 存储序；条目形状与置顶
+/// 面同构（conversationId + kind）。
+fn blocked_payload(entries: &[storage_sync::EngineConversationId]) -> Value {
+    json!({
+        "blocked": entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "conversationId": entry.id_string(),
+                    "kind": entry.kind(),
+                })
             })
             .collect::<Vec<_>>(),
     })

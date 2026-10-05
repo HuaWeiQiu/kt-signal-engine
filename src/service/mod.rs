@@ -1323,6 +1323,20 @@ impl Service {
         storage_sync::read_pinned(&context).await
     }
 
+    /// getBlockedConversations（P5 扩面）：读 Storage Service 全部
+    /// Contact/GroupV1/GroupV2 记录的 blocked 位 → 引擎会话标识投影（存储
+    /// 序；形状与置顶条目同构，只读面不落 store）。
+    pub(crate) async fn blocked_conversations(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<storage_sync::EngineConversationId>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::read_blocked_conversations(&context).await
+    }
+
     /// setConversationPinned（P4 扩面）：官方写语义（读改写 AccountRecord，
     /// 仅动 pinned 字段）+ 409 冲突重放（conflictBackOff 3 次）。
     pub(crate) async fn set_conversation_pinned(

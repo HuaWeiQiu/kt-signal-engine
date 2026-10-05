@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Storage Service 同步：会话级置顶（P4 扩面）+ 写面泛化（P5，支撑贴纸包
+//! Storage Service 同步：会话级置顶（P4 扩面）+ 拉黑只读面（P5，
+//! `getBlockedConversations` 批量原样读）+ 写面泛化（P5，支撑贴纸包
 //! 记录面 `storage_sticker` 与账号级设置写面 `setAccountConfiguration`/
 //! `setUniversalExpireTimer`，共用 `update_account_record` 编排骨架）。
 //!
@@ -776,6 +777,132 @@ fn project_pinned(account: &AccountRecord) -> Vec<PinnedEntry> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 拉黑只读面（P5 扩面）
+// ---------------------------------------------------------------------------
+
+/// ContactRecord → 引擎会话标识（口径与 `storage_to_engine` 的 contact 分支
+/// 对齐：aciBinary 16 字节 → UUID 字符串优先，字符串形态直通，e164 形态非
+/// 本引擎 contact 标识口径 → 跳过）。
+fn contact_engine_id(contact: &storage_proto::ContactRecord) -> Option<EngineConversationId> {
+    if !contact.aci_binary.is_empty() {
+        let uuid =
+            presage::libsignal_service::prelude::Uuid::from_slice(&contact.aci_binary).ok()?;
+        return Some(EngineConversationId::Contact(uuid.to_string()));
+    }
+    if contact.aci.is_empty() {
+        return None;
+    }
+    presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(&contact.aci)
+        .map(|sid| EngineConversationId::Contact(sid.service_id_string()))
+}
+
+/// 单条明文 StorageRecord → 引擎会话标识（blocked 面投影）：仅
+/// Contact/GroupV1/GroupV2 三类参与，`blocked==false`、非三类记录或标识
+/// 映射不出 → None（调用方跳过，零 stderr——daemon 静默纪律，compat §1）。
+pub(crate) fn blocked_conversation_of(plaintext: &[u8]) -> Option<EngineConversationId> {
+    let record = storage_proto::StorageRecord::decode(plaintext)
+        .ok()?
+        .record?;
+    match record {
+        storage_proto::storage_record::Record::Contact(contact) if contact.blocked => {
+            contact_engine_id(&contact)
+        }
+        storage_proto::storage_record::Record::GroupV1(group)
+            if group.blocked && !group.id.is_empty() =>
+        {
+            Some(EngineConversationId::LegacyGroup(
+                String::from_utf8_lossy(&group.id).into_owned(),
+            ))
+        }
+        storage_proto::storage_record::Record::GroupV2(group)
+            if group.blocked && !group.master_key.is_empty() =>
+        {
+            Some(EngineConversationId::Group(
+                base64::engine::general_purpose::STANDARD.encode(&group.master_key),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// manifest 全部 Contact/GroupV1/GroupV2 identifier → 批量原样读 → 解密 →
+/// vendored proto 解码 → blocked 位过滤（存储序 = manifest identifiers 首
+/// 现序；单条坏 item 跳过不炸面，与贴纸批量读同纪律）。
+async fn read_blocked_ids(
+    push: &PushService,
+    storage_key: &StorageServiceKey,
+    manifest: &ManifestRecord,
+) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+    let keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            matches!(
+                identifier.r#type(),
+                manifest_record::identifier::Type::Contact
+                    | manifest_record::identifier::Type::Groupv1
+                    | manifest_record::identifier::Type::Groupv2
+            )
+        })
+        .map(|identifier| identifier.raw.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let record_ikm = if manifest.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest.record_ikm.as_slice())
+    };
+    let auth = storage_auth(push).await?;
+    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(item) = items.iter().find(|item| item.key == key) else {
+            continue;
+        };
+        let Ok(plaintext) = decrypt_raw_item(storage_key, item, record_ikm) else {
+            continue;
+        };
+        if let Some(id) = blocked_conversation_of(&plaintext) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// 读面编排：master key → manifest → 全部 blocked 会话（存储序）。master
+/// key 缺失或 manifest 404（账号从未有过 storage 状态）→ 空列表。v1 投影
+/// 不含 blockedAtTimestamp（官方 Contact/GroupV2 记录有该字段，投影面 v1
+/// 裁剪——compat §5 登记）。
+pub(crate) async fn read_blocked_conversations(
+    context: &StorageContext,
+) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+    let Some(master_key) = context
+        .store
+        .fetch_master_key()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)?
+    else {
+        return Ok(Vec::new());
+    };
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let storage = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await?;
+    let manifest = match storage.manifest().await {
+        Ok(manifest) => manifest,
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+            return Ok(Vec::new());
+        }
+        Err(_) => return Err(StorageSyncError::Unavailable),
+    };
+    read_blocked_ids(&context.push, &storage_key, &manifest).await
+}
+
 /// 账号记录写编排通用骨架（write_pinned 收敛出的共用面，账号级设置批
 /// setAccountConfiguration / setUniversalExpireTimer 复用）：seed master
 /// key → manifest 读取（404 → 最小 AccountRecord 首写分支）→ mutate 回调
@@ -1271,6 +1398,132 @@ mod tests {
         assert!(storage_to_engine(&release).is_none());
         // 空标识（无 oneof）→ 跳过。
         assert!(storage_to_engine(&PinnedConversation::default()).is_none());
+    }
+
+    /// 拉黑只读面投影：blocked 三类记录 wire → decode → 过滤 → 投影；
+    /// 未拉黑/非三类记录/垃圾 bytes/空标识 → None（调用方跳过）。
+    #[test]
+    fn blocked_conversation_projection_faces() {
+        use storage_proto::{ContactRecord, GroupV1Record, GroupV2Record};
+
+        fn wire(record: storage_proto::storage_record::Record) -> Vec<u8> {
+            storage_proto::StorageRecord {
+                record: Some(record),
+            }
+            .encode_to_vec()
+        }
+
+        // contact blocked：aciBinary 16 字节优先 → 小写连字 UUID（置顶面
+        // contact 投影同口径）。
+        let contact = ContactRecord {
+            blocked: true,
+            aci_binary: [
+                0x6a, 0x2c, 0xb1, 0x7f, 0xef, 0x7c, 0x4a, 0x5d, 0x9c, 0x69, 0x6f, 0x8b, 0x2b, 0x1f,
+                0x88, 0xae,
+            ]
+            .to_vec(),
+            ..Default::default()
+        };
+        let expected_aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
+                contact.clone()
+            ))),
+            Some(EngineConversationId::Contact(expected_aci.to_owned()))
+        );
+
+        // 字符串形态回退（无 binary）：ACI 字符串直通。
+        let mut by_string = contact.clone();
+        by_string.aci_binary = Vec::new();
+        by_string.aci = expected_aci.to_owned();
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
+                by_string
+            ))),
+            Some(EngineConversationId::Contact(expected_aci.to_owned()))
+        );
+
+        // e164 形态非引擎 contact 口径 → 跳过。
+        let mut e164_only = contact.clone();
+        e164_only.aci_binary = Vec::new();
+        e164_only.e164 = "+15551234567".to_owned();
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
+                e164_only
+            ))),
+            None
+        );
+
+        // 未拉黑 → None。
+        let mut unblocked = contact;
+        unblocked.blocked = false;
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
+                unblocked
+            ))),
+            None
+        );
+
+        // group（v2）blocked：master key → 标准 base64（send groupId 口径）。
+        let mut group = GroupV2Record {
+            blocked: true,
+            master_key: vec![9u8; 32],
+            ..Default::default()
+        };
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV2(
+                group.clone()
+            ))),
+            Some(EngineConversationId::Group(
+                base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+            ))
+        );
+        // 空 master key → 跳过。
+        let mut keyless = group.clone();
+        keyless.master_key = Vec::new();
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV2(
+                keyless
+            ))),
+            None
+        );
+        // 未拉黑 → None。
+        group.blocked = false;
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV2(group))),
+            None
+        );
+
+        // legacyGroup（v1）blocked：id bytes → 引擎字符串口径。
+        let mut legacy = GroupV1Record {
+            blocked: true,
+            id: b"old-group-id".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV1(
+                legacy.clone()
+            ))),
+            Some(EngineConversationId::LegacyGroup("old-group-id".to_owned()))
+        );
+        // 未拉黑 → None。
+        legacy.blocked = false;
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV1(
+                legacy
+            ))),
+            None
+        );
+
+        // 非三类记录（Account）/垃圾 bytes/空明文 → None（跳过不炸面）。
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Account(
+                AccountRecord::default()
+            ))),
+            None
+        );
+        assert_eq!(blocked_conversation_of(&[0xff, 0xff, 0xff]), None);
+        assert_eq!(blocked_conversation_of(&[]), None);
     }
 
     /// contact 反投影：ACI 字符串 → serviceIdBinary 往返；无 service_id

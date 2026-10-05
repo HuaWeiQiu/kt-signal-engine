@@ -273,6 +273,12 @@ fn real_mode_no_network_error_paths() {
         json!({ "account": "+15559990000", "conversationId": "x", "kind": "contact", "pinned": true }),
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    // 未注册账号的拉黑只读面：storage 上下文打不开 → 同置顶面折叠。
+    let (code, message) = engine.error_of(
+        "getBlockedConversations",
+        json!({ "account": "+15559990000" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
     // 未注册账号的 sendViewOnceOpen：self-send 前置即内部失败（不触网）。
     let (code, message) = engine.error_of(
@@ -386,6 +392,30 @@ fn conversation_pinned_fake_shapes_and_param_fail_closed() {
         "setConversationPinned",
         json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact" }),
     );
+    assert_eq!(code, -32603);
+}
+
+/// 拉黑只读面（P5 扩面，Storage Service 真相源）：fake 模式空列表成功面 +
+/// 参数面 fail-closed（-32603，storage 四码只覆盖链路，参数错误不占用；
+/// real 模式未注册账号折叠见 real_mode_no_network_error_paths）。
+#[test]
+fn blocked_conversations_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("blocked-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 读：空列表成功。
+    assert_eq!(
+        engine.request(
+            "getBlockedConversations",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({ "blocked": [] })
+    );
+
+    // 缺 account / account 非字符串形状 → -32603。
+    let (code, _) = engine.error_of("getBlockedConversations", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getBlockedConversations", json!({ "account": 7 }));
     assert_eq!(code, -32603);
 }
 
