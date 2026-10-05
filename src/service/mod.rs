@@ -295,6 +295,9 @@ struct PendingLink {
     result: Arc<LinkResultSlot>,
 }
 
+/// transfer_archive 下载进度快照注册表（契约 1.53 §4.38 扩展）。
+mod transfer_progress;
+
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
@@ -308,6 +311,8 @@ pub(crate) struct Service {
     backup_tasks: Arc<backup_task::BackupTaskRegistry>,
     /// 已终止群登记表（进程内存，groups 模块：receive 投影 → send 面拦截）。
     terminated_groups: groups::TerminatedGroups,
+    /// transfer_archive 下载进度快照（进程内存，不落盘；§4.38 progress 面）。
+    transfer_progress: transfer_progress::TransferProgress,
 }
 
 struct Inner {
@@ -334,6 +339,7 @@ impl Service {
             pipelines: AsyncMutex::new(HashMap::new()),
             backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
             terminated_groups: groups::TerminatedGroups::new(),
+            transfer_progress: transfer_progress::TransferProgress::new(),
         })
     }
 
@@ -406,8 +412,9 @@ impl Service {
         // start_link 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
         let task_dir = store_dir.clone();
         let task_slot = Arc::clone(&slot);
+        let task_progress = self.transfer_progress.clone();
         tokio::task::spawn_local(async move {
-            match link_flow(store, url_tx, task_dir).await {
+            match link_flow(store, url_tx, task_dir, task_progress).await {
                 Ok(number) => task_slot.complete(Ok(number)),
                 Err(()) => task_slot.complete(Err(())),
             }
@@ -504,6 +511,17 @@ impl Service {
             .map_err(|_| LinkError::Internal)?;
         self.spawn_pipeline(number.clone(), pending.store_dir).await;
         Ok(number)
+    }
+
+    /// transfer_archive 下载进度查询（契约 1.53 §4.38 扩展，connector 的
+    /// `history.importStatus` progress 组合面消费）：进程内快照只读，无
+    /// 网络、无 store。快照缺席（未开始/已结束/引擎重启过）= None，消费方
+    /// 维持无 progress 的诚实投影。
+    pub(crate) fn transfer_archive_snapshot(
+        &self,
+        account: &str,
+    ) -> Option<transfer_progress::TransferSnapshot> {
+        self.transfer_progress.snapshot(account)
     }
 
     pub(crate) async fn delete_account(&self, account: &str) -> std::io::Result<bool> {
@@ -2757,6 +2775,7 @@ async fn link_flow(
     mut store: SqliteStore,
     url_tx: futures::channel::oneshot::Sender<url::Url>,
     store_dir: PathBuf,
+    transfer_progress: transfer_progress::TransferProgress,
 ) -> Result<String, ()> {
     let mut rng = rng();
     let password = Alphanumeric.sample_string(&mut rng, 24);
@@ -2880,6 +2899,8 @@ async fn link_flow(
             service_ids.aci,
             backup_key,
             credentials,
+            number.clone(),
+            transfer_progress,
         ));
     }
     Ok(number)
@@ -2891,12 +2912,19 @@ async fn link_flow(
 /// （`history-import.ndjson`，S3 connector 消费）。任何一步失败静默放弃并
 /// 清理半成品——失败形态即 NDJSON 缺席，消费方以文件存在性判定导入结果；
 /// 本任务不产生 stderr（compat §1），不影响链接成功。
+///
+/// 下载段边读边累计进程内进度快照（`account` 名下的 `progress` 观测面，
+/// 契约 1.53 §4.38 扩展）；无论成败，任务收尾清快照——快照缺席即引擎
+/// 无在途下载，消费方不猜。
 async fn download_transfer_archive(
     store_dir: PathBuf,
     aci: presage::libsignal_service::prelude::Uuid,
     backup_key: [u8; 32],
     credentials: ServiceCredentials,
+    account: String,
+    transfer_progress: transfer_progress::TransferProgress,
 ) {
+    transfer_progress.begin(&account, None);
     let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
 
     let manifest: Value = {
@@ -2908,29 +2936,47 @@ async fn download_transfer_archive(
                 HttpAuthOverride::NoOverride,
             ) {
                 Ok(builder) => builder,
-                Err(_) => return,
+                Err(_) => {
+                    transfer_progress.clear(&account);
+                    return;
+                }
             };
             let response = match response.send().await {
                 Ok(response) => response,
-                Err(_) => return,
+                Err(_) => {
+                    transfer_progress.clear(&account);
+                    return;
+                }
             };
             match response.status().as_u16() {
                 200 => {
                     let bytes = match response.bytes().await {
                         Ok(bytes) => bytes,
-                        Err(_) => return,
+                        Err(_) => {
+                            transfer_progress.clear(&account);
+                            return;
+                        }
                     };
                     match serde_json::from_slice(&bytes) {
                         Ok(value) => break value,
-                        Err(_) => return,
+                        Err(_) => {
+                            transfer_progress.clear(&account);
+                            return;
+                        }
                     }
                 }
-                204 if polls >= 9 => return,
+                204 if polls >= 9 => {
+                    transfer_progress.clear(&account);
+                    return;
+                }
                 204 => {
                     polls += 1;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                _ => return,
+                _ => {
+                    transfer_progress.clear(&account);
+                    return;
+                }
             }
         }
     };
@@ -2938,6 +2984,7 @@ async fn download_transfer_archive(
         manifest["cdn"].as_u64().map(|value| value as u32),
         manifest["key"].as_str().map(str::to_owned),
     ) else {
+        transfer_progress.clear(&account);
         return;
     };
 
@@ -2947,20 +2994,51 @@ async fn download_transfer_archive(
         HttpAuthOverride::NoOverride,
     ) {
         Ok(builder) => builder,
-        Err(_) => return,
+        Err(_) => {
+            transfer_progress.clear(&account);
+            return;
+        }
     };
-    let bytes = match response.send().await {
-        Ok(response) => match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        },
-        Err(_) => return,
+    let response = match response.send().await {
+        Ok(response) => response,
+        Err(_) => {
+            transfer_progress.clear(&account);
+            return;
+        }
     };
+    // content-length 缺席（chunked/代理剥头）是诚实形态：total=None，只报
+    // stage（官方 Process 段同理只有文案没有数字）。
+    let bytes_total = response.content_length().filter(|total| *total > 0);
+    transfer_progress.begin(&account, bytes_total);
+
+    // 块读（reqwest 流式 chunk）：边读边累计快照，不整包驻内存。
+    let mut archive_bytes = Vec::new();
+    {
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    transfer_progress.add(&account, chunk.len() as u64);
+                    archive_bytes.extend_from_slice(&chunk);
+                }
+                Err(_) => {
+                    transfer_progress.clear(&account);
+                    return;
+                }
+            }
+        }
+    }
 
     let archive_path = store_dir.join("transfer-archive.bin");
-    if std::fs::write(&archive_path, &bytes).is_err() {
+    if std::fs::write(&archive_path, &archive_bytes).is_err() {
+        transfer_progress.clear(&account);
         return;
     }
+    // 导出（解密+分帧）是本地计算不再有下载字节：快照在导出前清掉——
+    // connector 观测的 progress 只覆盖官方 Download 段，Process 段由
+    // connector 自己的导入 pass 投影（§4.38 progress 语义）。
+    transfer_progress.clear(&account);
     let ndjson_path = store_dir.join("history-import.ndjson");
     let outcome = std::fs::File::create(&ndjson_path)
         .map_err(|_| ())

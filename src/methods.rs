@@ -1168,6 +1168,32 @@ async fn dispatch(
                 Err(()) => internal_error(id),
             }
         }
+        // transfer_archive 下载进度快照查询（transfer.downloadStatus，KT 扩展
+        // 方法）：`history.importStatus` progress 组合面的引擎侧只读数据源
+        // （契约 1.53 §4.38 扩展）。快照缺席（未开始/已结束/引擎重启过）=
+        // `{present: false}`；在跑 = `{present: true, bytesRead,
+        // bytesTotal?}`——total 缺席是诚实形态（content-length 拿不到），
+        // 消费方不给假 0。只读不落调度日志零 stderr，同 backup.exportStatus
+        // 纪律。未注册/fake 账号同样答 `{present: false}`：快照面是进程内
+        // 观测，不泄露注册状态。
+        "transfer.downloadStatus" => {
+            let account = params.get("account").and_then(Value::as_str).unwrap_or("");
+            let snapshot = service.transfer_archive_snapshot(account);
+            let payload = match snapshot {
+                None => json!({ "present": false }),
+                Some(snapshot) => {
+                    let mut value = json!({
+                        "present": true,
+                        "bytesRead": snapshot.bytes_read,
+                    });
+                    if let Some(total) = snapshot.bytes_total {
+                        value["bytesTotal"] = json!(total);
+                    }
+                    value
+                }
+            };
+            jsonrpc::success_response(id, payload)
+        }
         // 群终止（terminateGroup，KT 扩展方法）：协议上行面，落调度日志
         //（send 系/reportSpam 同纪律）。groupId 必须 32B 标准 base64 群
         // master key、缺 account/坏 groupId → 参数面 -32603 fail-closed；
