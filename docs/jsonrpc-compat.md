@@ -99,6 +99,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
 | `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration}`（本批只收 expiration 一个参数族，0=关闭；expiration 缺席 = 无操作整拒，不静默 no-op） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration 缺席·null·字符串·负数·小数·超 u32）`-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；fake：成功 `{status: "sent"}`（落调度日志，协议上行面纪律） |
+| `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -821,6 +822,64 @@ receive 面债务批）：
   getAvatar 同口径）；不做 profile 主动重取调度器（presage 栈无后台
   profile 刷新任务面，消费方按需拉取）；不动 vendored proto。协议栈无
   读写面的能力不顺手做。
+
+storage 写面 P0（2026-10-06，`storage.write` 批量 manifest item 写，KT
+扩展方法）：
+
+- **定位**：既有 storage 写面全部是「语义级」的——置顶/拉黑/账号设置/
+  贴纸包各自封装官方 toXxxRecord + generateManifest 语义，调用方只能表达
+  「把 X 设为 Y」；本批新增**通用**写面 `storage.write`：调用方自带
+  StorageRecord 明文与 item key，引擎只做协议面翻译（加密 + WriteOperation
+  组装 + PUT 上行），不感知业务字段。两者并存：语义级写面继续负责 409
+  采纳重放（conflictBackOff 3 次），通用写面面向外部协调方，冲突诚实上抛。
+- **参数命名**：`accountId`（本扩展契约原形，非白名单面惯用的 `account`
+  ——通用写面契约先行定形时按扩展方法族 accounts.updateConfiguration 的
+  accountId 命名惯例收敛）。
+- **record 载荷与白名单闸**：record = 官方 vendored proto `StorageRecord`
+  编码 bytes 的标准 base64。解码 + arm 白名单双闸：只收 Contact=1 /
+  GroupV1=2 / GroupV2=3 / StickerPack=6 四类 manifest 记录；Account=4
+  归专用写面（账号记录字段面引擎全量保真责任在语义级写面，通用写面不
+  收）；其余 arm（StoryDistributionList/CallLink/ChatFolder/
+  NotificationProfile）与解码失败/无 arm 一律 fail-closed `-32603`。
+  官方桌面 v8.31 的 storage record arm 集以 vendored proto
+  （`storage_record::Record` 九 arm）为准。
+- **官方行为锚（Signal-Desktop v8.31 `ts/services/storage.preload.ts`，
+  行为对齐不抄码）**：① sync() 读到 `version <= localManifestVersion`
+  即 refuse-and-resync（manifest version 是单调闸，写方必须 version+1）；
+  ② upload() 先 sync 拿最新 manifest 再组装 WriteOperation PUT；③ PUT 409
+  → conflictBackOff 自动重放（[1s,5s,30s]）。引擎差异登记：语义级写面
+  保留官方 409 自动重放；`storage.write` **不自动重试**——mutating 语义
+  且调用方意图（record 内容）引擎不可重推，409 答
+  `STORAGE_VERSION_CONFLICT`（`-1` + message + data
+  `{retryable: false, serverVersion?}`，serverVersion = 409 响应体
+  StorageManifest.version 明文可读），调用方重读 manifest 后自行重放。
+  文件名勘误：任务原文提到的 `ts/services/storageService` writeDelta 在
+  v8.31 检出中不存在，写面对齐锚为 storage.preload.ts 的 sync/upload。
+- **item id 轮换**：UPDATE 一律轮换新 16B item id（旧 key 进 deleteKey、
+  新 key 入 identifiers）——官方换记录必轮换 generateStorageID，其他设备
+  以 identifier diff 判变更（同 key = 未变不重拉），原地改写同 key 会静默
+  失联。INSERT 用调用方自带 key 原样（调用方自担唯一性，撞已存在 key 见
+  幂等/冲突条）。
+- **幂等面（重放安全）**：内容比较需读现存 item 明文（`PUT
+  /v1/storage/read` 批量 + item 解密 shim，与语义级写面同通道）。INSERT
+  key 已在 manifest 且明文相同 → no-op；明文不同 → 意图冲突 fail-closed
+  `-32603`（引擎不静默替换外部记录）。UPDATE 明文相同 → no-op；key 不在
+  manifest → no-op（重放安全：上次写已生效或从未存在）。DELETE key 不在
+  → no-op。全 no-op → 不 PUT 不 bump version，`version` = 当前 manifest
+  version。从未有 storage 状态（master key 缺失）：纯 UPDATE/DELETE 批 =
+  幂等成功不播种（version 0）；含 INSERT → master key 播种 + version 1
+  最小 AccountRecord 同批首写（§5 首写分支同款，Account 记录用官方
+  vendored proto 编码走 item 加密 shim）。UPDATE 换记录类型（同 key 在
+  manifest 中为其他类型）→ 意图冲突 fail-closed。
+- **fake 纪律**：参数闸全量生效后回 `{version: 0, results: [...]}` 桩
+  （INSERT/UPDATE 回 writtenKey = 原 key，DELETE 无 writtenKey，无 no-op
+  标注）；不落调度日志（storage 状态面纪律）。
+- **边界（本批红线）**：不做 clear_all / resetWithNewKey / 账号重置面；
+  不做业务字段校验（record 内容语义归调用方，引擎只验 arm 白名单）；无
+  人工批大小上限（协议面无此闸，调用方自控）；PUT 成功后不做 fetch
+  manifest 回读确认（200/204 即成功语义与官方 upload 同）；不感知
+  sticker 面 item key 缓存（本地 manifest 状态文件 stickerItemKeys 沿用
+  旧值，贴纸面读侧以服务器 manifest 为真相源不受影响）。
 
 ## 6. fake 服务模式（仅测试）
 

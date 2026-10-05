@@ -48,6 +48,7 @@ pub(crate) mod report;
 pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
+pub(crate) mod storage_write;
 
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
@@ -1605,6 +1606,22 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         report::report_spam(&context, &sender_aci, &server_guids, token.as_deref()).await
+    }
+
+    /// storage.write（P0，KT 扩展方法）：通用批量 manifest item 写（compat
+    /// §5「storage 写面 P0」块）。参数闸已在 dispatch 层 parse_request 全量
+    /// 生效；fake 模式参数闸后形状桩；409 → VersionConflict（不自动重试，
+    /// 调用方重读 manifest 后重放）。
+    pub(crate) async fn storage_write(
+        self: &Arc<Self>,
+        account: &str,
+        updates: Vec<storage_write::StorageItemUpdate>,
+    ) -> Result<storage_write::WriteOutcome, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_write::fake_outcome(&updates));
+        }
+        let context = storage_context(self, account).await?;
+        storage_write::write_items(&context, updates).await
     }
 }
 

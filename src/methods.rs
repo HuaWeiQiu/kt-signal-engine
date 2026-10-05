@@ -14,8 +14,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    storage_sync, LinkError, SendMention, SendPreview, SendQuote, SendSticker, Service,
-    UserStatusError,
+    storage_sync, storage_write, LinkError, SendMention, SendPreview, SendQuote, SendSticker,
+    Service, UserStatusError,
 };
 use crate::state::EngineState;
 
@@ -1258,6 +1258,28 @@ async fn dispatch(
                 }
             }
         }
+        // storage.write（P0，KT 扩展方法）：通用批量 manifest item 写
+        //（compat §3 storage.write 行 + §5「storage 写面 P0」块）。mutating
+        // 语义不落调度日志（storage 状态面纪律）；参数闸 fail-closed
+        // -32603（形状/白名单/重复 key 全拒）；版本冲突（服务器 409）答
+        // STORAGE_VERSION_CONFLICT（retryable=false，不自动重试）；INSERT
+        // 撞已存在 key 内容不同/UPDATE 换记录类型 → 意图冲突 -32603。
+        "storage.write" => {
+            let Ok((account, updates)) = storage_write::parse_request(params) else {
+                return internal_error(id);
+            };
+            match service.storage_write(&account, updates).await {
+                Ok(outcome) => jsonrpc::success_response(id, storage_write_payload(&outcome)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(storage_sync::StorageSyncError::VersionConflict { server_version }) => {
+                    jsonrpc::error_response(
+                        id,
+                        &storage_write::version_conflict_rpc(server_version),
+                    )
+                }
+                Err(error) => storage_error(id, &error),
+            }
+        }
         _ => jsonrpc::error_response(
             id,
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
@@ -1379,6 +1401,44 @@ fn avatar_error(id: &Value, error: crate::service::avatar::AvatarError) -> Value
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
+/// storage.write 返回体（compat §3 storage.write 行）：results 与输入序
+/// 对齐；key/writtenKey 标准 base64（DELETE 无 writtenKey 键）；no-op 条目
+/// 带 noop 标记。
+fn storage_write_payload(outcome: &storage_write::WriteOutcome) -> Value {
+    use base64::Engine as _;
+    json!({
+        "version": outcome.version,
+        "results": outcome
+            .results
+            .iter()
+            .map(|entry| {
+                let mut item = serde_json::Map::new();
+                item.insert("type".to_owned(), json!(entry.op.as_str()));
+                item.insert(
+                    "key".to_owned(),
+                    json!(base64::engine::general_purpose::STANDARD.encode(&entry.key)),
+                );
+                match &entry.outcome {
+                    // DELETE = Written 无 writtenKey（键缺省）；Noop 才带
+                    // noop 标记。
+                    storage_write::ItemOutcome::Written { written_key } => {
+                        if let Some(written_key) = written_key {
+                            item.insert(
+                                "writtenKey".to_owned(),
+                                json!(base64::engine::general_purpose::STANDARD.encode(written_key)),
+                            );
+                        }
+                    }
+                    storage_write::ItemOutcome::Noop => {
+                        item.insert("noop".to_owned(), Value::Bool(true));
+                    }
+                }
+                Value::Object(item)
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// 置顶面错误 → JSON-RPC 错误码（compat §4.33，connector 白名单逐字；
 /// UnknownAccount 已由调用点折叠为引擎内部错误）。
 fn storage_error(id: &Value, error: &storage_sync::StorageSyncError) -> Value {
@@ -1390,6 +1450,12 @@ fn storage_error(id: &Value, error: &storage_sync::StorageSyncError) -> Value {
         storage_sync::StorageSyncError::ReadFailed => (-1, "STORAGE_READ_FAILED"),
         storage_sync::StorageSyncError::WriteFailed => (-1, "STORAGE_WRITE_FAILED"),
         storage_sync::StorageSyncError::UnknownAccount => (-32603, "Internal error"),
+        // storage.write 通用写面：意图冲突（INSERT 撞已存在 key 内容不同 /
+        // UPDATE 换记录类型）→ -32603 fail-closed；VersionConflict 由
+        // storage.write 调用点单独拦截渲染（带 data），此处仅为 match
+        // exhaustive 兜底。
+        storage_sync::StorageSyncError::IntentConflict => (-32603, "Internal error"),
+        storage_sync::StorageSyncError::VersionConflict { .. } => (-1, "STORAGE_VERSION_CONFLICT"),
     };
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }

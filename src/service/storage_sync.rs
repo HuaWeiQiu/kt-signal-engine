@@ -93,6 +93,15 @@ pub(crate) enum StorageSyncError {
     ReadFailed,
     /// 写面失败（PUT、冲突重放放弃、写面本地状态准备失败）。
     WriteFailed,
+    /// storage.write 通用写面：调用方意图与现存记录冲突（INSERT 目标 key
+    /// 已存在且内容不同 / UPDATE 换记录类型）——fail-closed -32603，引擎
+    /// 不静默替换外部记录。
+    IntentConflict,
+    /// storage.write 通用写面：服务器 409 = base version 失配。写意图未
+    /// 落地且**不自动重试**（mutating 语义，引擎不可重推调用方 record）；
+    /// server_version = 409 响应体 StorageManifest.version（明文可读，取
+    /// 不到缺席）。
+    VersionConflict { server_version: Option<u64> },
 }
 
 /// 置顶条目投影（引擎会话标识口径）。

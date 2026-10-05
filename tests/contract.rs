@@ -1784,3 +1784,111 @@ fn stdin_eof_exits_zero() {
     let output = child.wait_with_output().expect("engine exits");
     assert_eq!(output.status.code(), Some(0), "EOF is a clean exit");
 }
+
+/// storage.write（P0，KT 扩展方法，compat §3 storage.write 行 + §5「storage
+/// 写面 P0」块）：fake 成功形状桩（version 0、逐条回显）+ 参数面 fail-closed
+/// 逐形状（-32603：缺 accountId/空/非串、缺 updates/空批/非数组、条目非
+/// 对象、type 未知、key 非 base64/15B、INSERT 缺 record、UPDATE record
+/// null、DELETE 带 record、record 垃圾/Account arm、批量重复 key）；不落
+/// 调度日志（storage 状态面纪律）；real 模式未注册账号 -32603。
+#[test]
+fn storage_write_fake_shapes_and_param_fail_closed() {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let dir = temp_dir("storage-write");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+
+    // fake 成功面：{version: 0, results: [...]}，INSERT/UPDATE 回显原 key
+    // 为 writtenKey，DELETE 无 writtenKey（桩不模拟幂等 no-op 标注）。
+    let key_insert = b64(&[0x01; 16]);
+    let key_update = b64(&[0x02; 16]);
+    let key_delete = b64(&[0x03; 16]);
+    assert_eq!(
+        engine.request(
+            "storage.write",
+            json!({
+                "accountId": number,
+                "updates": [
+                    { "type": "INSERT", "key": key_insert, "record": "CgA=" },
+                    { "type": "UPDATE", "key": key_update, "record": "CgA=" },
+                    { "type": "DELETE", "key": key_delete },
+                ],
+            })
+        )["result"],
+        json!({
+            "version": 0,
+            "results": [
+                { "type": "INSERT", "key": key_insert, "writtenKey": key_insert },
+                { "type": "UPDATE", "key": key_update, "writtenKey": key_update },
+                { "type": "DELETE", "key": key_delete },
+            ],
+        })
+    );
+
+    // 参数面 fail-closed 逐形状（fake 模式同样全量过闸）。
+    let rejects = [
+        json!({ "accountId": number }),
+        json!({ "accountId": number, "updates": [] }),
+        json!({ "accountId": number, "updates": "nope" }),
+        json!({ "updates": [{ "type": "DELETE", "key": key_delete }] }),
+        json!({ "accountId": "", "updates": [{ "type": "DELETE", "key": key_delete }] }),
+        json!({ "accountId": 7, "updates": [{ "type": "DELETE", "key": key_delete }] }),
+        json!({ "accountId": number, "updates": [7] }),
+        json!({ "accountId": number, "updates": [{ "type": "UPSERT", "key": key_delete }] }),
+        json!({ "accountId": number, "updates": [{ "type": "DELETE" }] }),
+        json!({ "accountId": number, "updates": [{ "type": "DELETE", "key": "!!!not-base64!!!" }] }),
+        json!({ "accountId": number, "updates": [{ "type": "DELETE", "key": b64(&[0x09; 15]) }] }),
+        json!({ "accountId": number, "updates": [{ "type": "INSERT", "key": key_insert }] }),
+        json!({ "accountId": number, "updates": [{ "type": "UPDATE", "key": key_update, "record": serde_json::Value::Null }] }),
+        json!({ "accountId": number, "updates": [{ "type": "DELETE", "key": key_delete, "record": "CgA=" }] }),
+        json!({ "accountId": number, "updates": [{ "type": "INSERT", "key": key_insert, "record": "AAAA" }] }),
+        // Account arm（field 4 LEN 0）归专用写面：通用写面拒。
+        json!({ "accountId": number, "updates": [{ "type": "INSERT", "key": key_insert, "record": "IgA=" }] }),
+        // 批量内 key 重复。
+        json!({
+            "accountId": number,
+            "updates": [
+                { "type": "DELETE", "key": key_delete },
+                { "type": "DELETE", "key": key_delete },
+            ],
+        }),
+    ];
+    for params in &rejects {
+        let response = engine.request("storage.write", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "storage.write rejects {params}"
+        );
+    }
+
+    // fake 纪律：mutating 写面不落调度日志。
+    let log_path = dir.join("engine-send-log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "storage.write must not write dispatch log entries"
+    );
+
+    // real 模式未注册账号：storage 上下文打不开（UnknownAccount）→ 引擎
+    // 内部错误折叠（不触网）。
+    let real_dir = temp_dir("storage-write-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "storage.write",
+        json!({
+            "accountId": "+15559990000",
+            "updates": [{ "type": "INSERT", "key": key_insert, "record": "CgA=" }],
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
