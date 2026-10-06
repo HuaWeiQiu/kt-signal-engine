@@ -311,6 +311,19 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 send + textStyle：send 系同折叠（不触网；textStyle 透传
+    // 批，契约 1.69 §4.62）。
+    let (code, message) = engine.error_of(
+        "send",
+        json!({
+            "account": "+15559990000",
+            "recipient": ["+15555550101"],
+            "message": "hi",
+            "textStyle": [{ "style": "BOLD", "start": 0, "length": 2 }]
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
@@ -1270,6 +1283,144 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
     assert_eq!(open_entry["params"]["senderAci"], json!(sender_aci));
     assert_eq!(open_entry["params"]["timestamp"], json!(42));
     assert_eq!(open_entry["params"]["account"], json!(number));
+}
+
+/// send textStyle 透传面（connector 契约 1.69 §4.62）：fake 合法面成功 +
+/// 调度日志 textStyle 数组逐字保留（connector 上游同名直投的 IPC 形状锚）；
+/// 参数面 fail-closed 逐形状（-32603：词表外（含 NONE——官方 composer 永不出
+/// 的 no-op 标记）、条目缺字段、start/length 超 u32、>64 条、textStyle 非
+/// 数组）；直聊/群组两形态；零回归锚 = 无参数时调度日志与旧版同形状。
+#[test]
+fn send_text_style_param_faces_and_dispatch_log() {
+    let dir = temp_dir("text-style");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 合法面：直聊多条目（覆盖五值词表中 3 值 + offset 组合）。
+    let ok = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "styled body",
+            "textStyle": [
+                { "style": "BOLD", "start": 0, "length": 6 },
+                { "style": "SPOILER", "start": 7, "length": 4 },
+                { "style": "MONOSPACE", "start": 0, "length": 11 }
+            ]
+        }),
+    );
+    assert!(ok["result"]["timestamp"].is_u64(), "styled send ok");
+
+    // 群组形态合法面（32B master key 标准 base64）。
+    let group_ok = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "message": "group styled",
+            "textStyle": [{ "style": "ITALIC", "start": 0, "length": 5 }]
+        }),
+    );
+    assert!(group_ok["result"]["timestamp"].is_u64(), "group styled ok");
+
+    // 空数组 = 无样式（合法，键保留原样落日志）。
+    let empty = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "empty list",
+            "textStyle": []
+        }),
+    );
+    assert!(empty["result"]["timestamp"].is_u64(), "empty list ok");
+
+    // fail-closed 逐形状。
+    let rejects = [
+        // 词表外值。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "MAGIC", "start": 0, "length": 1 }] }),
+        // NONE：官方 composer 永不发出的 no-op 标记（词表外）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "NONE", "start": 0, "length": 1 }] }),
+        // 小写词表（上游枚举面大小写敏感）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "bold", "start": 0, "length": 1 }] }),
+        // 条目缺 style / 缺 start / 缺 length。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "start": 0, "length": 1 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "BOLD", "length": 1 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "BOLD", "start": 0 }] }),
+        // start / length 超 u32。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "BOLD", "start": 4294967296u64, "length": 1 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": "BOLD", "start": 0, "length": 4294967296u64 }] }),
+        // style 非字符串。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": [{ "style": 1, "start": 0, "length": 1 }] }),
+        // textStyle 非数组。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": "BOLD:0:1" }),
+        // >64 条（receive cap 镜像，不静默截断）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "textStyle": (0..65).map(|i| json!({ "style": "BOLD", "start": i, "length": 1 })).collect::<Vec<_>>() }),
+    ];
+    for params in &rejects {
+        let response = engine.request("send", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "textStyle rejects {params}"
+        );
+    }
+
+    // 零回归锚：无 textStyle 参数的 send 照旧成功（上游字节与旧版一致）。
+    let plain = engine.request(
+        "send",
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "plain" }),
+    );
+    assert!(plain["result"]["timestamp"].is_u64());
+
+    // 调度日志：textStyle 数组逐字保留（IPC 形状锚——connector upstream
+    // params 的 `textStyle` 键原样进引擎、原样落日志）；非法 send 的派发
+    // 也落日志（记录的是派发，sticker 先例同款）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let styled = entries
+        .iter()
+        .find(|entry| {
+            entry["params"]
+                .get("textStyle")
+                .is_some_and(|t| t.as_array().is_some_and(|a| a.len() == 3))
+        })
+        .expect("styled send logged");
+    assert_eq!(
+        styled["params"]["textStyle"],
+        json!([
+            { "style": "BOLD", "start": 0, "length": 6 },
+            { "style": "SPOILER", "start": 7, "length": 4 },
+            { "style": "MONOSPACE", "start": 0, "length": 11 }
+        ]),
+        "textStyle array verbatim"
+    );
+    let rejected = entries
+        .iter()
+        .find(|entry| {
+            entry["params"]
+                .get("textStyle")
+                .is_some_and(|t| t.as_array().is_some_and(|a| a.len() == 65))
+        })
+        .expect("rejected over-cap send logged");
+    assert_eq!(
+        rejected["params"]["textStyle"].as_array().unwrap().len(),
+        65
+    );
 }
 
 /// 通话消息面（sendCallMessage，KT 扩展批）：fake 形状成功 {"timestamp":u64}；

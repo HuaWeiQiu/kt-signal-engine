@@ -15,7 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
     parse_legacy_call_face, storage_sync, storage_write, LinkError, SendMention, SendPreview,
-    SendQuote, SendSticker, Service, UserStatusError,
+    SendQuote, SendSticker, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -193,6 +193,49 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // textStyle 扩面（connector 契约 1.69 §4.62 同名直投）：条目
+            // {style, start, length}——style 五值白名单（上游 TextStyle 枚举
+            // 去 NONE）fail-closed，start/length 超 u32 fail-closed，>64 条
+            // fail-closed（receive cap 镜像，不静默截断）。官方 parseTextStyles
+            // 无 body 边界校验、官方桌面发送侧自行裁剪，引擎同款不设正文
+            // 长度闸。无参数 = 上游字节与旧版逐字节一致（键缺席纪律）。
+            let text_styles = match params.get("textStyle") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.len() > MAX_SEND_TEXT_STYLES {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let style = entry.get("style").and_then(Value::as_str);
+                        let start = entry
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let length = entry
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        match (style, start, length) {
+                            (
+                                Some(
+                                    style @ ("BOLD" | "ITALIC" | "SPOILER" | "STRIKETHROUGH"
+                                    | "MONOSPACE"),
+                                ),
+                                Some(start),
+                                Some(length),
+                            ) => parsed.push(SendTextStyle {
+                                style: style.to_owned(),
+                                start,
+                                length,
+                            }),
+                            _ => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
             // 贴纸扩面：对象形状，packId(hex)/packKey(base64)/stickerId/image
             // 必填，emoji/width/height 可选；缺字段/超 u32 fail-closed。
             let sticker = match params.get("sticker") {
@@ -280,6 +323,7 @@ async fn dispatch(
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
+                            &text_styles,
                             &attachments,
                             sticker.as_ref(),
                             view_once,
@@ -304,6 +348,7 @@ async fn dispatch(
                             quote.as_ref(),
                             preview.as_ref(),
                             &mentions,
+                            &text_styles,
                             &attachments,
                             sticker.as_ref(),
                             view_once,

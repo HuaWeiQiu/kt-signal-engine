@@ -69,7 +69,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
 | `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}], terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
-| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5） | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
+| `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], textStyle?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/textStyle 条目词表外（五值白名单；NONE 一并拒——官方 composer 永不发出的 no-op 标记）·缺字段·style 非字符串·start/length 超 u32·>64 条（cap 镜像整拒不截断）·非数组/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5） | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；textStyle→BodyRange.Style 五值词表单点映射（2026-10-06 透传批，connector 契约 1.69 §4.62 引擎侧缺口闭合：UTF-16 offsets 透传不查 body 边界——官方 parseTextStyles 同口径，与 mentions 同款调用方纪律，详见 §5）；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
@@ -244,8 +244,11 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
 - **getUserStatus**：P2 起 real——whoami 轻量探测；仅服务器 401 映射解绑态
   原文（`-32603`），网络等其他失败按 `-32603` "Internal error" 不误报解绑。
   recipient 维度的注册态需 CDSI 查询，未做（保持 `isRegistered: true` 面）。
-- **textStyles**：本引擎钉定的 presage proto 版本无该面，receive 不投影
-  （connector 侧为可选富体字段，缺失即无该键）。
+- **textStyles**：~~本引擎钉定的 presage proto 版本无该面，receive 不投影
+  （connector 侧为可选富体字段，缺失即无该键）。~~（2026-10-06 勘误：钉定
+  proto **有** BodyRange.Style——本仓当时只从 mention 维度看过 bodyRanges；
+  receive 投影维持「Style arm 不投」的边界不变，见 §4.20 接收清单。发送侧
+  同日闭合，见下方 textStyle 透传批。）
 - **finishLink 长等待**：等手机确认可阻塞数分钟；引擎在本线程 LocalSet
   并发 dispatch，其他方法不饿死。
 
@@ -362,6 +365,53 @@ backup5 历史导出 recipient 身份投影（2026-10-04，E5；消费方 connec
 - **kind=self 无身份可投**：proto Self_ 只携带 avatar_color；connector
   以账号注册号码（engine-state.json registry 号码→目录映射）作 self
   会话归属与自发信源，档案无需重复携带身份。
+
+send 面 textStyle 透传（2026-10-06，消费方 connector 契约 1.69 §4.62，
+735 批 declared gap 闭合；与 wt-accept 收包投影并行批零交集）：
+
+- **上游参数名/形状证据链（全部仓内可复核）**：signal-cli 0.14.7 pinned
+  发行 `lib/signal-cli-0.14.7.jar`——`org/asamk/signal/commands/
+  SendCommand.class` 常量池含 `--text-style`（帮助文「syntax:
+  start:length:STYLE. Unit of start and length is UTF-16 code units, NOT
+  Unicode code points.」）与 JSON-RPC 参数名 `textStyle`（camelCase，错误
+  原文 `Invalid textStyle syntax (`）；`org/asamk/signal/json/
+  JsonTextStyle.class` record 字段 `style`(String)/`start`/`length`；
+  `org/asamk/signal/manager/api/TextStyle$Style.class` 枚举 NONE/BOLD/
+  ITALIC/SPOILER/STRIKETHROUGH/MONOSPACE（switchmap 映射
+  `org/whispersystems/signalservice/internal/push/BodyRange$Style` 线上
+  枚举）；JSON-RPC 参数键 kebab→camel 归一 = `org/asamk/signal/commands/
+  JsonRpcNamespace.class` 的 `dashSeparatedToCamelCaseString`（connector
+  `upstream_text_send_params` 据此投 `textStyle` 数组——engine 侧键名与
+  之一字不差）。线上枚举面：钉定 libsignal-service-rs（9e6c08b）
+  `protobuf/SignalService.proto:983-1001` `BodyRange.Style`（NONE=0/BOLD=1/
+  ITALIC=2/SPOILER=3/STRIKETHROUGH=4/MONOSPACE=5，start/length=uint32
+  UTF-16 code units，style=field 4 oneof）。
+- **勘误（§5 P2 差异清单旧条目）**：钉定 presage proto **有**
+  BodyRange.Style 面（本仓 receive 侧 1.25 起即过滤 `AssociatedValue::
+  Style(_)`——mentions 投影只取 mention arm）；旧登记「proto 无该面」误。
+  receive 投影边界不变（收侧仍不投 style arm，属收包投影区，并行批领地）。
+- **校验口径 = 透传为主 + 本地形状快校验（镜像 send 面既有先例）**：
+  解析闸（methods.rs）五值白名单 fail-closed（NONE 一并拒——官方 composer
+  永不发出的 no-op 标记，connector 1.69 同理由）、start/length 超 u32 /
+  条目缺字段 / style 非字符串 fail-closed、>64 条整拒不截断（connector
+  `MAX_SEND_TEXT_STYLES` 同值镜像）；**无 body 长度边界闸**——官方
+  `parseTextStyles` 不查正文边界、官方桌面发送侧自行裁剪，引擎同款不发明
+  （与 mentions 同款调用方纪律）。取「快校验」而非 connector 全量镜像的
+  理由：connector 1.69 的闸就是五值+≤64+u32 形状三件（其错误体文
+  INVALID_REQUEST 归 connector 发明，引擎侧按本仓 send 面惯例统一
+  `-32603`），无遗漏语义可补。
+- **构造面（service/mod.rs `build_text_data_message`）**：五值词表 →
+  prost `body_range::Style` 单点映射 → `BodyRange.associated_value =
+  Style(value)`（tag=4 enumeration，repr i32 值即线上枚举序数）；与
+  mentions 同发时 MentionAci(tag=3)/Style(tag=4) 两 arm 共存 body_ranges
+  （官方 bodyRanges 语义）；NONE 在构造面二次 fail-closed（服务层防御，
+  解析闸之后的第二道闸）。无参数 = `body_ranges` 不产生 style 条目，
+  上游字节与旧版逐字节一致（单测字节级锚）。
+- **边界**：不做 receive 侧 style 投影（收包投影并行批领地）；不落
+  engine 本地持久化（styled echo 行是 connector 侧 pending rich payload
+  职责，引擎 metadata-only）；不改 guard 形状（textStyle 不参与
+  sticker/viewOnce 互斥矩阵，纯文本面附加格式）；viewOnce 与 textStyle
+  同发走 viewOnce 面构造（isViewOnce 消息不带 bodyRanges，官方同构）。
 
 附件指针投影面（2026-10-06，H3 附件媒体字节 v2 方案 C ①；消费方
 connector 契约 1.55 §4.38；调研全文

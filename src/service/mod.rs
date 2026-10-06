@@ -83,6 +83,20 @@ pub(crate) struct SendMention {
     pub(crate) length: u32,
 }
 
+/// send textStyle 条目（compat §3 send 行 textStyle 扩面，connector 契约
+/// 1.69 §4.62）：键名与 connector 上游同名直投；style 为五值白名单词表
+/// （methods.rs 解析闸钉定，此处透传），start/length 为 UTF-16 code units
+/// （官方 BodyRange 同语义），透传不校验正文对齐。
+pub(crate) struct SendTextStyle {
+    pub(crate) style: String,
+    pub(crate) start: u32,
+    pub(crate) length: u32,
+}
+
+/// send textStyle 条目上限：connector `MAX_SEND_TEXT_STYLES` 同值（其 §4.20
+/// receive cap 的发送侧镜像，契约 1.69 §4.62——超出整拒，不静默截断）。
+pub(crate) const MAX_SEND_TEXT_STYLES: usize = 64;
+
 /// send 贴纸参数（compat §3 send 行 sticker 扩面，键名与官方桌面
 /// sendStickerMessage 序列化同构：packId hex（Bytes.fromHex 逆运算）、
 /// packKey base64（Bytes.fromBase64 逆运算）、emoji、image data URI、
@@ -620,6 +634,7 @@ impl Service {
         quote: Option<&SendQuote>,
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
+        text_styles: &[SendTextStyle],
         attachments: &[String],
         sticker: Option<&SendSticker>,
         view_once: bool,
@@ -668,6 +683,7 @@ impl Service {
                         quote,
                         preview,
                         mentions,
+                        text_styles,
                         pointers.clone(),
                         preview_image.clone(),
                         timestamp,
@@ -1221,6 +1237,7 @@ impl Service {
         quote: Option<&SendQuote>,
         preview: Option<&SendPreview>,
         mentions: &[SendMention],
+        text_styles: &[SendTextStyle],
         attachments: &[String],
         sticker: Option<&SendSticker>,
         view_once: bool,
@@ -1249,6 +1266,7 @@ impl Service {
                     quote,
                     preview,
                     mentions,
+                    text_styles,
                     pointers,
                     preview_image,
                     timestamp,
@@ -3328,12 +3346,15 @@ async fn upload_attachments_for_send(
 }
 
 /// send 文本 dataMessage 公共构造（直聊/群组同形状，compat §3 send 行
-/// quoteTimestamp/quoteAuthor/previewUrl/mentions/attachments 扩面）：
+/// quoteTimestamp/quoteAuthor/previewUrl/mentions/attachments/textStyle 扩面）：
 /// - quote：assemble_quote 单点组装（与贴纸分支同源）。
 /// - preview：url/title/description 直投 proto Preview；previewImage 数据
 ///   URI 随同批 CDN 上行后挂 Preview.image（官方同构）。
 /// - mentions：number→ACI 后 BodyRange.MentionAci（≤条目数即上限，与接收
 ///   投影 ≤64 同口径的调用方纪律）；offsets 透传。
+/// - textStyles：五值白名单词表（解析闸钉定）→ BodyRange.Style（enum
+///   as_str_name 同构）单点映射；offsets UTF-16 code units 透传（与
+///   mentions 同款调用方纪律）。
 /// - attachments：caller 已上行完毕的 AttachmentPointer 原样入消息。
 #[allow(clippy::too_many_arguments)]
 async fn build_text_data_message(
@@ -3342,6 +3363,7 @@ async fn build_text_data_message(
     quote: Option<&SendQuote>,
     preview: Option<&SendPreview>,
     mentions: &[SendMention],
+    text_styles: &[SendTextStyle],
     attachment_pointers: Vec<presage::proto::AttachmentPointer>,
     preview_image: Option<presage::proto::AttachmentPointer>,
     timestamp: u64,
@@ -3379,6 +3401,34 @@ async fn build_text_data_message(
             });
         }
         dm.body_ranges = ranges;
+    }
+    if !text_styles.is_empty() {
+        // 上游词表同构映射：prost 生成的 `Style` 枚举（repr i32）即官方
+        // BodyRange.Style 的线上枚举形态（BOLD=1/ITALIC=2/SPOILER=3/
+        // STRIKETHROUGH=4/MONOSPACE=5，proto 枚举名同词表）；NONE 是协议
+        // 内部「无样式」标记（官方 composer 永不出、发出即静默无样式），
+        // 与词表外值一并 fail-closed（解析闸之后服务层防御，不静默丢样式）。
+        let mut ranges = Vec::with_capacity(text_styles.len());
+        for style in text_styles {
+            let value = match presage::proto::body_range::Style::from_str_name(&style.style) {
+                Some(
+                    value @ (presage::proto::body_range::Style::Bold
+                    | presage::proto::body_range::Style::Italic
+                    | presage::proto::body_range::Style::Spoiler
+                    | presage::proto::body_range::Style::Strikethrough
+                    | presage::proto::body_range::Style::Monospace),
+                ) => value,
+                _ => return Err(SendError::Internal),
+            };
+            ranges.push(presage::proto::BodyRange {
+                start: Some(style.start),
+                length: Some(style.length),
+                associated_value: Some(presage::proto::body_range::AssociatedValue::Style(
+                    value as i32,
+                )),
+            });
+        }
+        dm.body_ranges.extend(ranges);
     }
     Ok(dm)
 }
@@ -4229,6 +4279,157 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    /// textStyle 发送构造面（connector 契约 1.69 §4.62 透传批）：
+    /// - 五值词表逐值构造出 proto BodyRange.Style（线上枚举字节级断言，
+    ///   tag=4 enumeration；NONE 词表外不进引擎）、offsets UTF-16 透传；
+    /// - 与 mentions 同发 = MentionAci(tag=3)/Style(tag=4) 两 arm 共存于
+    ///   body_ranges（官方 bodyRanges 语义）；
+    /// - 无参数 = body_ranges 零差异（零回归锚：字节级 old==new）；
+    /// - 词表外值构造面兜底 fail-closed（解析闸在 methods.rs，此处防御
+    ///   服务层不可绕过的形状）。
+    #[tokio::test]
+    async fn text_style_send_build_faces() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-text-style-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+
+        // 合法面：五值白名单逐值构造 + 字节级断言（prost 线上编码，Style
+        // enumeration = BodyRange 字段 4，值 = proto 枚举序数）。
+        let styles = [
+            ("BOLD", presage::proto::body_range::Style::Bold),
+            ("ITALIC", presage::proto::body_range::Style::Italic),
+            ("SPOILER", presage::proto::body_range::Style::Spoiler),
+            (
+                "STRIKETHROUGH",
+                presage::proto::body_range::Style::Strikethrough,
+            ),
+            ("MONOSPACE", presage::proto::body_range::Style::Monospace),
+        ];
+        let entries: Vec<SendTextStyle> = styles
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| SendTextStyle {
+                style: name.to_string(),
+                start: index as u32 * 2,
+                length: 1,
+            })
+            .collect();
+        let dm = build_text_data_message(
+            &store,
+            "styled body",
+            None,
+            None,
+            &[],
+            &entries,
+            Vec::new(),
+            None,
+            1_700_000_000_000,
+        )
+        .await
+        .expect("styled text builds");
+        assert_eq!(dm.body.as_deref(), Some("styled body"));
+        assert_eq!(dm.body_ranges.len(), 5, "one BodyRange per entry");
+        for (index, (name, value)) in styles.iter().enumerate() {
+            let range = &dm.body_ranges[index];
+            assert_eq!(range.start, Some(index as u32 * 2));
+            assert_eq!(range.length, Some(1));
+            match &range.associated_value {
+                Some(AssociatedValue::Style(actual)) => {
+                    assert_eq!(*actual, *value as i32, "{name} wire enum value");
+                }
+                other => panic!("{name}: expected Style arm, got {other:?}"),
+            }
+        }
+        // 字节级：字段 4（tag byte 0x20 = field 4 wire type 0 varint）+
+        // 枚举值逐字（含 tag=5 MentionAciBinary 不出现的负样本面）。
+        for (index, (_, value)) in styles.iter().enumerate() {
+            let range = dm.body_ranges[index].encode_to_vec();
+            assert_eq!(
+                range,
+                vec![0x08, index as u8 * 2, 0x10, 0x01, 0x20, *value as i32 as u8],
+                "{index}: BodyRange wire bytes"
+            );
+        }
+
+        // 与 mentions 同发：MentionAci 与 Style 共存 body_ranges（arm 有序）。
+        let mention_aci = "11111111-2222-4333-8444-555555555555";
+        let dm = build_text_data_message(
+            &store,
+            "mixed",
+            None,
+            None,
+            &[SendMention {
+                number: mention_aci.to_owned(),
+                start: 0,
+                length: 4,
+            }],
+            &[SendTextStyle {
+                style: "BOLD".to_owned(),
+                start: 6,
+                length: 4,
+            }],
+            Vec::new(),
+            None,
+            1,
+        )
+        .await
+        .expect("mixed ranges build");
+        assert_eq!(dm.body_ranges.len(), 2);
+        assert!(matches!(
+            dm.body_ranges[0].associated_value,
+            Some(AssociatedValue::MentionAci(_))
+        ));
+        assert!(matches!(
+            dm.body_ranges[1].associated_value,
+            Some(AssociatedValue::Style(1)) // BOLD
+        ));
+        assert_eq!(dm.body_ranges[1].start, Some(6));
+        assert_eq!(dm.body_ranges[1].length, Some(4));
+
+        // 零回归锚：无参数（textStyle 键缺席）构造字节 = 旧版形状逐字节
+        // 一致（无 body_ranges 字段产生）。
+        let legacy =
+            build_text_data_message(&store, "plain", None, None, &[], &[], Vec::new(), None, 1)
+                .await
+                .expect("plain text builds");
+        assert!(legacy.body_ranges.is_empty());
+        let expected_legacy = DataMessage {
+            timestamp: Some(1),
+            body: Some("plain".to_owned()),
+            ..DataMessage::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            legacy.encode_to_vec(),
+            expected_legacy,
+            "no-param wire bytes unchanged"
+        );
+
+        // 构造面兜底 fail-closed：词表外 style（解析闸之后服务层防御）。
+        assert!(
+            build_text_data_message(
+                &store,
+                "x",
+                None,
+                None,
+                &[],
+                &[SendTextStyle {
+                    style: "NONE".to_owned(),
+                    start: 0,
+                    length: 1,
+                }],
+                Vec::new(),
+                None,
+                1,
+            )
+            .await
+            .is_err(),
+            "NONE rejected at build layer too"
+        );
     }
 
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构
