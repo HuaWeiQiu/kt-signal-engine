@@ -1911,6 +1911,10 @@ async fn serve_account_stream(
 /// （groupContext/groupChange 非空）v1 仍整体跳过（成员变更/权限面后续阶段）。
 /// 通话消息面（2026-10-06 扩展批）：CallMessage 1:1 信令透投影 +
 /// SyncMessage.CallEvent 通话记录同步投影；story/null 体跳过。
+/// messageRequestResponse 批（2026-10-06）：SyncMessage.messageRequest
+/// Response 收包终态投影（`syncMessage.messageRequestResponse`，多设备
+/// echo 的接受/拒绝位，connector §4.58 推导的引擎侧真数据面，详见函数内
+/// 与 compat §5）。
 /// profileKeyUpdate 批（2026-10-06）：DataMessage.profileKey 按发送方 ACI
 /// 落库 + contactProfileUpdated 事件（详见函数内与 compat §5）。
 /// 形状钉定 signal-cli 0.14.8 JSON（connector implementation-plan §4.13/
@@ -2059,6 +2063,17 @@ async fn project_content(
                         return Vec::new();
                     };
                     envelope["syncMessage"] = json!({ "callEvent": projection });
+                }
+                // 消息请求收包投影（messageRequestResponse 批，KT 扩展，
+                // compat §5）：多设备 echo 的接受/拒绝终态——官方 content
+                // oneof messageRequestResponse=14，connector §4.58 推导第一
+                // 因子权重（messageRequestResponseType === ACCEPT）的引擎侧
+                // 真数据面。
+                Some(presage::proto::sync_message::Content::MessageRequestResponse(mrr)) => {
+                    let Some(projection) = project_message_request_response(mrr) else {
+                        return Vec::new();
+                    };
+                    envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
                 }
                 _ => return Vec::new(),
             }
@@ -2267,6 +2282,49 @@ fn project_view_once_open(open: &presage::proto::sync_message::ViewOnceOpen) -> 
             .service_id_string(),
         "timestamp": open.timestamp.unwrap_or(0),
     }))
+}
+
+/// 消息请求收包投影（messageRequestResponse 批，compat §5）：SyncMessage.
+/// MessageRequestResponse 投影 `{threadAci?, groupId?,
+/// messageRequestResponseType}`。官方桌面 #handleMessageRequestResponse
+/// 行为同构：thread 双形 binary 优先 string 兜底（parse_thread_aci 钉定
+/// helper）；groupId 必须 32 字节（官方 GROUPV2_ID_LENGTH 校验同构）→
+/// 标准 base64（引擎 send/listGroups groupId 口径），长度非法整事件丢弃
+/// （官方 removeFromCache 同果）；线程双缺（无可路由会话）同丢（宁缺勿
+/// 错，viewOnceOpen senderAci 不可解析同纪律）；type 缺席/枚举外值强制
+/// UNKNOWN=0（官方 isKnownProtoEnumMember 同构），数字 = 官方因子词汇原值
+/// （桌面 conversationAttrs.messageRequestResponseType 同位，ACCEPT=1）。
+fn project_message_request_response(
+    mrr: &presage::proto::sync_message::MessageRequestResponse,
+) -> Option<Value> {
+    use base64::Engine as _;
+    use presage::proto::sync_message::message_request_response::Type;
+    const GROUP_V2_ID_LENGTH: usize = 32;
+    if mrr
+        .group_id
+        .as_deref()
+        .is_some_and(|group_id| group_id.len() != GROUP_V2_ID_LENGTH)
+    {
+        return None;
+    }
+    let thread_aci = mrr.parse_thread_aci();
+    if thread_aci.is_none() && mrr.group_id.is_none() {
+        return None;
+    }
+    let mut out = json!({
+        "messageRequestResponseType": mrr
+            .r#type
+            .and_then(|value| Type::try_from(value).ok())
+            .unwrap_or(Type::Unknown) as i32,
+    });
+    if let Some(aci) = thread_aci {
+        out["threadAci"] =
+            json!(presage::libsignal_service::protocol::ServiceId::from(aci).service_id_string());
+    }
+    if let Some(group_id) = mrr.group_id.as_deref() {
+        out["groupId"] = json!(base64::engine::general_purpose::STANDARD.encode(group_id));
+    }
+    Some(out)
 }
 
 /// CallMessage 1:1 信令投影（通话消息面，proto 只投影不发明）：opaque.data
@@ -5677,5 +5735,238 @@ mod tests {
             .is_none());
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 消息请求收包投影（messageRequestResponse 批，compat §3/§5）：sync
+    /// oneof messageRequestResponse=14 投影 `syncMessage.messageRequestResponse
+    /// {threadAci?, groupId?, messageRequestResponseType}`——多设备 echo 的
+    /// ACCEPT 终态（官方 isConversationAccepted 第一因子权重
+    /// messageRequestResponseType === ACCEPT，connector §4.58 推导的引擎侧
+    /// 真数据面）；拒绝（DELETE）对称投影同形状不同枚举值；信封公共位只增
+    /// 不改（旧宿主无该键不炸，键面纯增量）。
+    #[tokio::test]
+    async fn message_request_response_sync_projection_terminal_state() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir =
+            std::env::temp_dir().join(format!("kt-engine-mrr-{:016x}", mix_seed_step(mix_seed())));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let mrr = |r#type: Option<i32>,
+                   thread_aci: Option<String>,
+                   thread_aci_binary: Option<Vec<u8>>,
+                   group_id: Option<Vec<u8>>| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_message::Content::MessageRequestResponse(
+                        sync_message::MessageRequestResponse {
+                            r#type,
+                            thread_aci,
+                            thread_aci_binary,
+                            group_id,
+                        },
+                    )),
+                    ..SyncMessage::with_padding(&mut rng())
+                }),
+                envelope_metadata(),
+            )
+        };
+
+        // ACCEPT（1）直聊线程：单通知，syncMessage.messageRequestResponse
+        // 含 threadAci（binary 优先解析）与 messageRequestResponseType=1；
+        // 信封公共位保持（键面纯增量）。
+        let thread = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let notifications = project_content(
+            "acct",
+            &store,
+            &mrr(
+                Some(sync_message::message_request_response::Type::Accept as i32),
+                None,
+                Some(uuid_bytes(thread)),
+                None,
+            ),
+            &registry,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "accept: single投影");
+        let envelope = &notifications[0]["params"]["envelope"];
+        assert_eq!(envelope["timestamp"], json!(1_700_000_000_000_u64));
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        let projection = &envelope["syncMessage"]["messageRequestResponse"];
+        assert_eq!(projection["threadAci"], json!(thread));
+        assert_eq!(projection["messageRequestResponseType"], json!(1));
+
+        // 拒绝（DELETE=2）对称：同形状，枚举值 2（不做任何 ACCEPT 化变换）。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &mrr(
+                Some(sync_message::message_request_response::Type::Delete as i32),
+                Some(thread.to_owned()),
+                None,
+                None,
+            ),
+            &registry,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "delete: single投影");
+        let projection =
+            &notifications[0]["params"]["envelope"]["syncMessage"]["messageRequestResponse"];
+        assert_eq!(projection["threadAci"], json!(thread));
+        assert_eq!(projection["messageRequestResponseType"], json!(2));
+
+        // 群线程（32B master key）：groupId = 标准 base64（桌面
+        // GROUPV2_ID_LENGTH=32 校验同构），type = BLOCK_AND_SPAM=6。
+        let group_key = [0x77u8; 32];
+        let notifications = project_content(
+            "acct",
+            &store,
+            &mrr(
+                Some(sync_message::message_request_response::Type::BlockAndSpam as i32),
+                None,
+                None,
+                Some(group_key.to_vec()),
+            ),
+            &registry,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "group: single投影");
+        let projection =
+            &notifications[0]["params"]["envelope"]["syncMessage"]["messageRequestResponse"];
+        assert_eq!(
+            projection["groupId"],
+            json!(base64::engine::general_purpose::STANDARD.encode(group_key))
+        );
+        assert_eq!(projection["messageRequestResponseType"], json!(6));
+        assert!(
+            projection.get("threadAci").is_none(),
+            "群线程不投 threadAci"
+        );
+
+        // 无可路由线程（binary 坏 + string 缺 + 无 groupId）：整事件丢弃
+        // （宁缺勿错，viewOnceOpen senderAci 不可解析同纪律）。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &mrr(Some(1), None, Some(vec![0xde, 0xad]), None),
+            &registry,
+        )
+        .await;
+        assert!(notifications.is_empty(), "unroutable: dropped");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 消息请求收包投影 helper 全口径：六枚举值原值往返、thread 双形、
+    /// 群 32B 闸、type 缺席/枚举外强制 UNKNOWN=0（官方
+    /// isKnownProtoEnumMember 同构，不丢弃）、丢弃面（线程双缺/群长度非法）。
+    #[test]
+    fn message_request_response_projection_helper_faces() {
+        use presage::proto::sync_message::{message_request_response, MessageRequestResponse};
+        let thread = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+
+        // 六枚举值全部原值往返（数字 = 官方因子词汇，无字符串映射发明）。
+        for (value, wire) in [
+            (message_request_response::Type::Unknown, 0),
+            (message_request_response::Type::Accept, 1),
+            (message_request_response::Type::Delete, 2),
+            (message_request_response::Type::Block, 3),
+            (message_request_response::Type::BlockAndDelete, 4),
+            (message_request_response::Type::Spam, 5),
+            (message_request_response::Type::BlockAndSpam, 6),
+        ] {
+            let out = project_message_request_response(&MessageRequestResponse {
+                r#type: Some(value as i32),
+                thread_aci: Some(thread.to_owned()),
+                thread_aci_binary: None,
+                group_id: None,
+            })
+            .expect("known type projects");
+            assert_eq!(out["messageRequestResponseType"], json!(wire));
+            assert_eq!(out["threadAci"], json!(thread));
+            assert!(out.get("groupId").is_none(), "无群不投 groupId");
+        }
+
+        // thread 双形：string-only / binary-only 都投影（binary 优先）。
+        let out = project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: Some(thread.to_owned()),
+            thread_aci_binary: Some(uuid_bytes(thread)),
+            group_id: None,
+        })
+        .expect("dual form parses");
+        assert_eq!(out["threadAci"], json!(thread));
+        let out = project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: None,
+            thread_aci_binary: Some(uuid_bytes(thread)),
+            group_id: None,
+        })
+        .expect("binary form parses");
+        assert_eq!(out["threadAci"], json!(thread));
+
+        // 线程双缺但有合法群：只投 groupId + type（官方两形态各自路由同构）。
+        let group_key = [0x88u8; 32];
+        let out = project_message_request_response(&MessageRequestResponse {
+            r#type: None,
+            thread_aci: None,
+            thread_aci_binary: None,
+            group_id: Some(group_key.to_vec()),
+        })
+        .expect("group-only projects");
+        assert_eq!(
+            out["groupId"],
+            json!(base64::engine::general_purpose::STANDARD.encode(group_key))
+        );
+        // type 缺席 → UNKNOWN=0，事件照投（官方 coercion 同构）。
+        assert_eq!(out["messageRequestResponseType"], json!(0));
+
+        // 枚举外数值（未来枚举 99）→ UNKNOWN=0 不丢弃。
+        let out = project_message_request_response(&MessageRequestResponse {
+            r#type: Some(99),
+            thread_aci: Some(thread.to_owned()),
+            thread_aci_binary: None,
+            group_id: None,
+        })
+        .expect("unknown type still projects");
+        assert_eq!(out["messageRequestResponseType"], json!(0));
+
+        // 丢弃面：群长度非法（31B/33B）整事件丢弃（官方 removeFromCache 同果
+        // ——即使线程可解析也不路由）。
+        assert!(project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: Some(thread.to_owned()),
+            thread_aci_binary: None,
+            group_id: Some(vec![0x99u8; 31]),
+        })
+        .is_none());
+        assert!(project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: None,
+            thread_aci_binary: Some(uuid_bytes(thread)),
+            group_id: Some(vec![0x99u8; 33]),
+        })
+        .is_none());
+
+        // 丢弃面：线程不可解析（binary 坏 + string 缺/坏）且无群。
+        assert!(project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: Some("not-a-uuid".to_owned()),
+            thread_aci_binary: Some(vec![0xde, 0xad]),
+            group_id: None,
+        })
+        .is_none());
+        assert!(project_message_request_response(&MessageRequestResponse {
+            r#type: Some(1),
+            thread_aci: None,
+            thread_aci_binary: None,
+            group_id: None,
+        })
+        .is_none());
     }
 }

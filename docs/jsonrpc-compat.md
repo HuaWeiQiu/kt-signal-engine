@@ -178,6 +178,20 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   主键整事件丢弃（warn-only，零 stderr）。CallEvent 经 presage 落库
   （registered.rs message_for_sync CallMessage/CallEvent 分支）——引擎
   store 有行，connector 消费面按自身会话管线取用。
+- `syncMessage.messageRequestResponse {threadAci?, groupId?,
+  messageRequestResponseType}`（2026-10-06，KT 扩展批，官方 content oneof
+  messageRequestResponse=14 投影）：多设备 echo 的消息请求接受/拒绝终态
+  ——connector §4.58 推导第一因子权重（messageRequestResponseType ===
+  ACCEPT）的引擎侧真数据面。thread 双形 binary 优先 string 兜底（UUID
+  串）；群 = 32B master key 标准 base64（send groupId 口径）；
+  messageRequestResponseType = 数字枚举原值（缺席/枚举外强制
+  UNKNOWN=0：UNKNOWN=0/ACCEPT=1/DELETE=2/BLOCK=3/BLOCK_AND_DELETE=4/
+  SPAM=5/BLOCK_AND_SPAM=6，桌面 conversationAttrs
+  messageRequestResponseType 同位词汇）；线程双缺或群长度非法整事件丢弃
+  （宁缺勿错，零 stderr）。signal-cli 0.14.8 JSON-RPC 无此面（仅其纯
+  文本路径处理，connector implementation-plan §4.58 记档锚
+  ReceiveMessageHandler.java:413-424 / JsonSyncMessage.java:41-64），属
+  引擎扩展投影（§5 messageRequestResponse 收包投影批）。
 - `groupUpdated {groupId, revision, expireTimerSeconds, editor?}`
   （2026-10-06，KT 扩展批群 expiration）：群更新消息内密文 GroupChange 含
   expiration_timer action（`modify_disappearing_message_timer`，field 12）
@@ -935,6 +949,78 @@ storage 写面 P0（2026-10-06，`storage.write` 批量 manifest item 写，KT
   manifest 回读确认（200/204 即成功语义与官方 upload 同）；不感知
   sticker 面 item key 缓存（本地 manifest 状态文件 stickerItemKeys 沿用
   旧值，贴纸面读侧以服务器 manifest 为真相源不受影响）。
+
+messageRequestResponse 收包投影批（2026-10-06，connector §4.58 收包面
+债务批，KT 扩展投影）：
+
+- **背景**：connector 1.65（§4.58）把会话摘要 `messageRequestAccepted`
+  做成读时多因子推导，官方第一因子权重 = `messageRequestResponseType ===
+  ACCEPT`；该因子此前在两条引擎上都无诚实来源——signal-cli 0.14.8 只在
+  其纯文本路径处理该 sync（connector §4.58 pinned-tree 记档锚：
+  ReceiveMessageHandler.java:413-424；JSON-RPC wire 面 JsonSyncMessage.
+  java:41-64 整个省略该字段），本引擎投影层原先同样丢弃
+  （`project_content` SynchronizeMessage 臂 `_ =>` fall-through）。
+  connector 侧把该缺口记为「engine-side extension, never invented」的
+  recorded follow-up（connector implementation-plan §4.58 Reachability
+  record；connector store.rs `derive_message_request_accepted` 注释同
+  位），本批落地收包面。
+- **解析层落点勘定**：钉定 presage rev 33dd149 的上游 proto 已携带该面
+  ——libsignal-service 9e6c08b `SignalService.proto` SyncMessage.content
+  oneof `MessageRequestResponse messageRequestResponse = 14`（line 865），
+  `MessageRequestResponse{threadAci=2, groupId=3, type=4,
+  threadAciBinary=5}`（line 666-678；Type 枚举 UNKNOWN=0/ACCEPT=1/DELETE=
+  2/BLOCK=3/BLOCK_AND_DELETE=4/SPAM=5/BLOCK_AND_SPAM=6；threadE164 已
+  reserved 废止，线面只有 aci/groupId 两形态）；生成 prost
+  `sync_message::Content::MessageRequestResponse` oneof 变体与
+  `parse_thread_aci` helper 都在（proto.rs:178-184）；presage Content
+  转换不丢（`impl_from_for_sync_message!(MessageRequestResponse)`，
+  content.rs 同表）。引擎收包管线与 sent/viewOnceOpen/callEvent 同一
+  oneof 直达投影层，本批在投影层接入，无需动 vendored proto。
+- **官方行为锚（Signal-Desktop v8.31，第一手实读，行为对齐不抄码）**：
+  MessageReceiver.preload.ts `#handleMessageRequestResponse`
+  （:3274-3320；sync 分派 :3104-3110）：thread = fromAciUuidBytesOrString
+  （binary 16B 优先、string 兜底）；groupId 必须 32 字节
+  （GROUPV2_ID_LENGTH = :191）→ `Bytes.toBase64`，长度非法
+  removeFromCache 整事件丢弃；type 经 isKnownProtoEnumMember 强制已知
+  枚举否则 UNKNOWN（:3304-3309）——缺席/未来枚举值不丢弃。事件面
+  messageRequestResponseType 为数字枚举原值（messageReceiverEvents.std.ts
+  :387；会话 attr 同名 number 位 model-types.d.ts:413），消费面
+  background.preload.ts onMessageRequestResponse（:3774-3810）→
+  MessageRequests.onResponse 写会话 attr → isConversationAccepted
+  （ts/util/isConversationAccepted.preload.ts:21-82，第一因子权重
+  `messageRequestResponseType === ACCEPT` :38）。
+- **引擎落地（最小面）**：`project_content` SynchronizeMessage 臂增
+  MessageRequestResponse 分支 → `project_message_request_response` 投影
+  `syncMessage.messageRequestResponse {threadAci?, groupId?,
+  messageRequestResponseType}`：thread = `parse_thread_aci`（binary 优先
+  string 兜底）→ ServiceId UUID 串；groupId = 32 字节闸 + 标准 base64
+  （send/listGroups groupId 口径）；type 缺席/枚举外 → UNKNOWN=0（官方
+  coercion 同构），已知值数字原值投影。线程双缺（无可路由会话）或群
+  长度非法 → 整事件丢弃（宁缺勿错，零 stderr，receive 面纪律）。单测
+  两面：helper 全口径（六枚举原值往返、双形、32B 闸、UNKNOWN 强制、
+  丢弃面）+ project_content 端到端（accept/delete/群三形态投影形状、
+  信封公共位纯增量、不可路由丢弃）。
+- **投影差异（诚实边界）**：① 本面只覆盖**多设备 echo**（手机端/其他
+  链接设备接受或拒绝后同步过来）；本机自己的接受/拒绝在 Signal 协议里
+  是「发同步」不「收同步」——发起设备的 write outcome 即调用返回值，
+  引擎收包面永远看不到自己的 echo，connector 的本机 §4.56 写面（上游
+  sendMessageRequestResponse）终态仍以写调用结果为准（引擎亦无
+  sendMessageRequestResponse 方法）。② 引擎不落会话摘要表、不做
+  conversation-level accepted 查询面（§4.58 记录的另一半选项）——
+  「accept 终态进 connector 摘要」的落库与推导消费在 connector 侧执行，
+  引擎只投影事件原值不持久化。③ UNKNOWN=0 对推导零权重（官方因子只在
+  精确 ACCEPT 时放行），投影 UNKNOWN 是官方 coercion 行为不是发明。
+- **wire 兼容（键面纯增量）**：新键只出现在 `syncMessage` 对象内（既有
+  键零改名零移除）；现行 connector `normalize_receive_fields` 对
+  syncMessage 只读已知键（sentMessage/viewOnceOpen/callEvent…），仅含
+  messageRequestResponse 的 syncMessage 落「contacts/groups/read sync —
+  ignore」skip 臂（connector engine.rs:2912-2924 实读）——旧宿主无该键
+  不炸、不落行，1.65 推导照旧走本地派生 fallback；新宿主消费面按 §4.58
+  记录升级为权威读取，字段名 `messageRequestResponseType` 与官方因子
+  词汇一字不差。
+- **边界（本批红线）**：不动 §4.56 写面（引擎 sendMessageRequestResponse
+  另行立项）；不做会话级持久化/查询面；不动 vendored proto；不做
+  threadE164 面（上游已 reserved 废止）；协议栈无读写面的能力不顺手做。
 
 ## 6. fake 服务模式（仅测试）
 
