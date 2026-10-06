@@ -122,8 +122,10 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   `viewOnce: true`；viewOnce 行跑官方 isValidTapToView 同构校验，非法补
   `viewOnceInvalid: true`（2026-10-04，官方 isTapToViewInvalid 同位；引擎
   metadata-only 只标记不擦除，§5）。引用/反应作者号 contacts 命中投影
-  E.164，未命中保留 ACI 字符串。textStyles：本引擎钉定的 presage proto
-  版本无此面，不投影。消失消息 E 批（2026-10-05）：`expiresInSeconds`
+  E.164，未命中保留 ACI 字符串。textStyles：bodyRanges Style arm 投影
+  （2026-10-06 收包投影批，形状/口径详见下方「bodyRanges 收包投影」块；
+  旧登记「proto 无此面」系勘误，§5）。消失消息 E 批（2026-10-05）：
+  `expiresInSeconds`
   （DataMessage.expire_timer=5 透出，秒，0=关闭原样透出）与
   `isExpirationUpdate: true`（DataMessage flag 位 EXPIRATION_TIMER_UPDATE=2
   投影，官方桌面收发两侧同 flag 机制），缺省键不在。
@@ -247,9 +249,10 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
   recipient 维度的注册态需 CDSI 查询，未做（保持 `isRegistered: true` 面）。
 - **textStyles**：~~本引擎钉定的 presage proto 版本无该面，receive 不投影
   （connector 侧为可选富体字段，缺失即无该键）。~~（2026-10-06 勘误：钉定
-  proto **有** BodyRange.Style——本仓当时只从 mention 维度看过 bodyRanges；
-  receive 投影维持「Style arm 不投」的边界不变，见 §4.20 接收清单。发送侧
-  同日闭合，见下方 textStyle 透传批。）
+  proto **有** BodyRange.Style——本仓当时只从 mention 维度看过 bodyRanges。
+  发送侧同日闭合，见下方 textStyle 透传批；**receive 侧同日再闭合**，
+  Style arm 投影 `textStyles` 键，见下方「bodyRanges 收包投影」块——本条
+  差异登记整体销账。）
 - **finishLink 长等待**：等手机确认可阻塞数分钟；引擎在本线程 LocalSet
   并发 dispatch，其他方法不饿死。
 
@@ -413,6 +416,40 @@ send 面 textStyle 透传（2026-10-06，消费方 connector 契约 1.69 §4.62�
   职责，引擎 metadata-only）；不改 guard 形状（textStyle 不参与
   sticker/viewOnce 互斥矩阵，纯文本面附加格式）；viewOnce 与 textStyle
   同发走 viewOnce 面构造（isViewOnce 消息不带 bodyRanges，官方同构）。
+
+bodyRanges 收包投影（2026-10-06，`textStyles` wire 键三仓并行批钉定；
+与 §4.62 发送面同日对合成对称面）：
+
+- **wire 形状**：`receive` 通知的消息投影（dataMessage / editMessage
+  内嵌 dataMessage / syncMessage.sentMessage，共用 `project_data_message`
+  单点）新增 `textStyles` 键——数组，条目
+  `{style: "BOLD"|"ITALIC"|"SPOILER"|"STRIKETHROUGH"|"MONOSPACE",
+  start: u32, length: u32}`；style = proto 枚举词原样大写，start/length =
+  UTF-16 code units（proto 原语义透传，不换算 code points）。
+- **proto 证据**：钉定 libsignal-service-rs（9e6c08b）
+  `protobuf/SignalService.proto:983-1001`——`BodyRange{start=1, length=2,
+  oneof associatedValue{mentionAci=3, Style style=4, mentionAciBinary=5}}`，
+  `BodyRange.Style` 枚举 NONE=0/BOLD=1/ITALIC=2/SPOILER=3/STRIKETHROUGH=4/
+  MONOSPACE=5，start/length 注释即「UTF-16 code units」。
+- **投影口径（与 §4.62 发送面对称）**：
+  - **NONE 不投**（发送面词表拒收对称——官方 composer 永不发出的 no-op
+    标记）；滤掉后无剩余条目 → 键整体缺席。
+  - **未知枚举值整条丢弃，不 fatal**（proto 只投影不发明；prost oneof
+    对未知 enumeration 值保留原 i32，投影侧 `try_from` 不命中即丢）。
+  - **形状坏条目丢弃**：start+length（u32 缺省 0，proto 缺字段不发明）
+    超 body UTF-16 长度（UTF-16 code units 口径，跨 BMP 代理对正确计长）
+    的条目丢弃；body 缺席按 0 计。
+  - **重复/重叠条目不做重叠闸**：官方渲染侧直接按序应用，投影侧只丢
+    形状坏的，不发明官方没有的闸（与发送面「无 body 长度边界闸」同一
+    不发明纪律的收侧镜像：收侧只挡确认越界的坏形状，不裁剪不重排）。
+  - **无 Style 条目不携键**：缺席=纯文本，旧宿主零变化（mentions 键
+    同款缺省键纪律）；条目保持 wire 顺序（官方渲染侧按序应用）。
+  - mentions 与 textStyles 各取各的 arm（MentionAci(tag=3)/binary(tag=5)
+    → mentions；Style(tag=4) → textStyles），同一 body_ranges 两键共存。
+- **边界**：不落引擎持久化（metadata-only 纪律，与发送面同）；cap 不设
+  新闸（发送面 ≤64 是解析闸镜像，收侧 wire 条目数即发方 ≤64 纪律的
+  下游，投影不截断——与 mentions `.take(64)` 上限并存不冲突：mentions
+  上限是 connector 1.25 消费面既有形状，textStyles 不引入新 cap）。
 
 附件指针投影面（2026-10-06，H3 附件媒体字节 v2 方案 C ①；消费方
 connector 契约 1.55 §4.38；调研全文

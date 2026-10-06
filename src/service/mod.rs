@@ -2926,6 +2926,7 @@ fn project_data_message(
                         .ok()?
                         .to_string()
                 }
+                // Style arm 归 textStyles 投影（同函数下方），mentions 不取。
                 presage::proto::body_range::AssociatedValue::Style(_) => return None,
             };
             Some(json!({
@@ -2938,6 +2939,51 @@ fn project_data_message(
         .collect();
     if !mentions.is_empty() {
         out["mentions"] = json!(mentions);
+    }
+    // 文字格式化样式投影（connector 契约 1.69 §4.62 收侧对称面，wire 三仓
+    // 并行批钉定）：body_ranges 的 Style arm → `textStyles[] {style, start,
+    // length}`。NONE 不投（发送面拒收对称——官方 composer 永不发出的 no-op
+    // 标记）；未知枚举值整条丢弃（proto 只投影不发明，不 fatal）；重复/
+    // 重叠条目不做重叠闸（官方渲染侧直接按序应用，投影侧只丢形状坏的：
+    // start+length 超 body UTF-16 长度的条目丢弃——u32 字段经 unwrap_or(0)
+    // 缺省不会溢出；无 Style 条目不携键，缺席=纯文本，旧宿主零变化；条目
+    // 保持 wire 顺序，官方渲染侧按序应用）。proto 证据：钉定
+    // libsignal-service-rs（9e6c08b）SignalService.proto:983-1001。
+    let body_utf16_len = data_message
+        .body
+        .as_deref()
+        .map(|body| body.encode_utf16().count())
+        .unwrap_or(0);
+    let text_styles: Vec<Value> = data_message
+        .body_ranges
+        .iter()
+        .filter_map(|range| {
+            let value = match range.associated_value.as_ref()? {
+                presage::proto::body_range::AssociatedValue::Style(value) => *value,
+                _ => return None,
+            };
+            let word = presage::proto::body_range::Style::try_from(value)
+                .ok()?
+                .as_str_name();
+            // NONE=0 是 composer 永不发出的 no-op 标记：投影丢弃（发送面
+            // 词表拒收对称）。
+            if word == "NONE" {
+                return None;
+            }
+            let start = range.start.unwrap_or(0);
+            let length = range.length.unwrap_or(0);
+            if start as u64 + length as u64 > body_utf16_len as u64 {
+                return None;
+            }
+            Some(json!({
+                "style": word,
+                "start": start,
+                "length": length,
+            }))
+        })
+        .collect();
+    if !text_styles.is_empty() {
+        out["textStyles"] = json!(text_styles);
     }
     // 贴纸投影：官方接收面 = DataMessage.Sticker（packId hex/packKey base64
     // 官方桌面序列化同构），data 经既有附件指针投影（connector 媒体边界
@@ -4108,6 +4154,185 @@ mod tests {
         );
         assert_eq!(out["adminDelete"]["targetAuthor"], json!(author));
         assert_eq!(out["adminDelete"]["targetSentTimestamp"], json!(3));
+    }
+
+    /// bodyRanges 收包投影 `textStyles` 键（connector 契约 1.69 §4.62 收侧
+    /// 对称面，wire 三仓并行批钉定）：DataMessage.body_ranges 的 Style arm
+    /// 逐条投影 `textStyles[] {style, start, length}`——五值枚举词原样大写
+    /// （proto 枚举词表）、NONE 不投（与发送面拒收对称）、未知枚举值整条
+    /// 丢弃（proto 只投影不发明，未知值不 fatal）、start+length 超 body
+    /// UTF-16 长度的形状坏条目丢弃（官方渲染侧不发明闸，只丢形状坏的）、
+    /// 重复/重叠条目按官方容忍口径照投（官方渲染侧直接按序应用，投影侧
+    /// 不发明重叠闸）、无 Style 条目不携键（缺席=纯文本，旧宿主零变化）、
+    /// 条目保持 wire 顺序（官方渲染侧按序应用）。
+    #[test]
+    fn data_message_projection_projects_text_styles_wire_contract() {
+        let style_range = |name: i32, start: u32, length: u32| BodyRange {
+            start: Some(start),
+            length: Some(length),
+            associated_value: Some(AssociatedValue::Style(name)),
+        };
+
+        // 五值各一：词表原样大写、数值位 = proto 字段值（u32）。
+        let five = [
+            (presage::proto::body_range::Style::Bold, "BOLD"),
+            (presage::proto::body_range::Style::Italic, "ITALIC"),
+            (presage::proto::body_range::Style::Spoiler, "SPOILER"),
+            (
+                presage::proto::body_range::Style::Strikethrough,
+                "STRIKETHROUGH",
+            ),
+            (presage::proto::body_range::Style::Monospace, "MONOSPACE"),
+        ];
+        for (value, word) in five {
+            let out = project_data_message(
+                &DataMessage {
+                    body: Some("hello world".to_owned()),
+                    body_ranges: vec![style_range(value as i32, 0, 5)],
+                    ..Default::default()
+                },
+                &HashMap::new(),
+            );
+            assert_eq!(
+                out["textStyles"],
+                json!([{ "style": word, "start": 0, "length": 5 }]),
+                "{word} projects with proto enum word"
+            );
+        }
+
+        // NONE 不投：条目被滤掉后无剩余 → 键整体缺席（非空数组）。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("plain".to_owned()),
+                body_ranges: vec![style_range(
+                    presage::proto::body_range::Style::None as i32,
+                    0,
+                    5,
+                )],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(
+            out.get("textStyles").is_none(),
+            "NONE entry is not projected"
+        );
+
+        // 未知枚举值整条丢弃，不 fatal；同行 mention 条目不受牵连。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("mixed".to_owned()),
+                body_ranges: vec![
+                    style_range(99, 0, 5),
+                    BodyRange {
+                        start: Some(0),
+                        length: Some(5),
+                        associated_value: Some(AssociatedValue::MentionAci(
+                            "11111111-2222-4333-8444-555555555555".to_owned(),
+                        )),
+                    },
+                ],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("textStyles").is_none(), "unknown enum dropped");
+        assert_eq!(
+            out["mentions"][0]["number"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+
+        // start+length 超 body UTF-16 长度：形状坏条目丢弃（含跨 BMP 代理
+        // 对的 UTF-16 口径：7 个 UTF-16 code units ≠ 7 个 char）。
+        let out = project_data_message(
+            &DataMessage {
+                // "a😀b" = 4 UTF-16 code units（😀 占 2）。
+                body: Some("a😀b".to_owned()),
+                body_ranges: vec![
+                    style_range(presage::proto::body_range::Style::Bold as i32, 0, 4), // 恰好贴边
+                    style_range(presage::proto::body_range::Style::Italic as i32, 3, 2), // 3+2>4 越界
+                ],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out["textStyles"],
+            json!([{ "style": "BOLD", "start": 0, "length": 4 }]),
+            "out-of-bounds entry dropped, boundary entry kept"
+        );
+
+        // 无 Style 条目 = 不携键（缺席=纯文本，旧宿主零变化）；
+        // 仅 mention 条目时同样不携键。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("no styles".to_owned()),
+                body_ranges: vec![BodyRange {
+                    start: Some(0),
+                    length: Some(2),
+                    associated_value: Some(AssociatedValue::MentionAci(
+                        "11111111-2222-4333-8444-555555555555".to_owned(),
+                    )),
+                }],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("textStyles").is_none(), "mention-only: no key");
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("plain body".to_owned()),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert!(out.get("textStyles").is_none(), "no body_ranges: no key");
+
+        // 多条目保序：wire 顺序 = 投影顺序（官方渲染侧按序应用）；重复/
+        // 重叠条目不做重叠闸（官方容忍口径），照投。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("ordered body".to_owned()),
+                body_ranges: vec![
+                    style_range(presage::proto::body_range::Style::Monospace as i32, 0, 7),
+                    style_range(presage::proto::body_range::Style::Bold as i32, 0, 7),
+                    style_range(presage::proto::body_range::Style::Italic as i32, 8, 4),
+                ],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out["textStyles"],
+            json!([
+                { "style": "MONOSPACE", "start": 0, "length": 7 },
+                { "style": "BOLD", "start": 0, "length": 7 },
+                { "style": "ITALIC", "start": 8, "length": 4 },
+            ]),
+            "entries keep wire order, overlaps tolerated"
+        );
+
+        // start/length 缺席 = 0 缺省（proto 只投影不发明，mentions 同款
+        // unwrap_or(0) 口径）：0+0 ≤ body 长度恒成立，条目保留。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("x".to_owned()),
+                body_ranges: vec![BodyRange {
+                    start: None,
+                    length: None,
+                    associated_value: Some(AssociatedValue::Style(
+                        presage::proto::body_range::Style::Bold as i32,
+                    )),
+                }],
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out["textStyles"],
+            json!([{ "style": "BOLD", "start": 0, "length": 0 }]),
+            "missing start/length default to 0"
+        );
     }
 
     /// 贴纸收发面（官方 sendStickerMessage / DataMessage.Sticker 同构）：
