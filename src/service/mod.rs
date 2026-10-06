@@ -3035,9 +3035,30 @@ fn is_valid_view_once_row(data_message: &presage::proto::DataMessage) -> bool {
     data_message.contact.is_empty() && data_message.preview.is_empty()
 }
 
-/// 附件只投影元数据（connector §4.13/§6.7 媒体边界：字节永不下载）。
-/// `id` = AttachmentPointer.client_uuid（hyphenated UUID，signal-cli `id` 位）。
+/// 附件投影：v1 基础面（connector §4.13/§6.7 媒体边界：字节永不下载）+
+/// v2 locator 指针面（2026-10-07，connector 契约 1.61 §4.54 引擎侧缺口闭合，
+/// live receive 信封数据面）。`id` = AttachmentPointer.client_uuid（hyphenated
+/// UUID，signal-cli `id` 位）。
+///
+/// locator 面（proto 只投影不发明，缺/空一律省略键；导出侧
+/// `history.rs::project_pointer_common` 同款、engine-compat 1.56 消费形状同
+/// 形——connector `normalized_attachment` ingest 落 schema-19 live 列，
+/// `attachments.download` 据此走其 §4.38 step-3 transit CDN 链）：
+/// - `key` ← AttachmentPointer.key 标准 base64（附件 64B 加密材料，
+///   只经信封内存中转，引擎不持久化）；
+/// - `cdnKey` ← attachment_identifier CdnKey 字符串（legacy CdnId(fixed64)
+///   指针无字符串形态——该键缺席，下载资格闸由消费方判，宁缺勿错不发明）；
+/// - `cdnNumber` ← AttachmentPointer.cdn_number（Some(0) 是合法 CDN0 原样投）；
+/// - `uploadTimestamp` ← AttachmentPointer.upload_timestamp（0 无意义省略，
+///   官方 falsy 同款）；
+/// - `digest` ← AttachmentPointer.digest 标准 base64（whole-body SHA-256，
+///   transit 终闸输入）。钉定 rev 线上指针无 plaintextHash 面（backup transit
+///   指针专属字段），诚实缺席不发明——仅 digest 腿即 connector TransitFace
+///   可下载形态。
+/// - 指针全无定位材料（上游钉定面不含定位字段的形态）→ 整个
+///   `locator` 键缺席，wire 与旧版逐字节同形。
 fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Value {
+    use base64::Engine as _;
     use presage::proto::attachment_pointer::Flags;
     let id = pointer
         .client_uuid
@@ -3068,6 +3089,39 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
         .flags
         .is_some_and(|flags| flags & Flags::VoiceMessage as u32 != 0);
     value["isVoiceNote"] = json!(voice_note);
+    let mut locator = serde_json::Map::new();
+    if let Some(key) = pointer.key.as_deref().filter(|key| !key.is_empty()) {
+        locator.insert(
+            "key".into(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(key)),
+        );
+    }
+    if let Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(cdn_key)) =
+        pointer.attachment_identifier.as_ref()
+    {
+        if !cdn_key.is_empty() {
+            locator.insert("cdnKey".into(), Value::String(cdn_key.clone()));
+        }
+    }
+    if let Some(cdn_number) = pointer.cdn_number {
+        locator.insert("cdnNumber".into(), json!(cdn_number));
+    }
+    if let Some(timestamp) = pointer.upload_timestamp.filter(|ts| *ts > 0) {
+        locator.insert("uploadTimestamp".into(), json!(timestamp));
+    }
+    if let Some(digest) = pointer
+        .digest
+        .as_deref()
+        .filter(|digest| !digest.is_empty())
+    {
+        locator.insert(
+            "digest".into(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(digest)),
+        );
+    }
+    if !locator.is_empty() {
+        value["locator"] = Value::Object(locator);
+    }
     value
 }
 
@@ -3918,7 +3972,7 @@ mod tests {
     use base64::Engine as _;
     use presage::proto::attachment_pointer::Flags;
     use presage::proto::body_range::AssociatedValue;
-    use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage};
+    use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
 
     /// project_content 现返通知向量：契约测试形状 = 恰一条投影，取首条
@@ -4083,6 +4137,160 @@ mod tests {
         assert_eq!(out["reaction"]["targetAuthor"], json!(author));
         assert!(out.get("message").is_none(), "body absent stays absent");
         assert!(out.get("attachments").is_none());
+    }
+
+    /// 附件 locator 指针面投影（connector 契约 1.61 §4.54 引擎侧缺口闭合，
+    /// live receive 信封面；消费方 normalized_attachment ingest 落 schema-19
+    /// live 列 → attachments.download 走 §4.38 step-3 transit 链）。投影口径
+    /// = proto 只投影不发明（导出侧 project_pointer_common 同款，engine-compat
+    /// 1.56 消费形状同形）：key/cdnKey/uploadTimestamp/digest，全缺 → locator
+    /// 键缺席（wire 与旧版逐字节同形）。钉定 rev AttachmentPointer 无
+    /// plaintextHash 面（backup transit 指针专属），诚实缺席不发明。
+    #[test]
+    fn data_message_projection_projects_attachment_locator_faces() {
+        use base64::engine::general_purpose::STANDARD;
+        let key_set = [0x33_u8; 64];
+        let digest = [0x44_u8; 32];
+
+        // 完整 transit 面：key + cdnKey + cdnNumber + digest（官方
+        // isDownloadableFromTransitTier 四件齐形态，connector 侧可下载）。
+        let full = project_attachment_pointer(&AttachmentPointer {
+            client_uuid: Some(uuid_bytes("11111111-2222-4333-8444-555555555555")),
+            content_type: Some("image/jpeg".to_owned()),
+            size: Some(4096),
+            key: Some(key_set.to_vec()),
+            digest: Some(digest.to_vec()),
+            cdn_number: Some(2),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                    "live-cdn-key".to_owned(),
+                ),
+            ),
+            upload_timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        });
+        let locator = full["locator"].as_object().expect("locator face present");
+        assert_eq!(
+            locator["key"].as_str(),
+            Some(STANDARD.encode(key_set).as_str())
+        );
+        assert_eq!(locator["cdnKey"].as_str(), Some("live-cdn-key"));
+        assert_eq!(locator["cdnNumber"], json!(2));
+        assert_eq!(
+            locator["digest"].as_str(),
+            Some(STANDARD.encode(digest).as_str())
+        );
+        assert_eq!(locator["uploadTimestamp"], json!(1_700_000_000_000_u64));
+        // 钉定 rev 无 plaintextHash 字段：键不得发明。
+        assert!(locator.get("plaintextHash").is_none());
+
+        // CDN0 原样透出（cdnNumber=0 是合法 CDN0，导出侧同口径）；
+        // upload_timestamp 缺席/0 → 键省略（官方 falsy 同款）。
+        let cdn0 = project_attachment_pointer(&AttachmentPointer {
+            key: Some(key_set.to_vec()),
+            digest: Some(digest.to_vec()),
+            cdn_number: Some(0),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                    "cdn-zero".to_owned(),
+                ),
+            ),
+            upload_timestamp: Some(0),
+            ..Default::default()
+        });
+        let zero_locator = cdn0["locator"].as_object().expect("locator present");
+        assert_eq!(zero_locator["cdnNumber"], json!(0));
+        assert!(zero_locator.get("uploadTimestamp").is_none());
+
+        // 部分 locator 只投命中字段：legacy CdnId 指针无 cdnKey 字符串 → 该
+        // 键缺席（transit 资格闸在消费方判，宁缺勿错不发明字符串形态）。
+        let cdn_id = project_attachment_pointer(&AttachmentPointer {
+            key: Some(key_set.to_vec()),
+            digest: Some(digest.to_vec()),
+            cdn_number: Some(0),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnId(1234),
+            ),
+            ..Default::default()
+        });
+        let id_locator = cdn_id["locator"].as_object().expect("locator present");
+        assert!(id_locator.get("cdnKey").is_none());
+        assert!(id_locator.get("key").is_some());
+
+        // 空字节 key / 空 cdnKey / digest 缺 → 各自键省略；全缺 → 整个
+        // locator 键缺席（wire 与旧版逐字节同形）。
+        let empty_key = project_attachment_pointer(&AttachmentPointer {
+            key: Some(Vec::new()),
+            digest: Some(digest.to_vec()),
+            cdn_number: Some(3),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey("k".to_owned()),
+            ),
+            ..Default::default()
+        });
+        assert!(empty_key["locator"]
+            .as_object()
+            .unwrap()
+            .get("key")
+            .is_none());
+
+        let metadata_only = project_attachment_pointer(&AttachmentPointer {
+            client_uuid: Some(uuid_bytes("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            content_type: Some("image/png".to_owned()),
+            size: Some(8),
+            ..Default::default()
+        });
+        assert!(
+            metadata_only.get("locator").is_none(),
+            "metadata-only pointer stays byte-identical: no locator key"
+        );
+        assert_eq!(
+            metadata_only["id"],
+            json!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        );
+        assert_eq!(metadata_only["contentType"], json!("image/png"));
+        assert_eq!(metadata_only["size"], json!(8));
+    }
+
+    /// preview.image 与 sticker.data 同走附件指针投影：locator 面随行透出
+    /// （消费方 ingest 各按其归属落位；locator 全缺形状不变）。
+    #[test]
+    fn preview_and_sticker_pointer_projection_carries_locator() {
+        let pointer = || AttachmentPointer {
+            key: Some([0x55_u8; 64].to_vec()),
+            digest: Some([0x66_u8; 32].to_vec()),
+            cdn_number: Some(2),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                    "preview-key".to_owned(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let dm = DataMessage {
+            preview: vec![Preview {
+                url: Some("https://example.com/a".to_owned()),
+                image: Some(pointer()),
+                ..Default::default()
+            }],
+            sticker: Some(data_message::Sticker {
+                pack_id: Some(vec![0x01; 16]),
+                pack_key: Some(vec![0x02; 32]),
+                sticker_id: Some(7),
+                data: Some(pointer()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = project_data_message(&dm, &HashMap::new());
+        let preview_locator = out["previews"][0]["image"]["locator"]
+            .as_object()
+            .expect("preview image locator");
+        assert_eq!(preview_locator["cdnKey"].as_str(), Some("preview-key"));
+        let sticker_locator = out["sticker"]["data"]["locator"]
+            .as_object()
+            .expect("sticker data locator");
+        assert_eq!(sticker_locator["cdnNumber"], json!(2));
     }
 
     /// pinMessage=27/unpinMessage=28/adminDelete=29 投影（官方

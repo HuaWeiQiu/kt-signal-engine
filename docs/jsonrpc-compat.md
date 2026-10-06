@@ -116,8 +116,11 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
-  size?, width?, height?, caption?, isVoiceNote}`（≤32，元数据 only，
-  字节永不下载）、`previews[] {url, title?, description?, image?}`（≤4）、
+  size?, width?, height?, caption?, isVoiceNote, locator?}`（≤32；元数据
+  面 + 2026-10-07 起 `locator` 指针面随行——key/cdnKey/cdnNumber/
+  uploadTimestamp/digest，proto 只投影不发明，全缺键不在，§5 receive
+  信封附件 locator 投影块）、`previews[] {url, title?, description?,
+  image?}`（≤4；image 同走附件指针投影）、
   `mentions[] {number, start, length}`（≤64，来自 bodyRanges）、
   `viewOnce: true`；viewOnce 行跑官方 isValidTapToView 同构校验，非法补
   `viewOnceInvalid: true`（2026-10-04，官方 isTapToViewInvalid 同位；引擎
@@ -216,7 +219,11 @@ connector 测试驱动夹具的控制面，**引擎不实现也不接受**（按
 - 未知方法：上游 `-32601`；夹具回显。引擎取上游行为（-32601）。
 - `listAccounts` 的多账号投影、群组 Sender Keys、附件下载：夹具用标记
   文件模拟的部分，引擎在对应阶段（P1b/P3/P4）以真实实现替换；替换前的
-  桩行为都在本表「对齐状态」列注明，不得当成已完成。
+  桩行为都在本表「对齐状态」列注明，不得当成已完成。（附件下载批勘误
+  2026-10-07：现行架构下引擎侧的对应面 = receive 信封附件 `locator`
+  指针投影（见 §5 receive 信封附件 locator 投影块，已 real），下载执行
+  面按 connector §4.54 归 connector transit 链——引擎保持 metadata-only
+  立项红线，不新增下载方法。）
 
 P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）：
 
@@ -490,6 +497,45 @@ docs/2026-10-06-attachment-media-bytes-v2-research.md）：
   backup/file.rs:100-177：key 非空 ⇔ transit 或 plaintextHash 至少其一
   非空；空 locator 合法 = 附件已不可取）——此时消息行照出、附件只有
   v1 基础面，connector 侧如实降级为不可下载占位（官方同款「点按重试」）。
+
+receive 信封附件 locator 投影（2026-10-07，live receive 数据面；消费方
+connector 契约 1.61 §4.54，§4.54 原文裁定「live rows store the all-None
+faces … until an engine ships the receive projection——该列无需再迁移即
+自动填上，attachments.download 对新消息自动 live」的引擎侧缺口闭合；与
+上方导出面共用 engine-compat 1.56 wire 消费形状）：
+
+- **缺口核实（三面证据，2026-10-07 实读）**：① connector §4.54：live 行
+  locator 列（schema 19）由 receive 信封附件对象的 `locator` 键 ingest
+  落库，投影器是引擎侧 `project_attachment_pointer`——缺口在引擎；②
+  connector `normalized_attachment`（src/engine.rs）已实现 ingest 闸
+  （1.56 caps：base64 ≤512 字符、hex ≤128 小写、cdnNumber ≤u32、
+  uploadTimestamp >0、wrong-shaped keys 逐键丢弃、全空 face 折叠成
+  洞——引擎投真值，caps 归消费方，与导出面同分工）；③ 下载执行面在
+  connector（`attachments.download` = §4.38 step-3 transit CDN
+  下载→双层校验→落盘，引擎无网新面）——引擎侧零新方法，只有投影。
+- **投影面（`project_attachment_pointer` v2 扩，dataMessage.attachments
+  ≤32 / previews[].image / sticker.data 共一函数）**：钉定 rev 线上
+  `AttachmentPointer`（prost 生成结构实查）字段只投影不发明，缺/空一律
+  省略键：`key` ← pointer.key 标准 base64（64B 加密材料，信封内存中转，
+  引擎不持久化——密钥敏感性与导出面 NDJSON 裁定同级）；`cdnKey` ←
+  attachment_identifier CdnKey 字符串（空省略）；`cdnNumber` ←
+  pointer.cdn_number（Some(0) 合法 CDN0 原样投）；`uploadTimestamp` ←
+  pointer.upload_timestamp（0 无意义省略，官方 falsy 同款）；`digest` ←
+  pointer.digest 标准 base64（whole-body SHA-256，connector transit
+  终闸输入）。**plaintextHash 无从投影**：钉定 rev（9e6c08b）线上
+  proto 的 AttachmentPointer 无该字段（backup transit 指针专属）——仅
+  digest 腿即 connector `TransitFace` 可下载形态（其闸要求 key+cdnKey+
+  cdnNumber + digest/plaintextHash 至少其一）。
+- **legacy CdnId 指针不发明 cdnKey**：attachment_identifier = CdnId
+  (fixed64) 的旧指针无字符串形态——`cdnKey` 键缺席（宁可少投，切勿多投，
+  不发明字符串化数字），下载资格闸（官方 isDownloadableFromTransitTier
+  同构四件）由消费方判，该附件如实成为不可下载洞。
+- **wire 纯增量**：指针无任何定位材料（metadata-only 形态）→ `locator`
+  键缺席，信封与旧版逐字节同形（v1 基础面 id/contentType/filename/size/
+  width/height/caption/isVoiceNote 全不动）；单测锁两态。metadata-only
+  立项红线不变：字节永不下载（引擎侧无下载执行面，缓存/落盘/重试纪律
+  全归 connector §4.38 step-3 机器——有界/超时/不自动重试未知结局是其
+  既有记档，引擎投影面无网络路径故无新增有界参数）。
 
 消失消息 E 批（2026-10-05，1:1 计时器设置 + 接收/导出投影）：
 
