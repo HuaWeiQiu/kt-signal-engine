@@ -79,6 +79,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
 | `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
 | `sendViewOnceOpen` | `{account, senderAci(ACI/号码), timestamp(原消息 upstream 时间戳)}` | `{}` | 同 send；senderAci 不可解析/参数缺失或形状错 `-32603` | **P2 real（2026-10-04 阅后即焚扩面）**：官方 syncViewOnceOpen 同构——向自己 ACI 发 SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof viewOnceOpen=11，padded；多设备同步「该阅后即焚已被本机打开」），presage self-send 通路验证可行（§5，含钉定 rev 同内容二次转录重发怪癖）；与 sendViewedReceipt（作者面回执）双通道独立；fake：成功 `{}` |
+| `sendMessageRequestResponse` | `{account, recipient(单值，ACI/号码)\|groupId(32B 标准 base64 群 master key), type}`（**两腿恰一**：direct = recipient、群 = groupId，同置/双缺 `-32603`；type = 官方驼峰词六值白名单 `accept\|delete\|block\|blockAndDelete\|spam\|blockAndSpam`，缺席/`unknown`/数字/词表外/大小写漂移 `-32603`） | `{}`（上游钉定面成功答空结果对象同款） | 参数缺失/type 闸/两腿闸/群腿非 base64 或 ≠32B/recipient 数组 `-32603`；未注册账号 `-32603` | **2026-10-06 real（KT 扩展，§4.56 写面债务批）**：官方桌面 getMessageRequestResponseSync 同构——向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary\|threadAci?, groupId?, type}（content oneof messageRequestResponse=14；ACI 可解析 16B 直写 binary 字段=官方 isProtoBinaryEncodingEnabled 现行面，群 master key 原样=官方 groupId Uint8Array 同位；presage self-send 通路，padding 同源）；与 §3 receive 通知面 `syncMessage.messageRequestResponse` 投影对称（本机写 → 多设备 echo 收）；connector §4.56 `conversations.acceptRequest`/`declineRequest` 的引擎面（上游钉定 `sendMessageRequestResponse` params 逐字对齐：connector 上游 recipient 腿 = 其 peer_key 直通本引擎双形态解析、groupId 腿 = 群 master key、type 由宿主盖章 accept/delete）；写结局即返回值、未知结局不重试纪律不变（connector §4.56 SEND_OUTCOME_UNKNOWN 终态语义的引擎侧对应位）；fake：成功 `{}`（落调度日志，协议上行面纪律） |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 | `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
 | `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
@@ -1054,8 +1055,10 @@ messageRequestResponse 收包投影批（2026-10-06，connector §4.58 收包面
   链接设备接受或拒绝后同步过来）；本机自己的接受/拒绝在 Signal 协议里
   是「发同步」不「收同步」——发起设备的 write outcome 即调用返回值，
   引擎收包面永远看不到自己的 echo，connector 的本机 §4.56 写面（上游
-  sendMessageRequestResponse）终态仍以写调用结果为准（引擎亦无
-  sendMessageRequestResponse 方法）。② 引擎不落会话摘要表、不做
+  sendMessageRequestResponse）终态仍以写调用结果为准（该写面本引擎已于
+  同日落地，见下方 sendMessageRequestResponse 写面批——与 §4.56 对齐，
+  本投影与其构成「本机写 → 多设备 echo 收」对称面）。
+  ② 引擎不落会话摘要表、不做
   conversation-level accepted 查询面（§4.58 记录的另一半选项）——
   「accept 终态进 connector 摘要」的落库与推导消费在 connector 侧执行，
   引擎只投影事件原值不持久化。③ UNKNOWN=0 对推导零权重（官方因子只在
@@ -1069,8 +1072,90 @@ messageRequestResponse 收包投影批（2026-10-06，connector §4.58 收包面
   记录升级为权威读取，字段名 `messageRequestResponseType` 与官方因子
   词汇一字不差。
 - **边界（本批红线）**：不动 §4.56 写面（引擎 sendMessageRequestResponse
-  另行立项）；不做会话级持久化/查询面；不动 vendored proto；不做
-  threadE164 面（上游已 reserved 废止）；协议栈无读写面的能力不顺手做。
+  同日落地，见下方写面批）；不做会话级持久化/查询面；不动 vendored proto；
+  不做 threadE164 面（上游已 reserved 废止）；协议栈无读写面的能力不顺手做。
+
+sendMessageRequestResponse 写面（2026-10-06，connector §4.56 写面债务批，
+KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
+
+- **背景与对齐口径（connector 钉定契约逐字核验）**：connector 1.63
+  （§4.56）`conversations.acceptRequest`/`conversations.declineRequest`
+  是钉定上游 `sendMessageRequestResponse`（signal-cli pinned checkout
+  `v0.14.7-4-g472784e6`，`client/src/jsonrpc.rs:342`）之上的宿主薄封装，
+  其上游 params 形状（connector service.rs
+  `prepare_conversations_message_request` 实读）：`{account,
+  recipient(单值)|groupId, type}`——direct 会话 = 上游 `recipient` 一腿
+  （connector peer_key 直通）、群 = `groupId` 一腿（群 master key 原样，
+  `listGroups` id 同源）、type 由宿主盖章 `accept`/`delete`
+  （supervisor.rs `message_request_request` 实读）。本引擎面与该形状逐字
+  对齐：参数名 `account`/`recipient`/`groupId`/`type` 一字不差；recipient
+  腿收 ACI/号码双形态（引擎 send 系 `resolve_recipient` 既有口径，connector
+  peer_key 两形状都是其子集）、groupId 腿 = 32B 标准 base64
+  （`decode_group_id` 同源闸）。connector 收敛宿主词表只走 accept/delete
+  （官方 CLI 词表仅此两值，`client/src/cli.rs:664-669`），引擎线面收全
+  官方六值——这是引擎/宿主的词表差（引擎面是协议面，宿主面是产品面），
+  非 shape 分叉：引擎多收的四个词全部映射官方枚举原值，connector 打到
+  引擎的 accept/delete 两词行为逐字一致。
+- **协议事实（钉定栈实查）**：libsignal-service 9e6c08b
+  `SignalService.proto` SyncMessage.content oneof
+  `MessageRequestResponse messageRequestResponse = 14`（line 865），
+  `MessageRequestResponse{threadAci=2, groupId=3, type=4,
+  threadAciBinary=5}`（line 666-679），Type 枚举 UNKNOWN=0/ACCEPT=1/
+  DELETE=2/BLOCK=3/BLOCK_AND_DELETE=4/SPAM=5/BLOCK_AND_SPAM=6；
+  threadE164（field 1）已 reserved 废止，线上只有 aci/groupId 两腿。
+- **官方发送侧锚（Signal-Desktop v8.31 第一手实读，行为对齐不抄码）**：
+  `ts/textsecure/SendMessage.preload.ts:2314-2360`
+  `getMessageRequestResponseSync({threadAci?, groupId?, type})`——
+  `MessageSender.padSyncMessage({content:{messageRequestResponse{type,
+  groupId: options.groupId ? … : null, threadAciBinary/threadAci}}}`
+  （`isProtoBinaryEncodingEnabled()` 现行面直写 threadAciBinary 16B raw
+  UUID bytes，legacy 形态写 threadAci string；两形态互斥写），payload
+  type `messageRequestSync`；调用方
+  `ts/state/ducks/conversations.preload.ts:3781` `syncMessageRequestResponse`
+  → :3821 `singleProtoJobQueue.add(MessageSender.getMessageRequestResponseSync
+  ({threadAci, groupId: conversation.getGroupIdBuffer(), type: response}))`
+  —— ACCEPT（acceptConversation :4001-4013）/DELETE（deleteConversation
+  :4141-4147）/BLOCK（blockConversation :4089-4095）/SPAM（reportSpam
+  :3899-3901）全族直传 proto 枚举序数，群腿 = 群 master key buffer。发送
+  目标 = 自己 ACI（`serviceId: myAci`）——消息请求响应是「本机决策」的
+  多设备同步，不走收件人会话。
+- **构造面（service/mod.rs `build_message_request_response_sync`）**：
+  thread 腿 ACI 可解析 16B → `thread_aci_binary` 直写（官方现行面同构），
+  已闸非 UUID 串降写 `thread_aci` string 形态（官方 legacy 分支同位）；
+  群腿 = `MessageRequestTarget::Group(master_key)` 原样 bytes；
+  `SyncMessage::with_padding` 同源 padding（官方 padSyncMessage 同位）；
+  oneof 变体 `Content::MessageRequestResponse`（与收包投影
+  `project_message_request_response` 同一生成类型——本写面与其严格对称：
+  本机写 → 服务器 → 多设备 echo 收，两端共用字段 2/3/4/5 与六值枚举）。
+  presage self-send 通路与 sendViewOnceOpen 同款（compat §5 E4 已验证）；
+  钉定 rev「多设备自发 SyncMessage 二次同内容转录重发」怪癖同面（接收端
+  幂等，compat §5 E4 已登记）。单测字节级钉：thread 腿 = 字段5{16B UUID}+
+  字段4{枚举}（prost 字段序升序）、群腿 = 字段3{32B master key}+字段4、
+  string 兜底形态 = 字段2{utf8}+字段4，字段序与 tag 值对照官方 proto 手编。
+- **参数闸（methods.rs，fail-closed `-32603`）**：type = 六值驼峰词
+  白名单（`message_request_type_of` 单点映射官方枚举；`unknown`/数字
+  （含 0/1/7 等越界）/词表外/大小写漂移（`ACCEPT`/`block_and_delete`）/
+  布尔全拒——UNKNOWN=0 不在词表，官方发送侧无「发未知」语义）；两腿恰一
+  （同置/双缺/`recipient` 数组形状/群腿非 base64/≠32B 全拒）；account
+  缺失同拒。协议上行面落调度日志（send 系同纪律）；成功答空结果对象
+  （上游钉定面成功无 JSON 输出同款，connector §4.56 `MessageRequestOutcome
+  {status}` 宿主面之上的引擎诚实形态）。
+- **返回值语义与未知结局纪律**：写结局即返回值——manager 打开失败
+  （UnknownAccount）/腿解析失败/上行失败（Internal）按 SendError 上抛折叠
+  `-32603`，成功 = 服务器已受理的信封上行；引擎不缓存不重发，未知结局
+  （进程被杀/连接断）由调用方按终态处理——connector §4.56 的
+  `SEND_OUTCOME_UNKNOWN` 不重试纪律（AGENTS.md 边界）在引擎侧的对应位
+  就是「一次上行调用、无自动重试」，纪律不破。
+- **fake 纪律**：参数闸全量生效后成功 `{}`，只落调度日志不触网（send 系
+  同款）；real 模式未注册账号折叠 `-32603` 不触网。
+- **边界（本批红线）**：不动收包投影（bbf3087 已落地，本面为其对称写面，
+  两批零交集）；不做 accept 附带 profile-sharing 位写（官方
+  SyncHelper.java:412-415 的 acceptConversation 语义在 signal-cli 形态下
+  经 contacts 同步收敛，引擎面为纯 sync 写；桌面侧 flag 归宿主
+  conversations.setBlocked/资料面组合）；不收 recipient 数组（上游钉定面
+  recipients[] 在该方法的官方调用形状实为单值语义，connector 宿主面恒
+  单值——引擎闸单字符串防误用）；不动 vendored proto；不做
+  threadE164 面。
 
 ## 6. fake 服务模式（仅测试）
 

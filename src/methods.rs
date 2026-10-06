@@ -14,8 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    parse_legacy_call_face, storage_sync, storage_write, LinkError, SendMention, SendPreview,
-    SendQuote, SendSticker, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    parse_legacy_call_face, storage_sync, storage_write, LinkError, MessageRequestTarget,
+    SendMention, SendPreview, SendQuote, SendSticker, SendTextStyle, Service, UserStatusError,
+    MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -714,6 +715,66 @@ async fn dispatch(
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
                         }
                         Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        // sendMessageRequestResponse（消息请求写面，connector 契约 1.63
+        // §4.56 债务批，KT 扩展方法）：上游钉定面 params `{account,
+        // recipient?|groupId?, type}`（connector prepare_conversations_message_
+        // request + supervisor type 盖章同形状）。参数闸 fail-closed
+        //（-32603）：type 六值词表白名单（官方 MessageRequestResponse.Type
+        // 驼峰词；UNKNOWN=0 缺席/越界/词表外同拒——官方发送侧无「发未知」
+        // 语义）、两腿恰一（direct = recipient 单字符串，群 = groupId 32B
+        // 标准 base64；同置/双缺/腿形状非法全拒）；协议上行面落调度日志
+        //（send 系同纪律）；成功答空结果对象（上游同款）；未知结局不重试
+        // 纪律由写调用结果即返回值承载（connector §4.56 对齐）。
+        "sendMessageRequestResponse" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let request_type = params
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(crate::service::message_request_type_of);
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("groupId").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) if !text.is_empty() => Some(Some(text.clone())),
+                Some(_) => None,
+            };
+            let group = match params.get("groupId") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(MessageRequestTarget::Group))
+                }
+                Some(_) => None,
+            };
+            let target = match (recipient, group) {
+                // 两腿恰一：恰一腿解析成功才放行（另一腿必须缺席）。
+                (Some(Some(text)), None) => Some(MessageRequestTarget::Thread(text)),
+                (None, Some(Some(master_key))) => Some(master_key),
+                _ => None,
+            };
+            match (account, target, request_type) {
+                (Some(account), Some(target), Some(request_type)) => {
+                    match service
+                        .send_message_request_response(account, target, request_type)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),

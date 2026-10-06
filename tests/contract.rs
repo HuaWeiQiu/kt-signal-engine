@@ -2043,3 +2043,130 @@ fn storage_write_fake_shapes_and_param_fail_closed() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
+
+/// sendMessageRequestResponse 写面（connector §4.56 债务批，compat §3/§5）：
+/// 上游钉定面 params `{account, recipient?|groupId?, type}`——type 官方词汇
+/// 白名单（signal-cli cli.rs:664-669 只收 "accept"/"delete"，全枚举面为官方
+/// 桌面 syncMessageRequestResponse 的六值；UNKNOWN=0 一并拒——官方无发送
+/// UNKNOWN 语义）、两腿恰一（direct = recipient 单值、group = groupId 32B
+/// 标准 base64，connector prepare_conversations_message_request 同形状）。
+/// fake 模式合法 ACCEPT/DELETE/BLOCK 各一成功 `{}`（上游成功答空结果对象
+/// 同纪律）；形状面 fail-closed `-32603`；协议上行面落调度日志（send 系同
+/// 纪律）；real 模式未注册账号折叠 `-32603` 不触网。
+#[test]
+fn send_message_request_response_faces_and_param_fail_closed() {
+    use base64::Engine as _;
+    let group_id = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+    let dir = temp_dir("mrr-send");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+
+    // fake 合法面：direct/腿 + 群腿、ACCEPT/DELETE/BLOCK 各一（上游成功
+    // 答空结果对象；block 族为官方桌面六值枚举的线面能力，connector 主用
+    // accept/delete）。
+    for params in [
+        json!({ "account": number, "recipient": "+15555550101", "type": "accept" }),
+        json!({
+            "account": number,
+            "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+            "type": "delete"
+        }),
+        json!({ "account": number, "groupId": group_id, "type": "block" }),
+        json!({ "account": number, "groupId": group_id, "type": "blockAndDelete" }),
+        json!({ "account": number, "groupId": group_id, "type": "spam" }),
+        json!({ "account": number, "groupId": group_id, "type": "blockAndSpam" }),
+    ] {
+        let ok = engine.request("sendMessageRequestResponse", params.clone());
+        assert_eq!(
+            ok["result"],
+            json!({}),
+            "fake sendMessageRequestResponse ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状：缺 type/UNKNOWN=0/越界数字/词表外字符串/
+    // 两腿同置/两腿双缺/腿形状非法（群非 base64、群 ≠32B、recipient 数组）。
+    let rejects = [
+        json!({ "account": number, "recipient": "+15555550101" }),
+        json!({ "account": number, "recipient": "+15555550101", "type": "unknown" }),
+        json!({ "account": number, "recipient": "+15555550101", "type": 0 }),
+        json!({ "account": number, "recipient": "+15555550101", "type": 1 }),
+        json!({ "account": number, "recipient": "+15555550101", "type": 7 }),
+        json!({ "account": number, "recipient": "+15555550101", "type": "ACCEPT" }),
+        json!({ "account": number, "recipient": "+15555550101", "type": "nope" }),
+        json!({ "account": number, "recipient": "+15555550101", "type": true }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "groupId": group_id,
+            "type": "accept"
+        }),
+        json!({ "account": number, "type": "accept" }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "groupId": "!!!not-base64!!!",
+            "type": "accept"
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "groupId": base64::engine::general_purpose::STANDARD.encode([0x22u8; 31]),
+            "type": "accept"
+        }),
+        json!({ "account": number, "recipient": ["+15555550101"], "type": "accept" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("sendMessageRequestResponse", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendMessageRequestResponse rejects {params}"
+        );
+    }
+
+    // 调度日志：type/腿参数逐字保留（协议上行面纪律，send 系同款）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let direct = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "sendMessageRequestResponse"
+                && entry["params"].get("recipient").is_some()
+        })
+        .expect("direct-leg MRR logged");
+    assert_eq!(direct["params"]["type"], json!("accept"));
+    assert_eq!(direct["params"]["recipient"], json!("+15555550101"));
+    let group = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "sendMessageRequestResponse"
+                && entry["params"].get("groupId").is_some()
+        })
+        .expect("group-leg MRR logged");
+    assert_eq!(group["params"]["type"], json!("block"));
+    assert_eq!(group["params"]["groupId"], json!(group_id));
+
+    // real 模式未注册账号：打开已注册 manager 前置即内部失败（不触网；
+    // send 系同折叠）。
+    let real_dir = temp_dir("mrr-send-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "sendMessageRequestResponse",
+        json!({ "account": "+15559990000", "recipient": "+15555550101", "type": "accept" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}

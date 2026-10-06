@@ -333,6 +333,68 @@ pub(crate) enum SendError {
     Internal,
 }
 
+/// sendMessageRequestResponse 的线程腿（connector §4.56 同款两腿恰一）：
+/// Thread = 直聊对端（recipient，号码/UUID 双形态，service 层解析为 ACI）；
+/// Group = 群 master key（groupId，32B 标准 base64，decode_group_id 闸后
+/// 传入）。
+#[derive(Debug, Clone)]
+pub(crate) enum MessageRequestTarget {
+    Thread(String),
+    Group(Vec<u8>),
+}
+
+/// sendMessageRequestResponse type 参数词汇 → proto 枚举（方法参数单点
+/// 映射）：词表镜像官方 `Proto.SyncMessage.MessageRequestResponse.Type` 六值
+/// 驼峰词（桌面 conversations.preload.ts syncMessageRequestResponse 直传枚举
+/// 序数；UNKNOWN=0 不在词表——官方发送侧无「发未知」语义，缺席/越界同拒）。
+pub(crate) fn message_request_type_of(
+    text: &str,
+) -> Option<presage::proto::sync_message::message_request_response::Type> {
+    use presage::proto::sync_message::message_request_response::Type;
+    match text {
+        "accept" => Some(Type::Accept),
+        "delete" => Some(Type::Delete),
+        "block" => Some(Type::Block),
+        "blockAndDelete" => Some(Type::BlockAndDelete),
+        "spam" => Some(Type::Spam),
+        "blockAndSpam" => Some(Type::BlockAndSpam),
+        _ => None,
+    }
+}
+
+/// 消息请求同步构造（桌面 getMessageRequestResponseSync 行为同构）：
+/// SyncMessage{content: MessageRequestResponse{type, threadAciBinary|
+/// threadAci?, groupId?}}，padded sync message（官方 padSyncMessage 同位，
+/// presage send 面注入同源 padding）。thread 腿 ACI 可解析 16B 时直写
+/// threadAciBinary（官方 isProtoBinaryEncodingEnabled 现行面），不可解析的
+/// 已闸字符串降写 threadAci string 形态；group 腿 = 32B master key 原样。
+fn build_message_request_response_sync(
+    target: &MessageRequestTarget,
+    r#type: presage::proto::sync_message::message_request_response::Type,
+) -> presage::proto::SyncMessage {
+    let message_request_response = presage::proto::sync_message::MessageRequestResponse {
+        r#type: Some(r#type as i32),
+        thread_aci: match target {
+            MessageRequestTarget::Thread(aci) if aci_to_bytes(aci).is_none() => Some(aci.clone()),
+            _ => None,
+        },
+        thread_aci_binary: match target {
+            MessageRequestTarget::Thread(aci) => aci_to_bytes(aci),
+            MessageRequestTarget::Group(_) => None,
+        },
+        group_id: match target {
+            MessageRequestTarget::Group(master_key) => Some(master_key.clone()),
+            MessageRequestTarget::Thread(_) => None,
+        },
+    };
+    presage::proto::SyncMessage {
+        content: Some(
+            presage::proto::sync_message::Content::MessageRequestResponse(message_request_response),
+        ),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum UserStatusError {
     /// 账号在服务器侧已解绑（401）：connector 1.21 靠错误原文识别解绑态。
@@ -1072,6 +1134,45 @@ impl Service {
             )),
             ..presage::proto::SyncMessage::with_padding(&mut rng())
         });
+        let envelope_ts = now_ms();
+        manager
+            .send_message(own_aci, body, envelope_ts)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(())
+    }
+
+    /// sendMessageRequestResponse（消息请求写面，connector 契约 1.63 §4.56
+    /// 债务批，KT 扩展方法）：官方桌面 getMessageRequestResponseSync 同构——
+    /// 向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary/
+    /// threadAci?, groupId?, type}（content oneof messageRequestResponse=14，
+    /// 多设备同步「该消息请求已接受/拒绝/拉黑…」终态）。thread 腿 =
+    /// resolve_recipient 双形态解析 → ACI（binary 16B 直写，官方
+    /// isProtoBinaryEncodingEnabled 现行面同构）；group 腿 = decode_group_id
+    /// 32B master key 原样（官方 groupId Uint8Array 同位）。presage
+    /// self-send 通路与 sendViewOnceOpen 同款（compat §5 E4 已验证）；钉定
+    /// rev 的同内容二次转录重发怪癖同面（接收端幂等）。写结局即返回值：
+    /// 管理器打开/腿解析/上行任一步失败按 SendError 上抛，未知结局不重试
+    /// 纪律不变（connector §4.56 SEND_OUTCOME_UNKNOWN 终态语义的引擎侧
+    /// 对应位）。
+    pub(crate) async fn send_message_request_response(
+        self: &Arc<Self>,
+        account: &str,
+        target: MessageRequestTarget,
+        r#type: presage::proto::sync_message::message_request_response::Type,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let manager = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = manager;
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        let body =
+            ContentBody::SynchronizeMessage(build_message_request_response_sync(&target, r#type));
         let envelope_ts = now_ms();
         manager
             .send_message(own_aci, body, envelope_ts)
@@ -6169,5 +6270,156 @@ mod tests {
             group_id: None,
         })
         .is_none());
+    }
+
+    /// 消息请求写面 type 词汇表全口径：六值驼峰词逐一映射 proto 枚举序数
+    ///（桌面 syncMessageRequestResponse 直传枚举同词汇）；UNKNOWN/词表外/
+    /// 大小写漂移/空串一律 None（methods.rs 参数闸 fail-closed 的词表面）。
+    #[test]
+    fn message_request_type_glossary_maps_six_official_words() {
+        use presage::proto::sync_message::message_request_response::Type;
+        for (word, value) in [
+            ("accept", Type::Accept),
+            ("delete", Type::Delete),
+            ("block", Type::Block),
+            ("blockAndDelete", Type::BlockAndDelete),
+            ("spam", Type::Spam),
+            ("blockAndSpam", Type::BlockAndSpam),
+        ] {
+            assert_eq!(message_request_type_of(word), Some(value));
+            assert_eq!(
+                message_request_type_of(word).expect("mapped") as i32,
+                value as i32
+            );
+        }
+        for rejected in [
+            "unknown",
+            "UNKNOWN",
+            "Accept",
+            "ACCEPT",
+            "block_and_delete",
+            "blockanddelete",
+            "unblock",
+            "",
+            "0",
+        ] {
+            assert!(
+                message_request_type_of(rejected).is_none(),
+                "词表外 {rejected:?} 必须拒"
+            );
+        }
+    }
+
+    /// 消息请求同步构造字节面（官方 proto 字段钉）：thread 腿 binary 直写
+    ///（字段5 threadAciBinary = 16B UUID、字段2 缺席）；群腿（字段3 groupId
+    /// = 32B master key、thread 双字段全缺席）；type 序数落字段4；oneof 变体
+    /// = messageRequestResponse（SyncMessage.content 字段14）。两腿互斥同构
+    ///（官方 Params groupId/threadAci/threadAciBinary 三位按腿赋值）。
+    #[test]
+    fn message_request_response_sync_encodes_official_proto_bytes() {
+        use presage::proto::sync_message;
+        let thread = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+
+        // thread 腿：prost 字段序升序（4 < 5）= 字段4{1}（tag 0x20）在前、
+        // 长度分隔的 threadAciBinary（字段5，tag 0x2a + len 16）在后；
+        // 字段2（0x12）/字段3（0x1a）不在列。
+        let sync = build_message_request_response_sync(
+            &MessageRequestTarget::Thread(thread.to_owned()),
+            sync_message::message_request_response::Type::Accept,
+        );
+        let Some(sync_message::Content::MessageRequestResponse(mrr)) = sync.content else {
+            panic!("oneof 变体必须是 messageRequestResponse");
+        };
+        assert_eq!(mrr.r#type, Some(1));
+        assert_eq!(
+            mrr.thread_aci_binary.as_deref(),
+            Some(uuid_bytes(thread).as_slice())
+        );
+        assert!(mrr.thread_aci.is_none(), "binary 形态不写 string 字段");
+        assert!(mrr.group_id.is_none());
+        let bytes = {
+            use prost::Message as _;
+            let mut buf = Vec::new();
+            mrr.encode(&mut buf).expect("proto encodes");
+            buf
+        };
+        // prost 按字段序升序编码：type（字段4，tag 0x20）在前，长度分隔的
+        // threadAciBinary（字段5，tag 0x2a + len 16）在后。
+        assert_eq!(
+            bytes,
+            [vec![0x20, 0x01], vec![0x2a, 16], uuid_bytes(thread)].concat(),
+            "thread 腿 = 字段4{{1}} + 字段5{{16B UUID}}"
+        );
+        assert!(!bytes.starts_with(&[0x12]), "字段2（threadAci string）缺席");
+        assert!(!bytes.starts_with(&[0x1a]), "字段3（groupId）缺席");
+
+        // 群腿：字段3 = tag 0x1a + len 32 + master key；thread 双字段缺席；
+        // 字段4 = type 序数（BLOCK_AND_SPAM=6 → 0x20 0x06）。
+        let master_key = [0x33u8; 32];
+        let sync = build_message_request_response_sync(
+            &MessageRequestTarget::Group(master_key.to_vec()),
+            sync_message::message_request_response::Type::BlockAndSpam,
+        );
+        let Some(sync_message::Content::MessageRequestResponse(mrr)) = sync.content else {
+            panic!("oneof 变体必须是 messageRequestResponse");
+        };
+        assert_eq!(mrr.r#type, Some(6));
+        assert_eq!(mrr.group_id.as_deref(), Some(master_key.as_slice()));
+        assert!(mrr.thread_aci_binary.is_none());
+        assert!(mrr.thread_aci.is_none());
+        let bytes = {
+            use prost::Message as _;
+            let mut buf = Vec::new();
+            mrr.encode(&mut buf).expect("proto encodes");
+            buf
+        };
+        // prost 字段序升序（3 < 4）：群腿 = 字段3{32B master key} +
+        // 字段4{6}，thread 双字段（0x12/0x2a 头）缺席。
+        assert_eq!(
+            bytes,
+            [vec![0x1a, 32], master_key.to_vec(), vec![0x20, 0x06]].concat(),
+            "群腿 = 字段3{{32B master key}} + 字段4{{6}}"
+        );
+        assert!(!bytes.starts_with(&[0x12]), "字段2 缺席");
+        assert!(!bytes.windows(2).any(|w| w == [0x2a, 16]), "字段5 缺席");
+
+        // string 形态兜底（已闸的不可 16B 解析串，service 层防御分支）：
+        // 字段2 = tag 0x12 + len + utf8；字段5 缺席。
+        let odd = "u:88889999";
+        let sync = build_message_request_response_sync(
+            &MessageRequestTarget::Thread(odd.to_owned()),
+            sync_message::message_request_response::Type::Delete,
+        );
+        let Some(sync_message::Content::MessageRequestResponse(mrr)) = sync.content else {
+            panic!("oneof 变体必须是 messageRequestResponse");
+        };
+        assert_eq!(mrr.thread_aci.as_deref(), Some(odd));
+        assert!(mrr.thread_aci_binary.is_none());
+        assert_eq!(mrr.r#type, Some(2));
+        let bytes = {
+            use prost::Message as _;
+            let mut buf = Vec::new();
+            mrr.encode(&mut buf).expect("proto encodes");
+            buf
+        };
+        // prost 字段序升序（2 < 4）：string 形态 = 字段2{{utf8}} + 字段4{{2}}，
+        // 字段5 缺席。
+        assert_eq!(
+            bytes,
+            [
+                vec![0x12, odd.len() as u8],
+                odd.as_bytes().to_vec(),
+                vec![0x20, 0x02],
+            ]
+            .concat(),
+            "string 形态 = 字段2{{utf8}} + 字段4{{2}}"
+        );
+        assert!(
+            !bytes.windows(2).any(|w| w == [0x2a, odd.len() as u8]),
+            "字段5 缺席"
+        );
+
+        // padded sync message：其他字段为 padding 面（presage
+        // with_padding 同源），oneof 恰一个变体由上方模式匹配钉定。
     }
 }
