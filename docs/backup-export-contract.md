@@ -449,3 +449,91 @@ connector 消费，connector 契约 §4.38），本批是同一通道的反方�
 
 参数面（缺 `account`、未注册/fake 账号、AEP 缺失）不占用结构化码，一律
 `-32603` fail-closed（置顶/贴纸面先例）。
+
+## 11. 快照导入收向（官方桌面本地备份导入，B2 批，2026-10-08）
+
+本节固化官方 Signal Desktop 本地备份快照的引擎收向面（`backup.importSnapshot`
+/`backup.importSnapshotStatus`）：§10 是引擎**产出**快照（Android 恢复方向），
+本节是引擎**消费**官方桌面产出的快照（connector → NDJSON → connector sqlite
+的既有导入通路），两者共用 §3 密钥派生链与 §5 快照目录形态，方向互逆。
+
+### 11.1 官方锚点（AGPL 只读参照零拷贝）
+
+| 锚点 | 官方位置 | 语义 |
+|---|---|---|
+| 快照目录布局 | `SignalBackups/signal-backup-<yyyy-MM-dd-HH-mm-ss>/{metadata, main, files/}` | §5 同形态（本地变体无 `.bak` 后缀） |
+| `importLocalBackup` | `ts/services/backups/index.preload.ts:572-595`（v8.31.0-alpha.1） | importFromDisk(main, `local-encrypted`) 后跑 metadata 校验 |
+| `verifyLocalBackupMetadata` | `ts/services/backups/util/localBackup.node.ts` | 读 `<snapshotDir>/metadata` → decode `Signal.backup.local.Metadata` → strict `version === LOCAL_BACKUP_VERSION(1)` → backupId/iv/encryptedId 在场、iv 长 `LOCAL_BACKUP_BACKUP_ID_IV_LENGTH(12)` → AES-CTR 解密（计数器块 = iv(12B)‖4B 零）→ `Bytes.areEqual(backupId, 解密值)` |
+| metadata proto | 官方 `Metadata.proto`（本仓自持生成码 `src/proto/local_archive.rs`） | `Metadata{version, backupId{iv, encryptedId}}` |
+| main 容器 | 官方 `FramesReader`（HMAC-SHA256 尾验证 + AES-256-CBC + gzip + padding） | 与 §4 同原语，读方向 |
+
+### 11.2 KT 裁定
+
+- **校验序前移**：官方在 importFromDisk 内并行跑 metadata 校验与 main 解密；
+  KT 把 metadata 校验（CTR 16B，微秒级）前移为 start 同步闸——错目录/错账号
+  （`KeyMismatch`）当场短路，不空转解密整个 main。main 全链（解密/分帧/
+  HMAC/投影）留后台任务。语义面与官方一致，顺序是性能裁定。
+- **NDJSON 产物与存量历史迁移同一落点**：`<account_dir>/history-import.ndjson`
+  （connector `ARCHIVE_FILE_NAME` 消费面，§4.38 通路）。逐帧投影复用
+  `history::export_frames_loop`（transfer archive 导出与快照导入同一帧循环，
+  行形状逐字一致），connector 的两遍有界导入零改动消费。落盘用临时名
+  `history-import.ndjson-tmp` 写全后 rename 原子替换（POSIX rename 不打断
+  并发读）；任务失败删半成品、既有 NDJSON 不动——失败形态即 NDJSON 缺席或
+  旧内容，connector 按文件存在性判定。
+- **执行机制：`spawn_local`（与 §10.3 专用线程不同）**：帧导出走官方
+  `FramesReader`（async，内部持 Rc 非 Send 状态），future 进不了 OS 线程
+  边界，与接收管线/transfer 下载同策略由 LocalSet 承载（dispatch 本就跑在
+  LocalSet 内）。NDJSON 写出是每行小块 io，不构成 §10.3 意义上的阻塞面。
+- **快照目录路径由 connector 传入**（`snapshotDir` 参数，同机路径交接，
+  §10.2 artifact 反方向同款）；引擎不持久化该路径（任务注册表无此字段）。
+- **metadata_key 派生面登记**：官方派生链里 `metadata_key` 只依赖 AEP
+  （`BackupKey.derive_local_backup_metadata_key()` 不掺 ACI），`backup_id`
+  依赖 (AEP, ACI)——同 AEP 异账号的快照解密可解（keystream 相同）但
+  backupId 比对必不等，`KeyMismatch` 走的是比对而非解密失败路径。
+
+### 11.3 RPC 面（compat §3/§5 同步登记）
+
+- `backup.importSnapshot`：params `{account, snapshotDir}`。start 校验序：
+  账号已注册（fake/未注册 `-32603`）→ AEP/ACI 可读（presage store，缺
+  `-32603`）→ metadata 快校验（缺目录/metadata/main → `MISSING`；decode
+  失败/version≠1/iv≠12B/encryptedId≠16B/缺 backupId → `METADATA_INVALID`；
+  backupId 比对不等 → `KEY_MISMATCH`）→ 无在跑任务（`ALREADY_RUNNING`）。
+  成功即后台执行，回 `{"status": "started"}`。
+- `backup.importSnapshotStatus`：params `{account}`。result：
+
+```json
+{
+  "account": "<echo>",
+  "state": "idle|running|completed|failed",
+  "ndjsonPresent": false,
+  "startedAtMs": 0, "finishedAtMs": 0,
+  "lines": 0, "frames": 0,
+  "error": "BACKUP_SNAPSHOT_IO_FAILED"
+}
+```
+
+  `lines` = NDJSON 投影行数（recipient+chat+message）；`frames` = 档案总帧数
+  （含 BackupInfo 元帧）；其余诚实缺席纪律同 §10.4。`ndjsonPresent` 是盘面
+  真值（引擎重启后 state 归 idle 而 NDJSON 仍在场，消费方自行判定重导）。
+  未注册账号 `-32603`。不落调度日志零 stderr。
+
+### 11.4 结构化错误码
+
+全部 `-1` + message 码位（connector 1.78 白名单同步）：
+
+| 码 | 面 | retryable（connector 映射） |
+|---|---|---|
+| `BACKUP_IMPORT_ALREADY_RUNNING` | start：该账号导入任务在跑 | false |
+| `BACKUP_SNAPSHOT_MISSING` | start/运行：目录或 `metadata`/`main` 缺 | false |
+| `BACKUP_SNAPSHOT_METADATA_INVALID` | start：decode 失败/version≠1/形状不合规 | false |
+| `BACKUP_SNAPSHOT_KEY_MISMATCH` | start：backupId 比对不等（非本账号备份） | false |
+| `BACKUP_SNAPSHOT_IO_FAILED` | 运行：main 解密/HMAC/分帧/落盘失败（半成品删，既有 NDJSON 不动） | true |
+
+参数面（缺 `account`/`snapshotDir`、未注册/fake 账号、AEP 缺失）一律
+`-32603` fail-closed（§10.7 同口径）。
+
+### 11.5 密钥边界（§10.5 延续）
+
+导入侧密钥材料（AEP → `derive_keys` → 校验/解密）全部活在 start 校验序与
+任务 future 内，任务结束即 drop：不落日志、不落盘、不出进程。metadata 校验
+解出的 backupId 是派生值的回显，不构成新的持久化面。

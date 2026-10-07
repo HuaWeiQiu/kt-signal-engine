@@ -86,9 +86,7 @@ pub fn write_metadata<W: Write>(mut w: W, keys: &BackupKeys) -> Result<(), Backu
 }
 
 /// metadata `encryptedId` 解密回 `BackupId`（CTR 对称，恢复端同款操作；
-/// 官方 `LocalArchiver.decryptBackupId` 对齐面）。
-// 恢复端对齐面，恢复批接线后摘除（当前仅测试使用）。
-#[allow(dead_code)]
+/// 官方 `LocalArchiver.decryptBackupId` 对齐面，`receive.rs` 快照校验消费）。
 pub fn decrypt_backup_id(iv: &[u8], encrypted_id: &[u8], keys: &BackupKeys) -> [u8; 16] {
     let mut iv_block = [0u8; 16];
     let n = iv.len().min(METADATA_IV_LEN);

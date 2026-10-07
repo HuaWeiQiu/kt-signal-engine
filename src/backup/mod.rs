@@ -12,12 +12,17 @@ mod container;
 mod export;
 mod frames;
 mod keys;
+mod receive;
 
 /// connector 消费批任务层（`service::backup_task`）的输入面。
 pub(crate) use artifact::{assemble, validate_first_line, ARTIFACT_FILE_NAME};
 pub(crate) use export::{export_local_backup, LocalBackupParams};
-pub(crate) use keys::derive_keys;
+pub(crate) use keys::{derive_keys, BackupKeys};
+/// 快照导入收向面（`service::snapshot_import` 的输入面）。
+pub(crate) use receive::{export_snapshot_frames, verify_snapshot_metadata, SnapshotImportError};
 
+#[cfg(test)]
+pub(crate) use frames::ChatItemDirection;
 #[cfg(test)]
 pub(crate) use keys::tests_official_keys;
 

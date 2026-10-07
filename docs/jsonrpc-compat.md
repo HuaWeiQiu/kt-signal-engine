@@ -99,6 +99,8 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `sendCallMessage` | `{account, recipient(单号码/ACI), data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；1:1 only，groupId 形态 fail-closed——群组通话走 SFU 不在本面） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、groupId 在场）/未注册账号 `-32603` | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（online=false 偏差与 sent-transcript 缺席见 §5 通话消息块）；fake：成功 `{"timestamp":u64}`（落调度日志，协议上行面纪律） |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
+| `backup.importSnapshot` | `{account, snapshotDir}`（官方桌面本地备份快照目录，官方布局 `signal-backup-<ts>/{metadata, main, files/}`；connector 传入的同机路径，引擎不持久化） | `{"status": "started"}`（后台任务已启动，进度走 `backup.importSnapshotStatus`） | 未注册/fake 账号/AEP 缺失 `-32603`；该账号导入任务在跑 `BACKUP_IMPORT_ALREADY_RUNNING`；目录或 metadata/main 缺 `BACKUP_SNAPSHOT_MISSING`；metadata decode 失败/version≠1/形状不合规 `BACKUP_SNAPSHOT_METADATA_INVALID`；backupId 比对不等（非本账号备份）`BACKUP_SNAPSHOT_KEY_MISMATCH`——结构化码均 `-1` + message 码位（备份导出契约 §11.4，connector 1.78 白名单） | **B2 批 real（2026-10-08，快照导入收向）**：官方 `importLocalBackup`/`verifyLocalBackupMetadata` 行为对齐（AGPL 只读参照零拷贝）——metadata 校验（官方 strict assert 面：version==1、iv 12B、encryptedId 16B、CTR 解密 backupId 逐字节比对）前移为 start 同步闸，main 全链（官方 FramesReader 解密+HMAC+分帧）后台 `spawn_local`（帧导出 future 非 Send），逐帧投影复用 `history::export_frames_loop` 落 `<账号目录>/history-import.ndjson`（connector §4.38 通路同一落点，临时名+rename 原子替换，失败删半成品既有 NDJSON 不动）；密钥边界 §10.5 延续（任务 future 内即用即弃）；fake 模式账号无 store，按未注册 `-32603`；不落调度日志零 stderr |
+| `backup.importSnapshotStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, ndjsonPresent, startedAtMs?, finishedAtMs?, lines?, frames?, error?}`（lines = NDJSON 投影行数 recipient+chat+message；frames = 档案总帧数含 BackupInfo 元帧；诚实缺席不发明 0） | 未注册账号 `-32603` | **B2 批 real（2026-10-08）**：只读轮询面（backup.exportStatus 同语义）；注册表进程内存不跨重启（state 归 idle）；`ndjsonPresent` 是盘面真值（重启后 NDJSON 仍在场，消费方自行判定重导）；不落调度日志零 stderr |
 | `transfer.downloadStatus` | `{account}` | `{present: bool}`；present=true 时 `{present, bytesRead(u64), bytesTotal?(u64)}`（快照缺席（未开始/已结束/引擎重启过）答 `{present:false}`，不猜） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态） | **2026-10-06 real（KT 扩展，契约 1.53 §4.38 扩展）**：transfer_archive 下载进度快照查询——`history.importStatus` progress 组合面的引擎侧只读数据源。进程内 per-account 注册表（`src/service/transfer_progress.rs`，std Mutex + Arc，不落盘不走文件），下载任务边读 CDN 响应边累计（块读）、content-length 有则记 total（拿不到只报 stage 不给假 0），任务收尾/失败/中途退出统一清快照；官方对齐（语义零拷贝）：Signal-Desktop Download 段 currentBytes/totalBytes 进度（`ts/state/ducks/installer.preload.ts` L143-152 + reducer L642-675）。只读不落调度日志零 stderr（backup.exportStatus 同纪律）
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
 | `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration}`（本批只收 expiration 一个参数族，0=关闭；expiration 缺席 = 无操作整拒，不静默 no-op） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration 缺席·null·字符串·负数·小数·超 u32）`-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；fake：成功 `{status: "sent"}`（落调度日志，协议上行面纪律） |
@@ -781,6 +783,36 @@ docs/backup-export-contract.md §10 为完整裁定，此处登记 RPC 面边界
   connector 会话计时器面已在其自身链路处理；二期随 Chat.expireTimerMs 帧
   面一起开）；附件/引用/回应/编辑等富体面不在工件行集（§6.2 后续批），
   由 connector 侧逐因计数（其契约 §4.46）。
+
+快照导入收向面（2026-10-08 B2 批，connector 契约 1.78；引擎契约
+docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界）：
+
+- **新方法 `backup.importSnapshot` / `backup.importSnapshotStatus`**（独立
+  扩展方法）：官方桌面本地备份快照收向——connector 传入用户选定的官方
+  快照目录路径（同机路径交接，§10.2 artifact 反方向同款），引擎 start 同步
+  跑官方 `verifyLocalBackupMetadata` 对齐校验（decode → version==1 → iv
+  12B/encryptedId 16B → CTR 解密 backupId 逐字节比对），后台 `spawn_local`
+  跑官方 `FramesReader` 解密分帧，逐帧投影 NDJSON 到
+  `<账号目录>/history-import.ndjson`（§4.38 存量迁移通路同一落点）。与
+  §10 导出面共用密钥派生链（§3）与快照目录形态（§5），方向互逆。
+- **帧循环单点**：`history::export_frames_loop`（transfer archive 导出与
+  快照导入同一帧循环）——NDJSON 行形状逐字一致，connector 两遍有界导入
+  零改动消费。
+- **原子落盘**：临时名 `history-import.ndjson-tmp` 写全后 rename 原子替换
+  （POSIX rename 不打断并发读）；任务失败删半成品、既有 NDJSON 不动——
+  失败形态即 NDJSON 缺席或旧内容，connector 按文件存在性判定。
+- **执行机制（与 §10 导出不同）**：帧导出走官方 `FramesReader`（async、
+  内部 Rc 非 Send），future 进不了 OS 线程边界 → `spawn_local` 承载
+  （dispatch 本就跑在 LocalSet 内）；NDJSON 每行小块 io 不构成阻塞面。
+- **metadata_key 派生面**：官方链里 metadata_key 只依赖 AEP（不掺 ACI），
+  backup_id 依赖 (AEP, ACI)——同 AEP 异账号快照解密可解但比对必不等，
+  `KEY_MISMATCH` 走比对路径（官方 Bytes.areEqual 同语义）。
+- **结构化错误码 5 枚**（`-1` + message 码位）：
+  `BACKUP_IMPORT_ALREADY_RUNNING`/`BACKUP_SNAPSHOT_MISSING`/
+  `BACKUP_SNAPSHOT_METADATA_INVALID`/`BACKUP_SNAPSHOT_KEY_MISMATCH`/
+  `BACKUP_SNAPSHOT_IO_FAILED`（备份导出契约 §11.4；connector 1.78 白名单
+  同步）。参数面（缺 account/snapshotDir/未注册/fake/AEP 缺失）一律
+  `-32603`。
 
 头像下行 / 拉黑写面 / 举报（2026-10-06 扩展批，KT 扩展方法）：
 

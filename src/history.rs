@@ -87,6 +87,29 @@ pub async fn export_archive(
     let frames = FramesReader::new(&key, factory).await?;
     let mut delimited = VarintDelimitedReader::new(frames);
 
+    let stats = export_frames_loop(&mut delimited, out).await?;
+
+    // 流读完即到档案尾：消费 reader 校验 HMAC 尾部（不校验 = 不可信导入）。
+    delimited
+        .into_inner()
+        .verify_hmac()
+        .await
+        .map_err(HistoryError::Hmac)?;
+    Ok(stats)
+}
+
+/// 帧循环公共面（transfer archive 导出与官方快照导入两条入口共用，
+/// `backup::receive::export_snapshot_frames`）：首帧必须是 BackupInfo（档案
+/// 版本来源），后续帧按 recipient/chat/chatItem 投影 NDJSON，item unset/
+/// 未知帧型官方语义跳过并计数。尾部 HMAC 验证归入口层（调用方持有具体
+/// reader 类型）。future 非 Send，调用方须在 LocalSet 上运行。
+pub(crate) async fn export_frames_loop<R>(
+    delimited: &mut VarintDelimitedReader<R>,
+    out: &mut dyn Write,
+) -> Result<ExportStats, HistoryError>
+where
+    R: futures::io::AsyncRead + Unpin,
+{
     let first = delimited.read_next().await?.ok_or(HistoryError::NoFrames)?;
     let info = crate::proto::BackupInfo::decode(&first[..])?;
     let mut stats = ExportStats {
@@ -140,13 +163,6 @@ pub async fn export_archive(
             Some(_) | None => stats.skipped_frames += 1,
         }
     }
-
-    // 流读完即到档案尾：消费 reader 校验 HMAC 尾部（不校验 = 不可信导入）。
-    delimited
-        .into_inner()
-        .verify_hmac()
-        .await
-        .map_err(HistoryError::Hmac)?;
     Ok(stats)
 }
 
