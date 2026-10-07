@@ -77,6 +77,15 @@ aes = "0.9"
 cbc = "0.2"
 ctr = "0.10.1"
 
+# 用户名面（getUsername/usernameLookup/usernameReserve/usernameConfirm/
+# usernameDelete）：libsignal-usernames 官方原语——Username::new/from_parts
+# （语法面）、hash/proof（服务端 reserve/confirm 的 ZK 材料）、
+# candidates_from（裸昵称候选拒绝器）、create_for_username/decrypt_username
+# （username link 加解密）。与 message-backup/account-keys 同 tag 直接依赖
+#（v0.99.0，Cargo.lock 既有解析——经 libsignal-service/libsignal-message-backup
+# 已在图），不新增任何版本入图；许可 AGPL-3.0-only 与本仓一致。
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+
 [dev-dependencies]
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。

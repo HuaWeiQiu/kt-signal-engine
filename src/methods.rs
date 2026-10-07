@@ -1122,6 +1122,56 @@ async fn dispatch(
                 }
             }
         }
+        // ---- 用户名面（KT 扩展方法，compat §3 用户名块）----
+        // getUsername（读面）：AccountRecord.username(33)/usernameLink(35)
+        // 投影 `{username?, usernameLink?}`（键缺席 = 未设）。storage 读链
+        // 四码族（Unavailable/ReadFailed）；未注册账号 -32603。
+        "getUsername" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.get_username(account).await {
+                Ok(projection) => jsonrpc::success_response(id, projection),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        // usernameLookup（读面）：条目批 → 服务端匿名 lookup 通路 → 逐条
+        // 投影（输入序）。参数面 fail-closed：usernames 非数组/空批/超 20/
+        // 条目非字符串/空/超 64 字符一律 -32603；未注册账号 -32603。
+        // 单条解析失败诚实降级 `{recipient, isRegistered:false}` 不炸整批。
+        "usernameLookup" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let entries = match params.get("usernames") {
+                Some(Value::Array(items)) => {
+                    let mut entries = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item.as_str() {
+                            Some(entry)
+                                if !entry.is_empty()
+                                    && entry.chars().count()
+                                        <= crate::service::username::USERNAME_LOOKUP_ENTRY_MAX_CHARS =>
+                            {
+                                entries.push(entry.to_owned())
+                            }
+                            _ => return internal_error(id),
+                        }
+                    }
+                    if entries.is_empty()
+                        || entries.len() > crate::service::username::USERNAME_LOOKUP_MAX_ENTRIES
+                    {
+                        return internal_error(id);
+                    }
+                    entries
+                }
+                _ => return internal_error(id),
+            };
+            match service.username_lookup(account, entries).await {
+                Ok(rows) => jsonrpc::success_response(id, rows),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 账户级默认消失消息计时器（官方 universal timer 写面，Storage
         // Service 真相源，带 account 参数）：AccountRecord.universalExpireTimer
         // =17，0=关闭；参数形状错 fail-closed -32603（setExpirationTimer

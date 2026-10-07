@@ -2170,3 +2170,131 @@ fn send_message_request_response_faces_and_param_fail_closed() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
+
+/// getUsername（用户名读面，KT 扩展方法）：fake 形状桩 `{}`（未设 = 键
+/// 缺席，不发明 null/空串）+ 参数面 fail-closed（缺 account / 非字符串
+/// -32603）+ real 模式未注册账号 -32603（不触网，注册数据前置）。
+#[test]
+fn get_username_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("get-username");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake：未设用户名 = 空投影（两键均缺席）。
+    assert_eq!(
+        engine.request("getUsername", json!({ "account": number }))["result"],
+        json!({})
+    );
+
+    // 参数面 fail-closed。
+    assert_eq!(
+        engine.error_of("getUsername", json!({})),
+        (-32603, "Internal error".to_owned())
+    );
+    assert_eq!(
+        engine.error_of("getUsername", json!({ "account": 7 })),
+        (-32603, "Internal error".to_owned())
+    );
+
+    // real 模式未注册账号：注册数据前置即内部失败（不触网）。
+    let real_dir = temp_dir("get-username-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_eq!(
+        real_engine.error_of("getUsername", json!({ "account": "+15559990000" })),
+        (-32603, "Internal error".to_owned())
+    );
+}
+
+/// usernameLookup（用户名解析读面，KT 扩展方法）：fake 逐条回显
+/// `{recipient, isRegistered:false}`（输入序，不发明 username/uuid 键）+
+/// 参数面 fail-closed（usernames 缺席/非数组/空批/超 20/条目非字符串/空/
+/// 超 64 字符 -32603）+ real 模式未注册账号 -32603（不触网）。
+#[test]
+fn username_lookup_fake_echo_and_param_fail_closed() {
+    let dir = temp_dir("username-lookup");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake：逐条回显（输入序），单键形状。
+    assert_eq!(
+        engine.request(
+            "usernameLookup",
+            json!({ "account": number, "usernames": ["kt_pay.01", "https://signal.me/#eu/AAA"] }),
+        )["result"],
+        json!([
+            { "recipient": "kt_pay.01", "isRegistered": false },
+            { "recipient": "https://signal.me/#eu/AAA", "isRegistered": false },
+        ])
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let over_cap = vec!["kt_pay.01"; 21];
+    let rejects = [
+        json!({ "account": number }),
+        json!({ "account": number, "usernames": "kt_pay.01" }),
+        json!({ "account": number, "usernames": [] }),
+        json!({ "account": number, "usernames": over_cap }),
+        json!({ "account": number, "usernames": [7] }),
+        json!({ "account": number, "usernames": [""] }),
+        json!({ "account": number, "usernames": ["k".repeat(65)] }),
+    ];
+    for params in rejects {
+        assert_eq!(
+            engine.error_of("usernameLookup", params),
+            (-32603, "Internal error".to_owned()),
+            "param face must reject"
+        );
+    }
+
+    // 边界内放行：恰 20 条、恰 64 字符条目（fake 回显面）。
+    let at_cap = ["kt_pay.01"; 20].to_vec();
+    assert_eq!(
+        engine.request(
+            "usernameLookup",
+            json!({ "account": number, "usernames": at_cap }),
+        )["result"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    let wide = vec!["k".repeat(64)];
+    assert_eq!(
+        engine.request(
+            "usernameLookup",
+            json!({ "account": number, "usernames": wide }),
+        )["result"][0]["recipient"],
+        json!("k".repeat(64))
+    );
+
+    // real 模式未注册账号：账号解析前置即内部失败（不触网）。
+    let real_dir = temp_dir("username-lookup-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_eq!(
+        real_engine.error_of(
+            "usernameLookup",
+            json!({ "account": "+15559990000", "usernames": ["kt_pay.01"] }),
+        ),
+        (-32603, "Internal error".to_owned())
+    );
+}

@@ -49,6 +49,7 @@ pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 pub(crate) mod storage_write;
+pub(crate) mod username;
 
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
@@ -1835,6 +1836,56 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         report::report_spam(&context, &sender_aci, &server_guids, token.as_deref()).await
+    }
+
+    /// getUsername（用户名读面，KT 扩展方法）：AccountRecord.username(33)/
+    /// usernameLink(35) 投影——真相源 = Storage Service（多设备经 storage
+    /// sync 收敛，官方「仅 server confirm/delete 时更新」同语义）；从未有
+    /// storage 状态 = `{}`（未设，不报错）。fake 模式形状桩 `{}`。
+    pub(crate) async fn get_username(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<serde_json::Value, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(json!({}));
+        }
+        let context = storage_context(self, account).await?;
+        username::get_own_username(&context).await
+    }
+
+    /// usernameLookup（用户名解析读面，KT 扩展方法）：条目（全名或
+    /// signal.me 链接）→ 服务端匿名 lookup 通路 → 逐条投影（输入序，
+    /// 失败条目诚实降级 isRegistered:false，不炸整批）。账号参数照常
+    /// 走 storage_context 解析梯（未注册 -32603）。fake 模式形状桩。
+    pub(crate) async fn username_lookup(
+        self: &Arc<Self>,
+        account: &str,
+        entries: Vec<String>,
+    ) -> Result<serde_json::Value, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(json!(entries
+                .iter()
+                .map(|entry| json!({ "recipient": entry, "isRegistered": false }))
+                .collect::<Vec<_>>()));
+        }
+        // 账号解析梯（未注册账号 -32603，与一切 account 参数面同口径）。
+        let _context = storage_context(self, account).await?;
+        let push = username::anonymous_push();
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let (username, uuid, registered) = username::resolve_entry(&push, entry).await;
+            let mut row = serde_json::Map::new();
+            row.insert("recipient".to_owned(), json!(entry));
+            if let Some(username) = username {
+                row.insert("username".to_owned(), json!(username));
+            }
+            if let Some(uuid) = uuid {
+                row.insert("uuid".to_owned(), json!(uuid));
+            }
+            row.insert("isRegistered".to_owned(), json!(registered));
+            rows.push(serde_json::Value::Object(row));
+        }
+        Ok(json!(rows))
     }
 
     /// storage.write（P0，KT 扩展方法）：通用批量 manifest item 写（compat

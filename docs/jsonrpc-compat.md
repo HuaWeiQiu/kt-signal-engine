@@ -102,6 +102,8 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
 | `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration}`（本批只收 expiration 一个参数族，0=关闭；expiration 缺席 = 无操作整拒，不静默 no-op） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration 缺席·null·字符串·负数·小数·超 u32）`-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；fake：成功 `{status: "sent"}`（落调度日志，协议上行面纪律） |
 | `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
+| `getUsername` | `{account}` | `{username?, usernameLink?}`（键缺席 = 未设，不发明 null/空串；usernameLink 重建为完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；链接材料形状错该键缺席） | 参数缺失/非字符串 `-32603`；未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，用户名读面批）**：真相源 = Storage Service AccountRecord.username(33)/usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」同语义；多设备经 storage sync 收敛，无第二真相源）；从未有 storage 状态（无 master key / manifest 404 / 无 Account item）→ `{}`（未设不报错）；fake：恒 `{}`，不落调度日志（读面纪律） |
+| `usernameLookup` | `{account, usernames[1..20]}`（每条 1..64 字符——connector 契约 1.59 §4.55 帧界同源镜像，帧界而非语法界；条目 = 全名或 `https://signal.me/#eu/…` 链接） | `[{recipient, username?, uuid?, isRegistered}]`（输入序逐条投影；recipient = 条目回显；单条失败诚实降级 `{recipient, isRegistered:false}` 不炸整批——语法不符/链接打不开/解不开/未命中/网络皆同） | 参数缺失/形状错（usernames 缺席·非数组·空批·超 20、条目非字符串·空·超 64）`-32603`；未注册账号 `-32603` | **2026-10-08 real（KT 扩展，用户名读面批）**：官方同款服务端匿名 lookup 通路——全名条目 hash（libsignal usernames crate 权威语法面）→ `GET v1/accounts/username_hash/{hash}`（强制匿名，200 `{uuid}`/404）；链接条目 → `GET v1/accounts/username_link/{uuid}`（200 `{usernameLinkEncryptedValue}`）→ crate `decrypt_username`（entropy 系链接自带）→ 再走 hash lookup（官方 resolveUsernameLink 同序）；base64 一律 URL-safe 无 padding；匿名 PushService（带凭据反而 400，avatar CDN 先例同构）；fake：逐条回显 `{recipient, isRegistered:false}`，不落调度日志（读面纪律） |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -1239,6 +1241,30 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   recipients[] 在该方法的官方调用形状实为单值语义，connector 宿主面恒
   单值——引擎闸单字符串防误用）；不动 vendored proto；不做
   threadE164 面。
+
+用户名读面批（2026-10-08，KT 扩展，getUsername/usernameLookup）：
+
+- **真相源单点**：本账号用户名 = Storage Service AccountRecord.username(33)
+  + usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」，
+  多设备经 storage sync 收敛）。引擎不设第二真相源——presage 注册数据无
+  username 字段，whoami 只回 hash 不可逆，桌面侧亦以 storage 面为同步
+  真相（本地面仅模型缓存）。getUsername 读 33/35 投影；写面落地后由
+  写面经 `update_account_record` 维护同字段（后续批）。
+- **lookup 方向锚定**：服务端公开 lookup 通路只有「hash/链接 → ACI」单向
+  （`GET v1/accounts/username_hash/{hash}`、`GET
+  v1/accounts/username_link/{uuid}`，均强制匿名——带凭据 400）；「ACI →
+  username」无服务端通路。本面按服务端既有通路落（条目 = 全名/链接，
+  回 ACI），与 connector 契约 1.59 §4.55 `username.lookup` 的条目形状
+  （全名或链接）同构对齐，投影面补 `username` 键（链接条目解密所得）。
+- **已注册校验为全批前置**：usernameLookup 的匿名 lookup 本身不需要账号
+  凭据，但 account 参数照常走账号解析梯（未注册 `-32603`）——与一切
+  account 参数面同口径，防引擎侧哑放行（getUserStatus 同款纪律）。
+- **逐条降级不炸批**：单条解析/链接取载/解密/命中任一环失败 =
+  `{recipient, isRegistered:false}`（与上游 getUserStatus 未命中同形状）；
+  参数面形状错才整批拒。批帽 20/条帽 64 与 connector §4.55 帧界同源镜像。
+- **crate 依赖**：`usernames`（libsignal v0.99.0 同 tag 直接依赖，图中
+  既有解析，AGPL-3.0-only）——语法/hash/proof/link 加解密全走官方原语，
+  引擎零自研密码学。
 
 ## 6. fake 服务模式（仅测试）
 

@@ -791,6 +791,41 @@ pub(crate) async fn read_account_record(
     Ok(account_record_of_wire(&plaintext))
 }
 
+/// 本账号 AccountRecord 只读面（getUsername 等账号字段读面的真相源入口）：
+/// master key → manifest → Account item → vendored proto 解码。
+/// 从未有 storage 状态（无 master key / manifest 404 / manifest 无
+/// Account key / item 缺席）→ None（调用方按「未设」投影，不报错）。
+pub(crate) async fn read_own_account_record(
+    context: &StorageContext,
+) -> Result<Option<AccountRecord>, StorageSyncError> {
+    let Some(master_key) = context
+        .store
+        .fetch_master_key()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)?
+    else {
+        return Ok(None);
+    };
+    let storage = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await?;
+    let manifest = match storage.manifest().await {
+        Ok(manifest) => manifest,
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+            return Ok(None);
+        }
+        Err(_) => return Err(StorageSyncError::Unavailable),
+    };
+    read_account_record(
+        &context.push,
+        &StorageServiceKey::from_master_key(&master_key),
+        &manifest,
+    )
+    .await
+}
+
 /// 读面编排：master key → manifest → Account item → 引擎会话标识投影
 /// （存储序）。master key 缺失或 manifest 404（账号从未有过 storage 状态）
 /// → 空列表。
