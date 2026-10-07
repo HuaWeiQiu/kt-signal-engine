@@ -1464,6 +1464,52 @@ transfer 历史回填非文本扩面·第二类型 contact（2026-10-08，B1b �
   未立项，与 StandardMessage.reactions 同批缺位，如实记档不发明）；
   ExportStats 增 `contacts` 细分计数（行落地才计）。
 
+transfer 历史回填非文本扩面·第三类型 groupUpdate（2026-10-08，B1b 批；
+消费方 connector 契约 1.79 §4.38 扩面）：
+
+- **投影面（`history.rs::group_update_record` + `group_change_detail`，
+  message 行 `groupUpdate` 键）**：`chat_item::Item::UpdateMessage` 的
+  `GroupChange` 批由只投批内计时器改为逐条 detail 全词表投影——
+  summary/create/title/avatar/description/access-members/access-member-label/
+  access-attributes/announcements-only/member-privilege/member-remove/
+  member-add/member-add-from-invite/member-add-from-link/
+  member-add-from-admin-approval/pending-add-one/pending-add-many/
+  pending-remove-one/pending-remove-many/admin-approval-add-one/
+  admin-approval-remove-one/admin-approval-bounce/group-link-reset/
+  group-link-add/group-link-remove/access-invite-link/terminated。官方行为
+  对位（AGPL 只读参照零拷贝）：Signal-Desktop
+  `import.preload.ts:3190-3764` `#fromGroupUpdateMessage` + 
+  `parseGroupV2AccessLevel`:4608。键形逐臂对齐官方：`newTitle`/`removed`/
+  `description`/`newPrivilege`（access 族）/`announcementsOnly`/`aci`/
+  `serviceId`/`inviter`/`count`/`times`/`privilege`（group-link-add 专用，
+  官方同形异键）。
+- **updaterAci 随身投法**：官方逐条读 updaterAci 覆盖行级 `from` 变量，
+  KT 按条随身投出（proto 带 updater_aci 字段的臂，16B 小写 UUID 形，畸形
+  省略键），行级 actor 归消费方裁定；官方 from=self 的合成面
+  （selfInvitedOtherUser）不发明键。
+- **跳过纪律**：身份必需的 detail（官方 strictAssert/throw 面：member
+  aci/removedAci/inviteeServiceId/newMemberAci/requestorAci 等）身份残缺 =
+  该条 detail 丢弃（KT 永不致命），批内其余照投；invitation-revoked 名单
+  空 = 条目丢弃（官方 throw 的 KT 落法）；一行零 detail 且零计时器面 =
+  整 item 跳过计入 skippedItems。update 未设的条目按官方 proto 注释投
+  summary 无 updaterAci。
+- **migration 族归并**：GroupV2Migration{,SelfInvited,InvitedMembers,
+  DroppedMembers}Update 四变体官方不落 detail（独立 group-v1-migration
+  消息面），KT 归并为单条 `v1-migration` detail 追加批尾
+  `{areWeInvited, invitedMemberCount, droppedMemberCount}`（官方
+  `getDefaultMigrationMessage` 同面：缺省 false/0/0，逐位叠加）——KT
+  face 命名与官方消息 type 字符串（group-v1-migration）不同，如实记档。
+- **边界（本批红线）**：GroupExpirationTimerUpdate 不入 details（骑既有
+  `expirationTimerChange` 面，同批合行双键）；官方 openApproval/bounce
+  同名合并（isApprovalPending=true 的渲染侧 refine）KT 不做（消费方不
+  消费该位，如实记档）；details 上限 32 条（真实变更批 1-5 条，超限属
+  敌意行域，截断不致命）；ExportStats 增 `group_updates` 细分计数（行
+  落地才计）。detail 词表全覆盖（contact 批的地址面同级 gap 在本类型
+  不存在——proto 变体 36 个全部有落点或明确记档）。消费方 connector
+  契约 1.79：presence + 首个 title detail 的 newTitle 作 group_name
+  镜像，与 live 同形 system 通知行落库（同行双 face 拆两行，官方
+  additionalMessages 语义）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

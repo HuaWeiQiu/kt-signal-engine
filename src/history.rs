@@ -35,8 +35,8 @@ use crate::proto::{
 };
 
 /// 导出计数：结果与跳过都要可见，禁静默丢帧。
-/// `frames` 为档案总帧数（含 BackupInfo 元帧）。`contacts` 为 `messages`
-/// 内 contact 类型的细分计数（B1 扩面可见性）。
+/// `frames` 为档案总帧数（含 BackupInfo 元帧）。`contacts`/`group_updates`
+/// 为 `messages` 内两非文本类型的细分计数（B1 扩面可见性）。
 #[derive(Debug, Default, PartialEq)]
 pub struct ExportStats {
     pub backup_version: u64,
@@ -45,6 +45,7 @@ pub struct ExportStats {
     pub chats: u64,
     pub messages: u64,
     pub contacts: u64,
+    pub group_updates: u64,
     pub remote_deleted: u64,
     pub skipped_items: u64,
     pub skipped_frames: u64,
@@ -109,11 +110,21 @@ pub async fn export_archive(
             }
             Some(frame::Item::ChatItem(item)) => {
                 let is_contact = matches!(item.item, Some(chat_item::Item::ContactMessage(_)));
-                match message_record(&item) {
+                let is_group_update = matches!(
+                    &item.item,
+                    Some(chat_item::Item::UpdateMessage(update)) if matches!(
+                        update.update,
+                        Some(chat_update_message::Update::GroupChange(_))
+                    )
+                );
+                match message_record(&item, &aci) {
                     Some(record) => {
                         stats.messages += 1;
                         if is_contact {
                             stats.contacts += 1;
+                        }
+                        if is_group_update {
+                            stats.group_updates += 1;
                         }
                         write_json(out, record)?;
                     }
@@ -255,8 +266,12 @@ fn chat_record(c: &Chat) -> serde_json::Value {
 /// clientUuid/宽高/caption/blurHash/incrementalMac，见
 /// `project_pointer_common`；字节本身不在档案内，下载归 connector）+
 /// quote + sticker（`sticker_record`）+ contact（`contact_record`）+
-/// 远端删除。返回 `None` = 跳过（计数可见）。
-fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
+/// group update（`group_update_record`）+ 远端删除。返回 `None` = 跳过
+/// （计数可见）。
+fn message_record(
+    item: &ChatItem,
+    self_aci: &presage::libsignal_service::prelude::Uuid,
+) -> Option<serde_json::Value> {
     let direction = match item.directional_details.as_ref()? {
         chat_item::DirectionalDetails::Incoming(_) => "incoming",
         chat_item::DirectionalDetails::Outgoing(_) => "outgoing",
@@ -318,7 +333,17 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
             record["contact"] = contact_record(contact_message)?;
         }
         chat_item::Item::UpdateMessage(update) => {
-            record["expirationTimerChange"] = timer_change_record(update)?;
+            let timer = timer_change_record(update);
+            let group = group_update_record(update, self_aci);
+            if timer.is_none() && group.is_none() {
+                return None;
+            }
+            if let Some(face) = timer {
+                record["expirationTimerChange"] = face;
+            }
+            if let Some(face) = group {
+                record["groupUpdate"] = face;
+            }
         }
         // 其余 item 类型 v1 跳过（调用方计数）；方向可用的 call 类未来再扩。
         _ => return None,
@@ -329,9 +354,9 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
 /// E 批备份导出计时器变更行（connector 拿去做 system 行：会话归属 + 新
 /// timer 值 + 0=关闭语义）。1:1 取 ExpirationTimerChatUpdate；群取
 /// GroupChange 批内第一个 GroupExpirationTimerUpdate。其余 update 类型不投
-/// （返回 None 计入 skippedItems）。proto 只投影不发明：expiresInMs 为
-/// proto3 标量原样透出（0 原样保留）；updaterAci 为 16 字节 ACI 的小写
-/// UUID 形，畸形省略键。
+/// 计时器面（群元数据变更另走 `group_update_record` 的 `groupUpdate` 键）。
+/// proto 只投影不发明：expiresInMs 为 proto3 标量原样透出（0 原样保留）；
+/// updaterAci 为 16 字节 ACI 的小写 UUID 形，畸形省略键。
 fn timer_change_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> {
     match update.update.as_ref()? {
         chat_update_message::Update::ExpirationTimerChange(change) => {
@@ -388,6 +413,424 @@ fn sticker_record(sticker_message: &crate::proto::StickerMessage) -> Option<serd
         face["data"] = serde_json::json!(file_pointer_record(data));
     }
     Some(face)
+}
+
+/// B1 group update item 完整投影（官方 Transfer/backup 导入对位：
+/// Signal-Desktop `import.preload.ts:3190-3764` `#fromGroupUpdateMessage` ——
+/// GroupChangeChatUpdate.updates 逐条映射为 GroupV2Change detail 词表：
+/// summary/create/title/avatar/description/access-*/announcements-only/
+/// member-privilege/member-remove/member-add(-from-invite/-from-link/
+/// -from-admin-approval)/pending-add-one/pending-add-many/pending-remove-one/
+/// pending-remove-many/admin-approval-*/group-link-*，migration 族归并为单条
+/// v1-migration detail（官方 migrationMessage getDefaultMigrationMessage 同面：
+/// areWeInvited 缺省 false、计数缺省 0），GroupExpirationTimerUpdate 不入
+/// detail（骑既有 `expirationTimerChange` 面）。投影口径：
+/// - detail 词表逐条与官方对位；updaterAci 有则投（16B 小写 UUID 形，畸形
+///   省略键）——官方以 `from` 变量逐条覆盖，KT 按条随身投出，行级 actor 归
+///   消费方裁定。
+/// - 身份必需的 detail（member-privilege/member-remove/member-add 族/
+///   admin-approval 族等官方 strictAssert/throw 面）身份残缺 = 该条 detail
+///   丢弃（KT 永不致命——官方 throw 的 KT 落法），其余 detail 照投；一行
+///   零 detail（且零计时器面）= 整 item 跳过计入 skippedItems。
+/// - update 未设的条目：官方 proto 注释「importers should consider it to be
+///   a GenericGroupUpdate with unset updaterAci」→ 投 summary 无 updaterAci。
+/// - 官方 openApproval/bounce 同名合并（isApprovalPending=true）是渲染侧
+///   refine，KT 不做（消费方不消费该位），如实记档 §5。
+/// - details 上限 32 条（真实变更批 1-5 条，超限属敌意行域，截断不致命）。
+///
+/// 消费方 connector 契约 1.79：presence + title detail 的 newTitle 作
+/// group_name 镜像，落 live 同形 system 通知行（「群聊信息已更新」）。
+const MAX_GROUP_UPDATE_DETAILS: usize = 32;
+
+fn group_update_record(
+    update: &ChatUpdateMessage,
+    self_aci: &presage::libsignal_service::prelude::Uuid,
+) -> Option<serde_json::Value> {
+    let chat_update_message::Update::GroupChange(change) = update.update.as_ref()? else {
+        return None;
+    };
+
+    let mut details: Vec<serde_json::Value> = Vec::new();
+    let mut migration: Option<serde_json::Value> = None;
+    for entry in &change.updates {
+        if details.len() >= MAX_GROUP_UPDATE_DETAILS {
+            break;
+        }
+        if let Some(detail) = group_change_detail(entry, self_aci, &mut migration) {
+            details.push(detail);
+        }
+    }
+    // migration 族官方不落 detail（独立 group-v1-migration 消息）；KT 归并为
+    // 单条 v1-migration detail 追加在批尾（消费方单 face 承载同语义）。
+    if details.len() < MAX_GROUP_UPDATE_DETAILS {
+        if let Some(face) = migration.take() {
+            details.push(face);
+        }
+    }
+
+    (!details.is_empty()).then(|| serde_json::json!({ "details": details }))
+}
+
+/// updaterAci 公共投法：官方逐条读 `updaterAci` 覆盖行级 `from` 变量，KT 按
+/// 条随身投出（行级 actor 归消费方裁定）；畸形（非 16B）省略键不发明。
+fn project_updater(detail: &mut serde_json::Value, updater_aci: &Option<Vec<u8>>) {
+    if let Some(aci) = updater_aci.as_deref().and_then(aci_string) {
+        detail["updaterAci"] = serde_json::Value::String(aci);
+    }
+}
+
+/// 官方 `parseGroupV2AccessLevel`：UNKNOWN/词表外/越界一律归 UNKNOWN。
+fn group_v2_access_level_name(access_level: i32) -> &'static str {
+    crate::proto::GroupV2AccessLevel::try_from(access_level)
+        .map(|level| level.as_str_name())
+        .unwrap_or("UNKNOWN")
+}
+
+/// migration 族归并面：首见即建缺省 face（areWeInvited=false、两计数=0，
+/// 官方 `getDefaultMigrationMessage` 同面），后续变体逐位叠加。
+fn fold_migration(migration: &mut Option<serde_json::Value>) -> &mut serde_json::Value {
+    migration.get_or_insert_with(|| {
+        serde_json::json!({
+            "type": "v1-migration",
+            "areWeInvited": false,
+            "invitedMemberCount": 0,
+            "droppedMemberCount": 0,
+        })
+    })
+}
+
+/// GroupChange 批内单条 detail（官方 `#fromGroupUpdateMessage` 词表逐臂）。
+/// 身份必需的 detail（官方 strictAssert/throw 面）身份残缺 = 条目丢弃
+/// （`None`），永不致命；migration 族不入此处（归并见 `fold_migration`）；
+/// GroupExpirationTimerUpdate 不入 details（骑既有 `expirationTimerChange` 面）。
+fn group_change_detail(
+    entry: &group_change_chat_update::Update,
+    self_aci: &presage::libsignal_service::prelude::Uuid,
+    migration: &mut Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    use group_change_chat_update::update::Update as EntryUpdate;
+
+    let Some(update) = entry.update.as_ref() else {
+        // 官方 proto 注释：update 未设视为 GenericGroupUpdate 且 updaterAci
+        // 未设 → summary 无 updaterAci。
+        return Some(serde_json::json!({ "type": "summary" }));
+    };
+    match update {
+        EntryUpdate::GenericGroupUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "summary" });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupCreationUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "create" });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupNameUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "title" });
+            // 官方 dropNull 语义之上收紧：空串零信息量同缺席（caption/blurHash
+            // 同款纪律），键不在。
+            if let Some(title) = change.new_group_name.as_deref().filter(|t| !t.is_empty()) {
+                detail["newTitle"] = serde_json::Value::String(title.to_string());
+            }
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupAvatarUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "avatar", "removed": change.was_removed });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupDescriptionUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "description" });
+            match change.new_description.as_deref().filter(|d| !d.is_empty()) {
+                Some(description) => {
+                    detail["description"] = serde_json::Value::String(description.to_string());
+                }
+                // 官方：description 缺席/空串 → removed:true。
+                None => {
+                    detail["removed"] = serde_json::json!(true);
+                }
+            }
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupMembershipAccessLevelChangeUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "access-members",
+                "newPrivilege": group_v2_access_level_name(change.access_level),
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupMemberLabelAccessLevelChangeUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "access-member-label",
+                "newPrivilege": group_v2_access_level_name(change.access_level),
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupAttributesAccessLevelChangeUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "access-attributes",
+                "newPrivilege": group_v2_access_level_name(change.access_level),
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupAnnouncementOnlyChangeUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "announcements-only",
+                "announcementsOnly": change.is_announcement_only,
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupAdminStatusUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "member-privilege",
+                "aci": aci_string(&change.member_aci)?,
+                "newPrivilege": if change.was_admin_status_granted {
+                    "ADMINISTRATOR"
+                } else {
+                    "DEFAULT"
+                },
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupMemberLeftUpdate(change) => Some(serde_json::json!({
+            "type": "member-remove",
+            "aci": aci_string(&change.aci)?,
+        })),
+        EntryUpdate::GroupMemberRemovedUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "member-remove",
+                "aci": aci_string(&change.removed_aci)?,
+            });
+            project_updater(&mut detail, &change.remover_aci);
+            Some(detail)
+        }
+        EntryUpdate::SelfInvitedToGroupUpdate(change) => {
+            // 官方 serviceId = aboutMe.aci（受邀的是本机账号）。
+            let mut detail = serde_json::json!({
+                "type": "pending-add-one",
+                "serviceId": self_aci.to_string(),
+            });
+            project_updater(&mut detail, &change.inviter_aci);
+            Some(detail)
+        }
+        EntryUpdate::SelfInvitedOtherUserToGroupUpdate(change) => Some(serde_json::json!({
+            "type": "pending-add-one",
+            "serviceId": aci_string(&change.invitee_service_id)?,
+        })),
+        EntryUpdate::GroupUnknownInviteeUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "pending-add-many",
+                "count": change.invitee_count,
+            });
+            project_updater(&mut detail, &change.inviter_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupInvitationAcceptedUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "member-add-from-invite",
+                "aci": aci_string(&change.new_member_aci)?,
+            });
+            if let Some(inviter) = change.inviter_aci.as_deref().and_then(aci_string) {
+                detail["inviter"] = serde_json::Value::String(inviter);
+            }
+            Some(detail)
+        }
+        EntryUpdate::GroupInvitationDeclinedUpdate(change) => {
+            // 官方恒投此条：serviceId/inviter 各自畸形省键，条目不丢。
+            let mut detail = serde_json::json!({ "type": "pending-remove-one" });
+            if let Some(service_id) = change.invitee_aci.as_deref().and_then(aci_string) {
+                detail["serviceId"] = serde_json::Value::String(service_id);
+            }
+            if let Some(inviter) = change.inviter_aci.as_deref().and_then(aci_string) {
+                detail["inviter"] = serde_json::Value::String(inviter);
+            }
+            Some(detail)
+        }
+        EntryUpdate::GroupMemberJoinedUpdate(change) => Some(serde_json::json!({
+            "type": "member-add",
+            "aci": aci_string(&change.new_member_aci)?,
+        })),
+        EntryUpdate::GroupMemberAddedUpdate(change) => {
+            let aci = aci_string(&change.new_member_aci)?;
+            let invited = change.had_open_invitation
+                || change
+                    .inviter_aci
+                    .as_deref()
+                    .is_some_and(|inviter| !inviter.is_empty());
+            let mut detail = if invited {
+                let mut detail = serde_json::json!({
+                    "type": "member-add-from-invite",
+                    "aci": aci,
+                });
+                if let Some(inviter) = change.inviter_aci.as_deref().and_then(aci_string) {
+                    detail["inviter"] = serde_json::Value::String(inviter);
+                }
+                detail
+            } else {
+                serde_json::json!({
+                    "type": "member-add",
+                    "aci": aci,
+                })
+            };
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupSelfInvitationRevokedUpdate(change) => {
+            // 官方 serviceId = aboutMe.aci（被撤邀请的是本机账号）。
+            let mut detail = serde_json::json!({
+                "type": "pending-remove-one",
+                "serviceId": self_aci.to_string(),
+            });
+            project_updater(&mut detail, &change.revoker_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupInvitationRevokedUpdate(change) => {
+            // 官方 throw「missing invitees list」的 KT 落法：名单空 = 条目丢弃。
+            let first = change.invitees.first()?;
+            // 全体 inviter 一致才投 inviter（官方 firstInviter+every 同语义），
+            // 畸形省键；不一致/缺省则不投。
+            let inviter = first
+                .inviter_aci
+                .as_deref()
+                .filter(|first_inviter| {
+                    change
+                        .invitees
+                        .iter()
+                        .all(|invitee| invitee.inviter_aci.as_deref() == Some(*first_inviter))
+                })
+                .and_then(aci_string);
+            let mut detail = if change.invitees.len() == 1 {
+                // 单条：aci 优先 pni（官方同序），两者皆缺 → count:1 的 many。
+                let service_id = first
+                    .invitee_aci
+                    .as_deref()
+                    .and_then(aci_string)
+                    .or_else(|| first.invitee_pni.as_deref().and_then(aci_string));
+                match service_id {
+                    Some(service_id) => serde_json::json!({
+                        "type": "pending-remove-one",
+                        "serviceId": service_id,
+                    }),
+                    None => serde_json::json!({
+                        "type": "pending-remove-many",
+                        "count": 1,
+                    }),
+                }
+            } else {
+                serde_json::json!({
+                    "type": "pending-remove-many",
+                    "count": change.invitees.len(),
+                })
+            };
+            if let Some(inviter) = inviter {
+                detail["inviter"] = serde_json::Value::String(inviter);
+            }
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupJoinRequestUpdate(change) => Some(serde_json::json!({
+            "type": "admin-approval-add-one",
+            "aci": aci_string(&change.requestor_aci)?,
+        })),
+        EntryUpdate::GroupJoinRequestApprovalUpdate(change) => {
+            let mut detail = if change.was_approved {
+                serde_json::json!({
+                    "type": "member-add-from-admin-approval",
+                    "aci": aci_string(&change.requestor_aci)?,
+                })
+            } else {
+                serde_json::json!({
+                    "type": "admin-approval-remove-one",
+                    "aci": aci_string(&change.requestor_aci)?,
+                })
+            };
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupJoinRequestCanceledUpdate(change) => Some(serde_json::json!({
+            "type": "admin-approval-remove-one",
+            "aci": aci_string(&change.requestor_aci)?,
+        })),
+        EntryUpdate::GroupInviteLinkResetUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "group-link-reset" });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupInviteLinkEnabledUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "group-link-add",
+                "privilege": if change.link_requires_admin_approval {
+                    "ADMINISTRATOR"
+                } else {
+                    "ANY"
+                },
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupInviteLinkAdminApprovalUpdate(change) => {
+            let mut detail = serde_json::json!({
+                "type": "access-invite-link",
+                "newPrivilege": if change.link_requires_admin_approval {
+                    "ADMINISTRATOR"
+                } else {
+                    "ANY"
+                },
+            });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupInviteLinkDisabledUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "group-link-remove" });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        EntryUpdate::GroupMemberJoinedByLinkUpdate(change) => Some(serde_json::json!({
+            "type": "member-add-from-link",
+            "aci": aci_string(&change.new_member_aci)?,
+        })),
+        EntryUpdate::GroupV2MigrationUpdate(_) => {
+            fold_migration(migration);
+            None
+        }
+        EntryUpdate::GroupV2MigrationSelfInvitedUpdate(_) => {
+            fold_migration(migration)["areWeInvited"] = serde_json::json!(true);
+            None
+        }
+        EntryUpdate::GroupV2MigrationInvitedMembersUpdate(change) => {
+            fold_migration(migration)["invitedMemberCount"] =
+                serde_json::json!(change.invited_members_count);
+            None
+        }
+        EntryUpdate::GroupV2MigrationDroppedMembersUpdate(change) => {
+            fold_migration(migration)["droppedMemberCount"] =
+                serde_json::json!(change.dropped_members_count);
+            None
+        }
+        EntryUpdate::GroupSequenceOfRequestsAndCancelsUpdate(change) => {
+            // 官方 isApprovalPending 渲染侧 refine 合并 KT 不做（记档 §5）。
+            Some(serde_json::json!({
+                "type": "admin-approval-bounce",
+                "aci": aci_string(&change.requestor_aci)?,
+                "times": change.count,
+            }))
+        }
+        EntryUpdate::GroupTerminateChangeUpdate(change) => {
+            let mut detail = serde_json::json!({ "type": "terminated" });
+            project_updater(&mut detail, &change.updater_aci);
+            Some(detail)
+        }
+        // 群计时器不入 details：骑既有 `expirationTimerChange` 面（同批合行）。
+        EntryUpdate::GroupExpirationTimerUpdate(_) => None,
+    }
 }
 
 /// B1 contact item 完整投影（官方 Transfer/backup 导入对位：Signal-Desktop
@@ -662,6 +1105,17 @@ mod tests {
     const CONTACT_E164: u64 = 15550000001;
     const GROUP_MASTER_KEY_BYTES: [u8; 32] = [9u8; 32];
 
+    /// 本机账号 aci（self-invite/pending-remove-one 面 serviceId 期望值
+    /// 「11111111-1111-1111-1111-111111111111」）。
+    fn test_self_aci() -> presage::libsignal_service::prelude::Uuid {
+        presage::libsignal_service::prelude::Uuid::from_bytes([0x11u8; 16])
+    }
+
+    /// 单参便捷封装：非 roundtrip 的逐投影测试统一走本机 aci。
+    fn test_record(item: &ChatItem) -> Option<serde_json::Value> {
+        message_record(item, &test_self_aci())
+    }
+
     fn varint(mut value: usize) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -850,6 +1304,46 @@ mod tests {
                 ..Default::default()
             })),
         });
+        // B1 批：群变更 item（改名 + 批内群计时器合行 → 双 face 单行）成行。
+        let group_item = frame_bytes(&Frame {
+            item: Some(frame::Item::ChatItem(ChatItem {
+                chat_id: 3,
+                author_id: 7,
+                date_sent: 500,
+                directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                    IncomingMessageDetails::default(),
+                )),
+                item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                    update: Some(chat_update_message::Update::GroupChange(
+                        GroupChangeChatUpdate {
+                            updates: vec![
+                                group_change_chat_update::Update {
+                                    update: Some(
+                                        group_change_chat_update::update::Update::GroupNameUpdate(
+                                            crate::proto::GroupNameUpdate {
+                                                updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                                                new_group_name: Some("KT 群".into()),
+                                            },
+                                        ),
+                                    ),
+                                },
+                                group_change_chat_update::Update {
+                                    update: Some(
+                                        group_change_chat_update::update::Update::GroupExpirationTimerUpdate(
+                                            GroupExpirationTimerUpdate {
+                                                expires_in_ms: 604_800_000,
+                                                updater_aci: None,
+                                            },
+                                        ),
+                                    ),
+                                },
+                            ],
+                        },
+                    )),
+                })),
+                ..Default::default()
+            })),
+        });
 
         let payload: Vec<u8> = [
             info,
@@ -860,6 +1354,7 @@ mod tests {
             pinned,
             timer_update,
             contact_item,
+            group_item,
             skipped,
         ]
         .into_iter()
@@ -879,11 +1374,12 @@ mod tests {
             stats,
             ExportStats {
                 backup_version: 1,
-                frames: 9,
+                frames: 10,
                 recipients: 2,
                 chats: 1,
-                messages: 4,
+                messages: 5,
                 contacts: 1,
+                group_updates: 1,
                 remote_deleted: 0,
                 skipped_items: 0,
                 skipped_frames: 1,
@@ -895,7 +1391,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         // E5：会话归属身份随帧投影（connector §4.38 消费形状）。
         assert_eq!(lines[0]["kind"], "contact");
         assert_eq!(lines[0]["name"], "A B");
@@ -925,6 +1421,18 @@ mod tests {
         assert_eq!(lines[6]["contact"]["number"][0]["value"], "+15550000002");
         assert_eq!(lines[6]["contact"]["number"][0]["type"], "MOBILE");
         assert_eq!(lines[6]["direction"], "incoming");
+        // B1 批：群变更行双 face 合行（改名 detail + 批内群计时器），group_updates 细分计数。
+        assert_eq!(lines[7]["groupUpdate"]["details"][0]["type"], "title");
+        assert_eq!(lines[7]["groupUpdate"]["details"][0]["newTitle"], "KT 群");
+        assert_eq!(
+            lines[7]["groupUpdate"]["details"][0]["updaterAci"],
+            "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+        );
+        assert_eq!(
+            lines[7]["expirationTimerChange"]["expiresInMs"],
+            604_800_000
+        );
+        assert_eq!(lines[7]["direction"], "incoming");
 
         std::fs::remove_file(&path).ok();
     }
@@ -1020,7 +1528,7 @@ mod tests {
     #[test]
     fn timer_update_projection_faces() {
         // 1:1：expiresInMs 原样透出；directionless（官方导出形态）成行。
-        let one_to_one = message_record(&ChatItem {
+        let one_to_one = test_record(&ChatItem {
             chat_id: 3,
             author_id: 7,
             date_sent: 400,
@@ -1138,7 +1646,7 @@ mod tests {
         );
 
         // 方向缺失（官方导入器跳过的形态）→ 计入 skippedItems 不投行。
-        assert!(message_record(&ChatItem {
+        assert!(test_record(&ChatItem {
             chat_id: 3,
             author_id: 7,
             date_sent: 401,
@@ -1194,10 +1702,10 @@ mod tests {
             })),
             ..Default::default()
         };
-        let with = message_record(&item(Some(1_000), Some(86_400_000))).expect("行");
+        let with = test_record(&item(Some(1_000), Some(86_400_000))).expect("行");
         assert_eq!(with["expireStartDate"], 1_000);
         assert_eq!(with["expiresInMs"], 86_400_000);
-        let without = message_record(&item(Some(0), None)).expect("行");
+        let without = test_record(&item(Some(0), None)).expect("行");
         assert!(without.get("expireStartDate").is_none());
         assert!(without.get("expiresInMs").is_none());
     }
@@ -1377,6 +1885,348 @@ mod tests {
         assert!(malformed["locator"].is_null());
     }
 
+    /// B1 groupUpdate 投影词表钉样（官方 `#fromGroupUpdateMessage` 逐臂对位）：
+    /// title（空串收紧=缺席）/ summary 双源（update 未设条目 + 显式
+    /// GenericGroupUpdate）/ create/avatar removed 恒投/description 两态/
+    /// access 三面 + 越界 i32 归 UNKNOWN（官方 parseGroupV2AccessLevel）/
+    /// announcements-only 与 group-link 两 privilege 键形/member-privilege
+    /// 身份必需（残缺=条目丢弃不致命）/self-invite serviceId=本机 aci/
+    /// member-add 族分叉（有无 open invitation）/invitation-revoked 多人
+    /// inviter 归并/migration 族四变体归并单条 v1-migration/bounce times/
+    /// 零 detail（且零计时器面）整 item 跳过。updaterAci 一律 16B 小写 UUID
+    /// 随身投出，畸形省键。
+    #[test]
+    fn group_update_projection_vocabulary() {
+        use crate::proto::{
+            group_invitation_revoked_update, GroupAnnouncementOnlyChangeUpdate,
+            GroupAttributesAccessLevelChangeUpdate, GroupAvatarUpdate, GroupCreationUpdate,
+            GroupDescriptionUpdate, GroupInvitationRevokedUpdate,
+            GroupInviteLinkAdminApprovalUpdate, GroupInviteLinkEnabledUpdate,
+            GroupMemberAddedUpdate, GroupMemberLabelAccessLevelChangeUpdate,
+            GroupMembershipAccessLevelChangeUpdate, GroupNameUpdate,
+            GroupV2MigrationDroppedMembersUpdate, GroupV2MigrationInvitedMembersUpdate,
+            GroupV2MigrationSelfInvitedUpdate, GroupV2MigrationUpdate,
+            SelfInvitedOtherUserToGroupUpdate, SelfInvitedToGroupUpdate,
+        };
+        use group_change_chat_update::update::Update as Entry;
+
+        // 与 CONTACT_ACI 不同的第二身份（invitation-revoked 的 inviter 面）。
+        const INVITER_ACI_BYTES: [u8; 16] = [0x22u8; 16];
+        let inviter_uuid = "22222222-2222-2222-2222-222222222222";
+        let contact_uuid = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        let self_uuid = "11111111-1111-1111-1111-111111111111";
+
+        let group_item = |updates: Vec<group_change_chat_update::Update>| ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 700,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                update: Some(chat_update_message::Update::GroupChange(
+                    GroupChangeChatUpdate { updates },
+                )),
+            })),
+            ..Default::default()
+        };
+        let entry = |update: Option<Entry>| group_change_chat_update::Update { update };
+        let details = |updates: Vec<group_change_chat_update::Update>| {
+            test_record(&group_item(updates)).expect("有 detail 即成行")["groupUpdate"]["details"]
+                .clone()
+        };
+
+        // title：newTitle 非空才投；updaterAci 随身（官方 from 变量的按条投法）。
+        let d = details(vec![entry(Some(Entry::GroupNameUpdate(GroupNameUpdate {
+            updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+            new_group_name: Some("新名".into()),
+        })))]);
+        assert_eq!(d[0]["type"], "title");
+        assert_eq!(d[0]["newTitle"], "新名");
+        assert_eq!(d[0]["updaterAci"], contact_uuid);
+        // 空串标题零信息量：detail 仍在，newTitle 键不在（caption 同款纪律）。
+        let d = details(vec![entry(Some(Entry::GroupNameUpdate(GroupNameUpdate {
+            updater_aci: None,
+            new_group_name: Some(String::new()),
+        })))]);
+        assert!(d[0].get("newTitle").is_none());
+
+        // summary 双源：update 未设条目（官方视为 GenericGroupUpdate 无
+        // updaterAci）与显式 GenericGroupUpdate（updaterAci 随身）。
+        let d = details(vec![
+            entry(None),
+            entry(Some(Entry::GenericGroupUpdate(
+                crate::proto::GenericGroupUpdate {
+                    updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                },
+            ))),
+        ]);
+        assert_eq!(d[0], serde_json::json!({ "type": "summary" }));
+        assert_eq!(d[1]["type"], "summary");
+        assert_eq!(d[1]["updaterAci"], contact_uuid);
+
+        // create / avatar（removed 布尔恒投）/ description 两态（缺席或空串 →
+        // removed:true，非空 → description 键）。
+        let d = details(vec![
+            entry(Some(Entry::GroupCreationUpdate(GroupCreationUpdate {
+                updater_aci: None,
+            }))),
+            entry(Some(Entry::GroupAvatarUpdate(GroupAvatarUpdate {
+                updater_aci: None,
+                was_removed: true,
+            }))),
+            entry(Some(Entry::GroupDescriptionUpdate(
+                GroupDescriptionUpdate {
+                    updater_aci: None,
+                    new_description: Some("说明".into()),
+                },
+            ))),
+            entry(Some(Entry::GroupDescriptionUpdate(
+                GroupDescriptionUpdate {
+                    updater_aci: None,
+                    new_description: None,
+                },
+            ))),
+        ]);
+        assert_eq!(d[0], serde_json::json!({ "type": "create" }));
+        assert_eq!(
+            d[1],
+            serde_json::json!({ "type": "avatar", "removed": true })
+        );
+        assert_eq!(d[2]["type"], "description");
+        assert_eq!(d[2]["description"], "说明");
+        assert!(d[2].get("removed").is_none());
+        assert_eq!(
+            d[3],
+            serde_json::json!({ "type": "description", "removed": true })
+        );
+
+        // access 三面：词表值原样（as_str_name），越界 i32 归 UNKNOWN。
+        let d = details(vec![
+            entry(Some(Entry::GroupMembershipAccessLevelChangeUpdate(
+                GroupMembershipAccessLevelChangeUpdate {
+                    updater_aci: None,
+                    access_level: crate::proto::GroupV2AccessLevel::Administrator as i32,
+                },
+            ))),
+            entry(Some(Entry::GroupMemberLabelAccessLevelChangeUpdate(
+                GroupMemberLabelAccessLevelChangeUpdate {
+                    updater_aci: None,
+                    access_level: crate::proto::GroupV2AccessLevel::Any as i32,
+                },
+            ))),
+            entry(Some(Entry::GroupAttributesAccessLevelChangeUpdate(
+                GroupAttributesAccessLevelChangeUpdate {
+                    updater_aci: None,
+                    access_level: 99,
+                },
+            ))),
+        ]);
+        assert_eq!(
+            d[0],
+            serde_json::json!({ "type": "access-members", "newPrivilege": "ADMINISTRATOR" })
+        );
+        assert_eq!(
+            d[1],
+            serde_json::json!({ "type": "access-member-label", "newPrivilege": "ANY" })
+        );
+        assert_eq!(
+            d[2],
+            serde_json::json!({ "type": "access-attributes", "newPrivilege": "UNKNOWN" })
+        );
+
+        // announcements-only 布尔恒投；group-link-add 的 privilege 与
+        // access-invite-link 的 newPrivilege 两键形（官方同形异键）。
+        let d = details(vec![
+            entry(Some(Entry::GroupAnnouncementOnlyChangeUpdate(
+                GroupAnnouncementOnlyChangeUpdate {
+                    updater_aci: None,
+                    is_announcement_only: true,
+                },
+            ))),
+            entry(Some(Entry::GroupInviteLinkEnabledUpdate(
+                GroupInviteLinkEnabledUpdate {
+                    updater_aci: None,
+                    link_requires_admin_approval: true,
+                },
+            ))),
+            entry(Some(Entry::GroupInviteLinkAdminApprovalUpdate(
+                GroupInviteLinkAdminApprovalUpdate {
+                    updater_aci: None,
+                    link_requires_admin_approval: false,
+                },
+            ))),
+        ]);
+        assert_eq!(
+            d[0],
+            serde_json::json!({ "type": "announcements-only", "announcementsOnly": true })
+        );
+        assert_eq!(
+            d[1],
+            serde_json::json!({ "type": "group-link-add", "privilege": "ADMINISTRATOR" })
+        );
+        assert_eq!(
+            d[2],
+            serde_json::json!({ "type": "access-invite-link", "newPrivilege": "ANY" })
+        );
+
+        // 身份必需（官方 throw 面）：member-privilege 残缺 member aci = 条目
+        // 丢弃，批内其余照投不致命；健全条目 newPrivilege 两态 + updaterAci。
+        let d = details(vec![
+            entry(Some(Entry::GroupAdminStatusUpdate(
+                crate::proto::GroupAdminStatusUpdate {
+                    updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                    member_aci: vec![0x11; 15],
+                    was_admin_status_granted: true,
+                },
+            ))),
+            entry(Some(Entry::GroupAdminStatusUpdate(
+                crate::proto::GroupAdminStatusUpdate {
+                    updater_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                    member_aci: CONTACT_ACI_BYTES.to_vec(),
+                    was_admin_status_granted: false,
+                },
+            ))),
+        ]);
+        assert_eq!(d.as_array().unwrap().len(), 1, "残缺条目丢弃不致命");
+        assert_eq!(
+            d[0],
+            serde_json::json!({
+                "type": "member-privilege",
+                "aci": contact_uuid,
+                "newPrivilege": "DEFAULT",
+                "updaterAci": contact_uuid,
+            })
+        );
+
+        // self-invite：serviceId = 本机 aci（官方 aboutMe.aci），inviter 随身。
+        let d = details(vec![entry(Some(Entry::SelfInvitedToGroupUpdate(
+            SelfInvitedToGroupUpdate {
+                inviter_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+            },
+        )))]);
+        assert_eq!(
+            d[0],
+            serde_json::json!({
+                "type": "pending-add-one",
+                "serviceId": self_uuid,
+                "updaterAci": contact_uuid,
+            })
+        );
+        // self-invited-other-user：invitee 身份残缺 = 条目丢弃 → 零 detail 且
+        // 零计时器面 = 整 item 跳过（官方 throw 的 KT 落法）。
+        assert!(
+            test_record(&group_item(vec![entry(Some(
+                Entry::SelfInvitedOtherUserToGroupUpdate(SelfInvitedOtherUserToGroupUpdate {
+                    invitee_service_id: Vec::new(),
+                })
+            ))]))
+            .is_none(),
+            "零 detail 整 item 跳过"
+        );
+
+        // member-add 族分叉：open invitation/inviter 在场 → from-invite 带
+        // inviter；两者皆无 → 朴素 member-add。
+        let d = details(vec![
+            entry(Some(Entry::GroupMemberAddedUpdate(
+                GroupMemberAddedUpdate {
+                    updater_aci: None,
+                    new_member_aci: CONTACT_ACI_BYTES.to_vec(),
+                    had_open_invitation: true,
+                    inviter_aci: Some(CONTACT_ACI_BYTES.to_vec()),
+                },
+            ))),
+            entry(Some(Entry::GroupMemberAddedUpdate(
+                GroupMemberAddedUpdate {
+                    updater_aci: None,
+                    new_member_aci: CONTACT_ACI_BYTES.to_vec(),
+                    had_open_invitation: false,
+                    inviter_aci: None,
+                },
+            ))),
+        ]);
+        assert_eq!(d[0]["type"], "member-add-from-invite");
+        assert_eq!(d[0]["inviter"], contact_uuid);
+        assert_eq!(
+            d[1],
+            serde_json::json!({ "type": "member-add", "aci": contact_uuid })
+        );
+
+        // invitation-revoked 多人：全体 inviter 一致才投 inviter；count=N。
+        let invitee = |inviter: Option<Vec<u8>>| group_invitation_revoked_update::Invitee {
+            inviter_aci: inviter,
+            invitee_aci: None,
+            invitee_pni: None,
+        };
+        let d = details(vec![entry(Some(Entry::GroupInvitationRevokedUpdate(
+            GroupInvitationRevokedUpdate {
+                updater_aci: None,
+                invitees: vec![
+                    invitee(Some(INVITER_ACI_BYTES.to_vec())),
+                    invitee(Some(INVITER_ACI_BYTES.to_vec())),
+                ],
+            },
+        )))]);
+        assert_eq!(
+            d[0],
+            serde_json::json!({
+                "type": "pending-remove-many",
+                "count": 2,
+                "inviter": inviter_uuid,
+            })
+        );
+
+        // migration 族（self-invited/invited/dropped/plain 四变体）归并单条
+        // v1-migration，逐位叠加（官方 getDefaultMigrationMessage 同面）。
+        let d = details(vec![
+            entry(Some(Entry::GroupV2MigrationSelfInvitedUpdate(
+                GroupV2MigrationSelfInvitedUpdate {},
+            ))),
+            entry(Some(Entry::GroupV2MigrationInvitedMembersUpdate(
+                GroupV2MigrationInvitedMembersUpdate {
+                    invited_members_count: 3,
+                },
+            ))),
+            entry(Some(Entry::GroupV2MigrationDroppedMembersUpdate(
+                GroupV2MigrationDroppedMembersUpdate {
+                    dropped_members_count: 2,
+                },
+            ))),
+            entry(Some(Entry::GroupV2MigrationUpdate(
+                GroupV2MigrationUpdate {},
+            ))),
+        ]);
+        assert_eq!(d.as_array().unwrap().len(), 1, "migration 归并单条");
+        assert_eq!(
+            d[0],
+            serde_json::json!({
+                "type": "v1-migration",
+                "areWeInvited": true,
+                "invitedMemberCount": 3,
+                "droppedMemberCount": 2,
+            })
+        );
+
+        // admin-approval-bounce：times=count 原样（isApprovalPending 渲染侧
+        // refine 不投，记档 §5）。
+        let d = details(vec![entry(Some(
+            Entry::GroupSequenceOfRequestsAndCancelsUpdate(
+                crate::proto::GroupSequenceOfRequestsAndCancelsUpdate {
+                    requestor_aci: CONTACT_ACI_BYTES.to_vec(),
+                    count: 4,
+                },
+            ),
+        ))]);
+        assert_eq!(
+            d[0],
+            serde_json::json!({
+                "type": "admin-approval-bounce",
+                "aci": contact_uuid,
+                "times": 4,
+            })
+        );
+    }
+
     /// B1 sticker item 投影五面：完整（packId hex/packKey base64/stickerId/
     /// emoji/data 指针 locator 同款面）/ 缺 emoji / 缺 data（官方可缺席语义，
     /// 键不在）/ 身份畸形（packId 15B、packKey 31B → 整 item 跳过，官方
@@ -1420,7 +2270,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let full = message_record(&sticker_message(Some(full_sticker.clone()))).expect("完整是行");
+        let full = test_record(&sticker_message(Some(full_sticker.clone()))).expect("完整是行");
         assert_eq!(
             full["sticker"]["packId"],
             "ab".repeat(16),
@@ -1449,7 +2299,7 @@ mod tests {
 
         // 缺 emoji、缺 data：官方可缺席语义（emoji→undefined/data→undefined），
         // 键不在；身份面仍在。
-        let bare = message_record(&sticker_message(Some(Sticker {
+        let bare = test_record(&sticker_message(Some(Sticker {
             emoji: None,
             data: None,
             ..full_sticker
@@ -1460,7 +2310,7 @@ mod tests {
         assert!(bare["sticker"].get("data").is_none());
 
         // emoji 空串零信息量不投（caption/blurHash 同款纪律）。
-        let empty_emoji = message_record(&sticker_message(Some(Sticker {
+        let empty_emoji = test_record(&sticker_message(Some(Sticker {
             emoji: Some(String::new()),
             data: None,
             pack_id: vec![0xABu8; 16],
@@ -1482,7 +2332,7 @@ mod tests {
             ("pack-id-empty", Vec::new(), vec![0xCDu8; 32]),
         ] {
             assert!(
-                message_record(&sticker_message(Some(Sticker {
+                test_record(&sticker_message(Some(Sticker {
                     pack_id,
                     pack_key,
                     sticker_id: 1,
@@ -1493,7 +2343,7 @@ mod tests {
             );
         }
         // sticker 未设：官方「stickerMessage must have a sticker」同形跳过。
-        assert!(message_record(&sticker_message(None)).is_none());
+        assert!(test_record(&sticker_message(None)).is_none());
     }
 
     /// B1 contact item 投影多面：完整（name 子字段/number/email/organization/
@@ -1518,7 +2368,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let full = message_record(&contact_message(Some(ContactAttachment {
+        let full = test_record(&contact_message(Some(ContactAttachment {
             name: Some(contact_attachment::Name {
                 given_name: "Ada".into(),
                 family_name: "Lovelace".into(),
@@ -1584,7 +2434,7 @@ mod tests {
 
         // UNKNOWN 与词表外 type 归 HOME（官方 phoneToContactFormType 同口径）；
         // value 空条目整条丢弃；空 label 键不在。
-        let coerced = message_record(&contact_message(Some(ContactAttachment {
+        let coerced = test_record(&contact_message(Some(ContactAttachment {
             number: vec![
                 contact_attachment::Phone {
                     value: "+15550000005".into(),
@@ -1615,9 +2465,9 @@ mod tests {
 
         // 全零信息量 face（proto3 默认 ContactAttachment）= 整 item 跳过：
         // 空卡片即占位，KT 永不投占位。
-        assert!(message_record(&contact_message(Some(ContactAttachment::default()))).is_none());
+        assert!(test_record(&contact_message(Some(ContactAttachment::default()))).is_none());
         // contact 未设：官方「contactMessage must have a contact」同形跳过。
-        assert!(message_record(&contact_message(None)).is_none());
+        assert!(test_record(&contact_message(None)).is_none());
     }
 
     #[tokio::test]
