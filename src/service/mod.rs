@@ -4034,8 +4034,9 @@ fn build_expiration_timer_update_data_message(timestamp: u64) -> DataMessage {
 /// isValidTapToView 用 Chrome 支持集枚举表（GoogleChrome.std.ts：avif/bmp/
 /// gif/jpeg/webp/png/apng/ico 系 + mp4/ogg/webm），引擎 metadata-only 无渲染
 /// 面按族宽判——官方集外但手机端合法的 video/quicktime 等不被误标 invalid
-/// （差异登记 compat §5）。
-fn is_view_once_media(content_type: &str) -> bool {
+/// （差异登记 compat §5）。导出面 view-once 投影（history.rs）共用本函数
+/// 作单一真相源。
+pub(crate) fn is_view_once_media(content_type: &str) -> bool {
     let lowered = content_type.to_ascii_lowercase();
     lowered.starts_with("image/") || lowered.starts_with("video/")
 }

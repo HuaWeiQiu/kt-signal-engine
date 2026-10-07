@@ -180,7 +180,9 @@ async fn run_import_task(
     if let Some(record) = guard.get_mut(&account) {
         record.state = SnapshotImportState::Completed;
         record.finished_at_ms = Some(now_ms());
-        record.lines = Some(stats.recipients + stats.chats + stats.messages);
+        // lines = NDJSON 投影行数（recipient+chat+message+adhocCall，B1
+        // 递补批起含帧级通话记录行）。
+        record.lines = Some(stats.recipients + stats.chats + stats.messages + stats.calls);
         record.frames = Some(stats.frames);
         record.error_code = None;
     }

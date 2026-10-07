@@ -1542,6 +1542,84 @@ transfer 历史回填非文本扩面·第三类型 groupUpdate（2026-10-08，B1
   镜像，与 live 同形 system 通知行落库（同行双 face 拆两行，官方
   additionalMessages 语义）。
 
+transfer 历史回填非文本扩面·递补批（2026-10-08，B1 递补批，历史回填
+导出/导入/渲染三仓并行；消费方 connector 契约 §4.38 后续批扩面消费，
+行键名与官方 import.preload.ts 消费面同语义）：
+
+- **帧级 AdHocCall 通话记录行（`history.rs::adhoc_call_record`，新行型
+  `{"type": "adhocCall", callId, recipientId, state, callTimestamp}`）**：
+  `Frame.item` 第 6 臂由整帧落 skipped_frames 改为投影行——官方桌面导入
+  会恢复通话记录行（`import.preload.ts:601-603` 帧分派 + `:3926-3973`
+  `#fromAdHocCall`）。`callTimestamp` strictAssert 必须有效（0 = 官方
+  throw 的 KT 落法：帧级跳过，`skipped_frames` 同桶计数，永不致命）；
+  `callId` 0（legacy 无 id）官方本地生成 UUID 兜底、`recipientId` →
+  CallLink recipient 解析（找不到官方 warn 丢行）均归消费方裁定，KT
+  原样透出 proto3 标量；`state` 词表逐臂对位官方 parse face 输出
+  （`:4439-4458` `fromAdHocCallStateProto` + `AdhocCallStatus` 字符串值，
+  `ts/types/CallDisposition.std.ts:74,80`）：GENERIC → "GenericAdhocCall"、
+  UNKNOWN_STATE/词表外 → "Unknown"。ExportStats 增 `calls` 细分计数
+  （行落地才计）；快照导入 `lines` 统计同步计入 calls 行。官方
+  callHistory 行的 mode/type/direction/peerId/ringerId 等常量位与解析
+  面不入投影（消费方落库同语义）。
+- **ChatItem 级六型补齐**（ChatItem.item oneof 全臂投影闭环，message 行
+  新增 face 键，ExportStats 不再加细分、行计入 `messages`）：
+  - `payment`（`payment_record`，`:2788-2806`）：`{amountMob?, feeMob?,
+    note?, transactionDetailsBase64?}`——三个 optional string 官方
+    dropNull/`?? null` 同口径（Some 才投，显式空串是档案陈述照投）；
+    TransactionDetails 官方整体重编码 base64（`Bytes.toBase64(encode(td))`
+    同形），KT 以同 schema prost 重编码，消费方按官方语义存 opaque 串；
+    官方 `kind: Notification` 常量位不入 face。全零信息量 face = 整 item
+    跳过（空卡片纪律）。移动支付（MobileCoin）已退场，行投影仍保真。
+  - `giftBadge`（`gift_badge_record`，`:2809-2861`）：FAILED 短路只投
+    `state: "Failed"`（presentation 在场也不投，官方提前 return 同形）；
+    其余 state strictAssert presentation 非空（空 = 整 item 跳过）；state
+    词表对位官方 `GiftBadgeStates`（`ts/types/GiftBadgeStates.std.ts:4-10`）：
+    OPENED → "Opened"、REDEEMED → "Redeemed"、UNOPENED/词表外 →
+    "Unopened"；presentation 标准 base64。官方对 presentation 的 zk 解析
+    面（expiration/level）不入投影（引擎无该解析面，消费方后续批按需
+    补，如实记档）。
+  - `viewOnce` + `isErased` + `viewOnceInvalid`（`project_view_once_message`，
+    `:2300-2331` + `filePointers.preload.ts:170-205`）：行键与 live 接收
+    投影同形（`viewOnce` 顶层键 + `attachments` 单条数组，connector 一条
+    消费通路）；attachment 缺（proto「Will be null for viewed messages」
+    已查看形态）与 pointer 缺（官方转换 null → attachments 空）都投
+    `isErased`（官方同键），非 invalid；媒体族校验按 live view-once 语义
+    （2899e76，`crate::service::is_view_once_media` 单一真相源）违者补
+    `viewOnceInvalid`——archive proto 无 body/quote 等其余校验腿，唯一
+    可表达腿即媒体族（差异如实记档：官方导入路径不判 invalid，KT 与
+    live 行对齐以便消费方单通路处理）。
+  - `storyReply`（`story_reply_record`，`:2333-2372` + 分派闸
+    `:1772-1794`）：reply oneof 未设与 directionless（官方两条
+    strictAssert）= 整 item 跳过；textReply 臂 → `{body?, bodyAttachment?}`
+    （body 非空才投、longText 指针公共面）、emoji 臂 → `{emoji}`（空串=
+    官方 else-throw 落法跳过）；零信息量 textReply = 整 item 跳过；story
+    作者解析（incoming → aboutMe.aci、outgoing → 会话 serviceId，官方
+    `storyReplyContext.authorAci`）归消费方。
+  - `poll`（`poll_record`，`:1795-1847`）：`{question?, options[]:
+    {option, votes?: [{voterId, voteCount}]}, allowMultiple, hasEnded}`
+    ——投票聚合（voterId → 会话解析、optionIndexes 归并、unknown voterId
+    warn 丢弃）与 `terminatedAt`（`hasEnded ? dateSent : undefined`）归
+    消费方；空 option 条目丢弃、空 question 键不在、全零信息量 = 整 item
+    跳过；validator 面约束（libsignal `backup/chat/poll.rs`：question
+    1..=200、option 1..=100、至少两 options、voter 必须 self|contact）是
+    官方档案有效性判定，导出侧不复验。敌意行域截断不致命：options ≤ 32
+    （真实 poll ≤ 10 项）、单 option 投票 ≤ 1001（官方 GroupsV2 群上限
+    = 合法投票天花板）。
+  - `adminDeleted`（message 行 face `{adminId}`，`:2714-2732`）：adminId
+    原样透出（proto3 标量，0 照投）；官方 adminId → 会话 → serviceId
+    ACI 解析（`deletedForEveryoneByAdminAci`）归消费方；行落 tombstone
+    面由消费方路由，引擎不混既有 `remoteDeleted` 位。
+- **NotificationProfile/ChatFolder 两 Frame 型刻意维持 skipped_frames**：
+  官方导入消费它们（notificationProfile/chatFolder 分派臂），但桌面本机
+  投影已自持（本机设置面，非消息面），NDJSON 消息流不投影，commit 如实
+  记档。
+- **边界（本批红线）**：reactions 键不投（viewOnce/poll/storyReply 三型
+  proto 均带 reactions，官方导入 `#fromReactions` 消费——backup5 Reaction
+  投影面 v1 未立项，与 StandardMessage.reactions 同批缺位，如实记档不
+  发明）；payment/giftBadge 的字节面（MobileCoin blobs、presentation
+  二进制）只随 opaque base64 中转，引擎任何持久层不留存；ExportStats
+  只增 `calls` 字段不破坏既有（快照导入 `lines` 求和同步 +calls）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

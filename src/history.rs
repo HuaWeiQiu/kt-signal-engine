@@ -36,7 +36,8 @@ use crate::proto::{
 
 /// 导出计数：结果与跳过都要可见，禁静默丢帧。
 /// `frames` 为档案总帧数（含 BackupInfo 元帧）。`contacts`/`group_updates`
-/// 为 `messages` 内两非文本类型的细分计数（B1 扩面可见性）。
+/// 为 `messages` 内两非文本类型的细分计数、`calls` 为帧级 AdHocCall 通话
+/// 记录行数（B1 扩面 + 递补批可见性，只增不破坏既有字段）。
 #[derive(Debug, Default, PartialEq)]
 pub struct ExportStats {
     pub backup_version: u64,
@@ -46,6 +47,7 @@ pub struct ExportStats {
     pub messages: u64,
     pub contacts: u64,
     pub group_updates: u64,
+    pub calls: u64,
     pub remote_deleted: u64,
     pub skipped_items: u64,
     pub skipped_frames: u64,
@@ -100,10 +102,12 @@ pub async fn export_archive(
 
 /// 帧循环公共面（transfer archive 导出与官方快照导入两条入口共用，
 /// `backup::receive::export_snapshot_frames`）：首帧必须是 BackupInfo（档案
-/// 版本来源），后续帧按 recipient/chat/chatItem 投影 NDJSON，item unset/
-/// 未知帧型官方语义跳过并计数。`self_aci` 为本机账号 ACI（群变更 self-invite/
-/// pending-remove 投影的 serviceId 面需要）。尾部 HMAC 验证归入口层（调用方
-/// 持有具体 reader 类型）。future 非 Send，调用方须在 LocalSet 上运行。
+/// 版本来源），后续帧按 recipient/chat/chatItem/adHocCall 投影 NDJSON，
+/// item unset/未知帧型官方语义跳过并计数（NotificationProfile/ChatFolder
+/// 两 Frame 型刻意维持 skipped_frames：桌面本机投影已自持，非消息面）。
+/// `self_aci` 为本机账号 ACI（群变更 self-invite/pending-remove 投影的
+/// serviceId 面需要）。尾部 HMAC 验证归入口层（调用方持有具体 reader 类型）。
+/// future 非 Send，调用方须在 LocalSet 上运行。
 pub(crate) async fn export_frames_loop<R>(
     delimited: &mut VarintDelimitedReader<R>,
     out: &mut dyn Write,
@@ -133,6 +137,15 @@ where
                 stats.chats += 1;
                 write_json(out, chat_record(&chat))?;
             }
+            Some(frame::Item::AdHocCall(call)) => match adhoc_call_record(&call) {
+                Some(record) => {
+                    stats.calls += 1;
+                    write_json(out, record)?;
+                }
+                // 身份残缺（官方 strictAssert 的 KT 落法）：帧级跳过计数，
+                // 与 item unset/未知帧型同桶，永不致命。
+                None => stats.skipped_frames += 1,
+            },
             Some(frame::Item::ChatItem(item)) => {
                 let is_contact = matches!(item.item, Some(chat_item::Item::ContactMessage(_)));
                 let is_group_update = matches!(
@@ -280,12 +293,52 @@ fn chat_record(c: &Chat) -> serde_json::Value {
     record
 }
 
+/// B1 递补批：帧级 AdHocCall 通话记录投影（Call Link 通话，Frame.item 第 6
+/// 臂——此前整帧落 skipped_frames，官方桌面导入会恢复通话记录行）。官方
+/// 行为对位（AGPL 只读参照零拷贝）：Signal-Desktop `import.preload.ts:601-603`
+/// 帧分派 + `:3926-3973` `#fromAdHocCall` + `:4439-4458`
+/// `fromAdHocCallStateProto` ——
+/// - `callTimestamp` strictAssert 必须有效：0 = 无时间可恢复，帧级跳过
+///   （官方 throw 的 KT 落法，`skipped_frames` 同桶计数，永不致命）。
+/// - `callId` 为 0（legacy 无 id）官方本地生成 UUID 兜底、`recipientId` →
+///   CallLink recipient 解析（找不到官方 warn 丢行）均归消费方裁定，KT
+///   原样透出 proto3 标量（含 0），不发明合成身份。
+/// - `state` 词表逐臂对位官方 parse face 输出（官方 `AdhocCallStatus`
+///   字符串值，`ts/types/CallDisposition.std.ts:74,80`）：GENERIC →
+///   "GenericAdhocCall"，UNKNOWN_STATE/词表外 → "Unknown"。
+///
+/// 行形状 `{"type": "adhocCall", ...}`，ExportStats 增 `calls` 细分计数
+/// （行落地才计）；NotificationProfile/ChatFolder 两 Frame 型维持
+/// skipped_frames 不投（桌面本机投影已自持，非消息面）。
+fn adhoc_call_record(call: &crate::proto::AdHocCall) -> Option<serde_json::Value> {
+    if call.call_timestamp == 0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "adhocCall",
+        "callId": call.call_id,
+        "recipientId": call.recipient_id,
+        "state": ad_hoc_call_state_name(call.state),
+        "callTimestamp": call.call_timestamp,
+    }))
+}
+
+/// proto AdHocCall.State → 官方 AdhocCallStatus 词表（`fromAdHocCallStateProto`
+/// 同口径：UNKNOWN_STATE 与词表外一律归 Unknown，官方其余分支不可达）。
+fn ad_hoc_call_state_name(state: i32) -> &'static str {
+    match crate::proto::ad_hoc_call::State::try_from(state) {
+        Ok(crate::proto::ad_hoc_call::State::Generic) => "GenericAdhocCall",
+        Ok(crate::proto::ad_hoc_call::State::UnknownState) | Err(_) => "Unknown",
+    }
+}
+
 /// v2 中间表示：text + 附件 pointer-complete 投影（locator 面 +
 /// clientUuid/宽高/caption/blurHash/incrementalMac，见
 /// `project_pointer_common`；字节本身不在档案内，下载归 connector）+
 /// quote + sticker（`sticker_record`）+ contact（`contact_record`）+
-/// group update（`group_update_record`）+ 远端删除。返回 `None` = 跳过
-/// （计数可见）。
+/// group update（`group_update_record`）+ 递补批六型（payment/
+/// giftBadge/viewOnce/storyReply/poll/adminDeleted，B1 递补批）+
+/// 远端删除。返回 `None` = 跳过（计数可见）。
 fn message_record(
     item: &ChatItem,
     self_aci: &presage::libsignal_service::prelude::Uuid,
@@ -363,8 +416,33 @@ fn message_record(
                 record["groupUpdate"] = face;
             }
         }
-        // 其余 item 类型 v1 跳过（调用方计数）；方向可用的 call 类未来再扩。
-        _ => return None,
+        chat_item::Item::PaymentNotification(payment) => {
+            record["payment"] = payment_record(payment)?;
+        }
+        chat_item::Item::GiftBadge(badge) => {
+            record["giftBadge"] = gift_badge_record(badge)?;
+        }
+        chat_item::Item::ViewOnceMessage(view_once) => {
+            project_view_once_message(&mut record, view_once);
+        }
+        chat_item::Item::DirectStoryReplyMessage(reply) => {
+            // 官方 strictAssert「reply cannot be directionless」（
+            // import.preload.ts:1775-1778）的 KT 落法：directionless 整
+            // item 跳过，计数可见不致命。
+            if matches!(
+                item.directional_details,
+                Some(chat_item::DirectionalDetails::Directionless(_))
+            ) {
+                return None;
+            }
+            record["storyReply"] = story_reply_record(reply)?;
+        }
+        chat_item::Item::Poll(poll) => {
+            record["poll"] = poll_record(poll)?;
+        }
+        chat_item::Item::AdminDeletedMessage(deleted) => {
+            record["adminDeleted"] = serde_json::json!({ "adminId": deleted.admin_id });
+        }
     };
     Some(record)
 }
@@ -950,6 +1028,235 @@ fn contact_field_type_name(value: i32) -> &'static str {
     }
 }
 
+/// B1 递补批：paymentNotification item 投影（移动支付通知面）。官方行为
+/// 对位（AGPL 只读参照零拷贝）：Signal-Desktop `import.preload.ts:2788-2806`
+/// —— `payment` 面 `{amountMob?, feeMob?, note?, transactionDetailsBase64?}`：
+/// - `amountMob`/`feeMob`（proto optional string，十进制串）官方 `dropNull`
+///   同口径：Some 才投、缺席键不在；
+/// - `note` 官方 `?? null`（JS 侧显式 null 位），NDJSON 缺席同语义；
+/// - `transactionDetailsBase64`：官方把 TransactionDetails 子消息整体重
+///   编码 base64（`Bytes.toBase64(encode(td))`），KT 以同 schema prost 重
+///   编码同形——消费方按官方语义存 opaque 串，不在导入链路里解码；oneof
+///   Transaction/FailedTransaction 两臂同走此路（官方不区分臂）。
+///
+/// 全零信息量 face（四键全缺席）= 整 item 跳过（contact 空卡片同款纪律，
+/// KT 永不投占位）。官方 `kind: Notification` 常量位不入 face：archive 内
+/// 该 item 只有通知一型，消费方落库语义同形。
+fn payment_record(payment: &crate::proto::PaymentNotification) -> Option<serde_json::Value> {
+    use base64::Engine as _;
+    let mut face = serde_json::Map::new();
+    if let Some(amount) = &payment.amount_mob {
+        face.insert(
+            "amountMob".into(),
+            serde_json::Value::String(amount.clone()),
+        );
+    }
+    if let Some(fee) = &payment.fee_mob {
+        face.insert("feeMob".into(), serde_json::Value::String(fee.clone()));
+    }
+    if let Some(note) = &payment.note {
+        face.insert("note".into(), serde_json::Value::String(note.clone()));
+    }
+    if let Some(details) = &payment.transaction_details {
+        face.insert(
+            "transactionDetailsBase64".into(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(details.encode_to_vec()),
+            ),
+        );
+    }
+    (!face.is_empty()).then_some(serde_json::Value::Object(face))
+}
+
+/// B1 递补批：giftBadge item 投影（捐赠徽章）。官方行为对位（AGPL 只读
+/// 参照零拷贝）：Signal-Desktop `import.preload.ts:2809-2861` ——
+/// - FAILED 短路：只投 `state: "Failed"`，不要求 presentation（官方同形
+///   提前 return）；presentation 在场也不投（官方只回 state）。
+/// - 其余 state strictAssert presentation 非空（官方 throw 的 KT 落法：
+///   空 = 整 item 跳过计数不致命）。
+/// - state 词表逐臂对位官方 `GiftBadgeStates`（`ts/types/GiftBadgeStates.std.ts`
+///   :4-10 字符串值）：OPENED → "Opened"、REDEEMED → "Redeemed"、
+///   UNOPENED/词表外（官方 default 臂）→ "Unopened"、FAILED → "Failed"。
+/// - presentation 标准 base64（官方 `Bytes.toBase64` 同形）；官方对
+///   presentation 的 zk 解析面（expiration/level，ReceiptCredentialPresentation）
+///   不入投影——引擎无该解析面，消费方后续批按需补（如实记档 §5）。
+fn gift_badge_record(badge: &crate::proto::GiftBadge) -> Option<serde_json::Value> {
+    use base64::Engine as _;
+    let state = gift_badge_state_name(badge.state);
+    if state == "Failed" {
+        return Some(serde_json::json!({ "state": state }));
+    }
+    if badge.receipt_credential_presentation.is_empty() {
+        return None;
+    }
+    let mut face = serde_json::json!({ "state": state });
+    face["receiptCredentialPresentation"] = serde_json::Value::String(
+        base64::engine::general_purpose::STANDARD.encode(&badge.receipt_credential_presentation),
+    );
+    Some(face)
+}
+
+/// proto GiftBadge.State → 官方 GiftBadgeStates 词表（官方 default 臂同
+/// 口径：UNOPENED 与词表外一律归 Unopened）。
+fn gift_badge_state_name(state: i32) -> &'static str {
+    match crate::proto::gift_badge::State::try_from(state) {
+        Ok(crate::proto::gift_badge::State::Opened) => "Opened",
+        Ok(crate::proto::gift_badge::State::Redeemed) => "Redeemed",
+        Ok(crate::proto::gift_badge::State::Failed) => "Failed",
+        Ok(crate::proto::gift_badge::State::Unopened) | Err(_) => "Unopened",
+    }
+}
+
+/// B1 递补批：viewOnceMessage item 投影（阅后即焚）。官方行为对位（AGPL
+/// 只读参照零拷贝）：Signal-Desktop `import.preload.ts:2300-2331`
+/// `#fromViewOnceMessage` + `filePointers.preload.ts:170-205`
+/// `convertBackupMessageAttachmentToAttachment` ——
+/// - 行键与 live 接收投影同形（`viewOnce` 顶层键 + `attachments` 单条数组，
+///   connector 一条消费通路）；已查看消息 attachment 缺席（proto 注释
+///   Will be null for viewed messages）与 pointer 缺失（官方转换 null →
+///   attachments 空）都投 `isErased`（官方同键），非 invalid。
+/// - attachment 在场 → 单条附件经 `attachment_record` 公共面；媒体族校验
+///   按 live 收投影 view-once 语义（2899e76，官方 isValidTapToView 同构，
+///   `crate::service::is_view_once_media` 单一真相源：image/|video/ 前缀
+///   宽判）违者补 `viewOnceInvalid`——archive proto 无 body/quote 等其余
+///   校验腿，唯一可表达腿即媒体族。
+///
+/// reactions 键不投（backup5 Reaction 投影面 v1 未立项，如实记档）。
+fn project_view_once_message(
+    record: &mut serde_json::Value,
+    view_once: &crate::proto::ViewOnceMessage,
+) {
+    record["viewOnce"] = serde_json::json!(true);
+    let Some(face) = view_once.attachment.as_ref().and_then(attachment_record) else {
+        // 已查看（attachment 缺）或 pointer 缺失（官方转换 null）：官方
+        // `!result.attachments?.length → isErased = true` 同面，非 invalid。
+        record["isErased"] = serde_json::json!(true);
+        return;
+    };
+    let media = face
+        .get("contentType")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(crate::service::is_view_once_media);
+    if !media {
+        record["viewOnceInvalid"] = serde_json::json!(true);
+    }
+    record["attachments"] = serde_json::json!([face]);
+}
+
+/// B1 递补批：directStoryReplyMessage item 投影（对 story 的直聊回复）。
+/// 官方行为对位（AGPL 只读参照零拷贝）：Signal-Desktop
+/// `import.preload.ts:2333-2372` `#fromDirectStoryReplyMessage` + 分派闸
+/// `:1772-1794` ——
+/// - reply oneof 未设（官方 strictAssert throw）与 directionless（官方
+///   strictAssert「reply cannot be directionless」）= 整 item 跳过（KT
+///   永不致命）。
+/// - textReply 臂 → `body`（text.body 非空才投）+ `bodyAttachment`
+///   （longText 经 `file_pointer_record` 指针公共面）；emoji 臂 → `emoji`
+///   （官方空串 falsy 落入 else throw → KT：整 item 跳过）；零信息量
+///   textReply（无 text 无 longText）= 空 story 回复占位 → 整 item 跳过
+///   （contact 空卡片同款纪律）。
+/// - story 作者解析（incoming → aboutMe.aci、outgoing → 会话 serviceId，
+///   官方 `storyReplyContext.authorAci`）与会话归属同权归消费方，KT 不
+///   发明；reactions 键不投（backup5 Reaction 投影面 v1 未立项，如实记档）。
+fn story_reply_record(reply: &crate::proto::DirectStoryReplyMessage) -> Option<serde_json::Value> {
+    let mut face = serde_json::Map::new();
+    match reply.reply.as_ref()? {
+        crate::proto::direct_story_reply_message::Reply::TextReply(text_reply) => {
+            if let Some(body) = text_reply
+                .text
+                .as_ref()
+                .map(|text| text.body.as_str())
+                .filter(|body| !body.is_empty())
+            {
+                face.insert("body".into(), serde_json::Value::String(body.to_string()));
+            }
+            if let Some(long_text) = &text_reply.long_text {
+                face.insert(
+                    "bodyAttachment".into(),
+                    serde_json::json!(file_pointer_record(long_text)),
+                );
+            }
+        }
+        crate::proto::direct_story_reply_message::Reply::Emoji(emoji) => {
+            if emoji.is_empty() {
+                return None;
+            }
+            face.insert("emoji".into(), serde_json::Value::String(emoji.clone()));
+        }
+    }
+    (!face.is_empty()).then_some(serde_json::Value::Object(face))
+}
+
+/// B1 递补批：poll item 投影（官方 Poll 消息型）。官方行为对位（AGPL 只读
+/// 参照零拷贝）：Signal-Desktop `import.preload.ts:1795-1847` ——
+/// - `question`/`options[].option`（proto3 串）官方 `?? ''` 缺省即空串，
+///   空串零信息量键不在（caption 同款纪律）；空 option 条目整条丢弃
+///   （contact number/email 空值同口径）。
+/// - `allowMultiple`/`hasEnded` proto3 布尔恒投（官方 `?? false` 缺省即
+///   proto3 缺省，键形一致）；`terminatedAt`（官方 `hasEnded ? dateSent :
+///   undefined`）由消费方从行级 `dateSent` 派生，KT 不重复投影。
+/// - 投票聚合（voterId → 会话解析、optionIndexes 归并、官方 unknown
+///   voterId warn 丢弃）归消费方，KT 投原始 `{voterId, voteCount}` 条目。
+/// - 全零信息量（question 空 且 无可投 option）= 整 item 跳过（空卡片即
+///   占位纪律）。validator 面约束（libsignal
+///   `backup/chat/poll.rs`：question 1..=200、option 1..=100 字、至少两
+///   options、voter 必须 self|contact、voter 不重复）是官方档案有效性判定，
+///   导出侧不复验。
+///
+/// 敌意行域截断（都不致命）：options ≤ 32（真实 poll ≤ 10 项）；单 option
+/// 投票条目 ≤ 1001（官方 GroupsV2 群上限 = 合法投票天花板）。reactions
+/// 键不投（backup5 Reaction 投影面 v1 未立项，如实记档）。
+const MAX_POLL_OPTIONS: usize = 32;
+const MAX_POLL_OPTION_VOTES: usize = 1001;
+
+fn poll_record(poll: &crate::proto::Poll) -> Option<serde_json::Value> {
+    let options: Vec<serde_json::Value> = poll
+        .options
+        .iter()
+        .take(MAX_POLL_OPTIONS)
+        .filter_map(|option| {
+            let mut face = serde_json::Map::new();
+            if !option.option.is_empty() {
+                face.insert(
+                    "option".into(),
+                    serde_json::Value::String(option.option.clone()),
+                );
+            }
+            let votes: Vec<serde_json::Value> = option
+                .votes
+                .iter()
+                .take(MAX_POLL_OPTION_VOTES)
+                .map(|vote| {
+                    serde_json::json!({ "voterId": vote.voter_id, "voteCount": vote.vote_count })
+                })
+                .collect();
+            if !votes.is_empty() {
+                face.insert("votes".into(), serde_json::json!(votes));
+            }
+            (!face.is_empty()).then_some(serde_json::Value::Object(face))
+        })
+        .collect();
+    if poll.question.is_empty() && options.is_empty() {
+        return None;
+    }
+    let mut face = serde_json::Map::new();
+    if !poll.question.is_empty() {
+        face.insert(
+            "question".into(),
+            serde_json::Value::String(poll.question.clone()),
+        );
+    }
+    if !options.is_empty() {
+        face.insert("options".into(), serde_json::json!(options));
+    }
+    face.insert(
+        "allowMultiple".into(),
+        serde_json::json!(poll.allow_multiple),
+    );
+    face.insert("hasEnded".into(), serde_json::json!(poll.has_ended));
+    Some(serde_json::Value::Object(face))
+}
+
 /// 附件/文件指针投影公共面（H3 附件媒体字节 v2，方案 C ①）：v1 只有
 /// contentType/fileName/flag/size（metadata-only，locator 全丢——connector
 /// 无从下载）；v2 扩成 pointer-complete。官方消费面锚点：Signal-Desktop
@@ -1398,6 +1705,7 @@ mod tests {
                 messages: 5,
                 contacts: 1,
                 group_updates: 1,
+                calls: 0,
                 remote_deleted: 0,
                 skipped_items: 0,
                 skipped_frames: 1,
@@ -2486,6 +2794,842 @@ mod tests {
         assert!(test_record(&contact_message(Some(ContactAttachment::default()))).is_none());
         // contact 未设：官方「contactMessage must have a contact」同形跳过。
         assert!(test_record(&contact_message(None)).is_none());
+    }
+
+    /// B1 递补批 roundtrip：帧级 AdHocCall（一好一畸形）+ ChatItem 六型
+    /// （payment/giftBadge/viewOnce/storyReply/poll/adminDeleted）全链解密
+    /// 导出——stats 计数钉样（`calls` 细分、畸形帧落 `skipped_frames`、六型
+    /// 计入 `messages`）+ NDJSON 行形状端到端。
+    #[tokio::test]
+    async fn roundtrip_exports_recallback_types() {
+        const TEST_KEY: [u8; 32] = [7u8; 32];
+        let aci = presage::libsignal_service::prelude::Uuid::from_bytes([9u8; 16]);
+        let backup_key: BackupKey = BackupKey(TEST_KEY);
+        let backup_id =
+            backup_key.derive_backup_id(&presage::libsignal_service::protocol::Aci::from(aci));
+        let key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+
+        let call = frame_bytes(&Frame {
+            item: Some(frame::Item::AdHocCall(crate::proto::AdHocCall {
+                call_id: 42,
+                recipient_id: 9,
+                state: crate::proto::ad_hoc_call::State::Generic as i32,
+                call_timestamp: 1_700_000_000_000,
+            })),
+        });
+        let malformed_call = frame_bytes(&Frame {
+            item: Some(frame::Item::AdHocCall(crate::proto::AdHocCall {
+                call_id: 43,
+                recipient_id: 9,
+                state: crate::proto::ad_hoc_call::State::UnknownState as i32,
+                call_timestamp: 0,
+            })),
+        });
+        let item_frame = |item: crate::proto::chat_item::Item, date_sent: u64| {
+            frame_bytes(&Frame {
+                item: Some(frame::Item::ChatItem(ChatItem {
+                    chat_id: 3,
+                    author_id: 7,
+                    date_sent,
+                    directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                        IncomingMessageDetails::default(),
+                    )),
+                    item: Some(item),
+                    ..Default::default()
+                })),
+            })
+        };
+        let payment_item = item_frame(
+            crate::proto::chat_item::Item::PaymentNotification(crate::proto::PaymentNotification {
+                amount_mob: Some("1.00001".into()),
+                fee_mob: Some("0.00002".into()),
+                note: Some("coffee".into()),
+                transaction_details: Some(
+                    crate::proto::payment_notification::TransactionDetails {
+                        payment: Some(
+                            crate::proto::payment_notification::transaction_details::Payment::Transaction(
+                                crate::proto::payment_notification::transaction_details::Transaction {
+                                    status: crate::proto::payment_notification::transaction_details::transaction::Status::Successful as i32,
+                                    mobile_coin_identification: Some(
+                                        crate::proto::payment_notification::transaction_details::MobileCoinTxoIdentification {
+                                            public_key: vec![vec![7u8; 32]],
+                                            key_images: vec![vec![9u8; 32]],
+                                        },
+                                    ),
+                                    timestamp: Some(1_700_000_000_000),
+                                    block_index: Some(2),
+                                    block_timestamp: Some(3),
+                                    transaction: None,
+                                    receipt: None,
+                                },
+                            ),
+                        ),
+                    },
+                ),
+            }),
+            600,
+        );
+        let gift_item = item_frame(
+            crate::proto::chat_item::Item::GiftBadge(crate::proto::GiftBadge {
+                receipt_credential_presentation: vec![0xEE; 16],
+                state: crate::proto::gift_badge::State::Redeemed as i32,
+            }),
+            610,
+        );
+        let view_once_item = item_frame(
+            crate::proto::chat_item::Item::ViewOnceMessage(crate::proto::ViewOnceMessage {
+                attachment: Some(crate::proto::MessageAttachment {
+                    pointer: Some(FilePointer {
+                        content_type: Some("image/png".into()),
+                        file_name: Some("snap.png".into()),
+                        locator_info: Some(file_pointer::LocatorInfo {
+                            key: vec![0x31u8; 32],
+                            size: 88,
+                            transit_cdn_key: Some("viewonce-cdn".into()),
+                            transit_cdn_number: Some(1),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                reactions: Vec::new(),
+            }),
+            620,
+        );
+        let story_reply_item = item_frame(
+            crate::proto::chat_item::Item::DirectStoryReplyMessage(
+                crate::proto::DirectStoryReplyMessage {
+                    reply: Some(crate::proto::direct_story_reply_message::Reply::Emoji(
+                        "🎉".into(),
+                    )),
+                    reactions: Vec::new(),
+                },
+            ),
+            630,
+        );
+        let poll_item = item_frame(
+            crate::proto::chat_item::Item::Poll(crate::proto::Poll {
+                question: "Lunch?".into(),
+                allow_multiple: false,
+                options: vec![
+                    crate::proto::poll::PollOption {
+                        option: "Ramen".into(),
+                        votes: vec![
+                            crate::proto::poll::poll_option::PollVote {
+                                voter_id: 7,
+                                vote_count: 2,
+                            },
+                            crate::proto::poll::poll_option::PollVote {
+                                voter_id: 8,
+                                vote_count: 1,
+                            },
+                        ],
+                    },
+                    crate::proto::poll::PollOption {
+                        option: "Salad".into(),
+                        votes: Vec::new(),
+                    },
+                ],
+                has_ended: false,
+                reactions: Vec::new(),
+            }),
+            640,
+        );
+        let admin_deleted_item = item_frame(
+            crate::proto::chat_item::Item::AdminDeletedMessage(crate::proto::AdminDeletedMessage {
+                admin_id: 5,
+            }),
+            650,
+        );
+
+        let payload: Vec<u8> = [
+            frame_bytes(&BackupInfo {
+                version: 1,
+                ..Default::default()
+            }),
+            call,
+            malformed_call,
+            payment_item,
+            gift_item,
+            view_once_item,
+            story_reply_item,
+            poll_item,
+            admin_deleted_item,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let archive = encrypt_archive(payload, &key);
+        let dir = std::env::temp_dir().join("kt-engine-history-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("recallback.bin");
+        std::fs::write(&path, &archive).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let stats = export_archive(&path, aci, TEST_KEY, &mut out)
+            .await
+            .expect("export");
+        assert_eq!(
+            stats,
+            ExportStats {
+                backup_version: 1,
+                frames: 9,
+                recipients: 0,
+                chats: 0,
+                messages: 6,
+                contacts: 0,
+                group_updates: 0,
+                calls: 1,
+                remote_deleted: 0,
+                skipped_items: 0,
+                skipped_frames: 1,
+            }
+        );
+
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 7);
+        // 帧级通话记录行（type adhocCall + calls 细分计数）；畸形帧不落行。
+        assert_eq!(lines[0]["type"], "adhocCall");
+        assert_eq!(lines[0]["callId"], 42);
+        assert_eq!(lines[0]["recipientId"], 9);
+        assert_eq!(lines[0]["state"], "GenericAdhocCall");
+        assert_eq!(lines[0]["callTimestamp"], 1_700_000_000_000_u64);
+        // payment 行：字符串面直投 + TransactionDetails 重编码 base64 可逆。
+        assert_eq!(lines[1]["payment"]["amountMob"], "1.00001");
+        assert_eq!(lines[1]["payment"]["feeMob"], "0.00002");
+        assert_eq!(lines[1]["payment"]["note"], "coffee");
+        let details_bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                lines[1]["payment"]["transactionDetailsBase64"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let details =
+            crate::proto::payment_notification::TransactionDetails::decode(&details_bytes[..])
+                .unwrap();
+        assert_eq!(
+            details
+                .payment
+                .expect("details oneof 在场"),
+            crate::proto::payment_notification::transaction_details::Payment::Transaction(
+                crate::proto::payment_notification::transaction_details::Transaction {
+                    status: crate::proto::payment_notification::transaction_details::transaction::Status::Successful as i32,
+                    mobile_coin_identification: Some(
+                        crate::proto::payment_notification::transaction_details::MobileCoinTxoIdentification {
+                            public_key: vec![vec![7u8; 32]],
+                            key_images: vec![vec![9u8; 32]],
+                        },
+                    ),
+                    timestamp: Some(1_700_000_000_000),
+                    block_index: Some(2),
+                    block_timestamp: Some(3),
+                    transaction: None,
+                    receipt: None,
+                },
+            )
+        );
+        // giftBadge 行：state 词表 + presentation base64。
+        assert_eq!(lines[2]["giftBadge"]["state"], "Redeemed");
+        assert_eq!(
+            lines[2]["giftBadge"]["receiptCredentialPresentation"],
+            base64::engine::general_purpose::STANDARD.encode([0xEE; 16])
+        );
+        // viewOnce 行：与 live 收投影同键形（viewOnce + attachments 单条数组）。
+        assert_eq!(lines[3]["viewOnce"], true);
+        assert_eq!(lines[3]["attachments"][0]["contentType"], "image/png");
+        assert_eq!(
+            lines[3]["attachments"][0]["locator"]["cdnKey"],
+            "viewonce-cdn"
+        );
+        assert!(lines[3].get("isErased").is_none());
+        assert!(lines[3].get("viewOnceInvalid").is_none());
+        // storyReply 行：emoji 臂。
+        assert_eq!(lines[4]["storyReply"]["emoji"], "🎉");
+        // poll 行：question/options（投票条目原样）/allowMultiple/hasEnded。
+        assert_eq!(lines[5]["poll"]["question"], "Lunch?");
+        assert_eq!(lines[5]["poll"]["options"][0]["option"], "Ramen");
+        assert_eq!(lines[5]["poll"]["options"][0]["votes"][0]["voterId"], 7);
+        assert_eq!(lines[5]["poll"]["options"][0]["votes"][0]["voteCount"], 2);
+        assert_eq!(lines[5]["poll"]["options"][1]["option"], "Salad");
+        assert!(lines[5]["poll"]["options"][1].get("votes").is_none());
+        assert_eq!(lines[5]["poll"]["allowMultiple"], false);
+        assert_eq!(lines[5]["poll"]["hasEnded"], false);
+        // adminDeleted 行：adminId 原样（→ 会话 → ACI 解析归消费方）。
+        assert_eq!(lines[6]["adminDeleted"]["adminId"], 5);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// B1 递补批帧级 AdHocCall 三面：state 词表（GENERIC → GenericAdhocCall、
+    /// UNKNOWN_STATE/词表外 → Unknown，官方 fromAdHocCallStateProto 同口径）/
+    /// callTimestamp=0 畸形 → 帧级跳过（skipped_frames 桶）/ callId=0 原样
+    /// 透出（legacy 兜底生成 UUID 归消费方）。
+    #[test]
+    fn adhoc_call_frame_faces() {
+        use crate::proto::ad_hoc_call;
+
+        let call = |state: i32, call_timestamp: u64| {
+            adhoc_call_record(&crate::proto::AdHocCall {
+                call_id: 42,
+                recipient_id: 9,
+                state,
+                call_timestamp,
+            })
+        };
+        let generic = call(ad_hoc_call::State::Generic as i32, 1_700_000_000_000).expect("行");
+        assert_eq!(generic["type"], "adhocCall");
+        assert_eq!(generic["state"], "GenericAdhocCall");
+        assert_eq!(generic["callId"], 42);
+        assert_eq!(generic["recipientId"], 9);
+        assert_eq!(generic["callTimestamp"], 1_700_000_000_000_u64);
+
+        assert_eq!(
+            call(ad_hoc_call::State::UnknownState as i32, 1).expect("行")["state"],
+            "Unknown"
+        );
+        assert_eq!(call(99, 1).expect("行")["state"], "Unknown");
+
+        // legacy 无 callId：0 原样透出（官方本地生成 UUID 的兜底归消费方）。
+        let legacy = adhoc_call_record(&crate::proto::AdHocCall {
+            call_id: 0,
+            recipient_id: 9,
+            state: ad_hoc_call::State::Generic as i32,
+            call_timestamp: 1,
+        })
+        .expect("行");
+        assert_eq!(legacy["callId"], 0);
+
+        // callTimestamp=0（官方 strictAssert「must have a valid timestamp」
+        // 的 KT 落法）：帧级跳过，调用方计 skipped_frames。
+        assert!(call(ad_hoc_call::State::Generic as i32, 0).is_none());
+    }
+
+    /// B1 递补批 viewOnce 三面：合法媒体族（image/video → attachments 单条、
+    /// 无 invalid）/ 畸形媒体族（audio → viewOnceInvalid 补标记，附件照投）/
+    /// 缺席（attachment 缺=已查看、pointer 缺=官方转换 null → 两面都
+    /// isErased，非 invalid）。
+    #[test]
+    fn view_once_message_projection_faces() {
+        let view_once = |attachment: Option<crate::proto::MessageAttachment>| {
+            let mut record = serde_json::json!({
+                "type": "message",
+                "chatId": 3,
+                "authorId": 7,
+                "dateSent": 620,
+                "direction": "incoming",
+            });
+            project_view_once_message(
+                &mut record,
+                &crate::proto::ViewOnceMessage {
+                    attachment,
+                    reactions: Vec::new(),
+                },
+            );
+            record
+        };
+        let pointer = |content_type: &str| crate::proto::MessageAttachment {
+            pointer: Some(FilePointer {
+                content_type: Some(content_type.into()),
+                locator_info: Some(file_pointer::LocatorInfo {
+                    key: vec![0x31u8; 32],
+                    size: 88,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for content_type in ["image/png", "video/mp4", "IMAGE/WEBP"] {
+            let row = view_once(Some(pointer(content_type)));
+            assert_eq!(row["viewOnce"], true, "{content_type}");
+            assert_eq!(
+                row["attachments"].as_array().unwrap().len(),
+                1,
+                "{content_type}"
+            );
+            assert!(
+                row.get("isErased").is_none() && row.get("viewOnceInvalid").is_none(),
+                "{content_type}: 合法行无 erased/invalid 位"
+            );
+        }
+        // 大小写不敏感媒体族（live is_view_once_media 单一真相源同函数）。
+        assert!(
+            view_once(Some(pointer("Video/QuickTime")))
+                .get("viewOnceInvalid")
+                .is_none(),
+            "宽判前缀族不误标"
+        );
+
+        let audio = view_once(Some(pointer("audio/mp4")));
+        assert_eq!(audio["viewOnceInvalid"], true, "媒体族外补 invalid");
+        assert_eq!(
+            audio["attachments"].as_array().unwrap().len(),
+            1,
+            "附件照投"
+        );
+
+        // pointer 缺失（官方 convertBackupMessageAttachmentToAttachment 返回
+        // null → attachments 空 → isErased）。
+        let no_pointer = view_once(Some(crate::proto::MessageAttachment::default()));
+        assert_eq!(no_pointer["isErased"], true);
+        assert!(no_pointer.get("attachments").is_none());
+        assert!(no_pointer.get("viewOnceInvalid").is_none());
+        // attachment 缺席（官方「Will be null for viewed messages」已查看形态）。
+        let viewed = view_once(None);
+        assert_eq!(viewed["isErased"], true);
+        assert!(viewed.get("attachments").is_none());
+    }
+
+    /// B1 递补批 payment 三面：完整 transaction（base64 重编码可逆
+    /// TransactionDetails）/ failed 臂（同走 base64，官方不区分臂）/ 缺席
+    /// （amountMob/feeMob/note/details 各键独立缺席；全零信息量 = 整 item
+    /// 跳过）/ 显式 optional 空串照投（proto3 optional presence 语义，官方
+    /// dropNull 同口径）。
+    #[test]
+    fn payment_notification_projection_faces() {
+        use crate::proto::payment_notification::transaction_details::{
+            self, FailedTransaction, Transaction,
+        };
+        use crate::proto::payment_notification::TransactionDetails;
+        use crate::proto::PaymentNotification;
+
+        let transaction = |payment: Option<transaction_details::Payment>| PaymentNotification {
+            amount_mob: Some("1.00001".into()),
+            fee_mob: None,
+            note: None,
+            transaction_details: Some(TransactionDetails { payment }),
+        };
+        let paid = payment_record(&transaction(Some(
+            transaction_details::Payment::Transaction(Transaction {
+                status: transaction_details::transaction::Status::Successful as i32,
+                mobile_coin_identification: Some(
+                    transaction_details::MobileCoinTxoIdentification {
+                        public_key: vec![vec![7u8; 32]],
+                        key_images: Vec::new(),
+                    },
+                ),
+                timestamp: Some(1_700_000_000_000),
+                block_index: None,
+                block_timestamp: None,
+                transaction: None,
+                receipt: None,
+            }),
+        )))
+        .expect("行");
+        assert_eq!(paid["amountMob"], "1.00001");
+        assert!(paid.get("feeMob").is_none());
+        assert!(paid.get("note").is_none());
+        let details_bytes = base64::engine::general_purpose::STANDARD
+            .decode(paid["transactionDetailsBase64"].as_str().unwrap())
+            .unwrap();
+        let decoded = TransactionDetails::decode(&details_bytes[..]).unwrap();
+        assert_eq!(
+            decoded.payment,
+            Some(transaction_details::Payment::Transaction(Transaction {
+                status: transaction_details::transaction::Status::Successful as i32,
+                mobile_coin_identification: Some(
+                    transaction_details::MobileCoinTxoIdentification {
+                        public_key: vec![vec![7u8; 32]],
+                        key_images: Vec::new(),
+                    }
+                ),
+                timestamp: Some(1_700_000_000_000),
+                block_index: None,
+                block_timestamp: None,
+                transaction: None,
+                receipt: None,
+            }))
+        );
+
+        // failed 臂：同走 base64（官方 import 不区分两臂），reason 词表原样。
+        let failed = payment_record(&transaction(Some(
+            transaction_details::Payment::FailedTransaction(FailedTransaction {
+                reason: transaction_details::failed_transaction::FailureReason::InsufficientFunds
+                    as i32,
+            }),
+        )))
+        .expect("行");
+        let failed_bytes = base64::engine::general_purpose::STANDARD
+            .decode(failed["transactionDetailsBase64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            TransactionDetails::decode(&failed_bytes[..])
+                .unwrap()
+                .payment,
+            Some(transaction_details::Payment::FailedTransaction(
+                FailedTransaction {
+                    reason:
+                        transaction_details::failed_transaction::FailureReason::InsufficientFunds
+                            as i32,
+                }
+            ))
+        );
+
+        // 缺席：details 缺 → 键不在，amount/fee/note 仍在。
+        let bare_details = payment_record(&PaymentNotification {
+            amount_mob: Some("2".into()),
+            fee_mob: Some("0".into()),
+            note: Some("n".into()),
+            transaction_details: None,
+        })
+        .expect("行");
+        assert!(bare_details.get("transactionDetailsBase64").is_none());
+        // 全零信息量 = 整 item 跳过（contact 空卡片同款纪律）。
+        assert!(payment_record(&PaymentNotification::default()).is_none());
+        // 显式 optional 空串照投（官方 dropNull 只滤 nullish，空串是档案陈述）。
+        let empty_note = payment_record(&PaymentNotification {
+            note: Some(String::new()),
+            ..Default::default()
+        })
+        .expect("行");
+        assert_eq!(empty_note["note"], "");
+    }
+
+    /// B1 递补批 giftBadge 三面：state 词表（UNOPENED/词表外 → Unopened、
+    /// OPENED/REDEEMED 逐臂、官方 default 臂同口径）/ FAILED 短路（只投
+    /// state，presentation 在场也不投）/ 非 FAILED 空 presentation 畸形 →
+    /// 整 item 跳过。
+    #[test]
+    fn gift_badge_projection_faces() {
+        use crate::proto::gift_badge;
+
+        let badge = |state: i32, presentation: Vec<u8>| {
+            gift_badge_record(&crate::proto::GiftBadge {
+                receipt_credential_presentation: presentation,
+                state,
+            })
+        };
+        assert_eq!(
+            badge(gift_badge::State::Unopened as i32, vec![0xEE; 16]).expect("行"),
+            serde_json::json!({
+                "state": "Unopened",
+                "receiptCredentialPresentation": base64::engine::general_purpose::STANDARD.encode([0xEE; 16]),
+            })
+        );
+        assert_eq!(
+            badge(gift_badge::State::Opened as i32, vec![1]).expect("行")["state"],
+            "Opened"
+        );
+        assert_eq!(
+            badge(gift_badge::State::Redeemed as i32, vec![1]).expect("行")["state"],
+            "Redeemed"
+        );
+        assert_eq!(
+            badge(99, vec![1]).expect("行")["state"],
+            "Unopened",
+            "词表外归 Unopened"
+        );
+
+        // FAILED 短路：presentation 在场也不投（官方提前 return 同形）。
+        assert_eq!(
+            badge(gift_badge::State::Failed as i32, vec![0xEE; 16]).expect("行"),
+            serde_json::json!({ "state": "Failed" })
+        );
+
+        // 非 FAILED 空 presentation（官方 strictAssert 的 KT 落法）= 跳过。
+        assert!(badge(gift_badge::State::Redeemed as i32, Vec::new()).is_none());
+    }
+
+    /// B1 递补批 storyReply 三面：textReply 臂（body 非空才投 + longText
+    /// 指针公共面；无 text 无 longText = 零信息量跳过）/ emoji 臂（空串=
+    /// 官方 else-throw 落法跳过）/ reply 未设与 directionless（官方两
+    /// strictAssert 的 KT 落法）整 item 跳过。
+    #[test]
+    fn story_reply_projection_faces() {
+        use crate::proto::direct_story_reply_message::{self, TextReply};
+
+        let reply_item =
+            |reply: Option<direct_story_reply_message::Reply>,
+             direction: Option<chat_item::DirectionalDetails>| {
+                test_record(&ChatItem {
+                    chat_id: 3,
+                    author_id: 7,
+                    date_sent: 630,
+                    directional_details: direction.or(Some(
+                        chat_item::DirectionalDetails::Incoming(IncomingMessageDetails::default()),
+                    )),
+                    item: Some(Item::DirectStoryReplyMessage(
+                        crate::proto::DirectStoryReplyMessage {
+                            reply,
+                            reactions: Vec::new(),
+                        },
+                    )),
+                    ..Default::default()
+                })
+            };
+        let text = |body: &str| {
+            Some(direct_story_reply_message::Reply::TextReply(TextReply {
+                text: Some(Text {
+                    body: body.into(),
+                    ..Default::default()
+                }),
+                long_text: None,
+            }))
+        };
+
+        let body_row = reply_item(text("wow"), None).expect("行");
+        assert_eq!(body_row["storyReply"]["body"], "wow");
+        assert!(body_row["storyReply"].get("bodyAttachment").is_none());
+
+        // longText only：bodyAttachment 指针公共面，body 键不在。
+        let long_row = reply_item(
+            Some(direct_story_reply_message::Reply::TextReply(TextReply {
+                text: None,
+                long_text: Some(FilePointer {
+                    content_type: Some("text/plain".into()),
+                    file_name: Some("story.txt".into()),
+                    locator_info: Some(file_pointer::LocatorInfo {
+                        key: vec![0x41u8; 32],
+                        size: 12,
+                        transit_cdn_number: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            })),
+            None,
+        )
+        .expect("行");
+        assert!(long_row["storyReply"].get("body").is_none());
+        assert_eq!(long_row["storyReply"]["bodyAttachment"]["size"], 12);
+        assert_eq!(
+            long_row["storyReply"]["bodyAttachment"]["locator"]["cdnNumber"],
+            0
+        );
+
+        // 零信息量 textReply（空 body 无 longText）= 整 item 跳过。
+        assert!(reply_item(text(""), None).is_none());
+        assert!(reply_item(
+            Some(direct_story_reply_message::Reply::TextReply(TextReply {
+                text: None,
+                long_text: None,
+            })),
+            None
+        )
+        .is_none());
+
+        // emoji 臂：非空成行；空串（官方 falsy 落入 else throw 的 KT 落法）跳过。
+        let emoji_row = reply_item(
+            Some(direct_story_reply_message::Reply::Emoji("❤️".into())),
+            None,
+        )
+        .expect("行");
+        assert_eq!(emoji_row["storyReply"]["emoji"], "❤️");
+        assert!(reply_item(
+            Some(direct_story_reply_message::Reply::Emoji(String::new())),
+            None
+        )
+        .is_none());
+
+        // reply 未设（官方 strictAssert「reply is missing」）与 directionless
+        // （官方 strictAssert「reply cannot be directionless」）= 整 item 跳过。
+        assert!(reply_item(None, None).is_none());
+        assert!(reply_item(
+            Some(direct_story_reply_message::Reply::Emoji("🎉".into())),
+            Some(chat_item::DirectionalDetails::Directionless(
+                DirectionlessMessageDetails::default()
+            ))
+        )
+        .is_none());
+    }
+
+    /// B1 递补批 poll 三面：完整（question/options 投票条目原样/allowMultiple/
+    /// hasEnded 恒投；无投票 option 的 votes 键不在）/ 缺席（空 option 条目
+    /// 丢弃、空 question 键不在、全零信息量整 item 跳过）/ 超限（options 40
+    /// → 32 截断；单 option 投票 1010 → 1001 截断，官方 GroupsV2 群上限 =
+    /// 合法天花板）。
+    #[test]
+    fn poll_projection_faces() {
+        use crate::proto::poll::{poll_option::PollVote, PollOption};
+
+        let poll_item = |poll: crate::proto::Poll| {
+            test_record(&ChatItem {
+                chat_id: 3,
+                author_id: 7,
+                date_sent: 640,
+                directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                    IncomingMessageDetails::default(),
+                )),
+                item: Some(Item::Poll(poll)),
+                ..Default::default()
+            })
+            .expect("行")["poll"]
+                .clone()
+        };
+        let full = poll_item(crate::proto::Poll {
+            question: "Lunch?".into(),
+            allow_multiple: true,
+            options: vec![
+                PollOption {
+                    option: "Ramen".into(),
+                    votes: vec![
+                        PollVote {
+                            voter_id: 7,
+                            vote_count: 2,
+                        },
+                        PollVote {
+                            voter_id: 0,
+                            vote_count: 1,
+                        },
+                    ],
+                },
+                PollOption {
+                    option: "Salad".into(),
+                    votes: Vec::new(),
+                },
+            ],
+            has_ended: true,
+            reactions: Vec::new(),
+        });
+        assert_eq!(full["question"], "Lunch?");
+        assert_eq!(full["options"][0]["option"], "Ramen");
+        assert_eq!(full["options"][0]["votes"][0]["voterId"], 7);
+        assert_eq!(full["options"][0]["votes"][0]["voteCount"], 2);
+        // voterId=0 原样透出（官方 nullish 检查的 proto3 等价面=消费方
+        // recipient 解析丢弃，不在此处发明判断）。
+        assert_eq!(full["options"][0]["votes"][1]["voterId"], 0);
+        assert!(
+            full["options"][1].get("votes").is_none(),
+            "无投票 votes 键不在"
+        );
+        assert_eq!(full["allowMultiple"], true);
+        assert_eq!(
+            full["hasEnded"], true,
+            "terminatedAt 归消费方从 dateSent 派生"
+        );
+
+        // 缺席：空 option 条目丢弃；空 question 键不在但行仍在。
+        let no_question = poll_item(crate::proto::Poll {
+            question: String::new(),
+            allow_multiple: false,
+            options: vec![
+                PollOption {
+                    option: "A".into(),
+                    votes: Vec::new(),
+                },
+                PollOption {
+                    option: String::new(),
+                    votes: Vec::new(),
+                },
+            ],
+            has_ended: false,
+            reactions: Vec::new(),
+        });
+        assert!(no_question.get("question").is_none());
+        assert_eq!(
+            no_question["options"].as_array().unwrap().len(),
+            1,
+            "空 option 条目整条丢弃"
+        );
+
+        // 全零信息量（question 空 且 无可投 option）= 整 item 跳过。
+        assert!(test_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 641,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default()
+            )),
+            item: Some(Item::Poll(crate::proto::Poll {
+                question: String::new(),
+                allow_multiple: false,
+                options: vec![PollOption {
+                    option: String::new(),
+                    votes: Vec::new()
+                }],
+                has_ended: false,
+                reactions: Vec::new(),
+            })),
+            ..Default::default()
+        })
+        .is_none());
+
+        // 超限截断（敌意行域，不致命）：options 40 → 32；votes 1010 → 1001。
+        let many_options = poll_item(crate::proto::Poll {
+            question: "q".into(),
+            allow_multiple: false,
+            options: (0..40)
+                .map(|i| PollOption {
+                    option: format!("opt{i}"),
+                    votes: Vec::new(),
+                })
+                .collect(),
+            has_ended: false,
+            reactions: Vec::new(),
+        });
+        assert_eq!(
+            many_options["options"].as_array().unwrap().len(),
+            MAX_POLL_OPTIONS,
+            "options 超限截断"
+        );
+        let many_votes = poll_item(crate::proto::Poll {
+            question: "q".into(),
+            allow_multiple: false,
+            options: vec![PollOption {
+                option: "A".into(),
+                votes: (0..1010)
+                    .map(|i| PollVote {
+                        voter_id: i as u64 + 1,
+                        vote_count: 1,
+                    })
+                    .collect(),
+            }],
+            has_ended: false,
+            reactions: Vec::new(),
+        });
+        assert_eq!(
+            many_votes["options"][0]["votes"].as_array().unwrap().len(),
+            MAX_POLL_OPTION_VOTES,
+            "votes 超限截断"
+        );
+    }
+
+    /// B1 递补批 adminDeleted 面：adminId 原样透出（proto3 标量；官方
+    /// adminId → 会话 → serviceId ACI 解析归消费方，解析残缺=消费方
+    /// strictAssert 面）。
+    #[test]
+    fn admin_deleted_projection_faces() {
+        let row = test_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 650,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::AdminDeletedMessage(
+                crate::proto::AdminDeletedMessage { admin_id: 5 },
+            )),
+            ..Default::default()
+        })
+        .expect("行");
+        assert_eq!(row["adminDeleted"], serde_json::json!({ "adminId": 5 }));
+        assert!(
+            row.get("remoteDeleted").is_none(),
+            "独立 face 不混 tombstone 位"
+        );
+
+        // adminId=0 原样透出（消费方 recipient 解析丢弃面，proto 只投影不发明）。
+        let zero = test_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 651,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::AdminDeletedMessage(
+                crate::proto::AdminDeletedMessage { admin_id: 0 },
+            )),
+            ..Default::default()
+        })
+        .expect("行");
+        assert_eq!(zero["adminDeleted"]["adminId"], 0);
     }
 
     #[tokio::test]
