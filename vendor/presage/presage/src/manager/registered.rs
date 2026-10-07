@@ -1144,6 +1144,56 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// KT fork (stories): send a story message (`ContentBody::StoryMessage`)
+    /// to a single recipient over the official story transport face
+    /// (sealed sender + `?story=true`, see libsignal-service
+    /// `MessageSender::send_story_message`).
+    ///
+    /// Differences from [`Self::send_message`], each mirroring the official
+    /// client (behavioral comparison, no code copied):
+    /// - the sender's own profile key is injected into the `StoryMessage`
+    ///   (Signal-Desktop `ts/jobs/helpers/sendStory.preload.ts:72` refuses
+    ///   to send without it, `:198-205` puts it in the proto — same shape
+    ///   `send_message` applies to `DataMessage`);
+    /// - the message is **not** saved to the local store: stories do not
+    ///   belong to the local timeline (upstream presage already skips
+    ///   saving received `StoryMessage`s, and the desktop story flow keeps
+    ///   the story out of the recipient chat list);
+    /// - no sent-transcript is produced here; the story self-sync
+    ///   (`SyncMessage.Sent` with `story_message` +
+    ///   `story_message_recipients`) is the caller's responsibility, sent
+    ///   once after all per-recipient sends (Signal-Desktop
+    ///   `sendStory.preload.ts:338-340`, `:565-598`).
+    pub async fn send_story_message(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let recipient = recipient.into();
+        let mut content_body: ContentBody = message.into();
+
+        // we need to put our profile key in StoryMessage
+        if let ContentBody::StoryMessage(message) = &mut content_body {
+            message
+                .profile_key
+                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+        }
+
+        let sender_certificate = self.sender_certificate().await?;
+        let mut sender = self.new_message_sender().await?;
+        sender
+            .send_story_message(
+                &recipient,
+                &sender_certificate,
+                content_body,
+                timestamp,
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Uploads one attachment prior to linking them in a message.
     pub async fn upload_attachment(
         &self,

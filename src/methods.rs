@@ -720,6 +720,127 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // sendStory（Stories 发送批，KT 扩展方法）：text story 一面（v1，
+        // 群 story / 文件 story 不做）。协议上行面落调度日志（send 系同纪
+        // 律）；参数面 fail-closed（-32603）：account/message 非空、
+        // recipients 非空字符串数组（story 面恒为名单展开集，无单字符串
+        // 形态——成员解析归 connector）、distributionListId 非空字符串缺省
+        // 官方 MY_STORY_ID、allowsReplies 布尔（缺省 false = 线上 proto 缺
+        // 席位，官方值源为名单属性）、textStyle 单词六值词表（官方
+        // TextAttachment.Style 词表，DEFAULT = proto 字段省略）、bodyRanges
+        // 五值内联样式 {style,start,length} ≤64（send textStyle 同款
+        // fail-closed 闸 + 服务层防御双保险）、previewImage 非空字符串
+        //（缺失/null = 无预览，其他类型 fail-closed 不静默丢弃）。
+        "sendStory" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let recipients = match params.get("recipients") {
+                Some(Value::Array(entries)) if !entries.is_empty() => {
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(number) if !number.is_empty() => parsed.push(number.to_owned()),
+                            _ => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                _ => return internal_error(id),
+            };
+            let distribution_list_id = match params.get("distributionListId") {
+                None | Some(Value::Null) => crate::service::stories::MY_STORY_ID,
+                Some(Value::String(list_id)) if !list_id.is_empty() => list_id.as_str(),
+                _ => return internal_error(id),
+            };
+            let allows_replies = match params.get("allowsReplies") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return internal_error(id),
+            };
+            let text_style = match params.get("textStyle") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(word)) => {
+                    match crate::service::stories::parse_story_text_style(word) {
+                        Ok(style) => style,
+                        Err(()) => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            let body_ranges = match params.get("bodyRanges") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.len() > MAX_SEND_TEXT_STYLES {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let style = entry.get("style").and_then(Value::as_str);
+                        let start = entry
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let length = entry
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        match (style, start, length) {
+                            (
+                                Some(
+                                    style @ ("BOLD" | "ITALIC" | "SPOILER" | "STRIKETHROUGH"
+                                    | "MONOSPACE"),
+                                ),
+                                Some(start),
+                                Some(length),
+                            ) => parsed.push(SendTextStyle {
+                                style: style.to_owned(),
+                                start,
+                                length,
+                            }),
+                            _ => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
+            let preview_image = match params.get("previewImage") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(uri)) if !uri.is_empty() => Some(uri.as_str()),
+                Some(_) => return internal_error(id),
+            };
+            match (account, message) {
+                (Some(account), Some(message)) => {
+                    match service
+                        .send_story(
+                            account,
+                            &recipients,
+                            distribution_list_id,
+                            allows_replies,
+                            message,
+                            text_style,
+                            &body_ranges,
+                            preview_image,
+                        )
+                        .await
+                    {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // sendMessageRequestResponse（消息请求写面，connector 契约 1.63
         // §4.56 债务批，KT 扩展方法）：上游钉定面 params `{account,
         // recipient?|groupId?, type}`（connector prepare_conversations_message_

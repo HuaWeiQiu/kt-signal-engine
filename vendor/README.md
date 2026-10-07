@@ -20,6 +20,35 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 （Cargo.lock `git+https://…` 形状），`[patch.crates-io]` 对 git 依赖不
 生效，按事实改用对应 git 源 URL 的 `[patch."…"]` 段（批汇报偏差项）。
 
+## fork 改动清单（Stories 批，随 commit 递增登记）
+
+钉定 rev 之上的**全部**叠加改动（逐文件；其余上游代码零漂移，可
+`diff -rq` 对照 checkout 复核）：
+
+`vendor/libsignal-service/`（rev 9e6c08b）：
+
+- `src/websocket/sender.rs` — 新增 `send_messages_unidentified_story`：
+  `PUT /v1/messages/{dest}?story=true` 查询参、无 `Unidentified-Access-Key`
+  头。官方锚：libsignal v0.99.0 `ws/messages.rs:141-150`（story 后缀）+
+  `:39`（Story→无 user-based 授权头）；桌面 `WebAPI.preload.ts:3804/3850`
+  同查询参、`OutgoingMessage.preload.ts:392-394` story 恒 sealed sender。
+- `src/sender.rs` — ①`try_send_message` 增 `story: Option<&SenderCertificate>`
+  参数（既有 6 处调用点全传 `None` = 上游行为逐字保持；Some 时加密
+  cert = `story.or(unidentified_access.map(cert))`、分发走 story ws 方法、
+  无 identified 降级）；②新增 pub `send_story_message`（单收件人 sealed
+  sender + `?story=true` 传输面；不产 sent-transcript——官方
+  sendStory.preload.ts:338-340「story 同步由收尾单独发」同口径）。
+
+`vendor/presage/`（rev 33dd149）：
+
+- `presage/src/manager/registered.rs` — 新增 pub
+  `Manager::send_story_message`（注入发送者 profile_key 到 StoryMessage、
+  不落 store、不产 transcript，官方 profileKey 必需 + story 不进本地
+  timeline 同口径）。
+
+`presage-store-sqlite` 零改动。E2 接收面 fork（Metadata.story 位）随该
+commit 追加登记。
+
 ## 更新纪律
 
 后续再动 `vendor/`：先 `diff -rq` 对照上表 rev 的 cargo checkout 确认

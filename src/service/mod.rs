@@ -49,6 +49,7 @@ pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 pub(crate) mod storage_write;
+pub(crate) mod stories;
 
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
@@ -796,6 +797,35 @@ impl Service {
                 .map_err(|_| SendError::Internal)?;
         }
         Ok(())
+    }
+
+    /// sendStory（Stories 发送批，KT 扩展方法）：text story 构造 + 逐收件人
+    /// 分发 + best-effort 自同步，编排全量在 stories 模块（compat §3
+    /// sendStory 行）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_story(
+        self: &Arc<Self>,
+        account: &str,
+        recipients: &[String],
+        distribution_list_id: &str,
+        allows_replies: bool,
+        text: &str,
+        text_style: Option<i32>,
+        body_ranges: &[SendTextStyle],
+        preview_image: Option<&str>,
+    ) -> Result<(u64, Vec<Value>), SendError> {
+        stories::send_story(
+            self,
+            account,
+            recipients,
+            distribution_list_id,
+            allows_replies,
+            text,
+            text_style,
+            body_ranges,
+            preview_image,
+        )
+        .await
     }
 
     pub(crate) async fn send_reaction(

@@ -381,6 +381,7 @@ where
                     .try_send_message(
                         *recipient,
                         None,
+                        None,
                         &sync_message,
                         timestamp,
                         include_pni_signature,
@@ -405,6 +406,7 @@ where
             .try_send_message(
                 *recipient,
                 unidentified_access.as_ref(),
+                None,
                 &content_body,
                 timestamp,
                 include_pni_signature,
@@ -434,6 +436,7 @@ where
                 debug!("sending multi-device sync message");
                 self.try_send_message(
                     self.local_aci.into(),
+                    None,
                     None,
                     &body,
                     timestamp,
@@ -476,6 +479,7 @@ where
                 .try_send_message(
                     *recipient,
                     unidentified_access.as_ref(),
+                    None,
                     &content_body,
                     timestamp,
                     *include_pni_signature,
@@ -509,6 +513,7 @@ where
                     .try_send_message(
                         self.local_aci.into(),
                         None,
+                        None,
                         &sync_message,
                         timestamp,
                         false, // XXX: maybe the sync device does want a PNI signature?
@@ -536,6 +541,11 @@ where
         &mut self,
         recipient: ServiceId,
         mut unidentified_access: Option<&UnidentifiedAccess>,
+        // KT fork (stories): story 发送模式。Some = sealed sender 加密用该
+        // sender certificate（不派生 UAK 头）、经 `?story=true` 传输面分发；
+        // None = 上游既有行为逐字保持。官方依据见 send_story_message 与
+        // websocket/sender.rs `send_messages_unidentified_story` 文档。
+        story: Option<&SenderCertificate>,
         content_body: &ContentBody,
         timestamp: u64,
         include_pni_signature: bool,
@@ -561,7 +571,8 @@ where
             }) = self
                 .create_encrypted_messages(
                     &recipient,
-                    unidentified_access.map(|x| &x.certificate),
+                    story
+                        .or(unidentified_access.map(|x| &x.certificate)),
                     &content_bytes,
                 )
                 .await?
@@ -579,7 +590,12 @@ where
                 online,
             };
 
-            let send = if let Some(unidentified) = &unidentified_access {
+            let send = if let Some(_sender_certificate) = story {
+                tracing::debug!("sending via unidentified (story)");
+                self.unidentified_ws
+                    .send_messages_unidentified_story(messages)
+                    .await
+            } else if let Some(unidentified) = &unidentified_access {
                 tracing::debug!("sending via unidentified");
                 self.unidentified_ws
                     .send_messages_unidentified(messages, unidentified)
@@ -797,6 +813,7 @@ where
             self.try_send_message(
                 self.local_aci.into(),
                 None,
+                None,
                 &content,
                 timestamp,
                 false,
@@ -805,6 +822,49 @@ where
             .await?;
         }
         Ok(())
+    }
+
+    /// KT fork (stories): send a story message (ContentBody::StoryMessage)
+    /// to a single recipient over the official story transport face:
+    /// sealed-sender encryption with `sender_certificate` and the
+    /// `?story=true` request suffix, with no per-recipient access key.
+    ///
+    /// Official behavior mirrored (behavioral comparison, no code copied):
+    /// - Signal-Desktop `ts/textsecure/OutgoingMessage.preload.ts:392-394`:
+    ///   story sends take the sealed-sender path unconditionally (auth =
+    ///   `'story'` outranks access key / group send token); no fallback to
+    ///   the identified channel on authorization failures.
+    /// - libsignal v0.99.0 `rust/net/chat/src/ws/messages.rs:141-150` +
+    ///   `:39`: `PUT /v1/messages/{destination}?story=true`, no
+    ///   user-based authorization header for story sends.
+    /// - Signal-Desktop `ts/jobs/helpers/sendStory.preload.ts:338-340`
+    ///   ("Don't send normal sync messages; a story sync is sent at the end
+    ///   of the process"): this method deliberately does **not** build a
+    ///   sent-transcript; the caller is responsible for the story sync
+    ///   (`SyncMessage.Sent` with `story_message` +
+    ///   `story_message_recipients`), which the upstream
+    ///   `create_multi_device_sent_transcript_content` does not cover.
+    ///
+    /// Errors (including `Unauthorized`) are returned as-is: retry/backoff
+    /// policy belongs to the caller, matching upstream `send_message`.
+    pub async fn send_story_message(
+        &mut self,
+        recipient: &ServiceId,
+        sender_certificate: &SenderCertificate,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let content_body = message.into();
+        self.try_send_message(
+            *recipient,
+            None,
+            Some(sender_certificate),
+            &content_body,
+            timestamp,
+            false,
+            false,
+        )
+        .await
     }
 
     /// Send a `SyncMessage` request message
