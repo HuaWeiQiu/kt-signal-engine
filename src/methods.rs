@@ -1517,6 +1517,43 @@ async fn dispatch(
                 Err(()) => internal_error(id),
             }
         }
+        // 官方桌面本地备份快照导入（docs/backup-export-contract.md §11，KT
+        // 扩展方法）：`{account, snapshotDir}` → metadata 快校验（目录/metadata
+        // 缺、形状不合规、错钥当场答结构化码）→ 后台帧导出（NDJSON 落盘与
+        // 存量历史迁移同一落点，connector 消费）。成功 `{"status":"started"}`；
+        // 参数面 -32603（缺 account/snapshotDir/未注册/AEP 缺）；结构化码
+        // -1 + message（§11 五码位 + ALREADY_RUNNING）。快照目录路径由
+        // connector 传入（同机路径交接，§10.2 artifact 反向同款），引擎不
+        // 持久化。
+        "backup.importSnapshot" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(snapshot_dir) = params.get("snapshotDir").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service
+                .backup_import_snapshot(account, std::path::Path::new(snapshot_dir))
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "started" })),
+                Err(crate::service::snapshot_import::SnapshotImportRejection::Structured(code)) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, code))
+                }
+                Err(crate::service::snapshot_import::SnapshotImportRejection::Internal) => {
+                    internal_error(id)
+                }
+            }
+        }
+        "backup.importSnapshotStatus" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.backup_import_snapshot_status(account).await {
+                Ok(payload) => jsonrpc::success_response(id, payload),
+                Err(()) => internal_error(id),
+            }
+        }
         // transfer_archive 下载进度快照查询（transfer.downloadStatus，KT 扩展
         // 方法）：`history.importStatus` progress 组合面的引擎侧只读数据源
         // （契约 1.53 §4.38 扩展）。快照缺席（未开始/已结束/引擎重启过）=

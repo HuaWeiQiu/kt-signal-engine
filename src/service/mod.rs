@@ -45,6 +45,7 @@ pub(crate) mod backup_task;
 pub(crate) mod groups;
 pub(crate) mod profile;
 pub(crate) mod report;
+pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
@@ -454,6 +455,8 @@ pub(crate) struct Service {
     pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
     /// 备份导出任务注册表（进程内存，backup_task 模块契约 §10.3）。
     backup_tasks: Arc<backup_task::BackupTaskRegistry>,
+    /// 官方快照导入任务注册表（进程内存，snapshot_import 模块 §11）。
+    snapshot_imports: Arc<snapshot_import::SnapshotImportRegistry>,
     /// 已终止群登记表（进程内存，groups 模块：receive 投影 → send 面拦截）。
     terminated_groups: groups::TerminatedGroups,
     /// transfer_archive 下载进度快照（进程内存，不落盘；§4.38 progress 面）。
@@ -483,6 +486,7 @@ impl Service {
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
             backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            snapshot_imports: Arc::new(StdMutex::new(HashMap::new())),
             terminated_groups: groups::TerminatedGroups::new(),
             transfer_progress: transfer_progress::TransferProgress::new(),
         })
