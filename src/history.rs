@@ -35,7 +35,8 @@ use crate::proto::{
 };
 
 /// 导出计数：结果与跳过都要可见，禁静默丢帧。
-/// `frames` 为档案总帧数（含 BackupInfo 元帧）。
+/// `frames` 为档案总帧数（含 BackupInfo 元帧）。`contacts` 为 `messages`
+/// 内 contact 类型的细分计数（B1 扩面可见性）。
 #[derive(Debug, Default, PartialEq)]
 pub struct ExportStats {
     pub backup_version: u64,
@@ -43,6 +44,7 @@ pub struct ExportStats {
     pub recipients: u64,
     pub chats: u64,
     pub messages: u64,
+    pub contacts: u64,
     pub remote_deleted: u64,
     pub skipped_items: u64,
     pub skipped_frames: u64,
@@ -105,19 +107,25 @@ pub async fn export_archive(
                 stats.chats += 1;
                 write_json(out, chat_record(&chat))?;
             }
-            Some(frame::Item::ChatItem(item)) => match message_record(&item) {
-                Some(record) => {
-                    stats.messages += 1;
-                    write_json(out, record)?;
-                }
-                None => {
-                    if matches!(item.item, Some(chat_item::Item::RemoteDeletedMessage(_))) {
-                        stats.remote_deleted += 1;
-                    } else {
-                        stats.skipped_items += 1;
+            Some(frame::Item::ChatItem(item)) => {
+                let is_contact = matches!(item.item, Some(chat_item::Item::ContactMessage(_)));
+                match message_record(&item) {
+                    Some(record) => {
+                        stats.messages += 1;
+                        if is_contact {
+                            stats.contacts += 1;
+                        }
+                        write_json(out, record)?;
+                    }
+                    None => {
+                        if matches!(item.item, Some(chat_item::Item::RemoteDeletedMessage(_))) {
+                            stats.remote_deleted += 1;
+                        } else {
+                            stats.skipped_items += 1;
+                        }
                     }
                 }
-            },
+            }
             Some(_) | None => stats.skipped_frames += 1,
         }
     }
@@ -246,8 +254,8 @@ fn chat_record(c: &Chat) -> serde_json::Value {
 /// v2 中间表示：text + 附件 pointer-complete 投影（locator 面 +
 /// clientUuid/宽高/caption/blurHash/incrementalMac，见
 /// `project_pointer_common`；字节本身不在档案内，下载归 connector）+
-/// quote + sticker（`sticker_record`）+ 远端删除。返回 `None` = 跳过
-/// （计数可见）。
+/// quote + sticker（`sticker_record`）+ contact（`contact_record`）+
+/// 远端删除。返回 `None` = 跳过（计数可见）。
 fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
     let direction = match item.directional_details.as_ref()? {
         chat_item::DirectionalDetails::Incoming(_) => "incoming",
@@ -306,10 +314,13 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
         chat_item::Item::StickerMessage(sticker_message) => {
             record["sticker"] = sticker_record(sticker_message)?;
         }
+        chat_item::Item::ContactMessage(contact_message) => {
+            record["contact"] = contact_record(contact_message)?;
+        }
         chat_item::Item::UpdateMessage(update) => {
             record["expirationTimerChange"] = timer_change_record(update)?;
         }
-        // 其余 item 类型 v1 跳过（调用方计数）；方向可用的 update/call 类未来再扩。
+        // 其余 item 类型 v1 跳过（调用方计数）；方向可用的 call 类未来再扩。
         _ => return None,
     };
     Some(record)
@@ -377,6 +388,105 @@ fn sticker_record(sticker_message: &crate::proto::StickerMessage) -> Option<serd
         face["data"] = serde_json::json!(file_pointer_record(data));
     }
     Some(face)
+}
+
+/// B1 contact item 完整投影（官方 Transfer/backup 导入对位：Signal-Desktop
+/// `import.preload.ts:2620-2705` —— `contactMessage` strictAssert 要求
+/// contact 在场，随后 name/number/email/organization/avatar 逐面映射为
+/// ContactForm 形状：name 子字段空串归缺席（官方 `givenName: name.given ||
+/// undefined` 同口径）、number/email 条目 value 空的整条丢弃（官方
+/// `!value → undefined` + `filter(isNotNil)`）、type 词表
+/// HOME/MOBILE/WORK/CUSTOM（`phoneToContactFormType`:191-214 /
+/// `emailToContactFormType`:216-240——UNKNOWN/词表外一律归 HOME）、organization
+/// 空串归缺席、avatar 经 `convertFilePointerToAttachment` 附件指针转换）。
+/// 投影口径：contact 未设 = 整 item 跳过（官方 strictAssert 的 KT 落法，
+/// 计数可见不致命）；全零信息量 face（无任何可渲染字段）= 整 item 跳过
+/// （空卡片即占位，KT 永不投占位）；地址面（PostalAddress）本批不投（任务
+/// 面=姓名/电话/邮箱字段指针面，如实记档 §5 gap）。avatar 复用附件指针
+/// 公共面（locator 同款面，字节不下载），消费方 connector 并入描述符列表
+/// 与 live 附件归一同构。
+fn contact_record(contact_message: &crate::proto::ContactMessage) -> Option<serde_json::Value> {
+    let contact = contact_message.contact.as_ref()?;
+    let mut face = serde_json::Map::new();
+    if let Some(name) = &contact.name {
+        let mut projected = serde_json::Map::new();
+        for (key, value) in [
+            ("givenName", &name.given_name),
+            ("familyName", &name.family_name),
+            ("prefix", &name.prefix),
+            ("suffix", &name.suffix),
+            ("middleName", &name.middle_name),
+            ("nickname", &name.nickname),
+        ] {
+            if !value.is_empty() {
+                projected.insert(key.into(), serde_json::Value::String(value.clone()));
+            }
+        }
+        if !projected.is_empty() {
+            face.insert("name".into(), serde_json::Value::Object(projected));
+        }
+    }
+    let numbers: Vec<_> = contact
+        .number
+        .iter()
+        .filter_map(|phone| contact_field_record(&phone.value, phone.r#type, &phone.label))
+        .collect();
+    if !numbers.is_empty() {
+        face.insert("number".into(), serde_json::json!(numbers));
+    }
+    let emails: Vec<_> = contact
+        .email
+        .iter()
+        .filter_map(|email| contact_field_record(&email.value, email.r#type, &email.label))
+        .collect();
+    if !emails.is_empty() {
+        face.insert("email".into(), serde_json::json!(emails));
+    }
+    if !contact.organization.is_empty() {
+        face.insert(
+            "organization".into(),
+            serde_json::Value::String(contact.organization.clone()),
+        );
+    }
+    if let Some(avatar) = &contact.avatar {
+        face.insert(
+            "avatar".into(),
+            serde_json::json!(file_pointer_record(avatar)),
+        );
+    }
+    (!face.is_empty()).then_some(serde_json::Value::Object(face))
+}
+
+/// number/email 条目投影：value 空的整条丢弃（官方 `!value → undefined` +
+/// `filter(isNotNil)` 同口径）；type 词表经 `contact_field_type_name`；label
+/// 非空才投（官方 `label || undefined` 同口径）。
+fn contact_field_record(value: &str, field_type: i32, label: &str) -> Option<serde_json::Value> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut record = serde_json::json!({
+        "value": value,
+        "type": contact_field_type_name(field_type),
+    });
+    if !label.is_empty() {
+        record["label"] = serde_json::Value::String(label.to_string());
+    }
+    Some(record)
+}
+
+/// proto Phone/Email.Type → 官方 ContactFormType 词表（HOME/MOBILE/WORK/
+/// CUSTOM）。UNKNOWN/缺省/词表外一律归 HOME（官方 `phoneToContactFormType`
+/// `import.preload.ts:191-214` 同口径：`isKnownProtoEnumMember` 失败与
+/// UNKNOWN 分支都归 HOME）。两枚举词表同形，共用一个映射函数。
+fn contact_field_type_name(value: i32) -> &'static str {
+    match crate::proto::contact_attachment::phone::Type::try_from(value) {
+        Ok(crate::proto::contact_attachment::phone::Type::Mobile) => "MOBILE",
+        Ok(crate::proto::contact_attachment::phone::Type::Work) => "WORK",
+        Ok(crate::proto::contact_attachment::phone::Type::Custom) => "CUSTOM",
+        Ok(crate::proto::contact_attachment::phone::Type::Home)
+        | Ok(crate::proto::contact_attachment::phone::Type::Unknown)
+        | Err(_) => "HOME",
+    }
 }
 
 /// 附件/文件指针投影公共面（H3 附件媒体字节 v2，方案 C ①）：v1 只有
@@ -712,6 +822,34 @@ mod tests {
                 ..Default::default()
             })),
         });
+        // B1 批：contact item（官方 contactMessage 导出形态）成行。
+        let contact_item = frame_bytes(&Frame {
+            item: Some(frame::Item::ChatItem(ChatItem {
+                chat_id: 3,
+                author_id: 7,
+                date_sent: 450,
+                directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                    IncomingMessageDetails::default(),
+                )),
+                item: Some(Item::ContactMessage(crate::proto::ContactMessage {
+                    contact: Some(crate::proto::ContactAttachment {
+                        name: Some(crate::proto::contact_attachment::Name {
+                            given_name: "Grace".into(),
+                            family_name: "Hopper".into(),
+                            ..Default::default()
+                        }),
+                        number: vec![crate::proto::contact_attachment::Phone {
+                            value: "+15550000002".into(),
+                            r#type: crate::proto::contact_attachment::phone::Type::Mobile as i32,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    reactions: Vec::new(),
+                })),
+                ..Default::default()
+            })),
+        });
 
         let payload: Vec<u8> = [
             info,
@@ -721,6 +859,7 @@ mod tests {
             item,
             pinned,
             timer_update,
+            contact_item,
             skipped,
         ]
         .into_iter()
@@ -740,10 +879,11 @@ mod tests {
             stats,
             ExportStats {
                 backup_version: 1,
-                frames: 8,
+                frames: 9,
                 recipients: 2,
                 chats: 1,
-                messages: 3,
+                messages: 4,
+                contacts: 1,
                 remote_deleted: 0,
                 skipped_items: 0,
                 skipped_frames: 1,
@@ -755,7 +895,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 7);
         // E5：会话归属身份随帧投影（connector §4.38 消费形状）。
         assert_eq!(lines[0]["kind"], "contact");
         assert_eq!(lines[0]["name"], "A B");
@@ -779,6 +919,12 @@ mod tests {
         // E 批：计时器变更 update 成行（计入 messages），connector 拿去做 system 行。
         assert_eq!(lines[5]["expirationTimerChange"]["expiresInMs"], 86_400_000);
         assert_eq!(lines[5]["direction"], "directionless");
+        // B1 批：contact 行成行（计入 messages 与 contacts 细分）。
+        assert_eq!(lines[6]["contact"]["name"]["givenName"], "Grace");
+        assert_eq!(lines[6]["contact"]["name"]["familyName"], "Hopper");
+        assert_eq!(lines[6]["contact"]["number"][0]["value"], "+15550000002");
+        assert_eq!(lines[6]["contact"]["number"][0]["type"], "MOBILE");
+        assert_eq!(lines[6]["direction"], "incoming");
 
         std::fs::remove_file(&path).ok();
     }
@@ -1348,6 +1494,130 @@ mod tests {
         }
         // sticker 未设：官方「stickerMessage must have a sticker」同形跳过。
         assert!(message_record(&sticker_message(None)).is_none());
+    }
+
+    /// B1 contact item 投影多面：完整（name 子字段/number/email/organization/
+    /// avatar 指针 locator 同款面）/ 空串子字段与空 value 条目、label 缺席
+    /// （官方 `|| undefined`/`filter(isNotNil)` 同口径，键不在）/ UNKNOWN 与
+    /// 词表外 type 归 HOME（官方 phoneToContactFormType 同口径）/ 全零信息量
+    /// face 与 contact 未设 → 整 item 跳过（官方 strictAssert 的 KT 落法）。
+    #[test]
+    fn contact_message_projection_faces() {
+        use crate::proto::{contact_attachment, ContactAttachment, ContactMessage};
+
+        let contact_message = |contact: Option<ContactAttachment>| ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 600,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::ContactMessage(ContactMessage {
+                contact,
+                reactions: Vec::new(),
+            })),
+            ..Default::default()
+        };
+        let full = message_record(&contact_message(Some(ContactAttachment {
+            name: Some(contact_attachment::Name {
+                given_name: "Ada".into(),
+                family_name: "Lovelace".into(),
+                prefix: "Dr.".into(),
+                nickname: "ada".into(),
+                ..Default::default()
+            }),
+            number: vec![
+                contact_attachment::Phone {
+                    value: "+15550000003".into(),
+                    r#type: contact_attachment::phone::Type::Home as i32,
+                    ..Default::default()
+                },
+                contact_attachment::Phone {
+                    value: "+15550000004".into(),
+                    r#type: contact_attachment::phone::Type::Mobile as i32,
+                    label: "cell".into(),
+                },
+            ],
+            email: vec![contact_attachment::Email {
+                value: "ada@example.org".into(),
+                r#type: contact_attachment::email::Type::Work as i32,
+                ..Default::default()
+            }],
+            organization: "Analytical Engines Ltd".into(),
+            avatar: Some(FilePointer {
+                content_type: Some("image/jpeg".into()),
+                file_name: Some("avatar.jpg".into()),
+                locator_info: Some(file_pointer::LocatorInfo {
+                    key: vec![0x21u8; 32],
+                    size: 55,
+                    transit_cdn_key: Some("avatar-cdn".into()),
+                    transit_cdn_number: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })))
+        .expect("完整 contact 是行");
+        assert_eq!(full["contact"]["name"]["givenName"], "Ada");
+        assert_eq!(full["contact"]["name"]["familyName"], "Lovelace");
+        assert_eq!(full["contact"]["name"]["prefix"], "Dr.");
+        assert_eq!(full["contact"]["name"]["nickname"], "ada");
+        assert!(
+            full["contact"]["name"].get("middleName").is_none(),
+            "空串子字段键不在（官方 || undefined 同口径）"
+        );
+        assert_eq!(full["contact"]["number"][0]["type"], "HOME");
+        assert!(full["contact"]["number"][0].get("label").is_none());
+        assert_eq!(full["contact"]["number"][1]["type"], "MOBILE");
+        assert_eq!(full["contact"]["number"][1]["label"], "cell");
+        assert_eq!(full["contact"]["email"][0]["value"], "ada@example.org");
+        assert_eq!(full["contact"]["email"][0]["type"], "WORK");
+        assert_eq!(full["contact"]["organization"], "Analytical Engines Ltd");
+        assert_eq!(full["contact"]["avatar"]["contentType"], "image/jpeg");
+        assert_eq!(full["contact"]["avatar"]["size"], 55);
+        assert_eq!(full["contact"]["avatar"]["locator"]["cdnKey"], "avatar-cdn");
+        assert!(
+            full.get("text").is_none() && full.get("attachments").is_none(),
+            "contact 身份即行本体，指针只在 contact.avatar"
+        );
+
+        // UNKNOWN 与词表外 type 归 HOME（官方 phoneToContactFormType 同口径）；
+        // value 空条目整条丢弃；空 label 键不在。
+        let coerced = message_record(&contact_message(Some(ContactAttachment {
+            number: vec![
+                contact_attachment::Phone {
+                    value: "+15550000005".into(),
+                    r#type: contact_attachment::phone::Type::Unknown as i32,
+                    ..Default::default()
+                },
+                contact_attachment::Phone {
+                    value: "+15550000006".into(),
+                    r#type: 99,
+                    ..Default::default()
+                },
+                contact_attachment::Phone {
+                    value: String::new(),
+                    r#type: contact_attachment::phone::Type::Work as i32,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })))
+        .expect("type 归一 face 是行");
+        assert_eq!(coerced["contact"]["number"][0]["type"], "HOME");
+        assert_eq!(coerced["contact"]["number"][1]["type"], "HOME");
+        assert_eq!(
+            coerced["contact"]["number"].as_array().unwrap().len(),
+            2,
+            "空 value 条目整条丢弃"
+        );
+
+        // 全零信息量 face（proto3 默认 ContactAttachment）= 整 item 跳过：
+        // 空卡片即占位，KT 永不投占位。
+        assert!(message_record(&contact_message(Some(ContactAttachment::default()))).is_none());
+        // contact 未设：官方「contactMessage must have a contact」同形跳过。
+        assert!(message_record(&contact_message(None)).is_none());
     }
 
     #[tokio::test]

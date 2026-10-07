@@ -1436,6 +1436,34 @@ transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批
   （backup5 Reaction 投影面 v1 未立项，与 StandardMessage.reactions 同批
   缺位，如实记档不发明）。
 
+transfer 历史回填非文本扩面·第二类型 contact（2026-10-08，B1b 批；
+消费方 connector 契约 1.78 §4.38 扩面）：
+
+- **投影面（`history.rs::contact_record`，message 行 `contact` 键）**：
+  `chat_item::Item::ContactMessage` 由 v1 整 item 跳过改为完整投影——
+  `name` 子字段面 givenName/familyName/prefix/suffix/middleName/nickname
+  （空串子字段键不在，官方 `name.given || undefined` 同口径）、
+  `number[]`/`email[]` 条目面 `{value, type, label?}`（value 空的整条丢弃、
+  label 非空才投，官方 `!value → undefined` + `filter(isNotNil)` 同口径；
+  type 词表 HOME/MOBILE/WORK/CUSTOM，UNKNOWN/缺省/词表外一律归 HOME，
+  官方 `phoneToContactFormType`:191-214 / `emailToContactFormType`:216-240
+  同口径）、`organization`（空串键不在）、`avatar` ← ContactAttachment.avatar
+  FilePointer 经 `file_pointer_record` 附件指针公共面（locator 同款面，
+  字节不下载）。官方行为对位（AGPL 只读参照零拷贝）：Signal-Desktop
+  `import.preload.ts:2620-2705`——contactMessage strictAssert 要求 contact
+  在场，逐面映射为 ContactForm 形状。
+- **跳过纪律**：contact 未设 = 整 item 跳过（官方 strictAssert 的 KT 落法，
+  计数可见不致命）；全零信息量 face（无任何可渲染字段）= 整 item 跳过
+  （空卡片即占位，KT 永不投占位）。行形状无 live 接收对应面（引擎
+  live 接收 dataMessage 无 contact 投影），消费方 connector 契约 1.78
+  以 rich 附加通道落库 + avatar 并入描述符列表。
+- **边界（本批红线）**：地址面（ContactAttachment.address PostalAddress
+  repeated）本批不投——任务面=姓名/电话/邮箱字段指针面，如实记档 gap
+  （桌面卡片 v1 不渲染地址，后续批按需扩）；avatar 字节永不下载
+  （metadata-only 红线）；reactions 键不投（backup5 Reaction 投影面 v1
+  未立项，与 StandardMessage.reactions 同批缺位，如实记档不发明）；
+  ExportStats 增 `contacts` 细分计数（行落地才计）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
