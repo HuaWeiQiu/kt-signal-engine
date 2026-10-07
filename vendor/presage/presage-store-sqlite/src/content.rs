@@ -147,6 +147,7 @@ impl ContentsStore for SqliteStore {
             was_plaintext,
             server_timestamp: _,
             pni_verified,
+            story: _, // KT fork (stories): not persisted (stories are not saved).
         } = metadata;
 
         let sender_device: u8 = sender_device.into();

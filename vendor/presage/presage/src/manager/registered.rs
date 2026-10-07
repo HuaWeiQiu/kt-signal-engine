@@ -1128,6 +1128,7 @@ impl<S: Store> Manager<S, Registered> {
                 unidentified_sender: false,
                 was_plaintext: false,
                 pni_verified: None,
+                story: None,
             },
             body: content_body,
         };
@@ -1307,6 +1308,7 @@ impl<S: Store> Manager<S, Registered> {
                 unidentified_sender: false,
                 was_plaintext: false,
                 pni_verified: None,
+                story: None,
             },
             body: content_body,
         };

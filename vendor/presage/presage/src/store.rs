@@ -624,6 +624,7 @@ pub async fn save_trusted_identity_message<S: Store>(
             unidentified_sender: false,
             was_plaintext: false,
             pni_verified: None,
+            story: None,
         },
         body: SyncMessage {
             content: Some(SyncContent::Verified(Verified {

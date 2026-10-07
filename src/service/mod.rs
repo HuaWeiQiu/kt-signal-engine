@@ -2100,6 +2100,28 @@ async fn project_content(
         }
     }
 
+    // Stories 接收批（E2）官方闸（MessageReceiver.preload.ts:1524-1544 行为
+    // 对齐，引擎零 stderr 同款只留判面）：信封 story 位在场，但体既不是
+    // story（StoryMessage）、也不是群 story 回复（dataMessage 带
+    // storyContext ∧ groupV2）、也不是 remote delete → 整信封丢弃。反向
+    // 违例（体是 story/群回复但信封无位）官方仅 warn 照续——引擎零 stderr
+    // 纪律下照投，isStory 位如实反映信封位（不发明）。
+    if content.metadata.story == Some(true) {
+        let (is_story, is_group_story_reply, is_delete_for_everyone) = match &content.body {
+            ContentBody::StoryMessage(_) => (true, false, false),
+            ContentBody::DataMessage(data_message) => (
+                false,
+                data_message.story_context.is_some() && data_message.group_v2.is_some(),
+                data_message.delete.is_some(),
+            ),
+            _ => (false, false, false),
+        };
+        if !is_story && !is_group_story_reply && !is_delete_for_everyone {
+            return Vec::new();
+        }
+        envelope["isStory"] = json!(true);
+    }
+
     // profileKeyUpdate 批（compat §5）：DataMessage.profileKey = 发送方随行
     // 的当前 profile key（改资料/首聊采集两形态）。官方行为：按 sender ACI
     // 存储后再决定消息面走向；key 与已存相同 = 无事件（幂等闸，官方
@@ -2233,9 +2255,15 @@ async fn project_content(
             };
             envelope["callMessage"] = projection;
         }
-        ContentBody::NullMessage(_)
-        | ContentBody::StoryMessage(_)
-        | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
+        ContentBody::StoryMessage(story) => match project_story_message(story) {
+            Some(projection) => {
+                envelope["storyMessage"] = projection;
+            }
+            // 无 attachment 位 = 官方发送面不可能产出的 malformed 行，整
+            // 信封丢弃（宁缺勿错）。
+            None => return Vec::new(),
+        },
+        ContentBody::NullMessage(_) | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
     }
 
     // 群变更投影放开（最小面）：群更新消息携带 terminated change →
@@ -3035,6 +3063,18 @@ fn project_data_message(
         }
         out["sticker"] = value;
     }
+    // story 回复投影（Stories 接收批，E2）：storyContext → `storyReply
+    // {authorAci, sentTimestamp}`（author binary 形态优先、string 兜底——
+    // mentions 同款二进制优先纪律；两者皆缺/不可解析 = 整键缺席宁缺勿错，
+    // 官方 storyReply 面无 author 不可路由）。
+    if let Some(context) = data_message.story_context.as_ref() {
+        if let Some(author) = story_reply_author(context) {
+            out["storyReply"] = json!({
+                "authorAci": author,
+                "sentTimestamp": context.sent_timestamp.unwrap_or(0),
+            });
+        }
+    }
     out
 }
 
@@ -3063,6 +3103,82 @@ fn is_valid_view_once_row(data_message: &presage::proto::DataMessage) -> bool {
         return false;
     }
     data_message.contact.is_empty() && data_message.preview.is_empty()
+}
+
+/// story 回复作者解析（Stories 接收批，E2）：author_aci_binary 16B UUID
+/// 优先、author_aci 字符串兜底；两者皆缺/不可解析 = None（调用方整键
+/// 缺席，宁缺勿错）。
+fn story_reply_author(context: &presage::proto::data_message::StoryContext) -> Option<String> {
+    if let Some(bytes) = context.author_aci_binary.as_deref() {
+        if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+            return Some(uuid.to_string());
+        }
+    }
+    context.author_aci.clone().filter(|aci| !aci.is_empty())
+}
+
+/// story 投影（Stories 接收批，E2，compat §5 Stories 接收批块）：proto 只
+/// 投影不发明，缺席键不在。textAttachment{text, textStyle?, preview.image
+/// 指针}/fileAttachment → 附件指针投影（connector 媒体边界同口径：元数据
+/// only，字节永不下载）；allowsReplies 恒投（proto bool 缺席 = 线上缺省
+/// false 如实）；profileKey/group 群 story 母钥 base64（有值才投）。
+/// textStyle 缺席/未知枚举值不投键（词表纪律同 textStyles 收投影）；
+/// DEFAULT=0 线上在场照投词——与发送面缺省省略的不对称是线上形状的如实
+/// 两面。无 attachment 位 = 官方发送面不可能产出的 malformed 行，返回
+/// None（调用方整信封丢弃）。
+fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> {
+    use base64::Engine as _;
+    let attachment = story.attachment.as_ref()?;
+    let mut out = serde_json::Map::new();
+    match attachment {
+        presage::proto::story_message::Attachment::TextAttachment(text) => {
+            let mut value = serde_json::Map::new();
+            if let Some(body) = text.text.as_deref() {
+                value.insert("text".into(), json!(body));
+            }
+            if let Some(style) = text.text_style {
+                if let Ok(word) = presage::proto::text_attachment::Style::try_from(style) {
+                    value.insert("textStyle".into(), json!(word.as_str_name()));
+                }
+            }
+            if let Some(image) = text
+                .preview
+                .as_ref()
+                .and_then(|preview| preview.image.as_ref())
+            {
+                value.insert(
+                    "preview".into(),
+                    json!({ "image": project_attachment_pointer(image) }),
+                );
+            }
+            out.insert("textAttachment".into(), Value::Object(value));
+        }
+        presage::proto::story_message::Attachment::FileAttachment(pointer) => {
+            out.insert("fileAttachment".into(), project_attachment_pointer(pointer));
+        }
+    }
+    out.insert(
+        "allowsReplies".into(),
+        json!(story.allows_replies.unwrap_or(false)),
+    );
+    if let Some(key) = story.profile_key.as_deref().filter(|key| !key.is_empty()) {
+        out.insert(
+            "profileKey".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(key)),
+        );
+    }
+    if let Some(key) = story
+        .group
+        .as_ref()
+        .and_then(|group| group.master_key.as_deref())
+        .filter(|key| !key.is_empty())
+    {
+        out.insert(
+            "group".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(key)),
+        );
+    }
+    Some(Value::Object(out))
 }
 
 /// 附件投影：v1 基础面（connector §4.13/§6.7 媒体边界：字节永不下载）+
@@ -5324,6 +5440,7 @@ mod tests {
             unidentified_sender: false,
             was_plaintext: false,
             server_guid,
+            story: None,
         };
         let server_guid = presage::libsignal_service::prelude::Uuid::parse_str(
             "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
@@ -5369,6 +5486,368 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// Stories 接收批（E2）：StoryMessage text 面投影——textAttachment
+    /// {text, textStyle, preview.image 指针投影}、allowsReplies、profileKey
+    /// base64（有值才投）、group 缺席键不在；isStory 位随信封 story 位；
+    /// textStyle 线上在场（含 DEFAULT=0）照投词。
+    #[tokio::test]
+    async fn receive_story_message_projects_text_face() {
+        use base64::Engine as _;
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{Preview, TextAttachment};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-text-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |story| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story,
+        };
+        let story = |text_style| presage::proto::StoryMessage {
+            profile_key: Some(vec![9u8; 32]),
+            group: None,
+            allows_replies: Some(true),
+            body_ranges: Vec::new(),
+            attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                TextAttachment {
+                    text: Some("hello story".to_owned()),
+                    text_style,
+                    text_foreground_color: None,
+                    text_background_color: None,
+                    preview: Some(Preview {
+                        url: None,
+                        title: None,
+                        image: Some(presage::proto::AttachmentPointer {
+                            content_type: Some("image/webp".to_owned()),
+                            cdn_number: Some(3),
+                            key: Some(vec![1u8; 64]),
+                            ..Default::default()
+                        }),
+                        description: None,
+                        date: None,
+                    }),
+                    background: None,
+                },
+            )),
+        };
+
+        let content = Content::from_body(
+            ContentBody::StoryMessage(story(Some(
+                presage::proto::text_attachment::Style::Bold as i32,
+            ))),
+            metadata(Some(true)),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["isStory"], json!(true), "story 位在场");
+        let face = &envelope["storyMessage"];
+        assert_eq!(face["textAttachment"]["text"], json!("hello story"));
+        assert_eq!(face["textAttachment"]["textStyle"], json!("BOLD"));
+        let preview = &face["textAttachment"]["preview"];
+        assert_eq!(preview["image"]["contentType"], json!("image/webp"));
+        assert!(
+            preview["image"]["locator"]["key"].is_string(),
+            "preview.image 走附件指针投影（locator.key base64）"
+        );
+        assert_eq!(face["allowsReplies"], json!(true));
+        assert_eq!(
+            face["profileKey"],
+            json!(base64::engine::general_purpose::STANDARD.encode([9u8; 32]))
+        );
+        assert!(face.get("group").is_none(), "群母钥缺席键不在");
+        assert!(
+            envelope.get("dataMessage").is_none(),
+            "story 不落普通会话流"
+        );
+
+        // textStyle DEFAULT=0 线上在场照投词（与发送面缺省省略的不对称是
+        // 线上形状的如实两面）。
+        let content = Content::from_body(
+            ContentBody::StoryMessage(story(Some(
+                presage::proto::text_attachment::Style::Default as i32,
+            ))),
+            metadata(Some(true)),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["storyMessage"]["textAttachment"]["textStyle"],
+            json!("DEFAULT")
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Stories 接收批（E2）官方闸三腿：①story 位 + 普通 dataMessage = 整
+    /// 信封丢弃（空向量）；②story 位 + remote delete = 豁免照投（isStory
+    /// 在场）；③story 位 + 群 story 回复（storyContext ∧ groupV2）= 豁免
+    /// 照投（dataMessage.storyReply + groupInfo + isStory）。
+    #[tokio::test]
+    async fn receive_story_gate_drop_and_exemptions() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{data_message, GroupContextV2};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-gate-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |story| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story,
+        };
+        let story_context = data_message::StoryContext {
+            author_aci: None,
+            sent_timestamp: Some(42),
+            author_aci_binary: Some(
+                presage::libsignal_service::prelude::Uuid::parse_str(
+                    "11111111-2222-4333-8444-555555555555",
+                )
+                .expect("author uuid")
+                .as_bytes()
+                .to_vec(),
+            ),
+        };
+
+        // ①普通正文 + story 位：官方同款整信封丢弃。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("plain".to_owned()),
+                ..Default::default()
+            }),
+            metadata(Some(true)),
+        );
+        assert!(
+            project_content("acct", &store, &content, &registry)
+                .await
+                .is_empty(),
+            "非 story/群回复/remote delete 行丢弃"
+        );
+
+        // ②remote delete 豁免：照投 remoteDelete 面 + isStory。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                delete: Some(presage::proto::data_message::Delete {
+                    target_sent_timestamp: Some(7),
+                }),
+                ..Default::default()
+            }),
+            metadata(Some(true)),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "delete projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["isStory"], json!(true));
+        assert_eq!(
+            envelope["dataMessage"]["remoteDelete"]["timestamp"],
+            json!(7)
+        );
+
+        // ③群 story 回复豁免：storyReply + groupInfo + isStory。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                story_context: Some(story_context.clone()),
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(vec![0x33u8; 32]),
+                    revision: None,
+                    group_change: None,
+                }),
+                ..Default::default()
+            }),
+            metadata(Some(true)),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "group story reply projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["isStory"], json!(true));
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"]["sentTimestamp"],
+            json!(42)
+        );
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"]["authorAci"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert!(
+            envelope["dataMessage"]["groupInfo"]["groupId"].is_string(),
+            "群 story 回复另带既有 groupInfo 投影"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Stories 接收批（E2）边界腿：①1:1 story 回复（信封无 story 位）→
+    /// dataMessage.storyReply 照投、isStory 键不在；author_aci 字符串形态
+    /// 兜底；author 不可解析整键缺席（宁缺勿错）；②反向违例（story 体但
+    /// 信封无位）官方 warn-only 放行——引擎照投 storyMessage、isStory 键
+    /// 不在（如实反映信封位，不发明）；空 profileKey 不投键。
+    #[tokio::test]
+    async fn receive_story_reply_and_malformed_story_body() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::data_message;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-edge-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |story| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story,
+        };
+
+        // ①1:1 story 回复：string 兜底形态，isStory 键不在。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                story_context: Some(data_message::StoryContext {
+                    author_aci: Some("22222222-3333-4444-8555-666666666666".to_owned()),
+                    sent_timestamp: Some(43),
+                    author_aci_binary: None,
+                }),
+                ..Default::default()
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story reply projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope.get("isStory").is_none(), "信封无位不发明标记");
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"],
+            json!({
+                "authorAci": "22222222-3333-4444-8555-666666666666",
+                "sentTimestamp": 43
+            })
+        );
+
+        // author 不可解析（两形态皆缺）：storyReply 整键缺席。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                story_context: Some(data_message::StoryContext {
+                    author_aci: None,
+                    sent_timestamp: Some(44),
+                    author_aci_binary: None,
+                }),
+                ..Default::default()
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story reply projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope["dataMessage"].get("storyReply").is_none());
+
+        // ②反向违例（官方 warn-only 放行面）：story 体但信封无位——
+        // storyMessage 照投，isStory 键不在；空 profileKey 不投键。
+        let content = Content::from_body(
+            ContentBody::StoryMessage(presage::proto::StoryMessage {
+                profile_key: Some(Vec::new()),
+                group: None,
+                allows_replies: Some(false),
+                body_ranges: Vec::new(),
+                attachment: Some(presage::proto::story_message::Attachment::FileAttachment(
+                    presage::proto::AttachmentPointer {
+                        content_type: Some("image/jpeg".to_owned()),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story body projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope.get("isStory").is_none());
+        let face = &envelope["storyMessage"];
+        assert_eq!(
+            face["fileAttachment"]["contentType"],
+            json!("image/jpeg"),
+            "文件 story 走附件指针投影"
+        );
+        assert_eq!(face["allowsReplies"], json!(false), "bool 缺省如实投影");
+        assert!(face.get("profileKey").is_none(), "空 key 不投");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// 群终止投影放开（最小面）：dataMessage.groupV2 携带 terminated change
     /// → 整信封替换为 `groupTerminated` 事件（{groupId, terminator,
     /// timestamp}）并落登记表；非 terminated change（改标题等）→ 群更新消息
@@ -5405,6 +5884,7 @@ mod tests {
             unidentified_sender: false,
             was_plaintext: false,
             server_guid: None,
+            story: None,
         };
 
         let master_key = [0x33u8; 32];
@@ -5581,6 +6061,7 @@ mod tests {
             unidentified_sender: false,
             was_plaintext: false,
             server_guid: None,
+            story: None,
         };
 
         let master_key = [0x55u8; 32];
@@ -6277,6 +6758,7 @@ mod tests {
             unidentified_sender: false,
             was_plaintext: false,
             server_guid: None,
+            story: None,
         }
     }
 

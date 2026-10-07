@@ -246,6 +246,7 @@ impl TryInto<Content> for SqlMessage {
                         .ok_or_else(|| SqliteStoreError::InvalidFormat)
                 })
                 .transpose()?,
+            story: None, // KT fork (stories): not persisted.
         };
         Content::from_proto(body, metadata).map_err(|_| SqliteStoreError::InvalidFormat)
     }

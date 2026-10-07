@@ -38,16 +38,28 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   无 identified 降级）；②新增 pub `send_story_message`（单收件人 sealed
   sender + `?story=true` 传输面；不产 sent-transcript——官方
   sendStory.preload.ts:338-340「story 同步由收尾单独发」同口径）。
+- `src/content.rs` — `Metadata` 增 `pub story: Option<bool>`（E2：官方
+  Envelope.story=16 接收分类位透传，Signal-Desktop
+  MessageReceiver.preload.ts:1517）。
+- `src/cipher.rs` — `decrypt` 唯一 Metadata 构造点填
+  `story: envelope.story`（E2）。
 
 `vendor/presage/`（rev 33dd149）：
 
-- `presage/src/manager/registered.rs` — 新增 pub
-  `Manager::send_story_message`（注入发送者 profile_key 到 StoryMessage、
-  不落 store、不产 transcript，官方 profileKey 必需 + story 不进本地
-  timeline 同口径）。
+- `presage/src/manager/registered.rs` — ①新增 pub
+  `Manager::send_story_message`（E1：注入发送者 profile_key 到
+  StoryMessage、不落 store、不产 transcript，官方 profileKey 必需 + story
+  不进本地 timeline 同口径）；②`send_message`/`send_message_to_group`
+  两处 Metadata 字面量补 `story: None`（E2 字段新增的编译面，出站消息
+  story 位恒无）。
+- `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
+  `story: None`（E2，同上纯编译面）。
 
-`presage-store-sqlite` 零改动。E2 接收面 fork（Metadata.story 位）随该
-commit 追加登记。
+`vendor/presage/presage-store-sqlite/`：
+
+- `src/content.rs` — Metadata 解构模式补 `story: _`（E2：story 位不落库
+  ——收侧 story 本就不存库，普通消息位恒 None）。
+- `src/data.rs` — Metadata 重放构造填 `story: None`（E2，同上）。
 
 ## 更新纪律
 

@@ -566,6 +566,8 @@ where
             was_plaintext: parts.was_plaintext,
             server_guid,
             pni_verified,
+            // KT fork (stories): story classification bit from the envelope.
+            story: envelope.story,
         };
         Ok(Plaintext { metadata, message })
     }

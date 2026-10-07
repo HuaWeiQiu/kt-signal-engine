@@ -38,6 +38,10 @@ pub struct Metadata {
     ///
     /// The server GUID is used to report spam messages.
     pub server_guid: Option<Uuid>,
+
+    /// KT fork (stories): Envelope.story=16 passthrough — receive-side
+    /// story classification bit (Signal-Desktop MessageReceiver.preload.ts:1517).
+    pub story: Option<bool>,
 }
 
 impl fmt::Display for Metadata {

@@ -1295,6 +1295,55 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   `distributionListId` 引擎不校验 UUID 形状（官方钉定 id = MY_STORY_ID 零
   UUID，其余名单 id 为任意 UUID 串——引擎透传给同步面，connector 侧闸）。
 
+**Stories 接收批（2026-10-08，E2，与发送批同分支双 commit）**
+
+- **背景**：钉定栈接收面除 `Metadata.story` 位外零 fork——presage 收侧对
+  StoryMessage 跳过存库但 `Received::Content` 照常 yield（registered.rs
+  接收管线），投影位只需 Metadata 透传（fork 清单见 vendor/README.md，
+  store-sqlite 两侧补字面量纯编译面、story 位不落库）。
+- **官方分类锚（MessageReceiver.preload.ts:1517-1556 第一手实读，行为对齐
+  不抄码）**：`isStory` = 体含 storyMessage；`isStoryReply` =
+  dataMessage.storyContext；`isGroupStoryReply` = isStoryReply ∧
+  dataMessage.groupV2；`isDeleteForEveryone` = dataMessage.delete。闸：
+  `envelope.story ∧ ¬(isGroupStoryReply ∨ isStory) ∧ ¬isDeleteForEveryone`
+  → 整信封丢弃；反向违例（体是 story/群回复但信封无位）官方仅 warn 照续。
+  另有「stories 功能禁用即丢弃」腿——引擎无账号设置读面，不设（边界）。
+- **引擎闸落点（project_content 头部，先于 profile-key 落库）**：metadata
+  story 位 `Some(true)` 且体既非 StoryMessage、非群 story 回复、非 remote
+  delete → 空向量整信封丢弃（官方同款）；位在场 = 信封级 `isStory: true`
+  如实投影（群 story 回复与 story 发送都带位）。反向违例照投且 `isStory`
+  键不在（零 stderr 纪律，位面如实不发明）。
+- **storyMessage 投影**（信封级 `storyMessage` 键，story 不落普通会话流，
+  connector 据此走 story 时间线）：`textAttachment{text, textStyle?,
+  preview.image 指针投影}` / `fileAttachment` → 附件指针投影（locator 面
+  同款，connector §4.54 媒体边界：元数据 only 字节永不下载）；
+  `allowsReplies` 恒投（bool 缺席=线上缺省 false 如实）；`profileKey`/
+  `group` 群 story 母钥 base64（有值才投）。textStyle 缺席/未知枚举值不投
+  键；DEFAULT=0 线上在场照投词（与发送面缺省省略的不对称是线上形状的
+  如实两面）。无 attachment 位 = 官方发送面不可能产出的 malformed 行，
+  整信封丢弃（宁缺勿错）。群 story（group 母钥位）接收面照投——发送面
+  v1 不做的不对称是既定边界（收得到、发不出）。
+- **storyReply 投影**（dataMessage 级 `storyReply` 键）：
+  `storyContext → {authorAci, sentTimestamp}`；author binary 16B UUID 优先、
+  string 兜底（mentions 同款二进制优先纪律），两者皆缺/不可解析 = 整键
+  缺席（宁缺勿错，官方 storyReply 面无 author 不可路由）。1:1 回复与群
+  回复同形状（群回复另带既有 groupInfo 投影）。钉定 proto `Quote.Type`
+  无 STORY_REPLY 枚举值（回复的 quote i32=3 prost 原样保留），投影零依赖
+  该枚举。
+- **不落库面**：presage 官方收侧已跳过 StoryMessage 存库（线程/历史无
+  story 行）；storyReply 是普通 DataMessage 照常落库（官方同构——回复
+  本身是 DM/群消息）。
+- **偏差登记**：①「stories 功能禁用即丢弃」官方腿不设（引擎无账号设置
+  读面，闸归 connector 宿主侧）；②envelope 级 `story` 原始 bool 不透出
+  （以 `isStory: true` 在场性表达，缺席键=无位——proto 只投影不发明）；
+  ③storyMessage 的 textAttachment.preview 只投 image 指针（url/title/
+  description/date 官方 story 预览面未消费，缺席键不在——需要时按
+  previews 投影同款扩）。
+- **边界（本批红线）**：24h 过期纯客户端语义不做（story 时间线过期归
+  connector/宿主，引擎只投影不计时）；不做 story 删除（remoteDelete story
+  形态）/已读回执/查看回执面；引擎零 stderr（官方两条 story warn 路径
+  只保留判面行为，无日志输出）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
