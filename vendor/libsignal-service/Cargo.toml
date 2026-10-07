@@ -1,0 +1,77 @@
+[package]
+name = "libsignal-service"
+version = "0.1.0"
+authors = [
+  "Ruben De Smet <ruben.de.smet@rubdos.be>",
+  "Gabriel Féron <g@leirbag.net>",
+]
+edition = "2021"
+license = "AGPL-3.0-only"
+readme = "README.md"
+
+[dependencies]
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", optional = true }
+libsignal-net-infra = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", optional = true }
+signal-crypto = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+
+aes = "0.9"
+aes-gcm = "0.11"
+cbc = "0.2"
+ctr = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+bincode = "1.3"
+bytes = "1"
+chrono = { version = "0.4", features = [
+  "serde",
+  "clock",
+], default-features = false }
+derive_more = { version = "2.1", features = ["debug"] }
+futures = "0.3"
+hex = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+phonenumber = { version = "0.3", optional = true }
+prost = "0.14"
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.85"
+sha2 = "0.11"
+thiserror = "2.0"
+url = { version = "2.1", features = ["serde"] }
+uuid = { version = "1", features = ["serde"] }
+
+# http
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "multipart",
+  "rustls-no-provider",
+  "stream",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+reqwest-websocket = { version = "0.6.0", features = ["json"] }
+
+tracing = { version = "0.1", features = ["log"] }
+tracing-futures = "0.2"
+
+tokio = { version = "1.0", features = ["macros"] }
+
+[build-dependencies]
+prost-build = "0.14"
+
+[dev-dependencies]
+regex = "1"
+anyhow = "1.0"
+tokio = { version = "1.0", features = ["macros", "rt"] }
+clap = { version = "4.4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["cdsi"]
+phonenumber = ["dep:phonenumber"]
+cdsi = ["dep:libsignal-net", "dep:libsignal-net-infra"]

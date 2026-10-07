@@ -874,6 +874,212 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
 }
 
 #[test]
+fn send_story_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("send-story-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 合法批：成功形状 {timestamp, results: []}（send 系 fake 纪律：
+    // 参数闸全量生效后成功桩，results 恒空）。全参数在场。
+    assert_eq!(
+        engine
+            .request(
+                "sendStory",
+                json!({
+                    "account": "+15550000000",
+                    "message": "story day",
+                    "recipients": ["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"],
+                    "distributionListId": "00000000-0000-0000-0000-000000000000",
+                    "allowsReplies": true,
+                    "textStyle": "BOLD",
+                    "bodyRanges": [{ "style": "BOLD", "start": 0, "length": 5 }],
+                    "previewImage": "data:image/png;base64,iVBORw0KGgo="
+                })
+            )
+            .pointer("/result/results"),
+        Some(&json!([]))
+    );
+    // 缺省面：可缺参数全部缺席同形状（MY_STORY_ID 缺省 + 线上缺席位）。
+    let minimal = engine.request(
+        "sendStory",
+        json!({ "account": "+15550000000", "message": "plain", "recipients": ["+15555550101"] }),
+    );
+    assert!(minimal["result"]["timestamp"].is_u64(), "timestamp is u64");
+    assert_eq!(minimal["result"]["results"], json!([]));
+
+    // 参数闸 fail-closed（-32603，compat §3 sendStory 行错误列）：
+    // account/message 缺失或空串。
+    for account in [None, Some(json!(""))] {
+        let mut params = json!({ "message": "story", "recipients": ["+15555550101"] });
+        if let Some(account) = account {
+            params["account"] = account;
+        }
+        let (code, _) = engine.error_of("sendStory", params);
+        assert_eq!(code, -32603);
+    }
+    for message in [None, Some(json!(""))] {
+        let mut params = json!({ "account": "+15550000000", "recipients": ["+15555550101"] });
+        if let Some(message) = message {
+            params["message"] = message;
+        }
+        let (code, _) = engine.error_of("sendStory", params);
+        assert_eq!(code, -32603);
+    }
+    // recipients：缺失/空批/单字符串形态（story 面恒数组）/条目非字符串/
+    // 空串条目。
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({ "account": "+15550000000", "message": "story" }),
+    );
+    assert_eq!(code, -32603);
+    for recipients in [json!([]), json!("+15555550101"), json!([42]), json!([""])] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({ "account": "+15550000000", "message": "story", "recipients": recipients }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // distributionListId：空串/非字符串。
+    for list_id in [json!(""), json!(42)] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "message": "story",
+                "recipients": ["+15555550101"],
+                "distributionListId": list_id
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // allowsReplies 非布尔。
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "allowsReplies": "yes"
+        }),
+    );
+    assert_eq!(code, -32603);
+    // textStyle：六值词表外（含 send 面内联样式词与大小写漂移）/非字符串。
+    for style in ["ITALIC", "SPOILER", "bold", ""] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "message": "story",
+                "recipients": ["+15555550101"],
+                "textStyle": style
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "textStyle": 42
+        }),
+    );
+    assert_eq!(code, -32603);
+    // bodyRanges：条目缺字段/词表外（DEFAULT 是正文样式词不是内联样式）/
+    // >64 条（cap 镜像整拒不截断）/非数组。
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "bodyRanges": [{ "style": "BOLD", "start": 0 }]
+        }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "bodyRanges": [{ "style": "DEFAULT", "start": 0, "length": 1 }]
+        }),
+    );
+    assert_eq!(code, -32603);
+    let overflow: Vec<Value> = (0..65)
+        .map(|index| json!({ "style": "BOLD", "start": index, "length": 1 }))
+        .collect();
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "bodyRanges": overflow
+        }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "bodyRanges": "BOLD"
+        }),
+    );
+    assert_eq!(code, -32603);
+    // previewImage 非字符串。
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "previewImage": 42
+        }),
+    );
+    assert_eq!(code, -32603);
+
+    // 调度日志纪律：成功与被拒调用都落日志（send 系同款，updateGroup
+    // 同构断言）；params 形状供 connector 侧依赖断言。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let story_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "sendStory")
+        .collect();
+    assert_eq!(
+        story_entries.len(),
+        24,
+        "成功两条 + 拒绝二十二条均落日志（append_dispatch 在参数闸之前）"
+    );
+    assert_eq!(
+        story_entries[0]["params"]["recipients"],
+        json!(["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
+    );
+    assert_eq!(
+        story_entries[1]["params"]["distributionListId"],
+        json!(null),
+        "缺省参数原样进日志（缺省值归服务层）"
+    );
+
+    // real 模式未注册账号：折叠 -32603 不触网（send 系同折叠）。
+    let real_dir = temp_dir("send-story-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "sendStory",
+        json!({ "account": "+15559990000", "message": "story", "recipients": ["+15555550101"] }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
+#[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");
     let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
