@@ -1406,6 +1406,36 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   形态）/已读回执/查看回执面；引擎零 stderr（官方两条 story warn 路径
   只保留判面行为，无日志输出）。
 
+transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批；
+消费方 connector 契约 1.76 §4.38 扩面）：
+
+- **投影面（`history.rs::sticker_record`，message 行 `sticker` 键）**：
+  `chat_item::Item::StickerMessage` 由 v1 整 item 跳过改为完整投影——
+  `packId` ← Sticker.pack_id 16B 小写 hex（官方 `Bytes.toHex` 同形）、
+  `packKey` ← pack_key 32B 标准 base64（官方 `Bytes.toBase64` 同形）、
+  `stickerId` ← sticker_id（proto3 标量原样，0 透出）、`emoji`（Some 且
+  非空才投，caption/blurHash 同款纪律）、`data` ← Sticker.data FilePointer
+  经 `file_pointer_record` 附件指针公共面（locator 三件套同款面，字节
+  不下载——附件媒体字节 v2 消费方口径不变）。官方行为对位（AGPL 只读
+  参照零拷贝）：Signal-Desktop `import.preload.ts:2749-2789`——
+  stickerMessage 要求 sticker 在场；packId/packKey 字节长 strictAssert
+  恰 16/32（`Stickers.preload.ts:108-109`）；emoji/data 官方可缺席
+  （emoji→undefined、`data ? convertFilePointerToAttachment(data) :
+  undefined`）。行形状与 live 接收投影 `project_data_message` 的
+  `sticker` 面同构（packId hex/packKey base64/stickerId/emoji?/data?），
+  connector 侧 1.35 NormalizedSticker 身份闸 + §4.38
+  import_attachments 描述符/locator 面直接消费。
+- **身份畸形 = 整 item 跳过**：sticker 未设、packId ≠16B、packKey ≠32B
+  → 返回 None 计入 skippedItems（官方 strictAssert 的 KT 落法——绝不投
+  半个贴纸；导入永不致命、计数可见）。与 live 接收投影的差别（live 对
+  身份长度不设闸、connector 侧 1.35 闸兜底）是既定分工：导出面一次性
+  消费、上游闸前移可省 connector 侧 skip 噪音；emoji/data 缺席不跳
+  （官方可缺席语义原样）。
+- **边界（本批红线）**：贴纸字节永不下载（metadata-only 红线）；不做
+  StickerPack 帧（贴纸包安装态是 Storage 面另行立项）；reactions 键不投
+  （backup5 Reaction 投影面 v1 未立项，与 StandardMessage.reactions 同批
+  缺位，如实记档不发明）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

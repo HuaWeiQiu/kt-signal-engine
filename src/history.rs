@@ -246,7 +246,8 @@ fn chat_record(c: &Chat) -> serde_json::Value {
 /// v2 中间表示：text + 附件 pointer-complete 投影（locator 面 +
 /// clientUuid/宽高/caption/blurHash/incrementalMac，见
 /// `project_pointer_common`；字节本身不在档案内，下载归 connector）+
-/// quote + 远端删除。返回 `None` = 跳过（计数可见）。
+/// quote + sticker（`sticker_record`）+ 远端删除。返回 `None` = 跳过
+/// （计数可见）。
 fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
     let direction = match item.directional_details.as_ref()? {
         chat_item::DirectionalDetails::Incoming(_) => "incoming",
@@ -302,6 +303,9 @@ fn message_record(item: &ChatItem) -> Option<serde_json::Value> {
         chat_item::Item::RemoteDeletedMessage(_) => {
             record["remoteDeleted"] = serde_json::json!(true);
         }
+        chat_item::Item::StickerMessage(sticker_message) => {
+            record["sticker"] = sticker_record(sticker_message)?;
+        }
         chat_item::Item::UpdateMessage(update) => {
             record["expirationTimerChange"] = timer_change_record(update)?;
         }
@@ -339,6 +343,40 @@ fn timer_change_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> 
         }
         _ => None,
     }
+}
+
+/// B1 sticker item 完整投影（官方 Transfer/backup 导入对位：Signal-Desktop
+/// `import.preload.ts:2749-2789` —— `stickerMessage` 要求 sticker 在场且
+/// packId/packKey 字节长恰为 16/32（`Stickers.preload.ts:108-109`
+/// STICKERPACK_ID_BYTE_LEN/KEY），序列化 = packId `Bytes.toHex` /
+/// packKey `Bytes.toBase64`，emoji 可选、data 经附件指针转换可选）。投影
+/// 口径：身份畸形（pack 字节长不合规）= 整 item 跳过（官方 strictAssert
+/// 的 KT 落法——绝不投半个贴纸，调用方计数可见，导入永不致命）；emoji 与
+/// data 沿官方可缺席语义，缺省键不在（data 缺席官方投 undefined 同形）。
+/// `data` 复用附件指针公共面（locator 三件套同款面，字节不下载）；emoji
+/// 空串零信息量不投（caption/blurHash 同款纪律）。行形状与 live 接收投影
+/// 同构（`service::project_data_message` 的 `sticker` 面：packId
+/// hex/packKey base64/stickerId/emoji?/data?），消费方 connector 契约
+/// 1.35 的 NormalizedSticker 身份面 + §4.38 import_attachments 描述符面
+/// 直接可吃。
+fn sticker_record(sticker_message: &crate::proto::StickerMessage) -> Option<serde_json::Value> {
+    let sticker = sticker_message.sticker.as_ref()?;
+    if sticker.pack_id.len() != 16 || sticker.pack_key.len() != 32 {
+        return None;
+    }
+    use base64::Engine as _;
+    let mut face = serde_json::json!({
+        "packId": hex_string(&sticker.pack_id),
+        "packKey": base64::engine::general_purpose::STANDARD.encode(&sticker.pack_key),
+        "stickerId": sticker.sticker_id,
+    });
+    if let Some(emoji) = sticker.emoji.as_deref().filter(|emoji| !emoji.is_empty()) {
+        face["emoji"] = serde_json::Value::String(emoji.to_string());
+    }
+    if let Some(data) = &sticker.data {
+        face["data"] = serde_json::json!(file_pointer_record(data));
+    }
+    Some(face)
 }
 
 /// 附件/文件指针投影公共面（H3 附件媒体字节 v2，方案 C ①）：v1 只有
@@ -1191,6 +1229,125 @@ mod tests {
         assert!(malformed.get("incrementalMac").is_none());
         assert!(malformed.get("chunkSize").is_none());
         assert!(malformed["locator"].is_null());
+    }
+
+    /// B1 sticker item 投影五面：完整（packId hex/packKey base64/stickerId/
+    /// emoji/data 指针 locator 同款面）/ 缺 emoji / 缺 data（官方可缺席语义，
+    /// 键不在）/ 身份畸形（packId 15B、packKey 31B → 整 item 跳过，官方
+    /// strictAssert 的 KT 落法）/ sticker 未设 → 整 item 跳过。proto 只投影
+    /// 不发明：stickerId=0 原样透出（proto3 标量）。
+    #[test]
+    fn sticker_message_projection_faces() {
+        use crate::proto::{Sticker, StickerMessage};
+
+        let sticker_message = |sticker: Option<Sticker>| ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 500,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::StickerMessage(StickerMessage {
+                sticker,
+                reactions: Vec::new(),
+            })),
+            ..Default::default()
+        };
+        let full_sticker = Sticker {
+            pack_id: vec![0xABu8; 16],
+            pack_key: vec![0xCDu8; 32],
+            sticker_id: 9,
+            emoji: Some("🎉".into()),
+            data: Some(FilePointer {
+                content_type: Some("image/webp".into()),
+                file_name: Some("sticker.webp".into()),
+                locator_info: Some(file_pointer::LocatorInfo {
+                    key: vec![0x11u8; 32],
+                    size: 77,
+                    transit_cdn_key: Some("pack-cdn".into()),
+                    transit_cdn_number: Some(2),
+                    integrity_check: Some(
+                        file_pointer::locator_info::IntegrityCheck::PlaintextHash(vec![0x2a; 32]),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let full = message_record(&sticker_message(Some(full_sticker.clone()))).expect("完整是行");
+        assert_eq!(
+            full["sticker"]["packId"],
+            "ab".repeat(16),
+            "官方 Bytes.toHex 同形"
+        );
+        assert_eq!(
+            full["sticker"]["packKey"],
+            base64::engine::general_purpose::STANDARD.encode([0xCDu8; 32]),
+            "官方 Bytes.toBase64 同形"
+        );
+        assert_eq!(full["sticker"]["stickerId"], 9);
+        assert_eq!(full["sticker"]["emoji"], "🎉");
+        assert_eq!(full["sticker"]["data"]["contentType"], "image/webp");
+        assert_eq!(full["sticker"]["data"]["size"], 77, "locator 公共面同款");
+        assert_eq!(full["sticker"]["data"]["locator"]["cdnKey"], "pack-cdn");
+        assert_eq!(full["sticker"]["data"]["locator"]["cdnNumber"], 2);
+        assert_eq!(
+            full["sticker"]["data"]["locator"]["plaintextHash"],
+            "2a".repeat(32)
+        );
+        assert!(full.get("text").is_none(), "贴纸行无文本键");
+        assert!(
+            full.get("attachments").is_none(),
+            "贴纸指针只在 sticker.data，不进顶层 attachments"
+        );
+
+        // 缺 emoji、缺 data：官方可缺席语义（emoji→undefined/data→undefined），
+        // 键不在；身份面仍在。
+        let bare = message_record(&sticker_message(Some(Sticker {
+            emoji: None,
+            data: None,
+            ..full_sticker
+        })))
+        .expect("缺 emoji/data 仍是行");
+        assert_eq!(bare["sticker"]["stickerId"], 9);
+        assert!(bare["sticker"].get("emoji").is_none());
+        assert!(bare["sticker"].get("data").is_none());
+
+        // emoji 空串零信息量不投（caption/blurHash 同款纪律）。
+        let empty_emoji = message_record(&sticker_message(Some(Sticker {
+            emoji: Some(String::new()),
+            data: None,
+            pack_id: vec![0xABu8; 16],
+            pack_key: vec![0xCDu8; 32],
+            sticker_id: 0,
+        })))
+        .expect("空 emoji 仍是行");
+        assert_eq!(
+            empty_emoji["sticker"]["stickerId"], 0,
+            "proto3 标量 0 原样透出"
+        );
+        assert!(empty_emoji["sticker"].get("emoji").is_none());
+
+        // 身份畸形 = 整 item 跳过（官方 strictAssert 的 KT 落法：不投半个
+        // 贴纸，调用方计入 skipped_items，导入永不致命）。
+        for (name, pack_id, pack_key) in [
+            ("pack-id-15b", vec![0xABu8; 15], vec![0xCDu8; 32]),
+            ("pack-key-31b", vec![0xABu8; 16], vec![0xCDu8; 31]),
+            ("pack-id-empty", Vec::new(), vec![0xCDu8; 32]),
+        ] {
+            assert!(
+                message_record(&sticker_message(Some(Sticker {
+                    pack_id,
+                    pack_key,
+                    sticker_id: 1,
+                    ..Default::default()
+                })))
+                .is_none(),
+                "{name}: 身份畸形整 item 跳过"
+            );
+        }
+        // sticker 未设：官方「stickerMessage must have a sticker」同形跳过。
+        assert!(message_record(&sticker_message(None)).is_none());
     }
 
     #[tokio::test]
