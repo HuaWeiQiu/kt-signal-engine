@@ -32,7 +32,12 @@ coverage/
 *.exe
 *.test
 *.out
-vendor/
+# vendor/ 为上游依赖的原样 fork 拷贝（Stories 批，2026-10-08）：目录内
+# 白名单化收编（README + libsignal-service + presage），其余仍忽略。
+vendor/*
+!vendor/README.md
+!vendor/libsignal-service/
+!vendor/presage/
 
 # ───────── Node / TypeScript ─────────
 node_modules/

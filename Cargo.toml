@@ -84,3 +84,18 @@ libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag
 # 测试专用（receive 投影单测构造 Metadata 时间戳）：presage 传递依赖同版，
 # MIT/Apache-2.0，不进运行时依赖图。
 chrono = "0.4"
+
+# Stories 发送面（E1/E2 批，2026-10-08）：presage 与 libsignal-service 以
+# 原样拷贝进 `vendor/`（上表 git 依赖行保留作来源锚点），经 [patch] 指向
+# 本地路径后叠加最小 story 面（改动清单见 vendor/README.md）。任务书原文
+# 写「[patch.crates-io] 指本地路径」，实际两仓均为 git 源依赖（Cargo.lock
+# `git+https://…`），[patch.crates-io] 不生效——按事实改用对应 git 源
+# URL 的 [patch] 段（汇报偏差项）。
+# 许可：libsignal-service AGPL-3.0-only、presage AGPL-3.0-only（与其 git
+# 源一致，本仓同为 AGPL-3.0-only，无新增许可面）。
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "vendor/libsignal-service" }
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage/presage" }
+presage-store-sqlite = { path = "vendor/presage/presage-store-sqlite" }
