@@ -117,7 +117,7 @@ pub(crate) async fn export_snapshot_frames(
     let frames = FramesReader::new(&keys.message_key, factory).await?;
     let mut delimited = VarintDelimitedReader::new(frames);
 
-    let stats = export_frames_loop(&mut delimited, out).await?;
+    let stats = export_frames_loop(&mut delimited, out, &keys.aci).await?;
 
     delimited
         .into_inner()
@@ -413,6 +413,7 @@ mod tests {
             backup_id: keys.backup_id,
             message_key: keys.message_key,
             metadata_key: [0x99u8; 32],
+            aci: keys.aci,
         };
         let wrong = decrypt_backup_id(&encrypted.iv, &encrypted.encrypted_id, &other);
         assert_ne!(wrong, keys.backup_id.0);

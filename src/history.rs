@@ -87,7 +87,7 @@ pub async fn export_archive(
     let frames = FramesReader::new(&key, factory).await?;
     let mut delimited = VarintDelimitedReader::new(frames);
 
-    let stats = export_frames_loop(&mut delimited, out).await?;
+    let stats = export_frames_loop(&mut delimited, out, &aci).await?;
 
     // 流读完即到档案尾：消费 reader 校验 HMAC 尾部（不校验 = 不可信导入）。
     delimited
@@ -101,11 +101,13 @@ pub async fn export_archive(
 /// 帧循环公共面（transfer archive 导出与官方快照导入两条入口共用，
 /// `backup::receive::export_snapshot_frames`）：首帧必须是 BackupInfo（档案
 /// 版本来源），后续帧按 recipient/chat/chatItem 投影 NDJSON，item unset/
-/// 未知帧型官方语义跳过并计数。尾部 HMAC 验证归入口层（调用方持有具体
-/// reader 类型）。future 非 Send，调用方须在 LocalSet 上运行。
+/// 未知帧型官方语义跳过并计数。`self_aci` 为本机账号 ACI（群变更 self-invite/
+/// pending-remove 投影的 serviceId 面需要）。尾部 HMAC 验证归入口层（调用方
+/// 持有具体 reader 类型）。future 非 Send，调用方须在 LocalSet 上运行。
 pub(crate) async fn export_frames_loop<R>(
     delimited: &mut VarintDelimitedReader<R>,
     out: &mut dyn Write,
+    self_aci: &presage::libsignal_service::prelude::Uuid,
 ) -> Result<ExportStats, HistoryError>
 where
     R: futures::io::AsyncRead + Unpin,
@@ -140,7 +142,7 @@ where
                         Some(chat_update_message::Update::GroupChange(_))
                     )
                 );
-                match message_record(&item, &aci) {
+                match message_record(&item, self_aci) {
                     Some(record) => {
                         stats.messages += 1;
                         if is_contact {

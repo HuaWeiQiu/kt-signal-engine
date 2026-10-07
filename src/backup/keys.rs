@@ -29,6 +29,9 @@ pub struct BackupKeys {
     pub backup_id: BackupId,
     pub message_key: MessageBackupKey,
     pub metadata_key: [u8; METADATA_KEY_LEN],
+    /// 本机账号 ACI（derive_keys 原始输入随件保存）：帧投影群变更 self-invite/
+    /// pending-remove 的 serviceId 面需要，快照导入入口不另带身份参数。
+    pub aci: presage::libsignal_service::prelude::Uuid,
 }
 
 /// AEP + ACI → 全套备份密钥（官方派生链单点封装）。
@@ -37,11 +40,13 @@ pub fn derive_keys(aep: &AccountEntropyPool, aci: &Aci) -> BackupKeys {
     let backup_id = backup_key.derive_backup_id(aci);
     let message_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
     let metadata_key = backup_key.derive_local_backup_metadata_key();
+    let aci_uuid: presage::libsignal_service::prelude::Uuid = (*aci).into();
     BackupKeys {
         backup_key,
         backup_id,
         message_key,
         metadata_key,
+        aci: aci_uuid,
     }
 }
 
