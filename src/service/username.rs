@@ -265,6 +265,307 @@ pub(crate) async fn get_own_username(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 写面（usernameReserve / usernameConfirm / usernameDelete）
+// ---------------------------------------------------------------------------
+
+/// 写面错误：参数面（BadParams）折叠 -32603 fail-closed；服务器态四码
+/// 结构化 `-1` + message 码位（reserve 409 全占=TAKEN / confirm 409 无
+/// 预约=RESERVATION_GONE / confirm 410 已占=TAKEN / 413·429=RATE_LIMITED /
+/// 其余 HTTP 与网络=SERVER_FAILED）；storage 链路同四码族透传。
+#[derive(Debug)]
+pub(crate) enum UsernameWriteError {
+    BadParams,
+    Taken,
+    ReservationGone,
+    RateLimited,
+    ServerFailed,
+    Storage(StorageSyncError),
+}
+
+impl From<StorageSyncError> for UsernameWriteError {
+    fn from(value: StorageSyncError) -> Self {
+        UsernameWriteError::Storage(value)
+    }
+}
+
+/// reserve 采纳结果：服务器采纳的候选全名 + 其 hash（base64url 无
+/// padding，confirm 参数面原样回传）。
+pub(crate) struct UsernameReservation {
+    pub(crate) username: String,
+    pub(crate) username_hash: String,
+}
+
+/// nickname 语法闸（官方桌面 Username.dom.ts 镜像，connector §4.55 同源）：
+/// `[a-zA-Z_][a-zA-Z0-9_]*` 3..32 字符。crate 硬语法为权威校验器，本闸
+/// 只是把软限与字符面提前到参数面 fail-closed。
+fn nickname_shape_ok(nickname: &str) -> bool {
+    let length = nickname.chars().count();
+    (3..=32).contains(&length)
+        && nickname
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && nickname
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// discriminator 语法闸（connector §4.55 同源）：全数字、非空、无 `00`
+/// 前缀、0 打头仅允许恰两位。数值域（crate u64 面）由 from_parts 权威校验。
+fn discriminator_shape_ok(discriminator: &str) -> bool {
+    !discriminator.is_empty()
+        && discriminator.bytes().all(|byte| byte.is_ascii_digit())
+        && !discriminator.starts_with("00")
+        && (!discriminator.starts_with('0') || discriminator.len() == 2)
+}
+
+/// usernameReserve 编排（官方 reserveUsername 同序）：候选生成 → 逐个
+/// hash 成批 → `PUT v1/accounts/username_hash/reserve` → 服务器采纳的
+/// hash 按下标对回候选全名。全名条目（带 `.`）= 单候选；裸昵称 =
+/// crate `candidates_from` 候选拒绝器（服务器各 range 取一个）。fake 面
+/// 由 Service 层短路（纯本地同函数，无网络）。
+pub(crate) async fn reserve_username(
+    context: &StorageContext,
+    username: &str,
+) -> Result<UsernameReservation, UsernameWriteError> {
+    let candidates = reserve_candidates(username)?;
+    let hashes: Vec<[u8; 32]> = candidates
+        .iter()
+        .map(|candidate| {
+            usernames::Username::new(candidate)
+                .map(|parsed| parsed.hash())
+                .map_err(|_| UsernameWriteError::BadParams)
+        })
+        .collect::<Result<_, _>>()?;
+    let accepted = reserve_hash_on_server(&context.push, &hashes).await?;
+    let index = hashes
+        .iter()
+        .position(|hash| *hash == accepted)
+        .ok_or(UsernameWriteError::ServerFailed)?;
+    Ok(UsernameReservation {
+        username: candidates[index].clone(),
+        username_hash: BASE64_URL_SAFE_NO_PAD.encode(accepted),
+    })
+}
+
+/// 候选生成：全名（带 `.`）= 单候选（语法闸 + crate from_parts 软限权威
+/// 校验）；裸昵称 = crate candidates_from（软限 3..32 同源默认）。
+pub(crate) fn reserve_candidates(username: &str) -> Result<Vec<String>, UsernameWriteError> {
+    match username.split_once('.') {
+        Some((nickname, discriminator)) => {
+            if !nickname_shape_ok(nickname) || !discriminator_shape_ok(discriminator) {
+                return Err(UsernameWriteError::BadParams);
+            }
+            let parsed = usernames::Username::from_parts(
+                nickname,
+                discriminator,
+                usernames::NicknameLimits::default(),
+            )
+            .map_err(|_| UsernameWriteError::BadParams)?;
+            Ok(vec![parsed.to_string()])
+        }
+        None => {
+            if !nickname_shape_ok(username) {
+                return Err(UsernameWriteError::BadParams);
+            }
+            let candidates = usernames::Username::candidates_from(
+                &mut rand::rng(),
+                username,
+                usernames::NicknameLimits::default(),
+            )
+            .map_err(|_| UsernameWriteError::BadParams)?;
+            Ok(candidates)
+        }
+    }
+}
+
+/// `PUT v1/accounts/username_hash/reserve`（本机凭据 basic auth）：批
+/// hashes → 200 `{usernameHash}`（b64url，32B）；409 → Taken（批内全占，
+/// 官方同码位）；413/429 → RateLimited；其余 → ServerFailed。
+async fn reserve_hash_on_server(
+    push: &PushService,
+    hashes: &[[u8; 32]],
+) -> Result<[u8; 32], UsernameWriteError> {
+    #[derive(serde::Serialize)]
+    struct ReserveRequest {
+        #[serde(rename = "usernameHashes")]
+        username_hashes: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ReserveResponse {
+        #[serde(rename = "usernameHash")]
+        username_hash: String,
+    }
+    let body = ReserveRequest {
+        username_hashes: hashes
+            .iter()
+            .map(|hash| BASE64_URL_SAFE_NO_PAD.encode(hash))
+            .collect(),
+    };
+    let response = push
+        .request(
+            reqwest::Method::PUT,
+            Endpoint::service("v1/accounts/username_hash/reserve"),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| UsernameWriteError::ServerFailed)?
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let status = response.status().as_u16();
+    if status == 409 {
+        return Err(UsernameWriteError::Taken);
+    }
+    if status == 413 || status == 429 {
+        return Err(UsernameWriteError::RateLimited);
+    }
+    if !response.status().is_success() {
+        return Err(UsernameWriteError::ServerFailed);
+    }
+    let parsed: ReserveResponse = response
+        .json()
+        .await
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(&parsed.username_hash)
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    bytes
+        .try_into()
+        .map_err(|_| UsernameWriteError::ServerFailed)
+}
+
+/// usernameConfirm 编排（官方 confirmUsername 同序）：语法面重验（硬语法）
+/// 与 hash 失配闸 → `Username::proof`（ZK，随机 32B）→ username link 加密
+/// 负载（`create_for_username`，新 entropy）→ `PUT
+/// v1/accounts/username_hash/confirm` → `usernameLinkHandle` 加本地 entropy
+/// 重建完整链接 → AccountRecord 33/35 storage 写（官方 confirm 落盘同位）。
+/// 服务器已确认而 storage 写失败 = 诚实部分成功面（STORAGE_* 浮出，多设备
+/// 经 storage sync 收敛；§5 用户名写面块）。
+pub(crate) async fn confirm_username(
+    context: &StorageContext,
+    username: &str,
+    username_hash: &str,
+) -> Result<serde_json::Value, UsernameWriteError> {
+    let parsed = usernames::Username::new(username).map_err(|_| UsernameWriteError::BadParams)?;
+    let computed = BASE64_URL_SAFE_NO_PAD.encode(parsed.hash());
+    if computed != username_hash {
+        // hash 失配 = 预约与本名不一致（两相调用面被撕裂），fail-closed。
+        return Err(UsernameWriteError::BadParams);
+    }
+
+    let mut randomness = [0u8; 32];
+    rand::Rng::fill(&mut rand::rng(), &mut randomness[..]);
+    let proof = parsed
+        .proof(&randomness)
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let (entropy, ciphertext) =
+        usernames::create_for_username(&mut rand::rng(), parsed.to_string(), None)
+            .map_err(|_| UsernameWriteError::ServerFailed)?;
+
+    #[derive(serde::Serialize)]
+    struct ConfirmRequest {
+        #[serde(rename = "usernameHash")]
+        username_hash: String,
+        #[serde(rename = "zkProof")]
+        zk_proof: String,
+        #[serde(rename = "encryptedUsername")]
+        encrypted_username: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ConfirmResponse {
+        #[serde(rename = "usernameLinkHandle")]
+        username_link_handle: String,
+    }
+    let body = ConfirmRequest {
+        username_hash: username_hash.to_owned(),
+        zk_proof: BASE64_URL_SAFE_NO_PAD.encode(&proof),
+        encrypted_username: BASE64_URL_SAFE_NO_PAD.encode(&ciphertext),
+    };
+    let response = context
+        .push
+        .request(
+            reqwest::Method::PUT,
+            Endpoint::service("v1/accounts/username_hash/confirm"),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| UsernameWriteError::ServerFailed)?
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let status = response.status().as_u16();
+    if status == 409 {
+        return Err(UsernameWriteError::ReservationGone);
+    }
+    if status == 410 {
+        return Err(UsernameWriteError::Taken);
+    }
+    if status == 413 || status == 429 {
+        return Err(UsernameWriteError::RateLimited);
+    }
+    if !response.status().is_success() {
+        return Err(UsernameWriteError::ServerFailed);
+    }
+    let parsed_response: ConfirmResponse = response
+        .json()
+        .await
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let handle = Uuid::parse_str(&parsed_response.username_link_handle)
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let link = build_username_link(&entropy, &handle);
+
+    // storage 面同步（AccountRecord 33/35 读改写；409 采纳重放与幂等无写
+    // 由 update_account_record 骨架承担）。
+    storage_sync::update_account_record(context, |record| {
+        storage_sync::account_record_with_username(
+            record,
+            Some(&parsed.to_string()),
+            Some((entropy, *handle.as_bytes())),
+        )
+    })
+    .await?;
+
+    let mut out = serde_json::Map::new();
+    out.insert("username".to_owned(), serde_json::json!(parsed.to_string()));
+    out.insert("usernameLink".to_owned(), serde_json::json!(link));
+    Ok(serde_json::Value::Object(out))
+}
+
+/// usernameDelete 编排（官方 deleteUsername 同序）：`DELETE
+/// v1/accounts/username_hash`（服务器清 hash；官方 AccountsManager 同语义
+/// 连带清 link 负载）→ AccountRecord 33/35 清除（读改写；本就未设 =
+/// 幂等无写）。413/429 → RateLimited；其余失败 → ServerFailed。
+pub(crate) async fn delete_username(
+    context: &StorageContext,
+) -> Result<serde_json::Value, UsernameWriteError> {
+    let response = context
+        .push
+        .request(
+            reqwest::Method::DELETE,
+            Endpoint::service("v1/accounts/username_hash"),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| UsernameWriteError::ServerFailed)?
+        .send()
+        .await
+        .map_err(|_| UsernameWriteError::ServerFailed)?;
+    let status = response.status().as_u16();
+    if status == 413 || status == 429 {
+        return Err(UsernameWriteError::RateLimited);
+    }
+    if !response.status().is_success() {
+        return Err(UsernameWriteError::ServerFailed);
+    }
+
+    storage_sync::update_account_record(context, |record| {
+        storage_sync::account_record_with_username(record, Some(""), None)
+    })
+    .await?;
+    Ok(serde_json::json!({}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +694,137 @@ mod tests {
         let projection = project_own_username(&malformed);
         assert!(projection.get("usernameLink").is_none());
         assert_eq!(projection["username"], json!("kt_pay.01"));
+    }
+
+    /// 候选生成面（reserve 参数闸 + crate 权威校验双层）：全名 = 单候选
+    /// （大小写保留）；裸昵称 = 候选拒绝器（crate 8 range 共 20 候选，
+    /// 全部硬语法合法、同昵称前缀、两位起 disc）；形状闸逐项 fail-closed。
+    #[test]
+    fn reserve_candidates_faces() {
+        use super::reserve_candidates;
+        use super::UsernameWriteError;
+
+        // 全名：单候选，原样大小写保留。
+        let single = reserve_candidates("KtPay.07").expect("valid full username");
+        assert_eq!(single, vec!["KtPay.07".to_owned()]);
+
+        // 裸昵称：crate 候选器（[4,3,3,2,2,2,2,2] × 8 range = 20），全部
+        // `{nick}.{disc:0>2}` 形态且通过 crate 权威语法。
+        let bare = reserve_candidates("kt_pay").expect("valid nickname");
+        assert_eq!(bare.len(), 20);
+        assert!(bare.iter().all(|candidate| {
+            usernames::Username::new(candidate)
+                .map(|parsed| parsed.to_string() == *candidate)
+                .unwrap_or(false)
+        }));
+        assert!(bare
+            .iter()
+            .all(|candidate| candidate.starts_with("kt_pay.")));
+
+        // 形状闸 fail-closed：短昵称/坏字符/数字开头/空 disc/单 0/前导零
+        // 三位/00 前缀。
+        let rejects = [
+            "ab.01",
+            "9ktpay.01",
+            "kt-pay.01",
+            "kt_pay.01x.02",
+            "kt_pay.",
+            "kt_pay.0",
+            "kt_pay.007",
+            "kt_pay.00",
+            "名.01",
+            "",
+        ];
+        for reject in rejects {
+            assert!(
+                matches!(
+                    reserve_candidates(reject),
+                    Err(UsernameWriteError::BadParams)
+                ),
+                "shape gate must reject {reject}"
+            );
+        }
+    }
+
+    /// 裸昵称候选可全量走完 reserve 本地面：每候选 hash 32B 确定性
+    /// （crate 面，无网络）。
+    #[test]
+    fn bare_candidates_all_hashable() {
+        let bare = reserve_candidates("kt_pay").expect("valid nickname");
+        for candidate in &bare {
+            let parsed = usernames::Username::new(candidate).expect("crate-valid candidate");
+            assert_eq!(parsed.hash().len(), 32);
+        }
+    }
+
+    /// username link 加解密 round-trip（写面 confirm 的 link 材料与读面
+    /// 链接解析共用 crate 面）：自造密文可解回原文；密文位翻转发 MAC 拒。
+    #[test]
+    fn link_encryption_round_trip() {
+        let (entropy, ciphertext) =
+            usernames::create_for_username(&mut rand::rng(), "kt_pay.01".to_owned(), None)
+                .expect("encrypts");
+        let plaintext =
+            usernames::decrypt_username(&entropy, &ciphertext).expect("decrypts own ciphertext");
+        assert_eq!(plaintext, "kt_pay.01");
+
+        let mut corrupted = ciphertext.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        assert!(usernames::decrypt_username(&entropy, &corrupted).is_err());
+    }
+
+    /// AccountRecord 33/35 写入 helper：写新=Some(变更)、同值幂等=None、
+    /// 清除（Some("")+None）落空、本就未设的清除=None。
+    #[test]
+    fn account_record_with_username_faces() {
+        use crate::proto::storage::account_record::UsernameLink;
+        let material: ([u8; 32], [u8; 16]) = ([9u8; 32], [8u8; 16]);
+
+        // 未设 → 写入：Some，双字段落位。
+        let fresh = crate::proto::storage::AccountRecord::default();
+        let updated =
+            storage_sync::account_record_with_username(&fresh, Some("kt_pay.01"), Some(material))
+                .expect("write lands");
+        assert_eq!(updated.username, "kt_pay.01");
+        let link = updated.username_link.clone().expect("link set");
+        assert_eq!(link.entropy, vec![9u8; 32]);
+        assert_eq!(link.server_id, vec![8u8; 16]);
+
+        // 同值幂等：无变化 → None（不 PUT 不 bump version）。
+        assert!(storage_sync::account_record_with_username(
+            &updated,
+            Some("kt_pay.01"),
+            Some(material)
+        )
+        .is_none());
+
+        // 清除：置空 + 链接清除。
+        let cleared = storage_sync::account_record_with_username(&updated, Some(""), None)
+            .expect("clear lands");
+        assert_eq!(cleared.username, "");
+        assert!(cleared.username_link.is_none());
+        // 本就未设的清除 = 幂等无写。
+        assert!(storage_sync::account_record_with_username(&fresh, Some(""), None).is_none());
+
+        // 只换名不换链接（大小写刷新场景）：33 变、35 保真原样。
+        let existing = crate::proto::storage::AccountRecord {
+            username: "old_name.01".to_owned(),
+            username_link: Some(UsernameLink {
+                entropy: vec![3u8; 32],
+                server_id: vec![4u8; 16],
+                color: 0,
+            }),
+            ..Default::default()
+        };
+        let renamed = storage_sync::account_record_with_username(
+            &existing,
+            Some("New_Name.01"),
+            Some(material),
+        )
+        .expect("rename lands");
+        assert_eq!(renamed.username, "New_Name.01");
+        // 新链接材料覆盖（confirm 面语义： entropy 每次新生成）。
+        assert_eq!(renamed.username_link.expect("link").entropy, vec![9u8; 32]);
     }
 }

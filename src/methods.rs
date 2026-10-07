@@ -1172,6 +1172,66 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // ---- 用户名写面（KT 扩展方法）----
+        // usernameReserve：候选生成 + 批 hash → 服务端 reserve → 采纳候选
+        // `{username, usernameHash}`。参数面（语法闸）-32603；服务器态四码
+        // （TAKEN/RESERVATION_GONE/RATE_LIMITED/SERVER_FAILED）-1 + 码位。
+        "usernameReserve" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(username) = params.get("username").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            if username.is_empty() || username.chars().count() > 38 {
+                return internal_error(id);
+            }
+            match service.username_reserve(account, username).await {
+                Ok(reservation) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "username": reservation.username,
+                        "usernameHash": reservation.username_hash,
+                    }),
+                ),
+                Err(error) => username_write_error(id, &error),
+            }
+        }
+        // usernameConfirm：proof + link 加密 → 服务端 confirm → 完整链接 →
+        // AccountRecord 33/35 落盘 → `{username, usernameLink}`。usernameHash
+        // 必带（reserve 采纳值回传）——缺失/非字符串/失配 -32603 fail-closed。
+        "usernameConfirm" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(username) = params.get("username").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(username_hash) = params.get("usernameHash").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            if username.is_empty() || username_hash.is_empty() {
+                return internal_error(id);
+            }
+            match service
+                .username_confirm(account, username, username_hash)
+                .await
+            {
+                Ok(result) => jsonrpc::success_response(id, result),
+                Err(error) => username_write_error(id, &error),
+            }
+        }
+        // usernameDelete：服务端 DELETE → AccountRecord 33/35 清除（本就
+        // 未设 = 幂等无写）→ `{}`。
+        "usernameDelete" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.username_delete(account).await {
+                Ok(result) => jsonrpc::success_response(id, result),
+                Err(error) => username_write_error(id, &error),
+            }
+        }
         // 账户级默认消失消息计时器（官方 universal timer 写面，Storage
         // Service 真相源，带 account 参数）：AccountRecord.universalExpireTimer
         // =17，0=关闭；参数形状错 fail-closed -32603（setExpirationTimer
@@ -1680,6 +1740,27 @@ fn has_image_or_video_mediatype(data_uri: &str) -> bool {
 
 fn internal_error(id: &Value) -> Value {
     jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
+}
+
+/// 用户名写面错误 → JSON-RPC 错误码：参数面（语法闸/hash 失配）-32603；
+/// 服务器态四码 `-1` + 结构化码位（connector 白名单逐字对位）：reserve 409
+/// 全占 / confirm 410 已占 = `USERNAME_TAKEN`（同输入确定性失败）；confirm
+/// 409 无预约 = `USERNAME_RESERVATION_GONE`（调用方重走 reserve）；413/429 =
+/// `USERNAME_RATE_LIMITED`（可重试）；其余 HTTP 与网络 = `USERNAME_SERVER_
+/// FAILED`；storage 链路复用 STORAGE 族四码。
+fn username_write_error(id: &Value, error: &crate::service::username::UsernameWriteError) -> Value {
+    use crate::service::username::UsernameWriteError as Error;
+    let (code, message) = match error {
+        Error::BadParams => return internal_error(id),
+        Error::Taken => (-1, "USERNAME_TAKEN"),
+        Error::ReservationGone => (-1, "USERNAME_RESERVATION_GONE"),
+        Error::RateLimited => (-1, "USERNAME_RATE_LIMITED"),
+        Error::ServerFailed => (-1, "USERNAME_SERVER_FAILED"),
+        Error::Storage(storage) => {
+            return storage_error(id, storage);
+        }
+    };
+    jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
 /// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation

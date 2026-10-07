@@ -104,6 +104,9 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
 | `getUsername` | `{account}` | `{username?, usernameLink?}`（键缺席 = 未设，不发明 null/空串；usernameLink 重建为完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；链接材料形状错该键缺席） | 参数缺失/非字符串 `-32603`；未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，用户名读面批）**：真相源 = Storage Service AccountRecord.username(33)/usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」同语义；多设备经 storage sync 收敛，无第二真相源）；从未有 storage 状态（无 master key / manifest 404 / 无 Account item）→ `{}`（未设不报错）；fake：恒 `{}`，不落调度日志（读面纪律） |
 | `usernameLookup` | `{account, usernames[1..20]}`（每条 1..64 字符——connector 契约 1.59 §4.55 帧界同源镜像，帧界而非语法界；条目 = 全名或 `https://signal.me/#eu/…` 链接） | `[{recipient, username?, uuid?, isRegistered}]`（输入序逐条投影；recipient = 条目回显；单条失败诚实降级 `{recipient, isRegistered:false}` 不炸整批——语法不符/链接打不开/解不开/未命中/网络皆同） | 参数缺失/形状错（usernames 缺席·非数组·空批·超 20、条目非字符串·空·超 64）`-32603`；未注册账号 `-32603` | **2026-10-08 real（KT 扩展，用户名读面批）**：官方同款服务端匿名 lookup 通路——全名条目 hash（libsignal usernames crate 权威语法面）→ `GET v1/accounts/username_hash/{hash}`（强制匿名，200 `{uuid}`/404）；链接条目 → `GET v1/accounts/username_link/{uuid}`（200 `{usernameLinkEncryptedValue}`）→ crate `decrypt_username`（entropy 系链接自带）→ 再走 hash lookup（官方 resolveUsernameLink 同序）；base64 一律 URL-safe 无 padding；匿名 PushService（带凭据反而 400，avatar CDN 先例同构）；fake：逐条回显 `{recipient, isRegistered:false}`，不落调度日志（读面纪律） |
+| `usernameReserve` | `{account, username}`（全名 `nick.disc` 或裸昵称——缺 disc = 引擎生成 20 候选轮转；wire 界 38 字符 = connector `USERNAME_MAX_WIRE_CHARS` 同源镜像，帧界而非语法界，语法面归官方 usernames crate 硬语法） | `{username, usernameHash}`（username = 采纳候选全名；usernameHash = b64url 无 padding 32B，confirm 回传值） | 参数缺失/非字符串/空/超 38 `-32603`；crate 硬语法不符（单数字 disc、0 打头非恰两位、超位、非法字符）`-32603`；未注册账号 `-32603`；服务器 409（批内全占）`USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方两相写面前相——候选 + 批 hash（crate 权威原语）→ `PUT v1/accounts/username_hash/reserve` `{usernameHashes:[…]}`（URL-safe 无 padding；200 `{usernameHash}` 采纳位，官方 AccountController 同码位）；reserve 无正式副作用（不落 username，官方同语义）；fake：本地候选 + hash 桩（真实 crate 原语）不触网，不落调度日志（storage 状态面纪律） |
+| `usernameConfirm` | `{account, username, usernameHash}`（usernameHash = reserve 采纳值回传；引擎重验语法 + hash 失配 fail-closed——两相调用面被撕裂即拒） | `{username, usernameLink}`（完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；entropy 系本端新生成，仅此响应与 storage 35 字段两处落地） | 参数缺失/形状错（三参缺失·非字符串·空、语法不符、hash 失配）`-32603`；未注册账号 `-32603`；服务器 409 `USERNAME_RESERVATION_GONE`（预约过期/被占）、410 `USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`；服务器已确认而 storage 33/35 落盘失败 → STORAGE 族（诚实部分成功：服务器态已变更，调用方按 STORAGE 语义处置，getUsername/多设备 sync 收敛）（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方后相同序——`Username::proof`（ZK，随机 32B）+ `create_for_username`（新 entropy 加密负载）→ `PUT v1/accounts/username_hash/confirm` `{usernameHash, zkProof, encryptedUsername}`（200 `{usernameLinkHandle}` 重建完整链接）→ AccountRecord 33/35 storage 落盘（官方 confirm 落盘同位）；fake：本地 link 桩（随机 handle）不触网不落盘，不落调度日志 |
+| `usernameDelete` | `{account}` | `{}`（幂等：本就未设照走服务器删除 + storage 清除，无写分支成功同形状） | 参数缺失 `-32603`；未注册账号 `-32603`；413/429 `USERNAME_RATE_LIMITED`、其余服务器失败 `USERNAME_SERVER_FAILED`；storage 33/35 清除失败 STORAGE 族（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方同序 `DELETE v1/accounts/username_hash`（服务器清 hash 并连带清 link 负载）→ AccountRecord 33/35 清除读改写；fake：`{}` 桩，不落调度日志 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -1248,8 +1251,8 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   + usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」，
   多设备经 storage sync 收敛）。引擎不设第二真相源——presage 注册数据无
   username 字段，whoami 只回 hash 不可逆，桌面侧亦以 storage 面为同步
-  真相（本地面仅模型缓存）。getUsername 读 33/35 投影；写面落地后由
-  写面经 `update_account_record` 维护同字段（后续批）。
+  真相（本地面仅模型缓存）。getUsername 读 33/35 投影；写面已落地，由
+  写面经 `update_account_record` 维护同字段（写面批）。
 - **lookup 方向锚定**：服务端公开 lookup 通路只有「hash/链接 → ACI」单向
   （`GET v1/accounts/username_hash/{hash}`、`GET
   v1/accounts/username_link/{uuid}`，均强制匿名——带凭据 400）；「ACI →
@@ -1265,6 +1268,40 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
 - **crate 依赖**：`usernames`（libsignal v0.99.0 同 tag 直接依赖，图中
   既有解析，AGPL-3.0-only）——语法/hash/proof/link 加解密全走官方原语，
   引擎零自研密码学。
+
+用户名写面批（2026-10-08，KT 扩展，usernameReserve/usernameConfirm/usernameDelete）：
+
+- **两相编排归 connector**：官方 reserve→confirm 两相在引擎侧保持独立
+  方法（与官方 AccountsManager 分步同构），`accounts.setUsername` 的
+  reserve→confirm 编排由 connector 宿主面承担（KT 扩展方法两跳）。中间
+  态（已 reserve 未 confirm）服务器无正式副作用（reserve 不落 username，
+  官方同语义）；撕裂面由 confirm 的语法重验 + hash 失配 fail-closed 闸
+  兜住。
+- **四枚结构化错误码**（`-1` + message）：`USERNAME_TAKEN`（reserve 409 /
+  confirm 410，retryable=false——用户名被占需换名）、
+  `USERNAME_RESERVATION_GONE`（confirm 409，retryable=false——预约过期
+  需重走 reserve）、`USERNAME_RATE_LIMITED`（413/429，retryable=true）、
+  `USERNAME_SERVER_FAILED`（其余，retryable=true）。参数面（语法闸/hash
+  失配）一律 `-32603`，不占结构化码。
+- **诚实部分成功**：confirm 服务器已确认（200 `usernameLinkHandle`）而
+  storage 33/35 落盘失败 → STORAGE 族透传浮出——服务器态已变更（username
+  已生效），调用方按 STORAGE 语义处置后以 getUsername / 多设备 storage
+  sync 收敛；引擎不缓存第二真相（读面批同锚）。
+- **无 case-change 快捷路径**：官方桌面同名只换大小写走本地快捷改写（跳
+  reserve）；引擎每次 setUsername 全走 reserve→confirm 两相（服务器是
+  hash 真相，本地无既有 hash 可依赖，多一跳成本可忽略）——connector 侧
+  同口径，不做快捷分支。
+- **无 usernameChangeSyncMessage**：官方桌面 confirm 后向本账号其他设备
+  发同步消息；引擎多设备经 Storage Service AccountRecord 33/35 storage
+  sync 收敛（官方 proto「仅 server confirm/delete 时更新」同锚），不发
+  第二信令（置顶面 storage-first 纪律同构）。
+- **fake 纪律**：参数闸全量生效后形状桩——reserve 本地候选 + hash（真实
+  crate 原语，形状与 real 一致）、confirm 本地 link（随机 handle 不落盘）、
+  delete `{}`；全不触网不落调度日志（storage 状态面纪律）。
+- **real 网络路径离线不可测**：无夹具服务器，reserve/confirm/delete 的
+  服务器路径以 crate 原语单测（语法/hash/proof/link round-trip）+ fake
+  形状契约测试覆盖；服务器码位（409/410/413/429）按上游
+  AccountController 钉定（读面批同款锚定方式）。
 
 ## 6. fake 服务模式（仅测试）
 

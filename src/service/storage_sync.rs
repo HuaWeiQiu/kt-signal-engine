@@ -1664,6 +1664,29 @@ pub(crate) fn account_record_with_universal_expire_timer(
     })
 }
 
+/// AccountRecord 读-改-写保真核心（用户名写面）：username(33) +
+/// usernameLink(35) 写入。`username=Some("")` = 清除（usernameDelete）；
+/// link material = (entropy 32B, server_id 16B)，`None` = 清链接。
+/// 意图已满足（33/35 均无变化）→ None（幂等无写）。
+pub(crate) fn account_record_with_username(
+    record: &AccountRecord,
+    username: Option<&str>,
+    link: Option<([u8; 32], [u8; 16])>,
+) -> Option<AccountRecord> {
+    let mut updated = record.clone();
+    if let Some(username) = username {
+        updated.username = username.to_owned();
+    }
+    updated.username_link = link.map(|(entropy, server_id)| account_record::UsernameLink {
+        entropy: entropy.to_vec(),
+        server_id: server_id.to_vec(),
+        color: account_record::username_link::Color::Unknown as i32,
+    });
+    let changed =
+        updated.username != record.username || updated.username_link != record.username_link;
+    changed.then_some(updated)
+}
+
 /// universal timer 写面（setUniversalExpireTimer，官方 universalTimer 等价）：
 /// 账户级默认消失消息计时器 → AccountRecord.universalExpireTimer(17)（
 /// 0=关闭），update_account_record 骨架（409 采纳重放；同值幂等无写）。

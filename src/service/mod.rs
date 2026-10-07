@@ -1888,6 +1888,75 @@ impl Service {
         Ok(json!(rows))
     }
 
+    /// usernameReserve（用户名写面一，KT 扩展方法）：候选生成 + 批 hash
+    /// → 服务端 reserve → 采纳候选投影。fake 模式纯本地形状桩（语法/hash
+    /// 走同一 crate 面，无网络）。
+    pub(crate) async fn username_reserve(
+        self: &Arc<Self>,
+        account: &str,
+        username: &str,
+    ) -> Result<username::UsernameReservation, username::UsernameWriteError> {
+        if !self.real {
+            // reserve_candidates 只产 BadParams（形状闸）——原样上浮，让
+            // 参数面 fail-closed 走 -32603 而非服务器四码。
+            let candidates = username::reserve_candidates(username)?;
+            let candidate = candidates
+                .first()
+                .ok_or(username::UsernameWriteError::ServerFailed)?;
+            let hash = usernames::Username::new(candidate)
+                .map_err(|_| username::UsernameWriteError::ServerFailed)?
+                .hash();
+            use base64::Engine as _;
+            return Ok(username::UsernameReservation {
+                username: candidate.clone(),
+                username_hash: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash),
+            });
+        }
+        let context = storage_context(self, account).await?;
+        username::reserve_username(&context, username).await
+    }
+
+    /// usernameConfirm（用户名写面二，KT 扩展方法）：proof + link 加密 →
+    /// 服务端 confirm → 完整链接重建 → AccountRecord 33/35 storage 落盘。
+    /// fake 模式纯本地形状桩（随机 handle，不落盘）。
+    pub(crate) async fn username_confirm(
+        self: &Arc<Self>,
+        account: &str,
+        username: &str,
+        username_hash: &str,
+    ) -> Result<serde_json::Value, username::UsernameWriteError> {
+        if !self.real {
+            let parsed = usernames::Username::new(username)
+                .map_err(|_| username::UsernameWriteError::BadParams)?;
+            let (entropy, _ciphertext) =
+                usernames::create_for_username(&mut rand::rng(), parsed.to_string(), None)
+                    .map_err(|_| username::UsernameWriteError::ServerFailed)?;
+            let mut handle_bytes = [0u8; 16];
+            rand::Rng::fill(&mut rand::rng(), &mut handle_bytes[..]);
+            let handle = presage::libsignal_service::prelude::Uuid::from_slice(&handle_bytes)
+                .map_err(|_| username::UsernameWriteError::ServerFailed)?;
+            return Ok(json!({
+                "username": parsed.to_string(),
+                "usernameLink": username::build_username_link(&entropy, &handle),
+            }));
+        }
+        let context = storage_context(self, account).await?;
+        username::confirm_username(&context, username, username_hash).await
+    }
+
+    /// usernameDelete（用户名写面三，KT 扩展方法）：服务端 DELETE →
+    /// AccountRecord 33/35 清除（本就未设 = 幂等无写）。fake 模式形状桩。
+    pub(crate) async fn username_delete(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<serde_json::Value, username::UsernameWriteError> {
+        if !self.real {
+            return Ok(json!({}));
+        }
+        let context = storage_context(self, account).await?;
+        username::delete_username(&context).await
+    }
+
     /// storage.write（P0，KT 扩展方法）：通用批量 manifest item 写（compat
     /// §5「storage 写面 P0」块）。参数闸已在 dispatch 层 parse_request 全量
     /// 生效；fake 模式参数闸后形状桩；409 → VersionConflict（不自动重试，

@@ -2298,3 +2298,140 @@ fn username_lookup_fake_echo_and_param_fail_closed() {
         (-32603, "Internal error".to_owned())
     );
 }
+
+/// 用户名写面（usernameReserve/usernameConfirm/usernameDelete，KT 扩展
+/// 方法）：fake 本地形状桩（语法/hash/link 加解密走同一 crate 面，无网络）
+/// 与参数面 fail-closed 逐形状（-32603）、服务器态结构化码位的 fake 不可达
+/// 面（fake 恒成功形状）、real 模式未注册账号 -32603（不触网）。
+#[test]
+fn username_write_faces_fake_shapes_and_param_fail_closed() {
+    use base64::Engine as _;
+    let dir = temp_dir("username-write");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // reserve fake：全名 = 单候选原样回 + 32B hash（b64url）；裸昵称 =
+    // 候选器首项（nick.DD 形态）。
+    let reserved = engine.request(
+        "usernameReserve",
+        json!({ "account": number, "username": "KtPay.07" }),
+    )["result"]
+        .clone();
+    assert_eq!(reserved["username"], json!("KtPay.07"));
+    let hash = reserved["usernameHash"].as_str().expect("hash string");
+    assert_eq!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(hash)
+            .expect("b64url")
+            .len(),
+        32
+    );
+
+    let bare = engine.request(
+        "usernameReserve",
+        json!({ "account": number, "username": "kt_pay" }),
+    )["result"]
+        .clone();
+    let bare_name = bare["username"].as_str().expect("candidate");
+    assert!(
+        bare_name.starts_with("kt_pay."),
+        "candidate shape: {bare_name}"
+    );
+    assert!(usernames::Username::new(bare_name).is_ok());
+
+    // confirm fake：reserve 采纳面回传（fake 不校 hash 值，只校形状）→
+    // `{username, usernameLink}`，链接为完整 signal.me 形态。
+    let confirmed = engine.request(
+        "usernameConfirm",
+        json!({
+            "account": number,
+            "username": bare_name,
+            "usernameHash": bare["usernameHash"],
+        }),
+    )["result"]
+        .clone();
+    assert_eq!(confirmed["username"], json!(bare_name));
+    let link = confirmed["usernameLink"].as_str().expect("link");
+    assert!(link.starts_with("https://signal.me/#eu/"), "link: {link}");
+
+    // delete fake：`{}`。
+    assert_eq!(
+        engine.request("usernameDelete", json!({ "account": number }))["result"],
+        json!({})
+    );
+
+    // 参数面 fail-closed 逐形状（reserve 闸最严，confirm 校双参数形状，
+    // delete 只校 account）。
+    let reserve_rejects = [
+        json!({ "account": number }),
+        json!({ "account": number, "username": "" }),
+        json!({ "account": number, "username": "k".repeat(39) }),
+        json!({ "account": number, "username": 7 }),
+        json!({ "username": "kt_pay.01" }),
+        json!({ "account": number, "username": "ab.01" }),
+        json!({ "account": number, "username": "kt_pay.0" }),
+        json!({ "account": number, "username": "kt_pay.00" }),
+        json!({ "account": number, "username": "kt_pay.007" }),
+        json!({ "account": number, "username": "kt-pay.01" }),
+        json!({ "account": number, "username": "名.01" }),
+    ];
+    for params in reserve_rejects {
+        assert_eq!(
+            engine.error_of("usernameReserve", params),
+            (-32603, "Internal error".to_owned()),
+            "reserve param face must reject"
+        );
+    }
+    let confirm_rejects = [
+        json!({ "account": number, "username": bare_name }),
+        json!({ "account": number, "usernameHash": hash }),
+        json!({ "account": number, "username": "bad grammar", "usernameHash": hash }),
+        json!({ "account": number, "username": bare_name, "usernameHash": "" }),
+    ];
+    for params in confirm_rejects {
+        assert_eq!(
+            engine.error_of("usernameConfirm", params),
+            (-32603, "Internal error".to_owned()),
+            "confirm param face must reject"
+        );
+    }
+    assert_eq!(
+        engine.error_of("usernameDelete", json!({})),
+        (-32603, "Internal error".to_owned())
+    );
+
+    // real 模式未注册账号：注册数据前置即内部失败（不触网）。
+    let real_dir = temp_dir("username-write-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    for (method, params) in [
+        (
+            "usernameReserve",
+            json!({ "account": "+15559990000", "username": "kt_pay.01" }),
+        ),
+        (
+            "usernameConfirm",
+            json!({
+                "account": "+15559990000",
+                "username": "kt_pay.01",
+                "usernameHash": hash,
+            }),
+        ),
+        ("usernameDelete", json!({ "account": "+15559990000" })),
+    ] {
+        assert_eq!(
+            real_engine.error_of(method, params),
+            (-32603, "Internal error".to_owned()),
+            "{method} unregistered must fold to internal error"
+        );
+    }
+}
