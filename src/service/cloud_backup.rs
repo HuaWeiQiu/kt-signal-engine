@@ -169,6 +169,11 @@ use zkgroup::Timestamp;
 /// 桥同源）。default.json 为 staging 值，KT 钉生产。
 pub const GENERIC_SERVER_PUBLIC_PARAMS_B64: &str = "AeCO67P9mIv1yUHkdeZ9JF789GDbox61GvTqq3S4kYc1ADUWxWHQygU390tv1oRWt9WjkdZlU7mKkifF59ftjE+2ZlMmxns6I+ySiLpR8FEmfu+TGpVp3zYTjNV93obJJTyBCCsSHVETCyQRbKdCyb5TMa6LGrvcZaX0Q/VAavhuNA/m4kSiRMgSnYrUjGhVekdDnF+7xioo4wvFnxjIDh7uJQrYOWD6MloNGX7St5gbysTuQQ7i/HI38b9V8x8mKazuDSXxB//BKGZx/XHkK8cHX+QK1MPxYUVM1/CBI5oW";
 
+/// 常量反序列化（zkgroup bincode 编码；损坏 = 引擎内嵌常量错误，fail-closed）。
+pub fn generic_server_public_params() -> Result<GenericServerPublicParams, ()> {
+    zkgroup::deserialize(&use_base64_decode(GENERIC_SERVER_PUBLIC_PARAMS_B64)?).map_err(|_| ())
+}
+
 /// 引导材料：请求上下文 + 官方 bootstrap PUT 体（b64(request)，WebAPI:813
 /// messagesBackupAuthCredentialRequest 同键）。
 pub struct BackupAuthRequestMaterials<const VERSION: u8> {
@@ -313,4 +318,247 @@ pub async fn connect_production_chat() -> Result<ChatConnection, ConnectError> {
         Default::default(),
         listener,
     ))
+}
+
+// —— 3B：云备份 restore 全流程编排（契约 §1.4-§1.6；官方 credentials.preload.ts
+//    + calling 前例 download_transfer_archive 传输形态同构）——
+//
+// I/O 面参数化注入（PushService 沿用 service 层装配）；帧导出复用
+// backup/receive.rs export_snapshot_frames（密文落 work_dir/main + AEP 派生
+// message_key + 尾部 HMAC）。future 非 Send——调用方 LocalSet 承载
+// （link_flow/download_transfer_archive 同策略）。
+
+use std::path::Path;
+
+use presage::libsignal_service::configuration::Endpoint;
+use presage::libsignal_service::prelude::PushService;
+use presage::libsignal_service::protocol::PrivateKey;
+use presage::libsignal_service::push_service::HttpAuthOverride;
+use rand::Rng as _;
+
+use libsignal_net_chat::api::backups::{BackupAuth, UnauthenticatedChatApi};
+use libsignal_net_chat::api::Unauth;
+
+use crate::backup::keys::BackupKeys;
+
+/// restore 流程错误族（methods 层映射 BACKUP_* 结构化码）。
+#[derive(Debug)]
+pub enum CloudRestoreError {
+    /// 引导自愈后仍无 backupId（账号从未开启云备份）——retryable=false。
+    NotProvisioned,
+    /// 凭据兑换被拒（zkgroup 验证失败）——retryable=false。
+    AuthRejected,
+    /// chat/REST 传输失败——retryable=true。
+    Transport(String),
+    /// CDN 下载失败——retryable=true。
+    Download(String),
+    /// 解密/HMAC 校验失败——retryable=false。
+    Decrypt(String),
+    /// 帧导出失败——retryable=false。
+    Export(String),
+}
+
+impl Clone for CloudRestoreError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NotProvisioned => Self::NotProvisioned,
+            Self::AuthRejected => Self::AuthRejected,
+            Self::Transport(m) => Self::Transport(m.clone()),
+            Self::Download(m) => Self::Download(m.clone()),
+            Self::Decrypt(m) => Self::Decrypt(m.clone()),
+            Self::Export(m) => Self::Export(m.clone()),
+        }
+    }
+}
+
+async fn fetch_credentials_once(
+    push: &PushService,
+    now_ms: u64,
+) -> Result<(Vec<BackupCredentialEntry>, bool), CloudRestoreError> {
+    let (start_day, end_day) = backup_credential_day_window(now_ms);
+    let path = format!(
+        "{}?redemptionStartSeconds={}&redemptionEndSeconds={}",
+        super::cloud_backup::BACKUP_CREDENTIALS_PATH,
+        start_day / 1000,
+        end_day / 1000
+    );
+    let response = push
+        .request(
+            http::Method::GET,
+            Endpoint::service(&path),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| CloudRestoreError::Transport("credentials build".into()))?
+        .send()
+        .await
+        .map_err(|e| CloudRestoreError::Transport(format!("credentials: {e}")))?;
+    let status = response.status().as_u16();
+    if status == 404 {
+        return Ok((Vec::new(), true));
+    }
+    if !(200..300).contains(&status) {
+        return Err(CloudRestoreError::Transport(format!(
+            "credentials status {status}"
+        )));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| CloudRestoreError::Transport(format!("credentials json: {e}")))?;
+    Ok((parse_backup_credentials_response(&body), false))
+}
+
+async fn bootstrap_backup_id(
+    push: &PushService,
+    request_b64: &str,
+) -> Result<(), CloudRestoreError> {
+    let body = serde_json::json!({
+        "messagesBackupAuthCredentialRequest": request_b64,
+        "mediaBackupAuthCredentialRequest": request_b64,
+    });
+    let response = push
+        .request(
+            http::Method::PUT,
+            Endpoint::service(super::cloud_backup::BACKUP_BACKUP_ID_PATH),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| CloudRestoreError::Transport("backupid build".into()))?
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| CloudRestoreError::Transport(format!("backupid: {e}")))?;
+    if !(200..300).contains(&response.status().as_u16()) {
+        return Err(CloudRestoreError::Transport(format!(
+            "backupid status {}",
+            response.status().as_u16()
+        )));
+    }
+    Ok(())
+}
+
+/// 当日凭据拉取（404→引导→重试一次，官方 credentials.preload.ts:242-258 同序）。
+///
+/// # Errors
+/// 引导/传输失败 = `Transport`；引导后仍空 = `NotProvisioned`。
+pub async fn fetch_today_credentials(
+    push: &PushService,
+    backup_request_b64: &str,
+    now_ms: u64,
+) -> Result<BackupCredentialEntry, CloudRestoreError> {
+    let (mut entries, mut missing) = {
+        let (list, was_missing) = fetch_credentials_once(push, now_ms).await?;
+        if was_missing {
+            bootstrap_backup_id(push, backup_request_b64).await?;
+            let (list, missing_again) = fetch_credentials_once(push, now_ms).await?;
+            (list, missing_again)
+        } else {
+            (list, false)
+        }
+    };
+    if missing {
+        return Err(CloudRestoreError::NotProvisioned);
+    }
+    let today_seconds = now_ms / 1000 / 86_400 * 86_400;
+    entries.sort_by_key(|entry| entry.redemption_time_seconds);
+    entries
+        .into_iter()
+        .find(|entry| entry.redemption_time_seconds == today_seconds)
+        .ok_or(CloudRestoreError::NotProvisioned)
+}
+
+/// 云备份 restore 全编排：凭据拉取（404 引导自愈）→ zkgroup 兑换 → BackupAuth
+/// → 备份定位（未鉴权 gRPC）→ CDN 读凭据头 → CDN 下载 → 密文落 work_dir/main
+/// → export_snapshot_frames（AEP 派生 message_key 解密 + 尾部 HMAC）→ NDJSON。
+///
+/// # Errors
+/// 各段错误如实映射（凭据空/兑换拒/传输/下载/解密导出）。
+///
+/// # Panics
+/// 无 tokio runtime 时 `Handle::try_current` panic——引擎 LocalSet 装配保证
+/// 存在（connect_production_chat 同前提）。
+pub async fn restore_from_cloud(
+    push: &PushService,
+    store_dir: &Path,
+    keys: &BackupKeys,
+    signing_key: &PrivateKey,
+    rng: &mut (dyn rand::CryptoRng + Send),
+    out: &mut dyn std::io::Write,
+) -> Result<crate::history::ExportStats, CloudRestoreError> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let materials = create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+    let entry = fetch_today_credentials(push, &materials.request_b64, now_ms).await?;
+
+    let params = generic_server_public_params()
+        .map_err(|_| CloudRestoreError::Decrypt("generic params".into()))?;
+    let response_bytes = super::cloud_backup::use_base64_decode(&entry.credential_b64)
+        .map_err(|_| CloudRestoreError::AuthRejected)?;
+    let response: zkgroup::api::backups::BackupAuthCredentialResponse =
+        zkgroup::deserialize(&response_bytes).map_err(|_| CloudRestoreError::AuthRejected)?;
+    let credential = materials
+        .request_context
+        .receive(
+            response,
+            &params,
+            zkgroup::Timestamp::from_epoch_seconds(entry.redemption_time_seconds),
+        )
+        .map_err(|_| CloudRestoreError::AuthRejected)?;
+    let backup_auth = BackupAuth::new(&credential, &params, signing_key);
+
+    // gRPC：未鉴权连接 + BackupAuth 呈现（官方 scaffold Unauth(shared_h2) 同构）。
+    let chat = connect_production_chat()
+        .await
+        .map_err(|e| CloudRestoreError::Transport(format!("chat connect: {e}")))?;
+    let grpc = Unauth(
+        chat.shared_h2_connection()
+            .expect("H2 connection available"),
+    );
+    let info = grpc
+        .get_message_backup_info(&backup_auth, rng)
+        .await
+        .map_err(|_| CloudRestoreError::Transport("backup info".into()))?;
+    let cdn_creds = grpc
+        .get_backup_cdn_credentials(&backup_auth, info.cdn, rng)
+        .await
+        .map_err(|_| CloudRestoreError::Transport("cdn credentials".into()))?;
+
+    // CDN 下载（presage cdn 主机映射 + 凭据头直附）。
+    let cdn_path = format!("backups/{}/{}", info.backup_dir, info.backup_name);
+    let mut request = push
+        .request(
+            http::Method::GET,
+            Endpoint::cdn(info.cdn, &cdn_path),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|_| CloudRestoreError::Download("cdn build".into()))?;
+    for (name, value) in cdn_creds.headers.iter() {
+        request = request.header(name.as_str(), value.as_bytes());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| CloudRestoreError::Download("cdn send".into()))?;
+    if !response.status().is_success() {
+        return Err(CloudRestoreError::Download(format!(
+            "cdn status {}",
+            response.status().as_u16()
+        )));
+    }
+    let ciphertext = response
+        .bytes()
+        .await
+        .map_err(|_| CloudRestoreError::Download("cdn read".into()))?;
+
+    // 密文落 work_dir/main（export_snapshot_frames 契约面），解密导出 NDJSON。
+    let work_dir = store_dir.join("cloud-backup");
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| CloudRestoreError::Export(format!("workdir: {e}")))?;
+    let main_path = work_dir.join("main");
+    std::fs::write(&main_path, ciphertext.as_ref())
+        .map_err(|e| CloudRestoreError::Export(format!("write: {e}")))?;
+    crate::backup::receive::export_snapshot_frames(&work_dir, keys, out)
+        .await
+        .map_err(|e| CloudRestoreError::Export(format!("{e:?}")))
 }
