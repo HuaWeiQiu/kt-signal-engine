@@ -33,6 +33,22 @@
 > **剩余实施项**：cloud_backup.rs 本体（REST+zkgroup+gRPC+CDN+解密）、methods.rs
 > 两方法注册、进度快照面、单测三链——按 §1-§4 契约直写。
 
+> **§0.2 第三片（gRPC 面）实施模板（官方 example 实读定稿）**：
+> `rust/net/chat/examples/chat_request_scaffold.rs` = 全链官方模板——
+> ①`libsignal_net::env::PROD`（生产 env；`env.chat_domain_config.connect.hostname =
+> "grpc.chat.signal.org"` + `http_version = Some(HttpVersion::Http2)` + ip_v4/v6 清空）；
+> ②`simple_chat_connection(&env, EnableDomainFronting::No, DirectOrProxyMode::DirectOnly,
+> |_route| true).await?` → chat_connection（注意：该 helper 在
+> `libsignal_net::chat::test_support` 命名空间——生产使用二选一：依赖开
+> test-support feature，或按其函数体自写构造（内部即 ConnectionResources +
+> start_connect_with 的装配，本文 §0.1 配方）；实施时读 helper 本体定夺）；
+> ③`Unauth(chat_connection.shared_h2_connection().expect("H2"))` → grpc 面；
+> ④api 调用（get_backup_cdn_credentials/get_message_backup_info 同 grpc/backups.rs
+> :242/:393 签名，含 BackupsAnonymousClient 路径 :408）。
+> CDN 下载段 = `GET cdn{N}/backups/{dir}/{name}`（§1.5）+ §3 头两件套；
+> 解密导入段 = derive_keys(AEP,aci).message_key + FramesReader + export_frames_loop
+> （backup/receive.rs:107 同款尾部 HMAC）。
+
 ## 1. 凭据链（全部官方实锤）
 
 1. **签发**：`GET v1/certificate/auth/group?redemptionStartSeconds=&redemptionEndSeconds=`
