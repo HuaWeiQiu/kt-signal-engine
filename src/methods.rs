@@ -1829,6 +1829,58 @@ async fn dispatch(
                 None => jsonrpc::success_response(id, json!({ "present": false })),
             }
         }
+        // 云备份 upload 启动（backups.uploadToCloud，KT 扩展方法；cloud-
+        // backup-contract §6）：send lane mutating。装配段（专用线程）→
+        // 凭据→zkgroup→form gRPC→TUS 单发 POST→refresh_backup 全链后台化，
+        // 同步答 started；重入答 BACKUP_UPLOAD_ALREADY_RUNNING（-1）；
+        // 工件缺失/首行非法答 BACKUP_ARTIFACT_MISSING/INVALID（同步终态）。
+        // 码表六族→BACKUP_* 映射随批记 compat §3（新码位白名单登记归
+        // connector 透传批）。
+        "backups.uploadToCloud" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.cloud_backup_upload_start(account).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "started" })),
+                Err(e) => {
+                    // 统一码表（cloud_upload::CloudUploadError::rpc_code）：
+                    // uploadStatus failed 相位同表，两端不漂。
+                    let rpc = match e.detail() {
+                        Some(detail) => {
+                            RpcError::with_data(-1, e.rpc_code(), json!({ "detail": detail }))
+                        }
+                        None => RpcError::new(-1, e.rpc_code()),
+                    };
+                    jsonrpc::error_response(id, &rpc)
+                }
+            }
+        }
+        // 云备份 upload 进度/状态（backups.uploadStatus，KT 扩展方法）：
+        // cloudStatus 同款快照读（缺席={present:false}；在跑={present:true,
+        // phase, bytesRead, bytesTotal?}，failed 相位附 errorCode）；只读不落
+        // 调度日志零 stderr（storage 状态面纪律）。account 仅做契约形状校验。
+        "backups.uploadStatus" => {
+            let Some(_account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.cloud_upload_status() {
+                Some(snapshot) => {
+                    let mut payload = json!({
+                        "present": true,
+                        "phase": snapshot.phase,
+                        "bytesRead": snapshot.bytes_read,
+                    });
+                    if let Some(total) = snapshot.bytes_total {
+                        payload["bytesTotal"] = json!(total);
+                    }
+                    if let Some(code) = snapshot.error_code {
+                        payload["errorCode"] = json!(code);
+                    }
+                    jsonrpc::success_response(id, payload)
+                }
+                None => jsonrpc::success_response(id, json!({ "present": false })),
+            }
+        }
         // transfer_archive 下载进度快照查询（transfer.downloadStatus，KT 扩展
         // 方法）：`history.importStatus` progress 组合面的引擎侧只读数据源
         // （契约 1.53 §4.38 扩展）。快照缺席（未开始/已结束/引擎重启过）=

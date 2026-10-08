@@ -486,6 +486,10 @@ mod transfer_progress;
 /// 纯函数核先行，REST/gRPC/CDN 传输面随批）。
 pub mod cloud_backup;
 
+/// 云备份 upload 面（docs/cloud-backup-contract.md §6，二期：uploadToCloud/
+/// uploadStatus；装配段专用线程 + 上行段 LocalSet watcher）。
+pub(crate) mod cloud_upload;
+
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
@@ -506,6 +510,9 @@ pub(crate) struct Service {
     /// 云备份 restore 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
     /// §2 cloudStatus 面）。
     cloud_restore_progress: cloud_backup::CloudRestoreProgress,
+    /// 云备份 upload 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
+    /// §6.2 uploadStatus 面）。
+    cloud_upload_progress: cloud_upload::CloudUploadProgress,
 }
 
 struct Inner {
@@ -535,6 +542,7 @@ impl Service {
             terminated_groups: groups::TerminatedGroups::new(),
             transfer_progress: transfer_progress::TransferProgress::new(),
             cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
+            cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
         })
     }
 
@@ -2323,6 +2331,106 @@ impl Service {
     /// `{present:false}`）。
     pub(crate) fn cloud_backup_status(&self) -> Option<cloud_backup::CloudRestoreSnapshot> {
         self.cloud_restore_progress.snapshot()
+    }
+
+    /// 云备份 upload 启动（cloud-backup-contract §6.2：`backups.uploadToCloud`；
+    /// send lane mutating；同引擎至多一个，重入 = BACKUP_UPLOAD_ALREADY_RUNNING）。
+    /// 前置检查序与 restore 同构：storage_context → AEP/registration → signing
+    /// key → 工件闸 → 单槽重入闸；装配段专用 OS 线程（§10.3 同款）+ 上行段
+    /// LocalSet watcher（watch_and_upload 统一 finally：临时产物必删 + 闸释放）。
+    pub(crate) async fn cloud_backup_upload_start(
+        &self,
+        account: &str,
+    ) -> Result<(), cloud_upload::CloudUploadError> {
+        use presage::libsignal_service::protocol::IdentityKeyStore as _;
+        use presage::store::Store as _;
+        let context = storage_context(self, account)
+            .await
+            .map_err(|_| cloud_upload::CloudUploadError::AuthRejected)?;
+        // fail-fast 预检（restore 同口径）：AEP/registration 缺席 = 同步
+        // AuthRejected（契约 §6.2 诚实上报）。
+        let account_entropy_pool = context
+            .store
+            .fetch_account_entropy_pool()
+            .await
+            .map_err(|_| cloud_upload::CloudUploadError::AuthRejected)?
+            .ok_or(cloud_upload::CloudUploadError::AuthRejected)?;
+        let registration = context
+            .store
+            .load_registration_data()
+            .await
+            .map_err(|_| cloud_upload::CloudUploadError::AuthRejected)?
+            .ok_or(cloud_upload::CloudUploadError::AuthRejected)?;
+        // 呈现签名密钥 = 本机 ACI 身份私钥（restore 同源）。
+        let signing_key = *context
+            .store
+            .aci_protocol_store()
+            .get_identity_key_pair()
+            .await
+            .map_err(|_| cloud_upload::CloudUploadError::AuthRejected)?
+            .private_key();
+        // 工件闸（§6.2）：缺失/首行非法同步终态，不起线程（非法当场删工件）。
+        let account_dir = context.account_dir.clone();
+        cloud_upload::precheck_artifact(&account_dir)?;
+        // 单槽重入闸：前置检查全过后、spawn 前抢占；watcher 收尾释放。
+        if !cloud_upload::CloudUploadProgress::try_begin_running() {
+            return Err(cloud_upload::CloudUploadError::AlreadyRunning);
+        }
+        self.cloud_upload_progress.begin_exporting();
+        // 密钥派生与 zkgroup 材料（spawn 前构造：keys 随 params 移入装配线程，
+        // materials 以值移交 watcher）。
+        let aci = presage::libsignal_service::protocol::Aci::from(registration.service_ids.aci);
+        let keys = crate::backup::derive_keys(&account_entropy_pool, &aci);
+        let materials =
+            cloud_backup::create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+        // mediaRootBackupKey：同 backup.export 口径——引擎无既定持久来源，每
+        // 次随机 32B（契约差异登记，§10.5 同款）。
+        use rand::RngCore as _;
+        let mut media_root_backup_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut media_root_backup_key);
+        let params = crate::backup::LocalBackupParams {
+            keys,
+            backup_time_ms: cloud_upload::now_ms(),
+            media_root_backup_key,
+            app_version: format!("kt-signal-engine {}", env!("CARGO_PKG_VERSION")),
+        };
+        let push = context.push.clone();
+        let progress = self.cloud_upload_progress.clone();
+        let temp = account_dir.join(cloud_upload::UPLOAD_TEMP_NAME);
+        let artifact = account_dir.join(crate::backup::ARTIFACT_FILE_NAME);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let temp_for_assembly = temp.clone();
+        let spawn = std::thread::Builder::new()
+            .name("cloud-upload-assembly".into())
+            .spawn(move || {
+                let _ = tx.send(cloud_upload::run_assembly(
+                    &artifact,
+                    &temp_for_assembly,
+                    &params,
+                ));
+            });
+        if let Err(error) = spawn {
+            progress.clear();
+            cloud_upload::CloudUploadProgress::finish_running();
+            return Err(cloud_upload::CloudUploadError::Io(format!(
+                "assembly thread spawn: {error}"
+            )));
+        }
+        tokio::task::spawn_local(cloud_upload::watch_and_upload(
+            rx,
+            push,
+            signing_key,
+            materials,
+            temp,
+            progress,
+        ));
+        Ok(())
+    }
+
+    /// 云备份 upload 进度/状态（`backups.uploadStatus` 只读数据源；快照缺席 =
+    /// `{present:false}`）。
+    pub(crate) fn cloud_upload_status(&self) -> Option<cloud_upload::CloudUploadSnapshot> {
+        self.cloud_upload_progress.snapshot()
     }
 }
 

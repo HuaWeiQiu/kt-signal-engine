@@ -111,4 +111,39 @@ mod tests {
         assert_ne!(a.metadata_key, a.message_key.hmac_key);
         assert_ne!(a.metadata_key, a.message_key.aes_key);
     }
+
+    /// remote 臂（Some(token) → NEW_DST）与 legacy 臂（None → OLD_DST）双向量
+    /// 钉定：token 即官方 key.rs 测试向量（"i pass the knife to the
+    /// axolotl!"）。云备份 upload 产物与桌面端 remote 型逐字节同构、派生钥
+    /// 相同的契约承诺（docs/cloud-backup-contract.md §6.1）以此测试固化。
+    #[test]
+    fn remote_arm_matches_official_some_and_none_vectors() {
+        use libsignal_account_keys::BackupForwardSecrecyToken;
+
+        const OFFICIAL_TOKEN_HEX: &str =
+            "69207061737320746865206b6e69666520746f207468652061786f6c6f746c21";
+        const OFFICIAL_REMOTE_HMAC_KEY_HEX: &str =
+            "20e6ab57b87e051f3e695e953cf8a261dd307e4f92ae2921673f1d397e07887b";
+        const OFFICIAL_REMOTE_AES_KEY_HEX: &str =
+            "602af6ecfc09d695a8d58da9f18225e967979c5e03543ca0224a03cca3d9735e";
+
+        let keys = official_keys();
+        let token_bytes: [u8; 32] = hex_decode(OFFICIAL_TOKEN_HEX)
+            .try_into()
+            .expect("token is 32 bytes");
+        let token = BackupForwardSecrecyToken(token_bytes);
+
+        let remote_key = MessageBackupKey::derive(&keys.backup_key, &keys.backup_id, Some(&token));
+        assert_eq!(
+            hex_decode(OFFICIAL_REMOTE_HMAC_KEY_HEX),
+            remote_key.hmac_key
+        );
+        assert_eq!(hex_decode(OFFICIAL_REMOTE_AES_KEY_HEX), remote_key.aes_key);
+
+        let legacy_key = MessageBackupKey::derive(&keys.backup_key, &keys.backup_id, None);
+        assert_eq!(hex_decode(OFFICIAL_HMAC_KEY_HEX), legacy_key.hmac_key);
+        assert_eq!(hex_decode(OFFICIAL_AES_KEY_HEX), legacy_key.aes_key);
+        assert_ne!(remote_key.hmac_key, legacy_key.hmac_key);
+        assert_ne!(remote_key.aes_key, legacy_key.aes_key);
+    }
 }

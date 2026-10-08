@@ -2122,6 +2122,65 @@ fn backup_export_param_faces_fail_closed() {
     assert_eq!((code, message.as_str()), (-32601, "Method not found"));
 }
 
+/// 云备份 upload 消费面（compat §3 注册块 + 契约 §6.2/§6.5）：参数面一律
+/// fail-closed（缺 account -32603；未注册/fake 账号 -1 BACKUP_AUTH_FAILED，
+/// restore 同口径）；uploadStatus 是进程内观测面（缺席={present:false}，
+/// 不泄露注册状态）；backups.* 命名空间外动词仍 -32601。结构化上传链
+/// （form gRPC/TUS/超帽）需要真凭据与真网络，由 cloud_upload 单元测试与
+/// 契约 §6.4 诚实边界覆盖。
+#[test]
+fn cloud_upload_param_faces_fail_closed() {
+    // real 模式：缺 account 两方法 -32603；未注册账号 uploadToCloud
+    // -1 BACKUP_AUTH_FAILED（storage_context 失败同步终态）。
+    let dir = temp_dir("cloud-upload-faces");
+    let mut engine = Engine::spawn(&dir);
+    let (code, message) = engine.error_of("backups.uploadToCloud", json!({}));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    let (code, message) = engine.error_of("backups.uploadStatus", json!({}));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+    let (code, message) = engine.error_of(
+        "backups.uploadToCloud",
+        json!({ "account": "+15550000000" }),
+    );
+    assert_eq!((code, message.as_str()), (-1, "BACKUP_AUTH_FAILED"));
+
+    // fake 模式链接出的账号：无真 store/AEP 可读，同未注册口径
+    // -1 BACKUP_AUTH_FAILED（fake 账号不进入真上传链）。
+    let fake_dir = temp_dir("cloud-upload-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    let started = fake_engine.request("startLink", json!({}));
+    let uri = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let finished = fake_engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    let (code, message) =
+        fake_engine.error_of("backups.uploadToCloud", json!({ "account": number }));
+    assert_eq!((code, message.as_str()), (-1, "BACKUP_AUTH_FAILED"));
+
+    // uploadStatus：未注册/fake 账号同样答 {present:false}（快照面是
+    // 进程内观测，不泄露注册状态）。
+    assert_eq!(
+        engine.request("backups.uploadStatus", json!({ "account": "+15550000000" }))["result"],
+        json!({ "present": false })
+    );
+    assert_eq!(
+        fake_engine.request("backups.uploadStatus", json!({ "account": number }))["result"],
+        json!({ "present": false })
+    );
+
+    // backups.* 命名空间内未注册动词与任意未知方法同面。
+    let (code, message) = engine.error_of("backups.uploadX", json!({ "account": "+15550000000" }));
+    assert_eq!((code, message.as_str()), (-32601, "Method not found"));
+}
+
 #[test]
 fn unknown_method_is_rejected_32601() {
     let dir = temp_dir("unknown-method");
