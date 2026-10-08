@@ -1,8 +1,9 @@
 # 云备份恢复契约（Cloud Backup Restore）——引擎侧
 
-状态：草案 v1（2026-10-08，主 agent 三轮官方取证定稿；代码批未开工）
+状态：v1 已落地（2026-10-08，引擎批四片合栈 main：方法面已并入
+`docs/jsonrpc-compat.md` §3 逐方法表，compat 为方法面真相源、本文档为凭据链/边界/测试真相源）
 关联：`adr/0005`（backup5 传送链）、`src/backup/keys.rs`（AEP 派生单点）、
-`docs/jsonrpc-compat.md`（本契约方法落 compat 的节待 813 在途批落地后并入，暂以本文档为契约真相源）
+`docs/jsonrpc-compat.md`（§3 `backups.restoreFromCloud`/`backups.cloudStatus` 两行）
 取证基线：官方 Signal-Desktop v8.31.0-alpha.1（端点/文件：行见各条）+ 引擎 pin libsignal tag v0.99.0
 
 ## 0. 依赖新增报备（AGENTS.md 纪律）
@@ -15,6 +16,39 @@
   对可 Clone GrpcService 自动实现，`net/chat/src/grpc.rs:87-99`）；官方同构先例
   `net/chat/src/registration/service.rs:16-73`。连接参数（chat.signal.org WS endpoint/TLS/keepalive）
   实施首日以 libsignal-net connect 入口实测钉定（本契约唯一机械未知项）。
+
+> **§0.1 实测钉定（2026-10-08，worktree feat/cloud-restore）**：依赖已入 Cargo.toml 并
+> cargo fetch 解析——`libsignal-net`/`libsignal-net-chat` 均解析至 tag v0.99.0 实树
+> （checkout 439f035，注意与早先行为参照的 e8cc2dd 不同树，API 以 439f035 为准）。
+> **连接配方实读（439f035 树）**：`ChatConnection`（rust/net/src/chat.rs:170）→
+> `ChatConnection::start_connect_with(connection_resources, service, http_route_provider,
+> endpoint_path, user_agent, ws_config, headers, log_tag)`（:269-286，返回
+> PendingChatConnection）；`ConnectionResources` 构造同款先例 =
+> **rust/net/examples/cdsi_lookup.rs:89-95**（`ConnectState::new(SUGGESTED_CONNECT_CONFIG)`
+> + DnsResolver + `no_network_change_events()` + confirmation_header_name），
+> 路由提供方 DirectOrProxyProvider（example :16 同款直连路由）；
+> backups gRPC 面 439f035 在位：`grpc/backups.rs:242 get_backup_cdn_credentials` /
+> `:393 get_message_backup_info`（BackupsAnonymousClient 路径 :408）。
+> endpoint_path = chat WS 路径（`/v1/websocket`，与 presage 收发同端点），
+> unauth 模式 headers=None（ChatHeaders::Auth 缺席）。
+> **剩余实施项**：cloud_backup.rs 本体（REST+zkgroup+gRPC+CDN+解密）、methods.rs
+> 两方法注册、进度快照面、单测三链——按 §1-§4 契约直写。
+
+> **§0.2 第三片（gRPC 面）实施模板（官方 example 实读定稿）**：
+> `rust/net/chat/examples/chat_request_scaffold.rs` = 全链官方模板——
+> ①`libsignal_net::env::PROD`（生产 env；`env.chat_domain_config.connect.hostname =
+> "grpc.chat.signal.org"` + `http_version = Some(HttpVersion::Http2)` + ip_v4/v6 清空）；
+> ②`simple_chat_connection(&env, EnableDomainFronting::No, DirectOrProxyMode::DirectOnly,
+> |_route| true).await?` → chat_connection（注意：该 helper 在
+> `libsignal_net::chat::test_support` 命名空间——生产使用二选一：依赖开
+> test-support feature，或按其函数体自写构造（内部即 ConnectionResources +
+> start_connect_with 的装配，本文 §0.1 配方）；实施时读 helper 本体定夺）；
+> ③`Unauth(chat_connection.shared_h2_connection().expect("H2"))` → grpc 面；
+> ④api 调用（get_backup_cdn_credentials/get_message_backup_info 同 grpc/backups.rs
+> :242/:393 签名，含 BackupsAnonymousClient 路径 :408）。
+> CDN 下载段 = `GET cdn{N}/backups/{dir}/{name}`（§1.5）+ §3 头两件套；
+> 解密导入段 = derive_keys(AEP,aci).message_key + FramesReader + export_frames_loop
+> （backup/receive.rs:107 同款尾部 HMAC）。
 
 ## 1. 凭据链（全部官方实锤）
 
@@ -43,14 +77,23 @@
 ## 2. JSON-RPC 方法面（KT 扩展，compat 修订随批）
 
 - `backups.cloudStatus`（read，只读不落调度日志，对齐 `transfer.downloadStatus`/`backup.exportStatus`
-  纪律）：`{account}` → `{present, phase?, bytesRead?, bytesTotal?}`——快照缺席
-  `{present:false}`，不泄露注册状态。
+  纪律）：`{account}` → `{present, phase?, bytesRead?, bytesTotal?, errorCode?}`——快照缺席
+  `{present:false}`（未开始/已成功收尾/引擎重启过），不泄露注册状态。phase：
+  `downloading`=在途（字节计数有效，total 缺席不给假 0）；`failed`=终态失败
+  （`errorCode` 结构化透出下表同码，快照保留至下次 start 覆盖，不装死）。
+  成功终态不留痕（清缺），产物走 NDJSON 消费链——transfer_archive
+  「无论成败收尾清快照」同纪律。
 - `backups.restoreFromCloud`（mutating，send lane per-account mutex）：`{account}` →
-  成功 `{status:"restored", stats:{frames,chats,messages,...}}`（ExportStats 投影）；
-  失败结构化：`BACKUP_NOT_PROVISIONED`（引导后仍无档=账号从未开启云备份，retryable=false）、
-  `BACKUP_AUTH_FAILED`（凭据兑换被拒，retryable=false）、`BACKUP_DOWNLOAD_FAILED`/
-  `BACKUP_DECRYPT_FAILED`（按族定 retryable）。进度经 `backups.cloudStatus` 观测，
-  语义对齐 §4.38 progress（total 缺席不给假 0）。
+  受理 `{status:"started"}`（全链后台化：凭据拉取 404 引导自愈→zkgroup 兑换→
+  生产 chat gRPC 定位→CDN 下载→解密导出 NDJSON；终态经 `backups.cloudStatus`
+  观测，语义对齐 §4.38 progress）。同步失败结构化（码表七族，
+  `CloudRestoreError::rpc_code` 单一映射源，cloudStatus failed 相位同表两端不漂）：
+  `BACKUP_NOT_PROVISIONED`（引导自愈后仍无档=账号从未开启云备份，retryable=false）、
+  `BACKUP_AUTH_FAILED`（AEP/registration/身份密钥缺席或 zkgroup 兑换被拒，
+  retryable=false）、`BACKUP_RUNNING`（同引擎已有在途 restore 重入，retryable=false）；
+  后台段失败经 cloudStatus failed 相位透出：`BACKUP_TRANSPORT_FAILED`（chat/REST
+  传输，retryable=true）、`BACKUP_DOWNLOAD_FAILED`（CDN，retryable=true）、
+  `BACKUP_DECRYPT_FAILED`/`BACKUP_EXPORT_FAILED`（retryable=false）。
 
 ## 3. 诚实边界
 

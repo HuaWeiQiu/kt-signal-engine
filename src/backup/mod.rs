@@ -11,8 +11,8 @@ mod artifact;
 mod container;
 mod export;
 mod frames;
-mod keys;
-mod receive;
+pub(crate) mod keys;
+pub(crate) mod receive;
 
 /// connector 消费批任务层（`service::backup_task`）的输入面。
 pub(crate) use artifact::{assemble, validate_first_line, ARTIFACT_FILE_NAME};
