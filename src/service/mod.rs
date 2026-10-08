@@ -444,6 +444,10 @@ struct PendingLink {
 /// transfer_archive 下载进度快照注册表（契约 1.53 §4.38 扩展）。
 mod transfer_progress;
 
+/// 云备份（Signal Backups）restore 凭据面（docs/cloud-backup-contract.md；
+/// 纯函数核先行，REST/gRPC/CDN 传输面随批）。
+pub mod cloud_backup;
+
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
