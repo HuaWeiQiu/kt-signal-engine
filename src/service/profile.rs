@@ -22,7 +22,6 @@
 //! 同构——多设备经 storage sync 收敛）。
 
 use presage::libsignal_service::configuration::Endpoint;
-use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::profile_cipher::ProfileCipher;
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::Aci;
@@ -152,8 +151,8 @@ pub(crate) fn encrypt_avatar(profile_key: &ProfileKey, plaintext: &[u8]) -> Vec<
     out
 }
 
-/// PUT /v1/profile 响应（官方 AvatarUploadAttributes；verifyAttributes 同构
-/// ——七字段全非空才可用）。
+/// PUT /v1/profile 响应（官方 AvatarUploadAttributes JSON 形状；校验与
+/// CDN 上行经共享件 `cdn_upload`，群面 updateGroup avatar 同一件）。
 #[derive(serde::Deserialize)]
 struct AvatarUploadAttributes {
     key: String,
@@ -166,87 +165,28 @@ struct AvatarUploadAttributes {
 }
 
 impl AvatarUploadAttributes {
-    fn verified(self) -> Option<Self> {
-        let empty = [
-            self.key.is_empty(),
-            self.credential.is_empty(),
-            self.acl.is_empty(),
-            self.algorithm.is_empty(),
-            self.date.is_empty(),
-            self.policy.is_empty(),
-            self.signature.is_empty(),
-        ];
-        (!empty.iter().any(|field| *field)).then_some(self)
+    fn into_fields(self) -> super::cdn_upload::AvatarUploadFields {
+        super::cdn_upload::AvatarUploadFields {
+            key: self.key,
+            credential: self.credential,
+            acl: self.acl,
+            algorithm: self.algorithm,
+            date: self.date,
+            policy: self.policy,
+            signature: self.signature,
+        }
     }
 }
 
-/// CDN multipart body（官方 WebAPI makePutParams 逐字节同构）：字段序
-/// key / x-amz-credential / acl / x-amz-algorithm / x-amz-date / policy /
-/// x-amz-signature / Content-Type（表单字段值 application/octet-stream）+
-/// file part（Content-Type: application/octet-stream）；段间 CRLF；结尾
-/// `\r\n--{boundary}--\r\n`。
-fn multipart_body(attrs: &AvatarUploadAttributes, encrypted: &[u8], boundary: &str) -> Vec<u8> {
-    let section = |name: &str, value: &str| {
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}")
-    };
-    let mut body = Vec::new();
-    body.extend_from_slice(section("key", &attrs.key).as_bytes());
-    let fields = [
-        ("x-amz-credential", attrs.credential.as_str()),
-        ("acl", attrs.acl.as_str()),
-        ("x-amz-algorithm", attrs.algorithm.as_str()),
-        ("x-amz-date", attrs.date.as_str()),
-        ("policy", attrs.policy.as_str()),
-        ("x-amz-signature", attrs.signature.as_str()),
-        ("Content-Type", "application/octet-stream"),
-    ];
-    for (name, value) in fields {
-        body.extend_from_slice(b"\r\n");
-        body.extend_from_slice(section(name, value).as_bytes());
-    }
-    body.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(encrypted);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body
-}
-
-/// CDN0 根 POST（官方 uploadAvatar 同路径）：成功任意 2xx，返回头像 path
-/// （= 上行属性 `key`）。匿名 CDN（无 basic auth）。
+/// CDN0 根 POST（共享件 `cdn_upload::post_to_cdn0`；错误面归一头像链
+/// 失败）。成功返回头像 path（= 上行属性 `key`）。
 async fn post_avatar_to_cdn(
-    attrs: AvatarUploadAttributes,
+    fields: super::cdn_upload::AvatarUploadFields,
     encrypted: &[u8],
 ) -> Result<String, ProfileError> {
-    let mut seed = [0u8; 16];
-    rand::rng().fill_bytes(&mut seed);
-    let boundary = format!("----------------{}", Uuid::from_bytes(seed).simple());
-    let body = multipart_body(&attrs, encrypted, &boundary);
-    let push = PushService::new(
-        presage::libsignal_service::configuration::SignalServers::Production,
-        None,
-        crate::service::USER_AGENT,
-    );
-    let response = push
-        .request(
-            reqwest::Method::POST,
-            Endpoint::cdn(0, "/"),
-            HttpAuthOverride::Unidentified,
-        )
-        .map_err(|_| storage_sync::StorageSyncError::WriteFailed)?
-        .header(
-            "Content-Type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
+    super::cdn_upload::post_to_cdn0(fields, encrypted)
         .await
-        .map_err(|_| storage_sync::StorageSyncError::WriteFailed)?;
-    if !response.status().is_success() {
-        return Err(storage_sync::StorageSyncError::WriteFailed.into());
-    }
-    Ok(attrs.key)
+        .map_err(|_| storage_sync::StorageSyncError::WriteFailed.into())
 }
 
 /// `PUT /v1/profile`（官方 putProfile 同端点同 JSON 面；本机凭据经
@@ -258,7 +198,7 @@ async fn put_profile(
     aci: Aci,
     update: &ProfileUpdate,
     avatar: bool,
-) -> Result<Option<AvatarUploadAttributes>, ProfileError> {
+) -> Result<Option<super::cdn_upload::AvatarUploadFields>, ProfileError> {
     let cipher = ProfileCipher::new(*profile_key);
     let mut rng = rand::rng();
     let name = ProfileName {
@@ -319,7 +259,8 @@ async fn put_profile(
         .json::<AvatarUploadAttributes>()
         .await
         .ok()
-        .and_then(AvatarUploadAttributes::verified)
+        .map(AvatarUploadAttributes::into_fields)
+        .and_then(super::cdn_upload::AvatarUploadFields::verified)
         .map(Some)
         .ok_or_else(|| storage_sync::StorageSyncError::WriteFailed.into())
 }
@@ -381,9 +322,7 @@ pub(crate) async fn set_profile(
                 .map_err(|_| ProfileError::UploadFailed { text_saved: true })?
                 .expect("avatar=true response carries upload attributes");
             let encrypted = encrypt_avatar(&profile_key, bytes);
-            let key = post_avatar_to_cdn(attrs, &encrypted)
-                .await
-                .map_err(|_| ProfileError::UploadFailed { text_saved: true })?;
+            let key = post_avatar_to_cdn(attrs, &encrypted).await?;
             Some(key)
         }
     };
@@ -428,62 +367,6 @@ mod tests {
         let mut corrupted = encrypted.clone();
         corrupted[20] ^= 0x01;
         assert!(cipher.decrypt_avatar(&corrupted).is_err());
-    }
-
-    /// CDN multipart body 官方 WebAPI makePutParams 逐字节同构钉定：字段序
-    /// key/x-amz-credential/acl/x-amz-algorithm/x-amz-date/policy/
-    /// x-amz-signature/Content-Type + file part（application/octet-stream），
-    /// 段间 CRLF、结尾 `--{boundary}--\r\n`。
-    #[test]
-    fn multipart_body_matches_official_shape() {
-        let attrs = AvatarUploadAttributes {
-            key: "avatars/ABCDEF".to_owned(),
-            credential: "cred/20261005/".to_owned(),
-            acl: "public-read".to_owned(),
-            algorithm: "AWS4-HMAC-SHA256".to_owned(),
-            date: "20261005T000000Z".to_owned(),
-            policy: "policy-b64".to_owned(),
-            signature: "sig-hex".to_owned(),
-        };
-        let boundary = "----------------abc123";
-        let body = multipart_body(&attrs, b"\x01\x02\x03", boundary);
-        let expected = "--{b}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\navatars/ABCDEF\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"x-amz-credential\"\r\n\r\ncred/20261005/\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"acl\"\r\n\r\npublic-read\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"x-amz-algorithm\"\r\n\r\nAWS4-HMAC-SHA256\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"x-amz-date\"\r\n\r\n20261005T000000Z\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"policy\"\r\n\r\npolicy-b64\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"x-amz-signature\"\r\n\r\nsig-hex\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"Content-Type\"\r\n\r\napplication/octet-stream\
-\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\n\x01\x02\x03\
-\r\n--{b}--\r\n"
-            .replace("{b}", boundary);
-        assert_eq!(String::from_utf8(body).expect("utf8"), expected);
-    }
-
-    /// 上行属性校验（官方 verifyAttributes 同构）：七字段全非空才可用。
-    #[test]
-    fn avatar_upload_attributes_require_all_fields() {
-        let attrs = AvatarUploadAttributes {
-            key: "k".to_owned(),
-            credential: "c".to_owned(),
-            acl: "a".to_owned(),
-            algorithm: "al".to_owned(),
-            date: "d".to_owned(),
-            policy: "p".to_owned(),
-            signature: "s".to_owned(),
-        };
-        assert!(attrs.verified().is_some());
-        let missing = AvatarUploadAttributes {
-            key: String::new(),
-            credential: "c".to_owned(),
-            acl: "a".to_owned(),
-            algorithm: "al".to_owned(),
-            date: "d".to_owned(),
-            policy: "p".to_owned(),
-            signature: "s".to_owned(),
-        };
-        assert!(missing.verified().is_none());
     }
 
     /// 头像 data URI 参数面：image/* base64 合法；非 image 族/非 base64/

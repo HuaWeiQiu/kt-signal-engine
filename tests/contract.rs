@@ -873,6 +873,129 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// updateGroup 群头像上行面（KT 扩展参数族，官方 buildUpdateAttributesChange
+/// 行为对齐）：fake 两臂——avatar 缺省/null 臂成功 `{status:"sent"}`（PATCH
+/// 形状桩）、data URI 臂失败 `GROUP_AVATAR_UPLOAD_FAILED`（data
+/// `{retryable:true, textSaved:false}`，合成单 change 语义下伴生面未提交
+/// ——fake 无 CDN/服务器上行面，上行链不可达即错误面，stickers 先例）。
+/// 参数面 fail-closed（-32603：avatar 非 image 族/非 base64 形状/坏 base64/
+/// 超 10MiB/非字符串、expiration 与 avatar 双缺、groupId 形状坏）+ 零可写
+/// 放开边界（avatar=null 单独在场合法）+ 调度日志 avatar 键形状摘要化
+///（data URI/base64 载荷零字节落盘，groupId/expiration 键照旧逐字保留）。
+#[test]
+fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
+    use base64::Engine as _;
+    let dir = temp_dir("update-group-avatar");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    let avatar = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake")
+    );
+
+    // fake 成功臂：avatar=null（移除，无上行链环节）+ expiration 同调/单独
+    // 在场均成功 {status:"sent"}。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "avatar": null, "expiration": 86_400 })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "avatar": null })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // fake 失败臂：avatar data URI（换新，需上行链）→ GROUP_AVATAR_UPLOAD_
+    // FAILED data {retryable:true, textSaved:false}（单独在场与同调同臂）。
+    for params in [
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": avatar }),
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": avatar, "expiration": 3600 }),
+    ] {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(response["error"]["code"], -1, "upload arm errors {params}");
+        assert_eq!(
+            response["error"]["message"], "GROUP_AVATAR_UPLOAD_FAILED",
+            "upload arm code {params}"
+        );
+        assert_eq!(
+            response["error"]["data"],
+            json!({ "retryable": true, "textSaved": false }),
+            "upload arm partial-success data {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状（-32603）。注：解码超 10MiB 的形状在本引擎
+    // IPC 面不可达——入站帧闸（1MiB 行帽，main.rs MAX_LINE_BYTES）先以
+    // parse error 拒收 >1MiB 的请求帧；超帽拒绝闸由 profile.rs 单测
+    // avatar_data_uri_parse_faces 钉定（parse_avatar_data_uri 同一函数，
+    // 群面/个人面共用）。
+    let rejects = [
+        // 非 image 族。
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": "data:text/plain;base64,aGk=" }),
+        // 非 base64 形状（无 base64 标志）/ 坏 base64 / 空载荷。
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": "data:image/png,notbase64payload" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": "data:image/png;base64,###" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": "data:image/png;base64," }),
+        // 非字符串。
+        json!({ "account": "+15550000000", "groupId": group_id, "avatar": 7 }),
+        // 双缺（expiration 与 avatar 都不在场）。
+        json!({ "account": "+15550000000", "groupId": group_id }),
+        // avatar 在场时 groupId 形状照旧闸（非 base64 / ≠32B）。
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "avatar": null }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG", "avatar": null }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：avatar data URI 键形状摘要化（零 data URI/base64 字节落盘），
+    // groupId/expiration 键照旧逐字保留；成功臂 + 失败臂 + 拒绝臂均落日志
+    //（mutating 面同款：成功 2 + 失败 2 + 拒绝 8 = 12 行 updateGroup 条目）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(entries.len(), 12, "成功两条 + 失败两条 + 拒绝八条均落日志");
+    assert!(
+        !log.contains("data:image") && !log.contains("iVBO"),
+        "avatar data URI/base64 payload leaked into dispatch log"
+    );
+    let redacted = &entries[2]["params"]["avatar"];
+    assert!(
+        redacted.is_string()
+            && redacted
+                .as_str()
+                .expect("avatar digest")
+                .starts_with("[avatar data uri: "),
+        "avatar key digested in dispatch log: {redacted}"
+    );
+    assert_eq!(entries[0]["params"]["groupId"], json!(group_id));
+    assert_eq!(entries[0]["params"]["expiration"], json!(86_400));
+    assert!(entries[0]["params"]["avatar"].is_null(), "null 臂原样保留");
+
+    // real 模式未注册账号 + avatar 在场：storage 上下文打不开折叠 -32603
+    //（参数闸全过后才触服务层，fake 之外的形状不再特判）。
+    let real_dir = temp_dir("update-group-avatar-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({ "account": "+15559990000", "groupId": group_id, "avatar": null }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
 /// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
 /// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同

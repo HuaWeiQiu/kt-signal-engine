@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! 群管理写面（KT 扩展方法）：群终止（terminateGroup）+ 群消失计时器
-//!（updateGroup {expiration}，KT 扩展批）。
+//! 群管理写面（KT 扩展方法）：群终止（terminateGroup）+ 群更新
+//!（updateGroup：expiration + avatar 参数族，KT 扩展批）。
 //!
 //! 官方行为锚（Signal-Desktop 行为对齐，不抄码）：
 //! - 协议载体 = GroupChange.Actions 特殊 action `terminate_group = 28`
@@ -17,6 +17,15 @@
 //!   encrypt_blob_with_padding(randomness, blob, 0)，桌面 encryptGroupBlob
 //!   同构）；admin 权限由服务器裁决；变更后群 revision+1，成员经群更新
 //!   消息收到新 timer。
+//! - 群头像变更（2026-10-09 群头像上行面批）= `modify_avatar = 11`
+//!   （`ModifyAvatarAction { string avatar = 1 }`——avatar 是上行后 path
+//!   明文，加密的是 CDN 载荷本身）；换新 = 上行链（群凭据
+//!   `GET v2/groups/avatar/form` → AvatarUploadAttributes protobuf →
+//!   `GroupAttributeBlob{avatar}` 加密 → CDN0 multipart POST → key）后
+//!   `modify_avatar = Some({avatar: key})`；移除 = `modify_avatar =
+//!   Some({avatar: ""})`（proto3 string 无 presence，官方 `{avatar: null}`
+//!   线面空 message，服务器语义 = 清头像）。一次调用的 expiration/avatar
+//!   合成单个 Actions（同 version 多 action）单次 PATCH（§5 群头像上行面批）。
 //! - 上传 = `PATCH v2/groups`（storage 服务 host，body =
 //!   GroupChange.Actions protobuf，群凭据 basic auth
 //!   `groupPublicParamsHex:authCredentialPresentationHex`，官方 modifyGroup
@@ -31,10 +40,12 @@
 //! - 成员侧：群态 `terminated=true`（官方 extractDiffs 只许 false→true）；
 //!   终止后发送面硬拒（官方 shouldSendToConversation `terminated` 位）。
 //!
-//! 上游缺口：libsignal-service-rs 无群 change 上传 API（只有群读面形状）——
-//! PATCH 上传为引擎自建薄封装（单点 `patch_group`，put_write_operation 的
-//! request 复用模式 + 群 HttpAuth），端点/鉴权/body 与官方 WebAPI 同形状，
-//! 上游补齐后整段替换。
+//! 上游缺口：libsignal-service-rs 无群 change 上传 API（只有群读面形状）与
+//! 群头像上行面（GroupsManager 仅 retrieve_avatar 读面）——PATCH 上传与
+//! avatar 上行链均为引擎自建薄封装（单点 `patch_group`/`upload_group_avatar`，
+//! put_write_operation 的 request 复用模式 + 群 HttpAuth + CDN multipart
+//! 共享件 cdn_upload），端点/鉴权/body 与官方 WebAPI 同形状，上游补齐后
+//! 整段替换。
 //!
 //! presage `model::groups::Group` 无 terminated 字段（有损投影丢弃该位），
 //! 读侧走 libsignal-service `decrypt_group`（投影 terminated）+ 本模块
@@ -65,13 +76,17 @@ pub(crate) const SUPPORTED_CHANGE_EPOCH: u32 = 7;
 /// `GROUP_TERMINATE_FAILED`、updateGroup = `GROUP_UPDATE_FAILED`）+
 /// data.status = 服务器状态码（官方错误语义诚实透传：403/401 = 非
 /// admin/凭据无效，409 = revision 竞争需重拉群态，400 = 请求形状被服务
-/// 器拒）；Unavailable 折叠 `-1` + `STORAGE_UNAVAILABLE`（网络面，STORAGE
-/// 族同款 retryable 语义）。
+/// 器拒）；AvatarUpload 折叠 `-1` + `GROUP_AVATAR_UPLOAD_FAILED`
+///（avatar 上行链任一步失败——form 拉取/属性校验/blob 加密/CDN POST，
+/// data `{retryable:true, textSaved:false}`：合成单 change 语义下伴生面
+/// 未提交，§5 群头像上行面批）；Unavailable 折叠 `-1` +
+/// `STORAGE_UNAVAILABLE`（网络面，STORAGE 族同款 retryable 语义）。
 #[derive(Debug)]
 pub(crate) enum TerminateError {
     UnknownAccount,
     UnknownGroup,
     Failed { status: Option<u16> },
+    AvatarUpload,
     Unavailable,
 }
 
@@ -166,40 +181,48 @@ pub(crate) fn build_terminate_change(revision: u32) -> presage::proto::group_cha
     }
 }
 
-/// 群消失计时器 change 编码（纯函数，单测钉定形状）：官方
-/// buildDisappearingMessagesTimerChange 同构——version = revision + 1
-///（饱和不回卷），`modify_disappearing_message_timer.timer` = 加密
-/// `GroupAttributeBlob { disappearingMessagesDuration }`（uint32 秒，
-/// 0 = 关闭；官方 encryptGroupBlob 同构即
-/// `encrypt_blob_with_padding(randomness, blob, 0)`，加密在此函数内完成，
-/// 密钥面不外泄），source_user_id/group_id 置空（terminate 面同纪律：
-/// sourceUserId 服务器回填、groupId 由服务器按鉴权群定界），其余 action
-/// 全部缺席。
-pub(crate) fn build_expiration_change(
+/// 群更新 change 合成核心（expiration/avatar 任意组合，至少一项在场由调用
+/// 方闸）：version = revision + 1（饱和不回卷），source_user_id/group_id
+/// 置空（terminate 面同纪律）；expiration 在场 = modify_disappearing_message_
+/// timer（加密 blob，官方 buildDisappearingMessagesTimerChange 同构）；
+/// avatar_path 在场 = modify_avatar（Some(path) = 换新、Some("") = 移除，
+/// proto3 string 无 presence——官方 `{avatar: null}` 线面空 message，服务器
+/// 语义 = 清头像）。一次调用单 Actions 多 action 单次 PATCH（§5 群头像
+/// 上行面批合成裁定）。
+pub(crate) fn build_update_change(
     secret_params: &GroupSecretParams,
     revision: u32,
-    expiration_secs: u32,
+    expiration_secs: Option<u32>,
+    avatar_path: Option<String>,
     randomness: [u8; 32],
 ) -> presage::proto::group_change::Actions {
-    let blob = presage::proto::GroupAttributeBlob {
-        content: Some(
-            presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(
-                expiration_secs,
-            ),
-        ),
-    }
-    .encode_to_vec();
-    presage::proto::group_change::Actions {
+    let mut actions = presage::proto::group_change::Actions {
         source_user_id: Vec::new(),
         group_id: Vec::new(),
         version: revision.saturating_add(1),
-        modify_disappearing_message_timer: Some(
+        ..presage::proto::group_change::Actions::default()
+    };
+    if let Some(expiration_secs) = expiration_secs {
+        let blob = presage::proto::GroupAttributeBlob {
+            content: Some(
+                presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(
+                    expiration_secs,
+                ),
+            ),
+        }
+        .encode_to_vec();
+        actions.modify_disappearing_message_timer = Some(
             presage::proto::group_change::actions::ModifyDisappearingMessageTimerAction {
                 timer: secret_params.encrypt_blob_with_padding(randomness, &blob, 0),
             },
-        ),
-        ..presage::proto::group_change::Actions::default()
+        );
     }
+    if let Some(avatar_path) = avatar_path {
+        actions.modify_avatar = Some(presage::proto::group_change::actions::ModifyAvatarAction {
+            avatar: avatar_path,
+        });
+    }
+    actions
 }
 
 /// `PATCH v2/groups` 群 change 上传（上游缺口单点，官方 modifyGroup 同形状）：
@@ -323,21 +346,115 @@ pub(crate) async fn terminate_group(
     Ok(())
 }
 
-/// updateGroup {expiration} 编排：群态读面取当前 revision（网络失败退化 0
-/// 继续写，terminate 面同口径；其余读面错误上抛——坏群在服务器侧裁决）→
-/// 群凭据 → PATCH 上传 expiration change → 成功。幂等不做同值折叠：群
-/// revision 每次变更 +1 是官方写面语义（revision 即变化本身），timer 同值
-/// 再写同样推进 revision 并广播，交服务器与成员侧收敛。
-pub(crate) async fn update_group_expiration(
+/// avatar 参数意图（updateGroup avatar 三态中的两个写臂；缺省 = 无 avatar
+/// action，不经此类型）。
+#[derive(Debug)]
+pub(crate) enum AvatarWrite {
+    /// null：移除头像（modify_avatar 空串线面，无上行链环节）。
+    Remove,
+    /// data URI 解码字节：换新头像（上行链 → modify_avatar 携新 path）。
+    Replace(Vec<u8>),
+}
+
+/// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
+/// 闸）：群态读面取 revision（Unavailable 退化 0，expiration 批同口径）→
+/// avatar Replace 臂先走上行链（官方 buildUpdateAttributesChange 同序：
+/// uploadAvatar 在 change 上送之前）→ 群凭据 → 单 Actions（同 version 多
+/// action）单次 PATCH。avatar 链失败 = AvatarUpload（伴生 expiration 面
+/// 未提交，GROUP_AVATAR_UPLOAD_FAILED data.textSaved=false 诚实呈现）；
+/// PATCH 面失败维持 Failed/Unavailable 四码。
+/// 群头像上行链（官方 uploadAvatar + uploadGroupAvatar 行为对齐，上游缺口
+/// 自建薄封装——presage/libsignal-service 均无群头像写面）：群凭据 basic
+/// auth `GET v2/groups/avatar/form` → `AvatarUploadAttributes` protobuf →
+/// 七字段全非空校验 → `GroupAttributeBlob{avatar}` 加密
+///（`encrypt_blob_with_padding`，CDN 载荷即密文本身）→ CDN0 multipart POST
+/// （共享件 cdn_upload，与 profile 面同一形状）→ 返回 avatar path（= 属性
+/// `key`）。链上任一步失败 = `TerminateError::AvatarUpload`（不细分：语义
+/// 同为「上行意图未落地」，data.retryable=true）。
+async fn upload_group_avatar(
     context: &StorageContext,
     master_key: &[u8],
-    expiration_secs: u32,
+    bytes: &[u8],
+) -> Result<String, TerminateError> {
+    let authorization = group_authorization(context, master_key).await?;
+    let response = context
+        .push
+        .request(
+            reqwest::Method::GET,
+            Endpoint::storage("v2/groups/avatar/form"),
+            HttpAuthOverride::Identified(authorization),
+        )
+        .map_err(|_| TerminateError::AvatarUpload)?
+        .send()
+        .await
+        .map_err(|_| TerminateError::AvatarUpload)?;
+    if !response.status().is_success() {
+        return Err(TerminateError::AvatarUpload);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| TerminateError::AvatarUpload)?;
+    let attrs = presage::proto::AvatarUploadAttributes::decode(body.as_ref())
+        .map_err(|_| TerminateError::AvatarUpload)?;
+    let fields = super::cdn_upload::AvatarUploadFields {
+        key: attrs.key,
+        credential: attrs.credential,
+        acl: attrs.acl,
+        algorithm: attrs.algorithm,
+        date: attrs.date,
+        policy: attrs.policy,
+        signature: attrs.signature,
+    };
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(
+        master_key
+            .try_into()
+            .map_err(|_| TerminateError::UnknownGroup)?,
+    ));
+    let blob = presage::proto::GroupAttributeBlob {
+        content: Some(presage::proto::group_attribute_blob::Content::Avatar(
+            bytes.to_vec(),
+        )),
+    }
+    .encode_to_vec();
+    use rand::RngCore as _;
+    let mut randomness = [0u8; 32];
+    rand::rng().fill_bytes(&mut randomness);
+    let ciphertext = secret_params.encrypt_blob_with_padding(randomness, &blob, 0);
+    super::cdn_upload::post_to_cdn0(fields, &ciphertext)
+        .await
+        .map_err(|_| TerminateError::AvatarUpload)
+}
+
+/// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
+/// 闸）：群态读面取 revision（Unavailable 退化 0，expiration 批同口径）→
+/// avatar Replace 臂先走上行链（官方 buildUpdateAttributesChange 同序：
+/// uploadAvatar 在 change 上送之前）→ 群凭据 → 单 Actions（同 version 多
+/// action）单次 PATCH。avatar 链失败 = AvatarUpload（伴生 expiration 面
+/// 未提交，GROUP_AVATAR_UPLOAD_FAILED data.textSaved=false 诚实呈现）；
+/// PATCH 面失败维持 Failed/Unavailable 四码。
+pub(crate) async fn update_group_change(
+    context: &StorageContext,
+    master_key: &[u8],
+    expiration_secs: Option<u32>,
+    avatar: Option<AvatarWrite>,
 ) -> Result<(), TerminateError> {
+    if expiration_secs.is_none() && avatar.is_none() {
+        // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
+        return Err(TerminateError::UnknownGroup);
+    }
     use rand::RngCore as _;
     let revision = match fetch_group_state(context, master_key).await {
         Ok(group) => group.version,
         Err(TerminateError::Unavailable) => 0,
         Err(error) => return Err(error),
+    };
+    let avatar_path = match avatar {
+        Some(AvatarWrite::Replace(bytes)) => {
+            Some(upload_group_avatar(context, master_key, &bytes).await?)
+        }
+        Some(AvatarWrite::Remove) => Some(String::new()),
+        None => None,
     };
     let mut randomness = [0u8; 32];
     rand::rng().fill_bytes(&mut randomness);
@@ -350,7 +467,13 @@ pub(crate) async fn update_group_expiration(
     patch_group(
         &context.push,
         authorization,
-        &build_expiration_change(&secret_params, revision, expiration_secs, randomness),
+        &build_update_change(
+            &secret_params,
+            revision,
+            expiration_secs,
+            avatar_path,
+            randomness,
+        ),
     )
     .await
 }
@@ -535,7 +658,7 @@ mod tests {
         use rand::RngCore as _;
         rand::rng().fill_bytes(&mut randomness);
 
-        let actions = build_expiration_change(&secret_params, 41, 86_400, randomness);
+        let actions = build_update_change(&secret_params, 41, Some(86_400), None, randomness);
         assert_eq!(actions.version, 42);
         let timer = actions
             .modify_disappearing_message_timer
@@ -588,7 +711,7 @@ mod tests {
         // 0 = 关闭：明文 duration 0 原样入 blob（不吞不转 None——线面
         // truth 在 duration 数值，关闭语义由消费方按 0 解读，官方
         // buildDisappearingMessagesTimerChange 对 expireTimer=0 同形状）。
-        let off = build_expiration_change(&secret_params, 3, 0, randomness);
+        let off = build_update_change(&secret_params, 3, Some(0), None, randomness);
         let plaintext = secret_params
             .decrypt_blob_with_padding(
                 &off.modify_disappearing_message_timer
@@ -606,11 +729,11 @@ mod tests {
 
         // revision 0 → version 1；u32::MAX 饱和不回卷。
         assert_eq!(
-            build_expiration_change(&secret_params, 0, 60, randomness).version,
+            build_update_change(&secret_params, 0, Some(60), None, randomness).version,
             1
         );
         assert_eq!(
-            build_expiration_change(&secret_params, u32::MAX, 60, randomness).version,
+            build_update_change(&secret_params, u32::MAX, Some(60), None, randomness).version,
             u32::MAX
         );
     }
@@ -627,7 +750,7 @@ mod tests {
         let master_key = [0x45u8; 32];
         let secret_params =
             GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
-        let actions = build_expiration_change(&secret_params, 7, 60, [0x77u8; 32]);
+        let actions = build_update_change(&secret_params, 7, Some(60), None, [0x77u8; 32]);
         assert_eq!(actions.version, 8);
         let bytes = actions.encode_to_vec();
         // version=8 varint: tag 0x10 (field 2, varint) + 0x08；
@@ -794,6 +917,161 @@ mod tests {
             )
         )
         .is_none());
+    }
+
+    /// 群头像 change（群头像上行面批）：换新 = modify_avatar 携上行 path；
+    /// 移除 = modify_avatar 空串线面（官方 `{avatar: null}` proto3 无
+    /// presence——空 message 在场即语义）；version = revision + 1；其余
+    /// action（含 timer）全部缺席。wire 字节钉死字段编号（modify_avatar =
+    /// field 11 wire 2，内部 avatar = field 1 wire 2）。
+    #[test]
+    fn avatar_change_replace_and_remove_shapes() {
+        // 换新：path 明文入 action（加密的是 CDN 载荷，非此处）。
+        let keyspace = GroupSecretParams::derive_from_master_key(GroupMasterKey::new([0u8; 32]));
+        let replace = build_update_change(
+            &keyspace,
+            41,
+            None,
+            Some("avatars/AbCdEf.g".to_owned()),
+            [0u8; 32],
+        );
+        assert_eq!(replace.version, 42);
+        assert_eq!(
+            replace
+                .modify_avatar
+                .as_ref()
+                .expect("avatar action 在场")
+                .avatar,
+            "avatars/AbCdEf.g"
+        );
+        let bytes = replace.encode_to_vec();
+        // version=42 varint 头（tag 0x10 + 0x2a）+ field 11 tag 0x5a + len +
+        // {field 1 tag 0x0a + len + "avatars/AbCdEf.g"}（prost 按字段号序，
+        // version 在前——expiration wire 面同款断言风格）。
+        assert_eq!(&bytes[0..2], &[0x10, 0x2a], "version=42 字段头");
+        assert_eq!(bytes[2], 0x5a, "modify_avatar tag (field 11, wire 2)");
+        let (outer_len, header) = (bytes[3] as usize, 4usize);
+        assert_eq!(header + outer_len, bytes.len(), "无尾随字段");
+        assert_eq!(bytes[header], 0x0a, "avatar 子字段 tag (field 1, wire 2)");
+        assert_eq!(&bytes[header + 2..], b"avatars/AbCdEf.g", "path 原样入线");
+
+        // 移除：空串 = 空 message 在场（field 11 tag + len 0）——官方
+        // {avatar: null} 线面。
+        let remove = build_update_change(&keyspace, 7, None, Some(String::new()), [0u8; 32]);
+        assert_eq!(remove.version, 8);
+        assert_eq!(
+            remove
+                .modify_avatar
+                .as_ref()
+                .expect("avatar action 在场")
+                .avatar,
+            "",
+            "移除 = 空串线面"
+        );
+        assert_eq!(remove.encode_to_vec(), vec![0x10, 0x08, 0x5a, 0x00]);
+
+        // 其余 action 全部缺席（两臂同）。
+        for actions in [replace, remove] {
+            assert!(actions.terminate_group.is_none());
+            assert!(actions.modify_title.is_none());
+            assert!(actions.modify_disappearing_message_timer.is_none());
+            assert!(actions.source_user_id.is_empty());
+            assert!(actions.group_id.is_empty());
+        }
+
+        // revision 饱和不回卷。
+        assert_eq!(
+            build_update_change(&keyspace, u32::MAX, None, Some("k".to_owned()), [0u8; 32]).version,
+            u32::MAX
+        );
+    }
+
+    /// 合成 change（expiration + avatar 同 version 双 action，群头像上行面批
+    /// 合成裁定）：一次调用单 Actions 单次 PATCH；timer blob 解密回读 =
+    /// duration、avatar path 原样；双缺（调用方闸后件）= 仅 version 的空
+    /// change（防御面不产生无意义上传，编排层另行拦截）。
+    #[test]
+    fn update_change_composes_timer_and_avatar() {
+        let master_key = [0x47u8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+
+        let actions = build_update_change(
+            &secret_params,
+            5,
+            Some(3_600),
+            Some("avatars/Key1".to_owned()),
+            [0x78u8; 32],
+        );
+        assert_eq!(actions.version, 6, "同 version 单 change");
+        let timer = actions
+            .modify_disappearing_message_timer
+            .as_ref()
+            .expect("timer action 在场");
+        let blob = presage::proto::GroupAttributeBlob::decode(
+            secret_params
+                .decrypt_blob_with_padding(&timer.timer)
+                .expect("blob decrypts")
+                .as_slice(),
+        )
+        .expect("blob decodes");
+        assert_eq!(
+            blob.content,
+            Some(
+                presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(3_600)
+            )
+        );
+        assert_eq!(
+            actions
+                .modify_avatar
+                .as_ref()
+                .expect("avatar action")
+                .avatar,
+            "avatars/Key1"
+        );
+        assert!(actions.terminate_group.is_none());
+
+        // 双缺 = 仅 version（零 action 空体；handler 面已闸，此处只钉
+        // 合成函数不发明 action）。
+        let empty = build_update_change(&secret_params, 5, None, None, [0u8; 32]);
+        assert_eq!(empty.version, 6);
+        assert!(empty.modify_disappearing_message_timer.is_none());
+        assert!(empty.modify_avatar.is_none());
+    }
+
+    /// 群头像 CDN 载荷加密面（upload_group_avatar 内联链的纯函数钉定）：
+    /// `GroupAttributeBlob{avatar: bytes}` → encrypt_blob_with_padding →
+    /// decrypt_blob_with_padding 回读 = 原始字节（官方 uploadAvatar:
+    /// groups.preload.ts:373-378 同形状；CDN 载荷即该密文，无二次包装）。
+    #[test]
+    fn group_avatar_blob_roundtrip() {
+        let master_key = [0x48u8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let payload: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let blob = presage::proto::GroupAttributeBlob {
+            content: Some(presage::proto::group_attribute_blob::Content::Avatar(
+                payload.clone(),
+            )),
+        }
+        .encode_to_vec();
+        let mut randomness = [0u8; 32];
+        use rand::RngCore as _;
+        rand::rng().fill_bytes(&mut randomness);
+        let ciphertext = secret_params.encrypt_blob_with_padding(randomness, &blob, 0);
+        // 密文 = AES-GCM-SIV：4B 填充长 + 明文 + 16B tag + 12B nonce + 1B reserved。
+        assert_eq!(ciphertext.len(), blob.len() + 33);
+        let plaintext = secret_params
+            .decrypt_blob_with_padding(&ciphertext)
+            .expect("roundtrip decrypts");
+        let round = presage::proto::GroupAttributeBlob::decode(plaintext.as_slice())
+            .expect("round decodes");
+        assert_eq!(
+            round.content,
+            Some(presage::proto::group_attribute_blob::Content::Avatar(
+                payload
+            ))
+        );
     }
 
     /// terminated 登记表：登记/判定/未登记 false（send 面拦截的会话内通道）。

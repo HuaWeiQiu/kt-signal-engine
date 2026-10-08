@@ -1927,6 +1927,10 @@ async fn dispatch(
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "terminated" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
                 | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                // 群终止链路不触头像上行（变体穷尽性；同按写面失败码位折叠）。
+                Err(crate::service::groups::TerminateError::AvatarUpload) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "GROUP_UPDATE_FAILED"))
+                }
                 Err(crate::service::groups::TerminateError::Failed { status }) => {
                     let mut data = serde_json::Map::new();
                     if let Some(status) = status {
@@ -1946,17 +1950,31 @@ async fn dispatch(
                 }
             }
         }
-        // 群消失计时器（updateGroup {expiration}，KT 扩展方法）：协议上行
-        // 面，落调度日志（terminateGroup 同纪律）。本批只收 expiration 一个
-        // 参数族（0 = 关闭；其余 updateGroup 参数族——成员/权限/头像/名称
-        // ——不收，compat §5 expiration 批边界）；expiration 缺席 = 无操作
-        // 整拒 -32603（不静默 no-op），非 u32 形状（负数/小数/超界/字符串）
-        // 同 -32603 fail-closed；groupId/account 纪律与 terminateGroup 同款；
-        // 服务器拒绝 → -1 GROUP_UPDATE_FAILED + data.status 诚实透传；网络
-        // 面 → -1 STORAGE_UNAVAILABLE；fake 模式成功 {status:"sent"}（群族
-        // 成功答同 connector 契约 1.45 纪律）。
+        // 群更新写面（updateGroup，KT 扩展方法）：expiration + avatar 参数
+        // 族，协议上行面，落调度日志（terminateGroup 同纪律；avatar 键落盘
+        // 前形状摘要化——data URI/base64 载荷零字节进日志，setProfile 头像
+        // 纪律）。expiration：0 = 关闭，u32 形状（null/字符串/负数/小数/超
+        // 界 fail-closed）；avatar 三态镜像 setProfile（缺省=保留、
+        // data:image/*;base64, 规范 base64=换新、null=移除；非 image 族/
+        // 非规范 base64/解码超 10MiB/非字符串 -32603）；双缺 = 无操作整拒
+        // -32603（不静默 no-op），单腿在场均合法；groupId/account 纪律与
+        // terminateGroup 同款；群头像上行链失败 → -1 GROUP_AVATAR_UPLOAD_
+        // FAILED + data {retryable:true, textSaved:false}（合成单 change
+        // 语义下伴生面未提交，§5）；服务器拒绝 → -1 GROUP_UPDATE_FAILED +
+        // data.status 诚实透传；网络面 → -1 STORAGE_UNAVAILABLE；fake 两臂：
+        // 缺省/null 臂成功 {status:"sent"}、data URI 臂失败
+        // GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
         "updateGroup" => {
-            state.lock().await.append_dispatch(method, params);
+            // 调度日志先落（mutating 面同款：被拒调用同样记录派发）；
+            // avatar 键落盘前形状摘要化（头像 data URI/base64 载荷零字节
+            // 进日志，setProfile「调度零头像字节」同纪律；摘要以 URI 字符
+            // 串长度记量级）。groupId/account/expiration 键照旧逐字保留。
+            let mut logged_params = params.clone();
+            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
+                let digest = format!("[avatar data uri: {} bytes]", uri.len());
+                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
+            }
+            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -1966,18 +1984,47 @@ async fn dispatch(
                 .get("expiration")
                 .and_then(Value::as_u64)
                 .and_then(|seconds| u32::try_from(seconds).ok());
-            let (Some(account), Some(master_key), Some(expiration)) =
-                (account, master_key, expiration)
-            else {
+            let avatar = match params.get("avatar") {
+                None => None,
+                Some(Value::Null) => Some(crate::service::groups::AvatarWrite::Remove),
+                Some(Value::String(uri)) => {
+                    match crate::service::profile::parse_avatar_data_uri(uri) {
+                        Some((_, bytes)) => {
+                            Some(crate::service::groups::AvatarWrite::Replace(bytes))
+                        }
+                        None => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            // expiration 键在场但形状非法（null/字符串/负数/小数/超界）恒拒
+            // ——与「合法缺席臂」（键不在场，avatar 在场时放行）区分。
+            if params.get("expiration").is_some() && expiration.is_none() {
+                return internal_error(id);
+            }
+            if expiration.is_none() && avatar.is_none() {
+                return internal_error(id);
+            }
+            let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
             match service
-                .update_group_expiration(account, master_key, expiration)
+                .update_group_change(account, master_key, expiration, avatar)
                 .await
             {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
                 | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::AvatarUpload) => {
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_AVATAR_UPLOAD_FAILED",
+                            json!({ "retryable": true, "textSaved": false }),
+                        ),
+                    )
+                }
                 Err(crate::service::groups::TerminateError::Failed { status }) => {
                     let mut data = serde_json::Map::new();
                     if let Some(status) = status {

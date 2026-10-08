@@ -43,6 +43,7 @@ use crate::state::EngineState;
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
+pub(crate) mod cdn_upload;
 pub(crate) mod groups;
 pub(crate) mod identity;
 pub(crate) mod profile;
@@ -1609,21 +1610,27 @@ impl Service {
         groups::terminate_group(&context, &self.terminated_groups, &master_key).await
     }
 
-    /// updateGroup {expiration}（群消失计时器，KT 扩展方法）：群态读面
-    /// （revision 面失败退化 0）→ 群凭据 → `PATCH v2/groups` 上传 expiration
-    /// change（modify_disappearing_message_timer action，0 = 关闭）。fake
-    /// 模式成功形状桩（terminateGroup 同款纪律）。
-    pub(crate) async fn update_group_expiration(
+    /// updateGroup（群更新写面，KT 扩展方法）：expiration + avatar 合成单
+    /// change（同 version 多 action）单次 `PATCH v2/groups`。avatar Replace
+    /// 臂先走群头像上行链（form 拉取 → blob 加密 → CDN POST，§5 群头像
+    /// 上行面批）。fake 两臂：缺省/null 臂成功形状桩（PATCH 面，expiration
+    /// 批纪律）；data URI 臂失败 AvatarUpload——fake 无 CDN/服务器上行面，
+    /// 上行链不可达即错误面（stickers fake 错误面先例）。
+    pub(crate) async fn update_group_change(
         self: &Arc<Self>,
         account: &str,
         master_key: Vec<u8>,
-        expiration_secs: u32,
+        expiration_secs: Option<u32>,
+        avatar: Option<groups::AvatarWrite>,
     ) -> Result<(), groups::TerminateError> {
         if !self.real {
-            return Ok(());
+            return match avatar {
+                Some(groups::AvatarWrite::Replace(_)) => Err(groups::TerminateError::AvatarUpload),
+                _ => Ok(()),
+            };
         }
         let context = storage_context(self, account).await?;
-        groups::update_group_expiration(&context, &master_key, expiration_secs).await
+        groups::update_group_change(&context, &master_key, expiration_secs, avatar).await
     }
 
     /// calls.linkPresentation（KT 扩展，P4c 切一）：当天 CallLinkAuthCredential

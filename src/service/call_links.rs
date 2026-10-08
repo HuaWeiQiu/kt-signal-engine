@@ -80,6 +80,9 @@ impl From<TerminateError> for CallCredentialError {
             TerminateError::UnknownAccount => CallCredentialError::UnknownAccount,
             TerminateError::UnknownGroup => CallCredentialError::UnknownGroup,
             TerminateError::Failed { status } => CallCredentialError::Failed { status },
+            // 群头像上行链错误不经 call 链（变体穷尽性）；同按 retryable
+            // 网络面折叠。
+            TerminateError::AvatarUpload => CallCredentialError::Unavailable,
             TerminateError::Unavailable => CallCredentialError::Unavailable,
         }
     }

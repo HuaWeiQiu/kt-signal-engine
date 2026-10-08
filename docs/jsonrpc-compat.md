@@ -108,7 +108,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `backup.importSnapshotStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, ndjsonPresent, startedAtMs?, finishedAtMs?, lines?, frames?, error?}`（lines = NDJSON 投影行数 recipient+chat+message；frames = 档案总帧数含 BackupInfo 元帧；诚实缺席不发明 0） | 未注册账号 `-32603` | **B2 批 real（2026-10-08）**：只读轮询面（backup.exportStatus 同语义）；注册表进程内存不跨重启（state 归 idle）；`ndjsonPresent` 是盘面真值（重启后 NDJSON 仍在场，消费方自行判定重导）；不落调度日志零 stderr |
 | `transfer.downloadStatus` | `{account}` | `{present: bool}`；present=true 时 `{present, bytesRead(u64), bytesTotal?(u64)}`（快照缺席（未开始/已结束/引擎重启过）答 `{present:false}`，不猜） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态） | **2026-10-06 real（KT 扩展，契约 1.53 §4.38 扩展）**：transfer_archive 下载进度快照查询——`history.importStatus` progress 组合面的引擎侧只读数据源。进程内 per-account 注册表（`src/service/transfer_progress.rs`，std Mutex + Arc，不落盘不走文件），下载任务边读 CDN 响应边累计（块读）、content-length 有则记 total（拿不到只报 stage 不给假 0），任务收尾/失败/中途退出统一清快照；官方对齐（语义零拷贝）：Signal-Desktop Download 段 currentBytes/totalBytes 进度（`ts/state/ducks/installer.preload.ts` L143-152 + reducer L642-675）。只读不落调度日志零 stderr（backup.exportStatus 同纪律）
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
-| `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration}`（本批只收 expiration 一个参数族，0=关闭；expiration 缺席 = 无操作整拒，不静默 no-op） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration 缺席·null·字符串·负数·小数·超 u32）`-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；fake：成功 `{status: "sent"}`（落调度日志，协议上行面纪律） |
+| `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration?, avatar?}`（expiration：0=关闭，u32；avatar 三态镜像 setProfile——缺省=保留、data URI `data:image/*;base64,` 规范 base64=换新、null=移除；解码后 ≤10MiB、非 image 族/非规范 base64/超帽/非字符串 `-32603`；expiration 与 avatar 至少一项在场，双缺 = 无操作整拒 `-32603` 不静默 no-op；expiration 单独在场或 avatar 单独在场均合法） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration null·字符串·负数·小数·超 u32、avatar 非 image 族 data URI/非规范 base64/解码超 10MiB/非字符串、expiration 与 avatar 双缺）`-32603`；未注册账号 `-32603`；群头像上行链（avatar/form 拉取·属性校验·加密·CDN POST）失败 `GROUP_AVATAR_UPLOAD_FAILED`（`-1` + message，data `{retryable:true, textSaved:false}`——合成单 change 语义下伴生面未提交，见 §5）；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；**2026-10-09 real（群头像上行面批，§5 块）**：avatar 三态 + 合成单 change（expiration/avatar 同 version 双 action 一次 PATCH），上行链 = 群凭据 `GET v2/groups/avatar/form`（AvatarUploadAttributes protobuf）→ `GroupAttributeBlob{avatar}` 加密 → CDN0 multipart POST → avatar path 进 modify_avatar action（field 11，官方 buildUpdateAttributesChange/uploadAvatar/uploadGroupAvatar 行为对齐，镜像 setProfile 头像面先例）；receive 投影 avatar change 不投影（宁缺勿错，§5）；fake：expiration/avatar 缺省·null 臂成功 `{status: "sent"}`、data URI 臂失败 `GROUP_AVATAR_UPLOAD_FAILED`（两臂纪律 §5）；调度日志 avatar 键形状摘要化（data URI/base64 载荷零字节落盘） |
 | `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StoryDistributionList=5/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
 | `getUsername` | `{account}` | `{username?, usernameLink?}`（键缺席 = 未设，不发明 null/空串；usernameLink 重建为完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；链接材料形状错该键缺席） | 参数缺失/非字符串 `-32603`；未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，用户名读面批）**：真相源 = Storage Service AccountRecord.username(33)/usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」同语义；多设备经 storage sync 收敛，无第二真相源）；从未有 storage 状态（无 master key / manifest 404 / 无 Account item）→ `{}`（未设不报错）；fake：恒 `{}`，不落调度日志（读面纪律） |
 | `usernameLookup` | `{account, usernames[1..20]}`（每条 1..64 字符——connector 契约 1.59 §4.55 帧界同源镜像，帧界而非语法界；条目 = 全名或 `https://signal.me/#eu/…` 链接） | `[{recipient, username?, uuid?, isRegistered}]`（输入序逐条投影；recipient = 条目回显；单条失败诚实降级 `{recipient, isRegistered:false}` 不炸整批——语法不符/链接打不开/解不开/未命中/网络皆同） | 参数缺失/形状错（usernames 缺席·非数组·空批·超 20、条目非字符串·空·超 64）`-32603`；未注册账号 `-32603` | **2026-10-08 real（KT 扩展，用户名读面批）**：官方同款服务端匿名 lookup 通路——全名条目 hash（libsignal usernames crate 权威语法面）→ `GET v1/accounts/username_hash/{hash}`（强制匿名，200 `{uuid}`/404）；链接条目 → `GET v1/accounts/username_link/{uuid}`（200 `{usernameLinkEncryptedValue}`）→ crate `decrypt_username`（entropy 系链接自带）→ 再走 hash lookup（官方 resolveUsernameLink 同序）；base64 一律 URL-safe 无 padding；匿名 PushService（带凭据反而 400，avatar CDN 先例同构）；fake：逐条回显 `{recipient, isRegistered:false}`，不落调度日志（读面纪律） |
@@ -1169,6 +1169,92 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   `-32603`（不静默 no-op，零可写字段先例）。不做群 timer 幂等（见上）。
   fake 模式成功 `{status: "sent"}`，落调度日志（协议上行面，
   terminateGroup 同纪律）。
+
+群头像上行面批（2026-10-09，官方桌面 buildUpdateAttributesChange/
+uploadAvatar/uploadGroupAvatar 行为对齐，KT 扩展参数族；expiration 批
+登记的「头像不收」红线由本批放开。connector 契约 groups.update avatar
+参数接引为其并行批，本批只交付引擎面）：
+
+- **updateGroup 增可选 `avatar`（三态，镜像 setProfile）**：缺省 = 保留
+  现有头像（不发 avatar action）、data URI = 换新、null = 移除；data
+  URI 形状与预算逐字复用 setProfile 先例（`data:image/*;base64,` 规范
+  base64、解码后非空且 ≤10MiB、非 image 族/非规范 base64/超帽/非字符
+  串 `-32603` fail-closed 不触网，解析面直接复用 `parse_avatar_data_uri`
+  同一函数）。expiration 与 avatar 至少一项在场：双缺 = 无操作整拒
+  `-32603`（零可写字段先例，expiration 批语义推广）；avatar 单独在场
+  （expiration 缺席）合法——官方单 action change 同形状。
+- **官方行为锚（Signal-Desktop v8.31 本地检出实查，行为对齐不抄码）**：
+  三态裁定 = buildUpdateAttributesChange（groups.preload.ts:767-786）：
+  `'avatar' in attributes` 三分支——字节在场 → `uploadAvatar` 后
+  `modifyAvatar={avatar: uploadedAvatar.key}`；undefined（null）→
+  `modifyAvatar={avatar: null}`；不在 attributes → 不改。上行链 =
+  uploadAvatar（groups.preload.ts:360-399）：`GroupAttributeBlob
+  {avatar: bytes}` → `encryptGroupBlob`（= `encrypt_blob_with_padding`
+  ，expiration 批同构原语）→ uploadGroupAvatar（WebAPI.preload.ts:
+  4638-4673）：群凭据 basic auth `GET v2/groups/avatar/form`（:824 端
+  点表）→ 响应 `AvatarUploadAttributes` **protobuf** 解码 →
+  verifyAttributes 七字段全非空 → makePutParams → CDN0 根 multipart
+  POST（与 profile 面同一 makePutParams 函数，字段序逐一同构）→ 返回
+  key（= avatar path）。
+- **proto 形状（编号依据 = 本地官方 protos/Groups.proto 实查，与 vendored
+  libsignal-service rev 9e6c08b protobuf/Groups.proto 逐字同号）**：
+  `AvatarUploadAttributes{key,credential,acl,algorithm,date,policy,
+  signature = 1..7}`（:11-19）、`ModifyAvatarAction{string avatar = 1}`
+  （:209-211）、`modifyAvatar = 11`（:258）。prost 生成面已含两者（
+  presage re-export `libsignal_service::proto`），引擎零 vendored 改动。
+- **上游缺口与薄封装裁定**：presage rev 33dd149 `Manager` 无群写面
+  （registered.rs pub 面仅 `retrieve_group_avatar` :456 读面）；钉定
+  libsignal-service rev 9e6c08b `GroupsManager` 仅读面
+  （get_authorization_for_today/fetch_encrypted_group/retrieve_avatar，
+  groups_v2/manager.rs），vendor 内无 `groups/avatar` 端点。本批**不动
+  vendor**：所需原语全部在引擎可用 pub 面（`GroupSecretParams::
+  encrypt_blob_with_padding`、群凭据 `group_authorization`、`patch_group`
+  均为本仓既有件；CDN multipart POST 为 setProfile 面既有自建件），上行
+  链在引擎 `service/groups.rs` 组装，上游补群写面后整段替换（setProfile
+  头像面同款登记）。
+- **合成单 change 裁定**：一次 updateGroup 调用的 expiration + avatar
+  合成**一个** GroupChange.Actions（同 version = revision+1，两个 action
+  各就各位）单次 PATCH——协议线面 Actions 多 action 是官方正式形状
+  （decrypt_group_change 解出 changes 数组）；官方桌面无 timer+avatar
+  同调先例（两者是不同 UI 入口各自 modifyGroupV2），引擎 API 面合成裁定
+  登记于此。写序 = 群态读面取 revision（Unavailable 退化 0，expiration
+  批同口径）→ avatar 上行链（Replace 臂：form 拉取 → blob 加密 → CDN
+  POST → key）→ PATCH 合成 change。avatar 移除（null）无上行链环节，
+  modify_avatar action 以**空串**入线（proto3 string 无 presence，官方
+  `{avatar: null}` 经 protobufjs 编码即空 message；服务器语义 = 清头像，
+  与 presage 读侧 `group.avatar.is_empty()` 判定自洽）。
+- **错误面（镜像 setProfile PROFILE_UPLOAD_FAILED 形状，值诚实偏离）**：
+  新码位 `GROUP_AVATAR_UPLOAD_FAILED`（`-1` + message，data
+  `{retryable: true, textSaved: false}`）——avatar 上行链任一步失败
+  （form 拉取非 2xx/网络、属性解码/七字段校验失败、blob 加密、CDN POST
+  非 2xx/网络）。**textSaved 恒 false 与 setProfile 的 Replace 臂
+  （true）不同**：profile 面文字面先行单独提交（两次 PUT），头像失败时
+  文字面已落地；群面是合成单 change，avatar 上行在 PATCH **之前**，失败
+  时整个 change 从未上送——expiration 伴生面同样未提交，诚实呈现
+  false（不抄形状抄语义）。PATCH 面错误维持 expiration 批四码：服务器
+  4xx/5xx `GROUP_UPDATE_FAILED`（data.status 透传）、传输面
+  `STORAGE_UNAVAILABLE`。参数面（avatar 形状/预算）不占用结构化码
+  （`-32603`，setProfile 同纪律）。
+- **调度日志纪律（avatar 键摘要化）**：updateGroup 方法级 dispatch 日志
+  保留（expiration 批契约钉定，mutating 面同款），但 avatar 键落盘前
+  形状摘要化（`"[avatar data uri: N bytes]"`）——头像 data URI/base64
+  载荷零字节进日志（setProfile「调度零头像字节」同纪律；groupId/
+  account/expiration 键照旧逐字保留）。
+- **fake 两臂纪律**：fake 模式 avatar 缺省/null 臂成功 `{status: "sent"}`
+  （PATCH 形状桩，expiration 批纪律照旧）；data URI 臂失败
+  `GROUP_AVATAR_UPLOAD_FAILED`——fake 无 CDN/服务器上行面，上行链不可达
+  即错误面（stickers「fake 模式走错误面」先例），成功/失败两臂均在 fake
+  契约层可测。
+- **入站帧闸层间事实（登记）**：引擎入站有界读帧帽 1MiB
+  （main.rs `MAX_LINE_BYTES`，超帽帧以 parse error 拒收）——经 IPC 面
+  avatar 解码量物理上限 ≈786KB，参数面 10MiB 超帽闸在 IPC 面不可达（该
+  形状由 `parse_avatar_data_uri` 单测钉定，profile/群两族共用同一函数与
+  闸位）；契约层 oversize 用例不再收（入站闸先拦，非 -32603 码位）。
+- **receive 投影边界（登记不做）**：成员侧收到的 avatar change 继续跳过
+  （宁缺勿错，expiration/terminate 最小面纪律）——头像变更投影与群头像
+  缓存失效联动另行立项；本端写后 listGroups/getAvatar 以下一次群态读面
+  为准。connector 消费面（groups.update avatar 参数接引、错误码白名单
+  登记）为其并行批，本批不定义。
 
 receive 链 profileKeyUpdate 批（2026-10-06，官方桌面 profileKeyUpdate /
 profileKeyHarvest 行为对齐；setProfile 写面批（main 8eabf67）登记的
