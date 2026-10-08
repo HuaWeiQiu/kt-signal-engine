@@ -153,3 +153,82 @@ mod tests {
         assert!(!is_backup_id_missing_status(500));
     }
 }
+
+// —— zkgroup 兑换/呈现（契约 §1.3；官方 credentials.preload.ts:316 与
+//    zkgroup auth_credential.rs 对位，批 2）——
+
+use libsignal_account_keys::BackupKey;
+use presage::libsignal_service::protocol::Aci;
+use rand::Rng as _;
+use zkgroup::api::generic_server_params::GenericServerPublicParams;
+use zkgroup::backups::{BackupAuthCredentialRequestContext, BackupAuthCredentialResponse};
+use zkgroup::Timestamp;
+
+/// 生产环境 GenericServerPublicParams（官方 config/production.json
+/// `genericServerPublicParams` 逐字节；zkgroup 公钥材料可入库，libsignal
+/// 桥同源）。default.json 为 staging 值，KT 钉生产。
+pub const GENERIC_SERVER_PUBLIC_PARAMS_B64: &str = "AeCO67P9mIv1yUHkdeZ9JF789GDbox61GvTqq3S4kYc1ADUWxWHQygU390tv1oRWt9WjkdZlU7mKkifF59ftjE+2ZlMmxns6I+ySiLpR8FEmfu+TGpVp3zYTjNV93obJJTyBCCsSHVETCyQRbKdCyb5TMa6LGrvcZaX0Q/VAavhuNA/m4kSiRMgSnYrUjGhVekdDnF+7xioo4wvFnxjIDh7uJQrYOWD6MloNGX7St5gbysTuQQ7i/HI38b9V8x8mKazuDSXxB//BKGZx/XHkK8cHX+QK1MPxYUVM1/CBI5oW";
+
+/// 引导材料：请求上下文 + 官方 bootstrap PUT 体（b64(request)，WebAPI:813
+/// messagesBackupAuthCredentialRequest 同键）。
+pub struct BackupAuthRequestMaterials<const VERSION: u8> {
+    pub request_b64: String,
+    pub request_context: BackupAuthCredentialRequestContext,
+}
+
+/// AEP 派生 BackupKey + 本机 ACI → 凭据请求上下文（官方
+/// createBackupAuthCredentialRequestContext 同构）。
+pub fn create_backup_auth_request_materials<const VERSION: u8>(
+    backup_key: &BackupKey<VERSION>,
+    aci: Aci,
+) -> BackupAuthRequestMaterials<VERSION> {
+    let request_context = BackupAuthCredentialRequestContext::new(backup_key, aci);
+    let request_b64 = use_base64_encode(&zkgroup::serialize(&request_context.get_request()));
+    BackupAuthRequestMaterials {
+        request_b64,
+        request_context,
+    }
+}
+
+/// 服务器凭据（b64）+ 兑换日（秒）→ 兑换后的凭据（zkgroup receive：日界
+/// 未对齐/签名验证失败 = ZkGroupVerificationFailure，收敛形状闸 fail-closed）。
+pub fn receive_backup_auth_credential(
+    request_context: BackupAuthCredentialRequestContext,
+    credential_b64: &str,
+    params: &GenericServerPublicParams,
+    redemption_time_seconds: u64,
+) -> Result<zkgroup::backups::BackupAuthCredential, ()> {
+    let response_bytes = use_base64_decode(credential_b64)?;
+    let response: BackupAuthCredentialResponse =
+        zkgroup::deserialize(&response_bytes).map_err(|_| ())?;
+    request_context
+        .receive(
+            response,
+            params,
+            Timestamp::from_epoch_seconds(redemption_time_seconds),
+        )
+        .map_err(|_| ())
+}
+
+/// 凭据 → 呈现字节（序列化后喂 gRPC 面与 SFU HTTP；rand 32B 由调用方注入）。
+/// 凭据 → 呈现字节 + 签名（gRPC 头两件套；官方 net/chat api BackupAuth::present
+/// 同构：zkgroup present 无签名，ACI 私钥 calculate_signature 签呈现字节）。
+/// rand/CryptoRng 与 presage 协议族同版本（rand re-export）。
+pub fn present_backup_auth_credential(
+    credential: &zkgroup::backups::BackupAuthCredential,
+    params: &GenericServerPublicParams,
+    signing_key: &presage::libsignal_service::protocol::PrivateKey,
+    rng: &mut dyn rand::CryptoRng,
+) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    let presentation = credential.present(params, rng.random());
+    let serialized = zkgroup::serialize(&presentation);
+    let signature = signing_key
+        .calculate_signature(&serialized, rng)
+        .map_err(|_| ())?;
+    Ok((serialized, signature.into()))
+}
+
+fn use_base64_encode(value: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
