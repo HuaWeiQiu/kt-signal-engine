@@ -465,6 +465,9 @@ pub(crate) struct Service {
     terminated_groups: groups::TerminatedGroups,
     /// transfer_archive 下载进度快照（进程内存，不落盘；§4.38 progress 面）。
     transfer_progress: transfer_progress::TransferProgress,
+    /// 云备份 restore 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
+    /// §2 cloudStatus 面）。
+    cloud_restore_progress: cloud_backup::CloudRestoreProgress,
 }
 
 struct Inner {
@@ -493,6 +496,7 @@ impl Service {
             snapshot_imports: Arc::new(StdMutex::new(HashMap::new())),
             terminated_groups: groups::TerminatedGroups::new(),
             transfer_progress: transfer_progress::TransferProgress::new(),
+            cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
         })
     }
 
@@ -2009,6 +2013,84 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_write::write_items(&context, updates).await
+    }
+
+    /// 云备份 restore 启动（cloud-backup-contract §2：`backups.restoreFromCloud`；
+    /// send lane mutating；同引擎至多一个，重入 = Transport already running）。
+    /// AEP/ACI/signing key 从账号 store/registration 取（snapshot_import 先例）；
+    /// 非 Send future spawn_local 承载（link_flow/download_transfer_archive 同
+    /// 策略）。NDJSON 产物落 `history-import-cloud.ndjson`（connector 消费链
+    /// 与 transfer_archive 同位）。
+    pub(crate) async fn cloud_backup_restore_start(
+        &self,
+        account: &str,
+    ) -> Result<(), cloud_backup::CloudRestoreError> {
+        use presage::libsignal_service::protocol::IdentityKeyStore as _;
+        use presage::store::Store as _;
+        let context = storage_context(self, account)
+            .await
+            .map_err(|_| cloud_backup::CloudRestoreError::AuthRejected)?;
+        // fail-fast 预检：AEP/registration 缺席 = 同步 AuthRejected（契约 §3
+        // 诚实上报口径）；派生 keys 由 run_cloud_restore 内部同路径自取，
+        // 此处不重复派生。
+        context
+            .store
+            .fetch_account_entropy_pool()
+            .await
+            .map_err(|_| cloud_backup::CloudRestoreError::AuthRejected)?
+            .ok_or(cloud_backup::CloudRestoreError::AuthRejected)?;
+        context
+            .store
+            .load_registration_data()
+            .await
+            .map_err(|_| cloud_backup::CloudRestoreError::AuthRejected)?
+            .ok_or(cloud_backup::CloudRestoreError::AuthRejected)?;
+        // 呈现签名密钥 = 本机 ACI 身份私钥（presage protocol store 对称读出；
+        // link_flow 落库对位）。
+        let signing_key = *context
+            .store
+            .aci_protocol_store()
+            .get_identity_key_pair()
+            .await
+            .map_err(|_| cloud_backup::CloudRestoreError::AuthRejected)?
+            .private_key();
+        let account_dir = context.account_dir.clone();
+        let push = context.push.clone();
+        let store = context.store.clone();
+        let progress = self.cloud_restore_progress.clone();
+        // 重入闸置位（原子 compare-and-set）：前置检查全过后、spawn 前抢占；
+        // 闭包收尾释放（finish_running），并发第二请求如实吃 AlreadyRunning。
+        if !cloud_backup::CloudRestoreProgress::try_begin_running() {
+            return Err(cloud_backup::CloudRestoreError::AlreadyRunning);
+        }
+        tokio::task::spawn_local(async move {
+            use rand::SeedableRng as _;
+            let mut rng = rand::rngs::StdRng::from_seed(rand::random());
+            let rng: &mut (dyn rand::CryptoRng + Send) = &mut rng;
+            let result = cloud_backup::run_cloud_restore(
+                &push,
+                account_dir,
+                store,
+                signing_key,
+                rng,
+                &progress,
+            )
+            .await;
+            // 终态纪律（transfer_archive 同）：成功清快照（缺席=无在途）；
+            // 失败留 failed 相位快照（结构化 code 诚实透出，下次 start 覆盖）。
+            match result {
+                Ok(_) => progress.clear(),
+                Err(e) => progress.fail(e.rpc_code()),
+            }
+            cloud_backup::CloudRestoreProgress::finish_running();
+        });
+        Ok(())
+    }
+
+    /// 云备份 restore 进度/状态（`backups.cloudStatus` 只读数据源；快照缺席 =
+    /// `{present:false}`）。
+    pub(crate) fn cloud_backup_status(&self) -> Option<cloud_backup::CloudRestoreSnapshot> {
+        self.cloud_restore_progress.snapshot()
     }
 }
 

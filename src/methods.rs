@@ -1554,6 +1554,61 @@ async fn dispatch(
                 Err(()) => internal_error(id),
             }
         }
+        // 云备份 restore 启动（backups.restoreFromCloud，KT 扩展方法；
+        // cloud-backup-contract §2）：send lane mutating。凭据拉取（404→
+        // backupId 引导自愈→重试）→zkgroup 兑换→生产 chat 连接→备份定位→
+        // CDN 读凭据→下载→解密导出 NDJSON 全链后台化，同步答 started；
+        // 重入（运行中再启）答 BACKUP_RUNNING（-1，retryable=false）；
+        // NotProvisioned=账号从未开启云备份（引导自愈后仍缺席，retryable=
+        // false，UI 诚实降级提示）；AuthRejected=zkgroup 兑换被拒
+        // （retryable=false）。错误族→BACKUP_* 码映射随批记 compat。
+        "backups.restoreFromCloud" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.cloud_backup_restore_start(account).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "started" })),
+                Err(e) => {
+                    // 统一码表（cloud_backup::CloudRestoreError::rpc_code）：
+                    // cloudStatus failed 相位同表，两端不漂。
+                    let rpc = match e.detail() {
+                        Some(detail) => {
+                            RpcError::with_data(-1, e.rpc_code(), json!({ "detail": detail }))
+                        }
+                        None => RpcError::new(-1, e.rpc_code()),
+                    };
+                    jsonrpc::error_response(id, &rpc)
+                }
+            }
+        }
+        // 云备份 restore 进度/状态（backups.cloudStatus，KT 扩展方法）：
+        // transfer.downloadStatus 同款快照读（缺席={present:false}；在跑=
+        // {present:true, bytesRead, bytesTotal?}）；只读不落调度日志零 stderr
+        // （storage 状态面纪律）。
+        "backups.cloudStatus" => {
+            // 进度面进程级单槽（同引擎至多一个 restore，运行闸全局）；account
+            // 仅做契约形状校验，不参与路由。
+            let Some(_account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.cloud_backup_status() {
+                Some(snapshot) => {
+                    let mut payload = json!({
+                        "present": true,
+                        "phase": snapshot.phase,
+                        "bytesRead": snapshot.bytes_read,
+                    });
+                    if let Some(total) = snapshot.bytes_total {
+                        payload["bytesTotal"] = json!(total);
+                    }
+                    if let Some(code) = snapshot.error_code {
+                        payload["errorCode"] = json!(code);
+                    }
+                    jsonrpc::success_response(id, payload)
+                }
+                None => jsonrpc::success_response(id, json!({ "present": false })),
+            }
+        }
         // transfer_archive 下载进度快照查询（transfer.downloadStatus，KT 扩展
         // 方法）：`history.importStatus` progress 组合面的引擎侧只读数据源
         // （契约 1.53 §4.38 扩展）。快照缺席（未开始/已结束/引擎重启过）=

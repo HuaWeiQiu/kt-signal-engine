@@ -76,14 +76,23 @@
 ## 2. JSON-RPC 方法面（KT 扩展，compat 修订随批）
 
 - `backups.cloudStatus`（read，只读不落调度日志，对齐 `transfer.downloadStatus`/`backup.exportStatus`
-  纪律）：`{account}` → `{present, phase?, bytesRead?, bytesTotal?}`——快照缺席
-  `{present:false}`，不泄露注册状态。
+  纪律）：`{account}` → `{present, phase?, bytesRead?, bytesTotal?, errorCode?}`——快照缺席
+  `{present:false}`（未开始/已成功收尾/引擎重启过），不泄露注册状态。phase：
+  `downloading`=在途（字节计数有效，total 缺席不给假 0）；`failed`=终态失败
+  （`errorCode` 结构化透出下表同码，快照保留至下次 start 覆盖，不装死）。
+  成功终态不留痕（清缺），产物走 NDJSON 消费链——transfer_archive
+  「无论成败收尾清快照」同纪律。
 - `backups.restoreFromCloud`（mutating，send lane per-account mutex）：`{account}` →
-  成功 `{status:"restored", stats:{frames,chats,messages,...}}`（ExportStats 投影）；
-  失败结构化：`BACKUP_NOT_PROVISIONED`（引导后仍无档=账号从未开启云备份，retryable=false）、
-  `BACKUP_AUTH_FAILED`（凭据兑换被拒，retryable=false）、`BACKUP_DOWNLOAD_FAILED`/
-  `BACKUP_DECRYPT_FAILED`（按族定 retryable）。进度经 `backups.cloudStatus` 观测，
-  语义对齐 §4.38 progress（total 缺席不给假 0）。
+  受理 `{status:"started"}`（全链后台化：凭据拉取 404 引导自愈→zkgroup 兑换→
+  生产 chat gRPC 定位→CDN 下载→解密导出 NDJSON；终态经 `backups.cloudStatus`
+  观测，语义对齐 §4.38 progress）。同步失败结构化（码表七族，
+  `CloudRestoreError::rpc_code` 单一映射源，cloudStatus failed 相位同表两端不漂）：
+  `BACKUP_NOT_PROVISIONED`（引导自愈后仍无档=账号从未开启云备份，retryable=false）、
+  `BACKUP_AUTH_FAILED`（AEP/registration/身份密钥缺席或 zkgroup 兑换被拒，
+  retryable=false）、`BACKUP_RUNNING`（同引擎已有在途 restore 重入，retryable=false）；
+  后台段失败经 cloudStatus failed 相位透出：`BACKUP_TRANSPORT_FAILED`（chat/REST
+  传输，retryable=true）、`BACKUP_DOWNLOAD_FAILED`（CDN，retryable=true）、
+  `BACKUP_DECRYPT_FAILED`/`BACKUP_EXPORT_FAILED`（retryable=false）。
 
 ## 3. 诚实边界
 

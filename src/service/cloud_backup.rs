@@ -152,6 +152,218 @@ mod tests {
         assert!(!is_backup_id_missing_status(401));
         assert!(!is_backup_id_missing_status(500));
     }
+
+    // —— 契约 §4 单测三链 ——
+
+    fn entry(day: u64) -> BackupCredentialEntry {
+        BackupCredentialEntry {
+            credential_b64: "AAEC".into(),
+            redemption_time_seconds: day,
+        }
+    }
+
+    /// ①zkgroup 兑换 roundtrip：客户端材料 →（模拟服务器签发）→ 包装函数
+    /// 兑换成功；日界不符/垃圾 b64/错服务器公钥族三面 fail-closed。
+    #[test]
+    fn zkgroup_credential_roundtrip_and_fail_closed() {
+        use zkgroup::api::generic_server_params::GenericServerSecretParams;
+        use zkgroup::backups::{BackupAuthCredentialRequest, BackupCredentialType, BackupLevel};
+
+        // 服务器侧材料（测试内模拟 Signal 服务器）：secret→public 参数对。
+        let server_secret = GenericServerSecretParams::generate([0xA0; 32]);
+        let server_public = server_secret.get_public_params();
+        let other_public = GenericServerSecretParams::generate([0xB0; 32]).get_public_params();
+
+        // 客户端材料（官方 AEP 测试向量 → BackupKey/ACI，确定性派生）。
+        let keys = crate::backup::keys::tests_official_keys();
+        let day_seconds = 86_400 * 20_400;
+        let materials = create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+
+        // 服务器视角：解请求 → 签发（messages 档/Free 级）→ b64 回传。
+        let request_bytes = use_base64_decode(&materials.request_b64).expect("request b64");
+        let request: BackupAuthCredentialRequest =
+            zkgroup::deserialize(&request_bytes).expect("request deser");
+        let response = request.issue(
+            Timestamp::from_epoch_seconds(day_seconds),
+            BackupLevel::Free,
+            BackupCredentialType::Messages,
+            &server_secret,
+            [0xA1; 32],
+        );
+        let response_b64 = use_base64_encode(&zkgroup::serialize(&response));
+
+        // roundtrip：包装函数全路径兑换成功，等级/类型如实。
+        let credential = receive_backup_auth_credential(
+            materials.request_context,
+            &response_b64,
+            &server_public,
+            day_seconds,
+        )
+        .expect("roundtrip receive");
+        assert_eq!(credential.backup_level(), BackupLevel::Free);
+        assert_eq!(credential.credential_type(), BackupCredentialType::Messages);
+
+        // fail-closed①：兑换日不符（expected ≠ response 内嵌日界）。
+        let m = create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+        assert!(receive_backup_auth_credential(
+            m.request_context,
+            &response_b64,
+            &server_public,
+            day_seconds + 86_400,
+        )
+        .is_err());
+        // fail-closed②：垃圾 b64。
+        let m = create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+        assert!(receive_backup_auth_credential(
+            m.request_context,
+            "not-b64!!",
+            &server_public,
+            day_seconds,
+        )
+        .is_err());
+        // fail-closed③：错服务器公钥族（IssuanceProof 验证不过）。
+        let m = create_backup_auth_request_materials(&keys.backup_key, keys.aci.into());
+        assert!(receive_backup_auth_credential(
+            m.request_context,
+            &response_b64,
+            &other_public,
+            day_seconds,
+        )
+        .is_err());
+    }
+
+    /// ②404→引导→重试状态机：注入 fetch/bootstrap 重演四场景（命中不引导/
+    /// 引导自愈/引导后仍缺席诚实上交/引导失败如实上抛）。
+    #[tokio::test]
+    async fn bootstrap_retry_state_machine() {
+        // A：首次即命中——不触发引导。
+        let bootstrapped = std::cell::Cell::new(false);
+        let (list, missing) = fetch_with_bootstrap_retry(
+            || async { Ok((vec![entry(86_400)], false)) },
+            || async {
+                bootstrapped.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .expect("first-hit");
+        assert_eq!(list.len(), 1);
+        assert!(!missing);
+        assert!(!bootstrapped.get());
+
+        // B：404→引导→重试命中（fetch 恰好两次）。
+        let fetches = std::cell::Cell::new(0u8);
+        let (list, missing) = fetch_with_bootstrap_retry(
+            || async {
+                fetches.set(fetches.get() + 1);
+                if fetches.get() == 1 {
+                    Ok((Vec::new(), true))
+                } else {
+                    Ok((vec![entry(86_400)], false))
+                }
+            },
+            || async { Ok(()) },
+        )
+        .await
+        .expect("bootstrap-healed");
+        assert_eq!(fetches.get(), 2);
+        assert_eq!(list.len(), 1);
+        assert!(!missing);
+
+        // C：引导后仍 404 = 诚实缺席（missing=true → 调用方映射
+        // NotProvisioned，fetch_today_credentials 同口径）。
+        let (_, missing) =
+            fetch_with_bootstrap_retry(|| async { Ok((Vec::new(), true)) }, || async { Ok(()) })
+                .await
+                .expect("still-missing is ok-value");
+        assert!(missing);
+
+        // D：引导失败如实上抛（不吞不伪装缺席）。
+        let result = fetch_with_bootstrap_retry(
+            || async { Ok((Vec::new(), true)) },
+            || async { Err(CloudRestoreError::Transport("bootstrap".into())) },
+        )
+        .await;
+        assert!(matches!(result, Err(CloudRestoreError::Transport(_))));
+    }
+
+    /// ③失败形态结构化错误面：七族 → 稳定码表（JSON-RPC 同步面与
+    /// cloudStatus failed 相位共用），detail 仅带消息族有。
+    #[test]
+    fn error_families_map_to_stable_rpc_codes() {
+        assert_eq!(
+            CloudRestoreError::NotProvisioned.rpc_code(),
+            "BACKUP_NOT_PROVISIONED"
+        );
+        assert_eq!(
+            CloudRestoreError::AuthRejected.rpc_code(),
+            "BACKUP_AUTH_FAILED"
+        );
+        assert_eq!(
+            CloudRestoreError::AlreadyRunning.rpc_code(),
+            "BACKUP_RUNNING"
+        );
+        assert_eq!(
+            CloudRestoreError::Transport("x".into()).rpc_code(),
+            "BACKUP_TRANSPORT_FAILED"
+        );
+        assert_eq!(
+            CloudRestoreError::Download("x".into()).rpc_code(),
+            "BACKUP_DOWNLOAD_FAILED"
+        );
+        assert_eq!(
+            CloudRestoreError::Decrypt("x".into()).rpc_code(),
+            "BACKUP_DECRYPT_FAILED"
+        );
+        assert_eq!(
+            CloudRestoreError::Export("x".into()).rpc_code(),
+            "BACKUP_EXPORT_FAILED"
+        );
+        assert_eq!(
+            CloudRestoreError::Download("cdn 502".into()).detail(),
+            Some("cdn 502")
+        );
+        assert_eq!(CloudRestoreError::NotProvisioned.detail(), None);
+        assert_eq!(CloudRestoreError::AlreadyRunning.detail(), None);
+    }
+
+    /// 进度面生命周期：begin/add/fail/clear + 在途前失败立 failed 相位；
+    /// 运行闸互斥（CAS 单抢到，finish 释放后可再抢）。
+    #[test]
+    fn progress_lifecycle_and_running_gate() {
+        let progress = CloudRestoreProgress::new();
+        assert!(progress.snapshot().is_none());
+        progress.begin(Some(100));
+        progress.add(40);
+        let s = progress.snapshot().expect("in-flight");
+        assert_eq!(s.phase, "downloading");
+        assert_eq!(s.bytes_read, 40);
+        assert_eq!(s.bytes_total, Some(100));
+        assert!(s.error_code.is_none());
+        // 失败终态：已计字节保留 + 相位翻面 + code 透出。
+        progress.fail("BACKUP_DOWNLOAD_FAILED");
+        let s = progress.snapshot().expect("failed terminal");
+        assert_eq!(s.phase, "failed");
+        assert_eq!(s.bytes_read, 40);
+        assert_eq!(s.error_code, Some("BACKUP_DOWNLOAD_FAILED"));
+        // 成功终态：清缺（transfer_archive 同纪律）。
+        progress.clear();
+        assert!(progress.snapshot().is_none());
+        // 在途前失败（凭据段）：无快照也立 failed。
+        progress.fail("BACKUP_AUTH_FAILED");
+        let s = progress.snapshot().expect("early failure");
+        assert_eq!(s.phase, "failed");
+        assert_eq!(s.bytes_read, 0);
+        progress.clear();
+        assert!(progress.snapshot().is_none());
+
+        // 运行闸互斥。
+        assert!(CloudRestoreProgress::try_begin_running());
+        assert!(!CloudRestoreProgress::try_begin_running());
+        CloudRestoreProgress::finish_running();
+        assert!(CloudRestoreProgress::try_begin_running());
+        CloudRestoreProgress::finish_running();
+    }
 }
 
 // —— zkgroup 兑换/呈现（契约 §1.3；官方 credentials.preload.ts:316 与
@@ -159,7 +371,6 @@ mod tests {
 
 use libsignal_account_keys::BackupKey;
 use presage::libsignal_service::protocol::Aci;
-use rand::Rng as _;
 use zkgroup::api::generic_server_params::GenericServerPublicParams;
 use zkgroup::backups::{BackupAuthCredentialRequestContext, BackupAuthCredentialResponse};
 use zkgroup::Timestamp;
@@ -215,24 +426,9 @@ pub fn receive_backup_auth_credential(
         .map_err(|_| ())
 }
 
-/// 凭据 → 呈现字节（序列化后喂 gRPC 面与 SFU HTTP；rand 32B 由调用方注入）。
-/// 凭据 → 呈现字节 + 签名（gRPC 头两件套；官方 net/chat api BackupAuth::present
-/// 同构：zkgroup present 无签名，ACI 私钥 calculate_signature 签呈现字节）。
-/// rand/CryptoRng 与 presage 协议族同版本（rand re-export）。
-pub fn present_backup_auth_credential(
-    credential: &zkgroup::backups::BackupAuthCredential,
-    params: &GenericServerPublicParams,
-    signing_key: &presage::libsignal_service::protocol::PrivateKey,
-    rng: &mut dyn rand::CryptoRng,
-) -> Result<(Vec<u8>, Vec<u8>), ()> {
-    let presentation = credential.present(params, rng.random());
-    let serialized = zkgroup::serialize(&presentation);
-    let signature = signing_key
-        .calculate_signature(&serialized, rng)
-        .map_err(|_| ())?;
-    Ok((serialized, signature.into()))
-}
-
+/// 凭据呈现+签名走 `BackupAuth::new` 内部（官方 net/chat api 同构，gRPC 面
+/// get_message_backup_info/get_backup_cdn_credentials 各自呈现），不另设
+/// 手工 present 包装——单一路径，不漂。
 fn use_base64_encode(value: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(value)
@@ -253,7 +449,6 @@ use libsignal_net::infra::dns::DnsResolver;
 use libsignal_net::infra::route::{DirectOrProxyMode, DirectOrProxyProvider};
 use libsignal_net::infra::utils::no_network_change_events;
 use libsignal_net::infra::{EnableDomainFronting, OverrideNagleAlgorithm};
-use rand::Rng as _;
 
 /// 生产 chat WS 连接（官方 simple_chat_connection 逐行复刻，chat.rs:510-573：
 /// env::PROD 直连、无域前端、无代理、headers=None=未鉴权）。
@@ -334,9 +529,8 @@ use presage::libsignal_service::configuration::Endpoint;
 use presage::libsignal_service::prelude::PushService;
 use presage::libsignal_service::protocol::PrivateKey;
 use presage::libsignal_service::push_service::HttpAuthOverride;
-use rand::Rng as _;
 
-use libsignal_net_chat::api::backups::{BackupAuth, UnauthenticatedChatApi};
+use libsignal_net_chat::api::backups::BackupAuth;
 use libsignal_net_chat::api::Unauth;
 
 use crate::backup::keys::BackupKeys;
@@ -348,6 +542,8 @@ pub enum CloudRestoreError {
     NotProvisioned,
     /// 凭据兑换被拒（zkgroup 验证失败）——retryable=false。
     AuthRejected,
+    /// 重入（同引擎已有在途 restore）——retryable=false。
+    AlreadyRunning,
     /// chat/REST 传输失败——retryable=true。
     Transport(String),
     /// CDN 下载失败——retryable=true。
@@ -363,10 +559,35 @@ impl Clone for CloudRestoreError {
         match self {
             Self::NotProvisioned => Self::NotProvisioned,
             Self::AuthRejected => Self::AuthRejected,
+            Self::AlreadyRunning => Self::AlreadyRunning,
             Self::Transport(m) => Self::Transport(m.clone()),
             Self::Download(m) => Self::Download(m.clone()),
             Self::Decrypt(m) => Self::Decrypt(m.clone()),
             Self::Export(m) => Self::Export(m.clone()),
+        }
+    }
+}
+
+impl CloudRestoreError {
+    /// 结构化错误码（cloud-backup-contract §2）：JSON-RPC 错误面与
+    /// cloudStatus failed 相位共用同一映射，两端不漂。
+    pub(crate) fn rpc_code(&self) -> &'static str {
+        match self {
+            Self::NotProvisioned => "BACKUP_NOT_PROVISIONED",
+            Self::AuthRejected => "BACKUP_AUTH_FAILED",
+            Self::AlreadyRunning => "BACKUP_RUNNING",
+            Self::Transport(_) => "BACKUP_TRANSPORT_FAILED",
+            Self::Download(_) => "BACKUP_DOWNLOAD_FAILED",
+            Self::Decrypt(_) => "BACKUP_DECRYPT_FAILED",
+            Self::Export(_) => "BACKUP_EXPORT_FAILED",
+        }
+    }
+
+    /// 错误细节（仅带消息的族有；观测面可选 detail 字段）。
+    pub(crate) fn detail(&self) -> Option<&str> {
+        match self {
+            Self::NotProvisioned | Self::AuthRejected | Self::AlreadyRunning => None,
+            Self::Transport(m) | Self::Download(m) | Self::Decrypt(m) | Self::Export(m) => Some(m),
         }
     }
 }
@@ -393,7 +614,7 @@ async fn fetch_credentials_once(
         .await
         .map_err(|e| CloudRestoreError::Transport(format!("credentials: {e}")))?;
     let status = response.status().as_u16();
-    if status == 404 {
+    if is_backup_id_missing_status(status) {
         return Ok((Vec::new(), true));
     }
     if !(200..300).contains(&status) {
@@ -440,21 +661,39 @@ async fn bootstrap_backup_id(
 ///
 /// # Errors
 /// 引导/传输失败 = `Transport`；引导后仍空 = `NotProvisioned`。
+/// 404→引导→重试状态机（官方 credentials.preload.ts:242-263 setBackupId 自愈
+/// 语义）：fetch 报 backupId 缺席 → bootstrap PUT → fetch 重试一次；仍缺席 =
+/// 诚实 missing=true（调用方映射 NotProvisioned）。fetch/bootstrap 注入形，
+/// 单测脱离 PushService 重演全状态机。
+async fn fetch_with_bootstrap_retry<F, B, FutF, FutB>(
+    fetch: F,
+    bootstrap: B,
+) -> Result<(Vec<BackupCredentialEntry>, bool), CloudRestoreError>
+where
+    F: Fn() -> FutF,
+    B: Fn() -> FutB,
+    FutF:
+        std::future::Future<Output = Result<(Vec<BackupCredentialEntry>, bool), CloudRestoreError>>,
+    FutB: std::future::Future<Output = Result<(), CloudRestoreError>>,
+{
+    let (list, was_missing) = fetch().await?;
+    if !was_missing {
+        return Ok((list, false));
+    }
+    bootstrap().await?;
+    fetch().await
+}
+
 pub async fn fetch_today_credentials(
     push: &PushService,
     backup_request_b64: &str,
     now_ms: u64,
 ) -> Result<BackupCredentialEntry, CloudRestoreError> {
-    let (mut entries, mut missing) = {
-        let (list, was_missing) = fetch_credentials_once(push, now_ms).await?;
-        if was_missing {
-            bootstrap_backup_id(push, backup_request_b64).await?;
-            let (list, missing_again) = fetch_credentials_once(push, now_ms).await?;
-            (list, missing_again)
-        } else {
-            (list, false)
-        }
-    };
+    let (mut entries, missing) = fetch_with_bootstrap_retry(
+        || fetch_credentials_once(push, now_ms),
+        || bootstrap_backup_id(push, backup_request_b64),
+    )
+    .await?;
     if missing {
         return Err(CloudRestoreError::NotProvisioned);
     }
@@ -482,6 +721,7 @@ pub async fn restore_from_cloud(
     keys: &BackupKeys,
     signing_key: &PrivateKey,
     rng: &mut (dyn rand::CryptoRng + Send),
+    progress: &CloudRestoreProgress,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::history::ExportStats, CloudRestoreError> {
     let now_ms = std::time::SystemTime::now()
@@ -493,18 +733,13 @@ pub async fn restore_from_cloud(
 
     let params = generic_server_public_params()
         .map_err(|_| CloudRestoreError::Decrypt("generic params".into()))?;
-    let response_bytes = super::cloud_backup::use_base64_decode(&entry.credential_b64)
-        .map_err(|_| CloudRestoreError::AuthRejected)?;
-    let response: zkgroup::api::backups::BackupAuthCredentialResponse =
-        zkgroup::deserialize(&response_bytes).map_err(|_| CloudRestoreError::AuthRejected)?;
-    let credential = materials
-        .request_context
-        .receive(
-            response,
-            &params,
-            zkgroup::Timestamp::from_epoch_seconds(entry.redemption_time_seconds),
-        )
-        .map_err(|_| CloudRestoreError::AuthRejected)?;
+    let credential = receive_backup_auth_credential(
+        materials.request_context,
+        &entry.credential_b64,
+        &params,
+        entry.redemption_time_seconds,
+    )
+    .map_err(|_| CloudRestoreError::AuthRejected)?;
     let backup_auth = BackupAuth::new(&credential, &params, signing_key);
 
     // gRPC：未鉴权连接 + BackupAuth 呈现（官方 scaffold Unauth(shared_h2) 同构）。
@@ -546,19 +781,177 @@ pub async fn restore_from_cloud(
             response.status().as_u16()
         )));
     }
-    let ciphertext = response
-        .bytes()
-        .await
-        .map_err(|_| CloudRestoreError::Download("cdn read".into()))?;
+    // 流式下载 + 进度快照（bytes_total 缺席 = 官方 WaitForBackup 同款不确定
+    // 形态，消费方不给假 0；transfer_archive 下载段同纪律）。
+    let bytes_total = response.content_length().filter(|total| *total > 0);
+    progress.begin(bytes_total);
+    let mut ciphertext = Vec::new();
+    {
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    progress.add(chunk.len() as u64);
+                    ciphertext.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    progress.clear();
+                    return Err(CloudRestoreError::Download(format!("cdn read: {e}")));
+                }
+            }
+        }
+    }
 
     // 密文落 work_dir/main（export_snapshot_frames 契约面），解密导出 NDJSON。
     let work_dir = store_dir.join("cloud-backup");
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| CloudRestoreError::Export(format!("workdir: {e}")))?;
     let main_path = work_dir.join("main");
-    std::fs::write(&main_path, ciphertext.as_ref())
+    std::fs::write(&main_path, ciphertext.as_slice())
         .map_err(|e| CloudRestoreError::Export(format!("write: {e}")))?;
     crate::backup::receive::export_snapshot_frames(&work_dir, keys, out)
         .await
         .map_err(|e| CloudRestoreError::Export(format!("{e:?}")))
+}
+
+// —— 第四片：进度注册表 + methods 挂载包装（cloud-backup-contract §2）——
+
+/// 进度快照（`backups.cloudStatus` 只读数据源；bytes_total 缺席 = 官方
+/// WaitForBackup 同款不确定形态，消费方不给假 0）。phase：downloading =
+/// 在途（字节计数有效）；failed = 终态失败（error_code 结构化透出，快照
+/// 保留至下次 start 覆盖，不装死）。成功终态 = 快照清缺（transfer_archive
+/// 「无论成败收尾清快照」同纪律——成功产物走 NDJSON 消费链，不在观测面
+/// 留痕）。
+#[derive(Debug, Clone, Copy)]
+pub struct CloudRestoreSnapshot {
+    pub phase: &'static str,
+    pub bytes_read: u64,
+    pub bytes_total: Option<u64>,
+    pub error_code: Option<&'static str>,
+}
+
+/// 进度注册表（Clone 供 Service 与 spawn 任务双持；进程内存不落盘）。
+#[derive(Clone, Default)]
+pub struct CloudRestoreProgress {
+    inner: std::sync::Arc<std::sync::Mutex<Option<CloudRestoreSnapshot>>>,
+}
+
+static CLOUD_RESTORE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl CloudRestoreProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// 重入闸抢占（`backups.restoreFromCloud` start 前置检查全过后调用）：
+    /// false→true 原子换位成功 = 抢到；已 true = 并发/在途，如实拒。
+    pub(crate) fn try_begin_running() -> bool {
+        CLOUD_RESTORE_RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// 重入闸释放（spawn 闭包收尾唯一出口，成败同路）。
+    pub(crate) fn finish_running() {
+        CLOUD_RESTORE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn begin(&self, bytes_total: Option<u64>) {
+        *self.inner.lock().expect("cloud progress lock") = Some(CloudRestoreSnapshot {
+            phase: "downloading",
+            bytes_read: 0,
+            bytes_total,
+            error_code: None,
+        });
+    }
+
+    pub(crate) fn add(&self, bytes: u64) {
+        let mut guard = self.inner.lock().expect("cloud progress lock");
+        if let Some(snapshot) = guard.as_mut() {
+            snapshot.bytes_read += bytes;
+        }
+    }
+
+    /// 终态失败：保留已计字节（部分下载如实），翻相位 + 结构化 code。
+    pub(crate) fn fail(&self, code: &'static str) {
+        let mut guard = self.inner.lock().expect("cloud progress lock");
+        let snapshot = guard.get_or_insert(CloudRestoreSnapshot {
+            phase: "failed",
+            bytes_read: 0,
+            bytes_total: None,
+            error_code: None,
+        });
+        snapshot.phase = "failed";
+        snapshot.error_code = Some(code);
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<CloudRestoreSnapshot> {
+        *self.inner.lock().expect("cloud progress lock")
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.inner.lock().expect("cloud progress lock") = None;
+    }
+}
+
+/// methods 挂载包装（mod.rs start 调用同签名）：AEP/ACI 从 store 取（
+/// snapshot_import 先例）→ 凭据拉取（404 引导自愈）→ 兑换呈现 → 全编排 →
+/// NDJSON 落 `history-import-cloud.ndjson`（connector 消费链同位）。
+///
+/// # Errors
+/// 全链错误如实映射（NotProvisioned/AuthRejected/Transport/Download/Decrypt/
+/// Export）。
+#[allow(clippy::too_many_lines)]
+pub async fn run_cloud_restore(
+    push: &PushService,
+    account_dir: std::path::PathBuf,
+    store: presage_store_sqlite::SqliteStore,
+    signing_key: presage::libsignal_service::protocol::PrivateKey,
+    rng: &mut (dyn rand::CryptoRng + Send),
+    progress: &CloudRestoreProgress,
+) -> Result<crate::history::ExportStats, CloudRestoreError> {
+    use presage::store::StateStore as _;
+    // ① AEP/ACI（presage store kv + registration data，snapshot_import 先例）。
+    let account_entropy_pool = store
+        .fetch_account_entropy_pool()
+        .await
+        .map_err(|_| CloudRestoreError::AuthRejected)?
+        .ok_or(CloudRestoreError::NotProvisioned)?;
+    let registration = store
+        .load_registration_data()
+        .await
+        .map_err(|_| CloudRestoreError::AuthRejected)?
+        .ok_or(CloudRestoreError::NotProvisioned)?;
+    let aci = presage::libsignal_service::protocol::Aci::from(registration.service_ids.aci);
+    let keys = crate::backup::keys::derive_keys(&account_entropy_pool, &aci);
+
+    // ② 全编排（restore_from_cloud 内含凭据拉取/404 引导自愈/zkgroup 兑现/
+    //    BackupAuth/gRPC 定位/CDN 下载；进度经 progress 面透出）。
+    let mut ndjson = Vec::new();
+    let stats = restore_from_cloud(
+        push,
+        &account_dir,
+        &keys,
+        &signing_key,
+        rng,
+        progress,
+        &mut ndjson,
+    )
+    .await?;
+
+    // ③ NDJSON 落盘（connector 消费链同位：transfer_archive 的
+    //    history-import.ndjson 消费面，云备份独立文件名免混淆）。
+    let ndjson_path = account_dir.join("history-import-cloud.ndjson");
+    std::fs::write(&ndjson_path, &ndjson)
+        .map_err(|e| CloudRestoreError::Export(format!("write: {e}")))?;
+    Ok(stats)
 }
