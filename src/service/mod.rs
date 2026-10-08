@@ -42,6 +42,7 @@ use crate::state::EngineState;
 
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
+pub(crate) mod call_links;
 pub(crate) mod groups;
 pub(crate) mod identity;
 pub(crate) mod profile;
@@ -54,6 +55,7 @@ pub(crate) mod storage_sync;
 pub(crate) mod storage_write;
 pub(crate) mod stories;
 pub(crate) mod username;
+pub(crate) mod zkgroup_consts;
 
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
@@ -513,6 +515,9 @@ pub(crate) struct Service {
     /// 云备份 upload 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
     /// §6.2 uploadStatus 面）。
     cloud_upload_progress: cloud_upload::CloudUploadProgress,
+    /// 群凭据双族缓存（进程内存 per-account ACI 键控，不落盘不跨重启；
+    /// P4c 切一 call_links 模块契约，官方 groupCredentialFetcher 对位件）。
+    group_credentials: Arc<call_links::GroupCredentialCache>,
 }
 
 struct Inner {
@@ -543,6 +548,7 @@ impl Service {
             transfer_progress: transfer_progress::TransferProgress::new(),
             cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
+            group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
         })
     }
 
@@ -1620,6 +1626,73 @@ impl Service {
         groups::update_group_expiration(&context, &master_key, expiration_secs).await
     }
 
+    /// calls.linkPresentation（KT 扩展，P4c 切一）：当天 CallLinkAuthCredential
+    /// 呈现字节（compat §3 calls 族行 + §5 块）。材料面非协议上行，不落调度
+    /// 日志；凭据/呈现字节零日志零落盘。fake 模式形状桩（非有效 zk 材料）。
+    pub(crate) async fn call_link_presentation(
+        self: &Arc<Self>,
+        account: &str,
+        root_key: &[u8],
+    ) -> Result<Vec<u8>, call_links::CallCredentialError> {
+        if !self.real {
+            return Ok(call_links::FAKE_LINK_PRESENTATION.to_vec());
+        }
+        let context = storage_context(self, account).await?;
+        call_links::link_presentation(&context, root_key).await
+    }
+
+    /// calls.createLinkAuth（同批）：两段式出 CreateCallLinkCredential
+    /// Presentation + CallLinkPublicParams 双字节。fake 模式形状桩。
+    pub(crate) async fn create_link_auth(
+        self: &Arc<Self>,
+        account: &str,
+        root_key: &[u8],
+        room_id: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), call_links::CallCredentialError> {
+        if !self.real {
+            return Ok((
+                call_links::FAKE_CREATE_PRESENTATION.to_vec(),
+                call_links::FAKE_CREATE_PUBLIC_PARAMS.to_vec(),
+            ));
+        }
+        let context = storage_context(self, account).await?;
+        call_links::create_link_auth(&context, root_key, room_id).await
+    }
+
+    /// calls.groupProof（同批）：ExternalGroupCredential.token 透出。fake
+    /// 模式形状桩（固定串）。
+    pub(crate) async fn call_group_proof(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+    ) -> Result<String, call_links::CallCredentialError> {
+        if !self.real {
+            return Ok(call_links::FAKE_GROUP_PROOF.to_owned());
+        }
+        let context = storage_context(self, account).await?;
+        call_links::group_proof(&context, &master_key).await
+    }
+
+    /// calls.groupMembers（同批）：群成员 UuidCiphertext 材料清单。fake
+    /// 模式空清单形状桩（读面纪律，getPinnedConversations 同款）。
+    pub(crate) async fn call_group_members(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+    ) -> Result<Vec<call_links::MemberMaterial>, call_links::CallCredentialError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        call_links::group_members(&context, &master_key).await
+    }
+
+    /// calls.endorsementsPublicKey（同批）：legacy ServerPublicParams 派生
+    /// EndorsementPublicKey 序列化字节；常量派生不触网，fake/real 同码路。
+    pub(crate) fn endorsements_public_key(&self) -> Vec<u8> {
+        call_links::endorsements_public_key_bytes()
+    }
+
     /// getUserStatus：whoami 轻量鉴权探测（real 模式触网；fake 恒已注册）。
     /// 仅 401 判解绑——网络等其他失败按内部失败，不误报解绑态。
     pub(crate) async fn get_user_status(
@@ -2444,6 +2517,8 @@ pub(crate) struct StorageContext {
     /// 本机 ACI/PNI（UUID；群凭据 present 面，groups 模块消费，不入日志）。
     pub(crate) aci_uuid: presage::libsignal_service::prelude::Uuid,
     pub(crate) pni_uuid: presage::libsignal_service::prelude::Uuid,
+    /// 群凭据双族缓存句柄（Service 共享，进程内存不落盘；P4c 切一）。
+    pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
 }
 
 /// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。
@@ -2497,6 +2572,7 @@ async fn storage_context(
         account_dir,
         aci_uuid: data.service_ids.aci,
         pni_uuid: data.service_ids.pni,
+        group_credentials: service.group_credentials.clone(),
     })
 }
 

@@ -97,6 +97,11 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `sendCallMessage` | `{account, recipient(单号码/ACI)?\|group(32B 群 master key 标准 base64，listGroups/terminateGroup/updateGroup 的 groupId 同源口径)?——寻址两腿恰一互斥, data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；**两腿恰一**（2026-10-08 群臂批）——`group` 与 `recipient` 同置/都缺/任一腿形状非法 `-32603`；群腿仅 modern 面放行（官方群信令恒 opaque，legacy 裸帧族群向无先例；sender-key 群发无设备定向位——destinationDeviceId 与 group 同置 `-32603`）；`groupId` 键维持禁入（wire 参数名是 `group`）） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、group 非法 base64/≠32B/非字符串、两腿同置/都缺、groupId 键在场、群腿携 legacy 或 destinationDeviceId）/未注册账号 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-08 群臂批） | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（online=false 偏差与 sent-transcript 缺席见 §5 通话消息块）；**2026-10-08 群臂批（P4b，connector 契约 1.82 wire 面对位，engine-compat）**：`group` 腿 sender-key 群发（官方 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 → sendCallingMessage.preload.ts:99-118 isGroup 臂 sendContentMessageToGroup 同落点），群头 = open_group_sender（terminated 硬拒，send 系群组形态同纪律）+ `send_message_to_group`（sendTyping 群臂同原语）；单测钉群臂 wire = `CallMessage{opaque{data,urgency}}` 字段10（无 busy/hangup/destinationDeviceId 位）；fake：成功 `{"timestamp":u64}` 两臂同口径（落调度日志，协议上行面纪律） |
+| `calls.linkPresentation` | `{account, rootKey(标准 base64，解码后恰 16B(V0)/21B(V1)——RingRTC CallLinkRootKey 两版本定长，zkgroup 派生只取前 16B CRN)}` | `{presentation(标准 base64 = CallLinkAuthCredentialPresentation bincode 序列化字节，当天 UTC 兑换日呈现)}` | 参数缺失/rootKey 非 base64·解码后非 16/21B/未注册账号 `-32603`；服务器拒绝·zkgroup 兑换/呈现验证失败·当日凭据缺席 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? = HTTP 状态码诚实透传）；网络/传输面 `CALL_CREDENTIALS_UNAVAILABLE`（`-1` + message，retryable=true 语义）（**两枚新码位，connector 白名单登记归 connector 批**） | **2026-10-09 real（KT 扩展，P4c 切一 call-link 凭据材料面，§5 块）**：官方 getCallLinkAuthCredentialPresentation 同链（util/callLinks/zkgroup.preload.ts:16-49）——双族凭据缓存取当日 CallLinkAuthCredential（窗口算法逐字对齐官方 getDatesForRequest，§5 块）→ `present(ACI, 兑换日秒, GenericServerPublicParams, CallLinkSecretParams::derive_from_root_key)` → bincode 序列化出字节（官方返未序列化对象给 RingRTC 绑定，引擎字节化出 RPC）；凭据/呈现字节只内存转发零日志零落盘（relay-api-v2 §5 纪律）；fake：参数闸后形状桩 `{presentation}`（桩字节非有效 zk 材料仅钉形状），不落调度日志 |
+| `calls.createLinkAuth` | `{account, rootKey(同 calls.linkPresentation 闸), roomId(标准 base64，解码后恰 32B——RingRTC `derive_room_id` HKDF-SHA256 固定 32B 输出)}` | `{presentation(标准 base64 = CreateCallLinkCredentialPresentation bincode 序列化), callLinkPublicParams(标准 base64 = CallLinkPublicParams bincode 序列化)}`（官方 createCallLink 凭据段双材料同形） | 参数缺失/rootKey·roomId 形状错/未注册账号 `-32603`；服务器拒绝·zkgroup 两段式兑换验证失败 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE`（同上行列） | **2026-10-09 real（同批）**：官方 createCallLink 凭据段同链（calling.preload.ts:860-940）——`CreateCallLinkCredentialRequestContext::new(roomId)` → `POST v1/call-link/create-auth`（chatService host 本机凭据，json `{createCallLinkCredentialRequest: b64}` → `{credential: b64}`，WebAPI.preload.ts:3439-3453 端点+形状、:1471-1473 schema；官方 2026-09-10 起加 `?v101=true` 切 V1 族，v0.99.0 钉不移植）→ `context.receive(ACI, GenericServerPublicParams)` → `present(roomId, ACI, generic, derive_from_root_key(rootKey))` + `get_public_params()` 双序列化；rootKey 生成/roomId 派生/adminPasskey 皆 RingRTC 侧职责引擎不收不做；单次 RPC 内两段式（无跨调用状态）；fake：参数闸后形状桩双键 |
+| `calls.groupProof` | `{account, groupId(32B 标准 base64 群 master key，listGroups/terminateGroup 的 groupId 同源)}` | `{proof(token 字符串 = ExternalGroupCredential.token 原样透出；RingRTC setMembershipProof 消费其 UTF-8 字节)}` | 参数缺失/groupId 非 base64·≠32B/未注册账号 `-32603`；服务器拒绝（凭据无效/非群成员）·响应 proto 解码失败·当日凭据缺席 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 fetchMembershipProof 同链（groups.preload.ts:1782-1806 → WebAPI getExternalGroupCredential:4566-4586）——双族缓存取当日 AuthCredentialWithPni → present(group) → `GET v2/groups/token`（storageService host，basic auth = `hex(GroupPublicParams):hex(presentation)`，generateGroupAuth:4533-4540 同构）→ `ExternalGroupCredential{token=1}`（Groups.proto:285-287，presage::proto 生成面复用）解 token 透出；fake：参数闸后形状桩 `{proof}` |
+| `calls.groupMembers` | `{account, groupId(同 calls.groupProof)}` | `{members: [{uuid(ACI 字符串), userIdCipherText(标准 base64 = UuidCiphertext bincode 序列化)}]}`（服务器群态成员序；RingRTC GroupMemberInfo{userId, userIdCipherText} 材料面） | 参数缺失/groupId 形状错/未注册账号 `-32603`；群态拉取被拒/解密失败 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 getMembershipList 同语义（groups.preload.ts:7611-7632：群成员逐一 encryptServiceId）——`GET v1/groups/` + decrypt_group（fetch_group_state 既有面复用）→ 每成员 `GroupSecretParams::encrypt_service_id(ACI)` → UuidCiphertext 序列化；uuid = ACI 字符串（relay-api-v2 §2 帧面对位）；fake：参数闸后 `{members: []}` |
+| `calls.endorsementsPublicKey` | `{}`（常量派生面，无 account——getStickerPackManifest 匿名面同纪律） | `{endorsementPublicKey(标准 base64 = EndorsementPublicKey bincode 序列化)}` | 无（常量派生不触网，fake 同码路真实答） | **2026-10-09 real（同批）**：legacy ServerPublicParams 派生 `get_endorsement_public_key()`（zkgroup pin 树 server_params.rs:347；官方 `serverPublicParams.getEndorsementPublicKey()` 同位，消费位 calling.preload.ts:1134/:2018 = RingRTC getCallLinkCall 的 endorsementPublicKey 槽）；共享常量模块 `zkgroup_consts` 单一真相源（云备份面同源不重复嵌） |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `backup.importSnapshot` | `{account, snapshotDir}`（官方桌面本地备份快照目录，官方布局 `signal-backup-<ts>/{metadata, main, files/}`；connector 传入的同机路径，引擎不持久化） | `{"status": "started"}`（后台任务已启动，进度走 `backup.importSnapshotStatus`） | 未注册/fake 账号/AEP 缺失 `-32603`；该账号导入任务在跑 `BACKUP_IMPORT_ALREADY_RUNNING`；目录或 metadata/main 缺 `BACKUP_SNAPSHOT_MISSING`；metadata decode 失败/version≠1/形状不合规 `BACKUP_SNAPSHOT_METADATA_INVALID`；backupId 比对不等（非本账号备份）`BACKUP_SNAPSHOT_KEY_MISMATCH`——结构化码均 `-1` + message 码位（备份导出契约 §11.4，connector 1.78 白名单） | **B2 批 real（2026-10-08，快照导入收向）**：官方 `importLocalBackup`/`verifyLocalBackupMetadata` 行为对齐（AGPL 只读参照零拷贝）——metadata 校验（官方 strict assert 面：version==1、iv 12B、encryptedId 16B、CTR 解密 backupId 逐字节比对）前移为 start 同步闸，main 全链（官方 FramesReader 解密+HMAC+分帧）后台 `spawn_local`（帧导出 future 非 Send），逐帧投影复用 `history::export_frames_loop` 落 `<账号目录>/history-import.ndjson`（connector §4.38 通路同一落点，临时名+rename 原子替换，失败删半成品既有 NDJSON 不动）；密钥边界 §10.5 延续（任务 future 内即用即弃）；fake 模式账号无 store，按未注册 `-32603`；不落调度日志零 stderr |
@@ -1773,6 +1778,136 @@ transfer 历史回填非文本扩面·递补批（2026-10-08，B1 递补批，�
   发明）；payment/giftBadge 的字节面（MobileCoin blobs、presentation
   二进制）只随 opaque base64 中转，引擎任何持久层不留存；ExportStats
   只增 `calls` 字段不破坏既有（快照导入 `lines` 求和同步 +calls）。
+
+call-link 凭据材料面（2026-10-09，KT 扩展，P4c 切一；消费方 =
+kt-signal-calling relay-api-v2 §2/§5 帧族，引擎只产材料字节，relay 帧
+组装/消费归 connector/calling 仓后续批）：
+
+- **五方法面**：`calls.linkPresentation`（rootKey → 当天 CallLinkAuth
+  CredentialPresentation 字节）、`calls.createLinkAuth`（rootKey+roomId →
+  CreateCallLinkCredentialPresentation + CallLinkPublicParams 双字节）、
+  `calls.groupProof`（群 master key → ExternalGroupCredential.token）、
+  `calls.groupMembers`（群 master key → [{uuid, userIdCipherText}]）、
+  `calls.endorsementsPublicKey`（常量派生 EndorsementPublicKey 字节）。
+  凭据与 presentation 字节**只经内存转发，零日志、零落盘**（relay-api-v2
+  §5 :95-97 纪律；引擎数据目录不落凭据材料文件）。
+- **官方锚点逐链（Signal-Desktop v8.31.0-alpha.1 abe80d3 实读 + 28a0430c59
+  轮换提交实读，AGPL 只读参照零拷贝）**：
+  - **legacy/V1 族分叉（本批实测纠偏）**：官方 2026-09-10 提交 28a0430c59
+    「Upgrade libsignal to 0.101.2 and request new zkc auth credentials」把
+    `genericServerPublicParams`/`backupServerPublicParams` 轮换为 V1
+    Standard 形（首字节 0x01），并在 `getGroupCredentials` 与
+    `callLinkCreateAuth` 请求加 `v101=true` 触发服务器签发 V1 族凭据；
+    本仓 zkgroup 钉 libsignal v0.99.0（439f035d，`GenericServerPublicParams`
+    的 `ReservedByte = VersionByte<0>` 严格校验首字节，pin 树
+    common/serialization.rs:98 + 上游自测 version_byte_wrong，V1 常量/
+    凭据均不可解）。故引擎对位**轮换前 legacy 形状**：常量钉 V0 生产值
+    （首字节 0x00，production.json 轮换前逐字节值，zkgroup_consts.rs 记
+    档），两请求一律不带 `v101=true`，服务器对 legacy 客户端照旧签发
+    legacy 族（旧客户端过渡窗内有效）。**附带修正前批死链**：已提交云备
+    份面（cloud_backup.rs）前批嵌的是轮换后 V1 值（production.json 现值
+    逐字节），在 v0.99.0 下常量反序列化必失败 = BackupAuth 兑换面潜在硬
+    故障（该面真机回归未做，契约 §6.5 后续批）；本批常量提升共享模块时
+    一并改挂 V0，云备份真机回归按 V0 常量执行。
+  - 凭据拉取 = `GET v1/certificate/auth/group?redemptionStartSeconds=
+    {秒}&redemptionEndSeconds={秒}&zkcCredential=true`
+    （WebAPI.preload.ts 轮换前 :4542-4564 getGroupCredentials，chatService
+    host 本机凭据），响应 `{pni?, credentials[], callLinkAuthCredentials[]}`
+    （groupCredentialFetcher.preload.ts:205-209，条目 `{credential(b64),
+    redemptionTime(秒)}`；callLinkAuthCredentials 字段经轮换提交
+    background.preload.ts 清缓存 hunk（isBeforeVersion('v8.29.0-beta.1')）
+    证实轮换前已存在，现树响应型别 = WebAPI.preload.ts:1035-1039，legacy
+    族照发）；callLink 族兑换 = formatCallingCredential
+    :259-276（`CallLinkAuthCredentialResponse.receive(ACI, redemptionTime
+    秒, GenericServerPublicParams)` → serialize 按兑换日存）。
+  - linkPresentation = ts/util/callLinks/zkgroup.preload.ts:16-49 同链：
+    当日凭据 → `present(ACI, redemptionTime/SECOND, genericParams,
+    CallLinkSecretParams.deriveFromRootKey(rootKey.bytes))`；官方把未序列化
+    对象交 RingRTC 绑定层，引擎侧 `zkgroup::serialize` 字节化出 RPC。
+  - createLinkAuth = calling.preload.ts:860-940 createCallLink 凭据段：
+    `CreateCallLinkCredentialRequestContext.forRoomId(roomId)` →
+    `POST v1/call-link/create-auth`（WebAPI.preload.ts 轮换前 :3439-3453
+    无 urlParameters，jsonData `{createCallLinkCredentialRequest: b64}`，
+    响应 `{credential: string}` schema :1471-1473）→ `context.receive(
+    response, ACI, genericParams)` → `present(roomId, ACI, genericParams,
+    secretParams)` + `secretParams.getPublicParams()` 各自 serialize。
+  - groupProof = groups.preload.ts:1782-1806 fetchMembershipProof →
+    WebAPI getExternalGroupCredential :4566-4586：`GET v2/groups/token`
+    （storageService host，basic auth = base64(`hex(groupPublicParams)` +
+    ":" + `hex(presentation)`)，generateGroupAuth :4533-4540 同构——与
+    vendor push_service HttpAuth 的 basic_auth 逐字同形），响应 bytes →
+    `ExternalGroupCredential{ token = 1 }`（Groups.proto:285-287，复用
+    presage::proto 生成面，不新嵌 proto）；RingRTC 侧
+    `setMembershipProof(Bytes.fromString(proof))` = token 字符串 UTF-8
+    字节（calling.preload.ts:1495 区域）。
+  - groupMembers = groups.preload.ts:7611-7632 getMembershipList 同语义：
+    群成员逐一 `encryptServiceId(clientZkGroupCipher, aci)` →
+    `{aci, uuidCiphertext}`；引擎侧源 = `GET v1/groups/` + decrypt_group
+    解密群态成员（fetch_group_state 既有面），`GroupSecretParams::
+    encrypt_service_id`（zkgroup group_params.rs:105）出 UuidCiphertext；
+    RingRTC GroupMemberInfo = `{userId: 16B UUID bytes,
+    userIdCipherText: bytes}`（ringrtc 2.72.1 dist Service.d.ts:511-515），
+    relay 帧 `{uuid, userIdCipherText}` 的 uuid = ACI 字符串。
+  - endorsementsPublicKey = legacy ServerPublicParams（生产常量，
+    `SignalServers::Production` 配置派生）`get_endorsement_public_key()`
+    （zkgroup pin 树 api/server_params.rs:347；官方 JS
+    `serverPublicParams.getEndorsementPublicKey()` 同位，消费位
+    calling.preload.ts:1134/:2018 = RingRTC getCallLinkCall 的
+    endorsementPublicKey 槽）。
+- **zkgroup pin 树对位**（libsignal tag v0.99.0 439f035d 实读）：
+  `call_links::CallLinkAuthCredentialResponse::receive(ACI, Timestamp,
+  &GenericServerPublicParams)`（内含日界对齐闸）→ `present(ACI, 兑换日,
+  generic, &CallLinkSecretParams, randomness)`；`CreateCallLinkCredential
+  RequestContext::new(room_id, randomness)` → `get_request()` →
+  `receive(response, ACI, generic)`（同含日界闸）→ `present(room_id, ACI,
+  generic, secret_params, randomness)`；序列化一律 `zkgroup::serialize`
+  （bincode）；`RandomnessBytes = [u8; 32]`（RANDOMNESS_LEN=32）每调用
+  新随机。
+- **凭据缓存节奏对齐官方**：进程内存 per-account（ACI 键控）双族缓存——
+  legacy AuthCredentialWithPni 与 callLink CallLinkAuthCredential 各自按
+  兑换日秒 → 兑换后序列化字节存储（官方 itemStorage 同语义，ms/秒单位差
+  在引擎侧统一为秒）；窗口算法逐字对齐官方 getDatesForRequest
+  （groupCredentialFetcher.preload.ts:336-362）：缺今日或末条 <今日 →
+  拉 {今日, 今日+6d}；末条 ≥今日+6d → 不拉；否则增量拉 {末条+1d,
+  今日+6d}；**双族各算窗取 min(start)/max(end) 合并**（
+  maybeFetchNewCredentials :175-196：requestDates/requestDatesCallLinks
+  两窗并集，任一族缺料即拉）；合并时清 <今日 条目（:285-301，prev 过滤
+  ≥today + new 拼接不去重，官方同形）。**官方 4h 主动定时器
+  （:77 scheduleAnother）不移植**——引擎无后台调度面，每次材料调用先跑
+  同一 maybeFetch 逻辑，使用时点新鲜度与官方等价（官方
+  fetchMembershipProof 前亦调 maybeFetchNewCredentials，:1789），偏差
+  如实记档。缓存不落盘不跨重启。
+- **群凭据旧面改造（groups.rs group_authorization）**：端点参数拓宽为
+  官方 legacy 族形状 `zkcCredential=true` 一次拉双族并入缓存（`v101=true`
+  为 libsignal ≥0.101 Standard 族签发开关，钉 v0.99.0 不移植），当日 legacy
+  条目由缓存供给（不再每次现取）；**窗口偏差修正**——旧实现请求窗
+  today→+7d（8 天）改对齐官方 today→+6d（7 天），行为修正如实记档。
+- **参数闸（fail-closed，-32603）**：rootKey = 标准 base64 解码后恰
+  16B（V0）或 21B（V1）——RingRTC v2.72.1 `CallLinkRootKey` 两版本定长
+  （root_key.rs：V0::LEN=CRN_LEN=16、V1::LEN=16+1+4=21），zkgroup
+  `derive_from_root_key` 只取前 16B CRN（ROOT_KEY_MAX_BYTES_FOR_SHO=16），
+  长度不符即拒不静默截断；roomId = 标准 base64 解码后恰 32B——
+  `derive_room_id` = HKDF-SHA256（salt=None，info
+  "20230501-Signal-CallLinkRootKey-RoomId"）固定 32B 输出（root_key.rs），
+  zkgroup 侧无长度闸（`CreateCallLinkCredentialRequestContext::new` 收任意
+  slice），引擎按官方派生定长收口；groupId 沿用 32B master key 闸。
+- **错误码（新族两枚，connector 白名单登记归 connector 批）**：参数形状/
+  未注册账号 `-32603`；`CALL_CREDENTIALS_FAILED`（`-1` + message +
+  data.status? = 服务器 HTTP 状态码诚实透传：服务器拒绝、zkgroup 兑换/
+  呈现验证失败、响应形状违例、当日凭据缺席同族，retryable=false 语义）；
+  `CALL_CREDENTIALS_UNAVAILABLE`（`-1` + message，网络/传输面，
+  retryable=true 语义）。
+- **fake 纪律**：参数闸照常 fail-closed；四方法答形状桩（固定占位字节/
+  固定 proof 串/空 members——桩字节**非有效 zk 材料**，仅钉契约形状），
+  不触网不落调度日志（材料供给面非协议上行）；`calls.endorsementsPublicKey`
+  常量派生不触网，fake/real 同码路真实答。
+- **边界（本批红线）**：不做群通话连接/SFU/媒体面（RingRTC/Calling 职责）；
+  rootKey 生成、roomId 派生、adminPasskey 生成皆 RingRTC 侧职责（
+  `CallLinkRootKey.generate()/derive_room_id()/generate_admin_passkey()`），
+  引擎只收成品字节；relay 帧组装与消费归 kt-signal-connector /
+  kt-signal-calling 仓后续批；群通话状态同步（storage 面）不做（relay
+  §6 诚实边界）；create-auth 的 POST 属凭据签发面（无用户可见状态变更），
+  不按协议上行面落调度日志。
 
 ## 6. fake 服务模式（仅测试）
 

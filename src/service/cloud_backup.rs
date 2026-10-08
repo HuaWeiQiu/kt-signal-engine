@@ -375,15 +375,14 @@ use zkgroup::api::generic_server_params::GenericServerPublicParams;
 use zkgroup::backups::{BackupAuthCredentialRequestContext, BackupAuthCredentialResponse};
 use zkgroup::Timestamp;
 
-/// 生产环境 GenericServerPublicParams（官方 config/production.json
-/// `genericServerPublicParams` 逐字节；zkgroup 公钥材料可入库，libsignal
-/// 桥同源）。default.json 为 staging 值，KT 钉生产。
-pub const GENERIC_SERVER_PUBLIC_PARAMS_B64: &str = "AeCO67P9mIv1yUHkdeZ9JF789GDbox61GvTqq3S4kYc1ADUWxWHQygU390tv1oRWt9WjkdZlU7mKkifF59ftjE+2ZlMmxns6I+ySiLpR8FEmfu+TGpVp3zYTjNV93obJJTyBCCsSHVETCyQRbKdCyb5TMa6LGrvcZaX0Q/VAavhuNA/m4kSiRMgSnYrUjGhVekdDnF+7xioo4wvFnxjIDh7uJQrYOWD6MloNGX7St5gbysTuQQ7i/HI38b9V8x8mKazuDSXxB//BKGZx/XHkK8cHX+QK1MPxYUVM1/CBI5oW";
-
-/// 常量反序列化（zkgroup bincode 编码；损坏 = 引擎内嵌常量错误，fail-closed）。
-pub fn generic_server_public_params() -> Result<GenericServerPublicParams, ()> {
-    zkgroup::deserialize(&use_base64_decode(GENERIC_SERVER_PUBLIC_PARAMS_B64)?).map_err(|_| ())
-}
+/// 生产 GenericServerPublicParams 常量面已提升为共享模块（P4c 切一：
+/// call-link 凭据链同源消费，不重复嵌）——此处重导出保持既有引用不漂。
+/// **行为修正（随批记档 compat §5）**：本模块前批嵌的是轮换后 V1 值
+/// （首字节 0x01，v0.99.0 `VersionByte<0>` 严格校验下反序列化必失败 =
+/// BackupAuth 兑换死链），共享模块改钉轮换前 V0 生产值（legacy 族，与
+/// v0.99.0 请求族匹配）；真机回归按 V0 执行（cloud-backup-contract §6.5
+/// 后续批）。
+pub use super::zkgroup_consts::generic_server_public_params;
 
 /// 引导材料：请求上下文 + 官方 bootstrap PUT 体（b64(request)，WebAPI:813
 /// messagesBackupAuthCredentialRequest 同键）。

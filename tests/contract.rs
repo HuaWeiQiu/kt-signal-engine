@@ -873,6 +873,179 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
+/// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
+/// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同
+/// terminateGroup 闸）；材料供给面非协议上行——不落调度日志。
+#[test]
+fn call_link_materials_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("call-link-materials-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // rootKey = RingRTC CallLinkRootKey 两版本定长（V0 16B / V1 21B）；
+    // roomId = derive_room_id 定长 32B；groupId = 32B master key（同
+    // terminateGroup 口径）。
+    let root_key_v0 = "EREREREREREREREREREREQ==";
+    let root_key_v1 = "ERERERERERERERERERERERERERER";
+    let root_key_15b = "ERERERERERERERERERER";
+    let room_id = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
+    let room_id_16b = "IiIiIiIiIiIiIiIiIiIiIg==";
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：五方法形状桩（不触网）。
+    assert_eq!(
+        engine.request(
+            "calls.linkPresentation",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0 })
+        )["result"],
+        json!({ "presentation": "a3QtZmFrZS1jYWxsLWxpbmstcHJlc2VudGF0aW9u" })
+    );
+    assert_eq!(
+        engine.request(
+            "calls.createLinkAuth",
+            json!({ "account": "+15550000000", "rootKey": root_key_v1, "roomId": room_id })
+        )["result"],
+        json!({
+            "presentation": "a3QtZmFrZS1jcmVhdGUtbGluay1wcmVzZW50YXRpb24=",
+            "callLinkPublicParams": "a3QtZmFrZS1jYWxsLWxpbmstcHVibGljLXBhcmFtcw==",
+        })
+    );
+    assert_eq!(
+        engine.request(
+            "calls.groupProof",
+            json!({ "account": "+15550000000", "groupId": group_id })
+        )["result"],
+        json!({ "proof": "kt-fake-group-proof" })
+    );
+    assert_eq!(
+        engine.request(
+            "calls.groupMembers",
+            json!({ "account": "+15550000000", "groupId": group_id })
+        )["result"],
+        json!({ "members": [] })
+    );
+    // endorsementsPublicKey：常量派生面，fake 同码路真实答——键在场、非空
+    // 字符串、跨调用确定。
+    let first = engine.request("calls.endorsementsPublicKey", json!({}));
+    let second = engine.request("calls.endorsementsPublicKey", json!({}));
+    let key = first["result"]["endorsementPublicKey"]
+        .as_str()
+        .expect("endorsementPublicKey 字符串");
+    assert!(!key.is_empty(), "常量派生非空");
+    assert_eq!(first["result"], second["result"], "常量面跨调用确定");
+
+    // 参数面 fail-closed 逐形状 → -32603。
+    let rejects = [
+        ("calls.linkPresentation", json!({ "rootKey": root_key_v0 })),
+        (
+            "calls.linkPresentation",
+            json!({ "account": "+15550000000" }),
+        ),
+        (
+            "calls.linkPresentation",
+            json!({ "account": "+15550000000", "rootKey": "not-base64!!" }),
+        ),
+        (
+            "calls.linkPresentation",
+            json!({ "account": "+15550000000", "rootKey": root_key_15b }),
+        ),
+        (
+            "calls.linkPresentation",
+            json!({ "account": "+15550000000", "rootKey": room_id }),
+        ),
+        (
+            "calls.createLinkAuth",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0 }),
+        ),
+        (
+            "calls.createLinkAuth",
+            json!({ "account": "+15550000000", "roomId": room_id }),
+        ),
+        (
+            "calls.createLinkAuth",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0, "roomId": room_id_16b }),
+        ),
+        (
+            "calls.createLinkAuth",
+            json!({ "account": "+15550000000", "rootKey": root_key_15b, "roomId": room_id }),
+        ),
+        ("calls.groupProof", json!({ "groupId": group_id })),
+        (
+            "calls.groupProof",
+            json!({ "account": "+15550000000", "groupId": "not-base64!!" }),
+        ),
+        (
+            "calls.groupProof",
+            json!({ "account": "+15550000000", "groupId": "QUJDREVG" }),
+        ),
+        ("calls.groupMembers", json!({ "groupId": group_id })),
+        (
+            "calls.groupMembers",
+            json!({ "account": "+15550000000", "groupId": "QUJDREVG" }),
+        ),
+    ];
+    for (method, params) in &rejects {
+        let response = engine.request(method, params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "{method} rejects {params}"
+        );
+    }
+
+    // 材料供给面非协议上行：不落调度日志（五个方法全部调用后日志文件仍
+    // 不存在）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "calls.* 材料面不落调度日志（compat §5 call-link 块纪律）"
+    );
+}
+
+/// calls.* real 模式未注册账号：四方法（带 account 面）折叠 -32603（storage
+/// 上下文打不开，细节不外泄，不触网）；endorsementsPublicKey 无 account 面
+/// 常量派生照答。
+#[test]
+fn call_link_materials_real_unregistered_account() {
+    let real_dir = temp_dir("call-link-materials-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let root_key = "EREREREREREREREREREREQ==";
+    let room_id = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    for (method, params) in [
+        (
+            "calls.linkPresentation",
+            json!({ "account": "+15559990000", "rootKey": root_key }),
+        ),
+        (
+            "calls.createLinkAuth",
+            json!({ "account": "+15559990000", "rootKey": root_key, "roomId": room_id }),
+        ),
+        (
+            "calls.groupProof",
+            json!({ "account": "+15559990000", "groupId": group_id }),
+        ),
+        (
+            "calls.groupMembers",
+            json!({ "account": "+15559990000", "groupId": group_id }),
+        ),
+    ] {
+        let (code, message) = real_engine.error_of(method, params);
+        assert_eq!(
+            (code, message.as_str()),
+            (-32603, "Internal error"),
+            "{method} 未注册账号折叠 -32603"
+        );
+    }
+
+    let response = real_engine.request("calls.endorsementsPublicKey", json!({}));
+    assert!(
+        response["result"]["endorsementPublicKey"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()),
+        "常量派生面不依赖账号"
+    );
+}
+
 #[test]
 fn send_story_fake_shape_and_param_fail_closed() {
     let dir = temp_dir("send-story-fake");

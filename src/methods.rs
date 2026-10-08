@@ -1997,6 +1997,107 @@ async fn dispatch(
                 }
             }
         }
+        // calls.linkPresentation（call-link 凭据材料面，KT 扩展，P4c 切一；
+        // compat §3 calls 族行 + §5 块）：材料供给面非协议上行，不落调度日志；
+        // 凭据/呈现字节零日志零落盘（relay-api-v2 §5 纪律）。参数闸 fail-
+        // closed -32603（rootKey 标准 base64 解码后恰 16/21B，RingRTC
+        // CallLinkRootKey 两版本定长）；未注册账号 -32603；服务器/zkgroup 面
+        // -1 CALL_CREDENTIALS_FAILED（data.status? 诚实透传）；网络面 -1
+        // CALL_CREDENTIALS_UNAVAILABLE；fake 形状桩（非有效 zk 材料）。
+        "calls.linkPresentation" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let root_key = params
+                .get("rootKey")
+                .and_then(Value::as_str)
+                .and_then(crate::service::call_links::decode_root_key);
+            let (Some(account), Some(root_key)) = (account, root_key) else {
+                return internal_error(id);
+            };
+            match service.call_link_presentation(account, &root_key).await {
+                Ok(presentation) => jsonrpc::success_response(
+                    id,
+                    json!({ "presentation": calls_b64(&presentation) }),
+                ),
+                Err(error) => call_credential_error(id, &error),
+            }
+        }
+        // calls.createLinkAuth（同批）：roomId = 标准 base64 解码后恰 32B
+        //（RingRTC derive_room_id HKDF-SHA256 固定输出）；单次 RPC 内两段式
+        //（create-auth POST → 兑换 → 呈现 + publicParams 双字节出）。
+        "calls.createLinkAuth" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let root_key = params
+                .get("rootKey")
+                .and_then(Value::as_str)
+                .and_then(crate::service::call_links::decode_root_key);
+            let room_id = params
+                .get("roomId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::call_links::decode_room_id);
+            let (Some(account), Some(root_key), Some(room_id)) = (account, root_key, room_id)
+            else {
+                return internal_error(id);
+            };
+            match service.create_link_auth(account, &root_key, &room_id).await {
+                Ok((presentation, public_params)) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "presentation": calls_b64(&presentation),
+                        "callLinkPublicParams": calls_b64(&public_params),
+                    }),
+                ),
+                Err(error) => call_credential_error(id, &error),
+            }
+        }
+        // calls.groupProof（同批）：groupId 32B master key 闸与 terminateGroup
+        // 同款；proof = ExternalGroupCredential.token 字符串原样透出。
+        "calls.groupProof" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let (Some(account), Some(master_key)) = (account, master_key) else {
+                return internal_error(id);
+            };
+            match service.call_group_proof(account, master_key).await {
+                Ok(proof) => jsonrpc::success_response(id, json!({ "proof": proof })),
+                Err(error) => call_credential_error(id, &error),
+            }
+        }
+        // calls.groupMembers（同批）：群成员 UuidCiphertext 材料清单（服务器
+        // 群态成员序）；fake 空清单形状桩。
+        "calls.groupMembers" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let (Some(account), Some(master_key)) = (account, master_key) else {
+                return internal_error(id);
+            };
+            match service.call_group_members(account, master_key).await {
+                Ok(members) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "members": members
+                            .iter()
+                            .map(|member| json!({
+                                "uuid": member.uuid,
+                                "userIdCipherText": calls_b64(&member.user_id_cipher_text),
+                            }))
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                Err(error) => call_credential_error(id, &error),
+            }
+        }
+        // calls.endorsementsPublicKey（同批）：常量派生面，无 account
+        //（getStickerPackManifest 匿名面同纪律）；不触网，fake 同码路真实答。
+        "calls.endorsementsPublicKey" => jsonrpc::success_response(
+            id,
+            json!({ "endorsementPublicKey": calls_b64(&service.endorsements_public_key()) }),
+        ),
         // storage.write（P0，KT 扩展方法）：通用批量 manifest item 写
         //（compat §3 storage.write 行 + §5「storage 写面 P0」块）。mutating
         // 语义不落调度日志（storage 状态面纪律）；参数闸 fail-closed
@@ -2271,6 +2372,40 @@ fn parse_record_batch(
 
 fn internal_error(id: &Value) -> Value {
     jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
+}
+
+/// calls.* 材料字节 → 标准 base64（凭据/presentation 字节面统一编码点；
+/// 字节内容零日志零落盘纪律不变，此处只编码出 RPC 响应）。
+fn calls_b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// calls.* 凭据材料面错误折叠（compat §3 calls 族行同表，P4c 切一）：
+/// UnknownAccount/UnknownGroup → -32603（细节不外泄）；Failed → `-1` +
+/// `CALL_CREDENTIALS_FAILED` + data.status 服务器状态码诚实透传；
+/// Unavailable → `-1` + `CALL_CREDENTIALS_UNAVAILABLE`（retryable 语义）。
+fn call_credential_error(
+    id: &Value,
+    error: &crate::service::call_links::CallCredentialError,
+) -> Value {
+    use crate::service::call_links::CallCredentialError as Error;
+    match error {
+        Error::UnknownAccount | Error::UnknownGroup => internal_error(id),
+        Error::Failed { status } => {
+            let mut data = serde_json::Map::new();
+            if let Some(status) = status {
+                data.insert("status".to_owned(), json!(status));
+            }
+            jsonrpc::error_response(
+                id,
+                &jsonrpc::RpcError::with_data(-1, "CALL_CREDENTIALS_FAILED", Value::Object(data)),
+            )
+        }
+        Error::Unavailable => {
+            jsonrpc::error_response(id, &RpcError::new(-1, "CALL_CREDENTIALS_UNAVAILABLE"))
+        }
+    }
 }
 
 /// 用户名写面错误 → JSON-RPC 错误码：参数面（语法闸/hash 失配）-32603；

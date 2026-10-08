@@ -47,10 +47,8 @@ use std::collections::HashSet;
 use presage::libsignal_service::configuration::Endpoint;
 use presage::libsignal_service::groups_v2::{decrypt_group, GroupOperations};
 use presage::libsignal_service::prelude::PushService;
-use presage::libsignal_service::protocol::{Aci, Pni};
 use presage::libsignal_service::push_service::HttpAuthOverride;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
-use presage::libsignal_service::zkgroup::Timestamp;
 use prost::Message;
 
 use super::storage_sync::StorageSyncError;
@@ -116,111 +114,23 @@ impl Default for TerminatedGroups {
     }
 }
 
-/// 群证书兑换窗口（官方 current_days_seconds 同语义）：今天 UTC 零点起的
-/// epoch 秒与 +7 天；按天整除换算（UTC 日界即 86400 整除，无历法面）。
-fn redemption_window(now_epoch_secs: u64) -> (u64, u64) {
-    let day = now_epoch_secs / 86_400;
-    (day * 86_400, (day + 7) * 86_400)
-}
-
-/// 群凭据响应（官方 CredentialResponse camelCase 同形状）。
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GroupCredentialsResponse {
-    credentials: Vec<TemporalCredential>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TemporalCredential {
-    credential: String,
-    redemption_time: u64,
-}
-
-/// 群凭据派生（官方 get_authorization_for_today 同语义链）：本机凭据 GET
-/// 群证书 → 当天条目 → zkgroup receive + present → HttpAuth{username =
-/// GroupPublicParams hex（bincode），password = presentation hex}。群凭据
-/// 不入日志（字段不进任何投影/日志）。
+/// 群凭据派生（官方 get_authorization_for_today 同语义链）：双族凭据缓存
+/// 供给（call_links::group_authorization：ensure_credentials 按需补拉，官方
+/// getDatesForRequest 窗口逐字对位 today→+6d——旧实现 today→+7d 请求窗偏差
+/// 随 P4c 切一修正并记档 compat §5；端点参数对位官方 legacy 族形状
+/// zkcCredential=true 一次拉双族，`v101=true` 为 libsignal ≥0.101 Standard
+/// 族开关不移植）→ 当日 legacy 条目 present → HttpAuth{
+/// username = GroupPublicParams hex（bincode），password = presentation hex}。
+/// 群凭据不入日志（字段不进任何投影/日志）。
 async fn group_authorization(
     context: &StorageContext,
     master_key: &[u8],
 ) -> Result<presage::libsignal_service::push_service::HttpAuth, TerminateError> {
-    use base64::Engine as _;
-
     let key: [u8; 32] = master_key
         .try_into()
         .map_err(|_| TerminateError::UnknownGroup)?;
     let group_secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
-
-    let (today, today_plus_7_days) = redemption_window(now_epoch_secs());
-    let path = format!(
-        "/v1/certificate/auth/group?redemptionStartSeconds={today}&redemptionEndSeconds={today_plus_7_days}&pniAsServiceId=true"
-    );
-    let response = context
-        .push
-        .request(
-            reqwest::Method::GET,
-            Endpoint::service(path),
-            // 本机凭据 basic auth（官方 identified 通道）。
-            HttpAuthOverride::NoOverride,
-        )
-        .map_err(|_| TerminateError::Unavailable)?
-        .send()
-        .await
-        .map_err(|_| TerminateError::Unavailable)?;
-    if !(200..300).contains(&response.status().as_u16()) {
-        return Err(TerminateError::Failed {
-            status: Some(response.status().as_u16()),
-        });
-    }
-    let credentials: GroupCredentialsResponse = response
-        .json()
-        .await
-        .map_err(|_| TerminateError::Failed { status: None })?;
-    // 当天条目（服务器按兑换窗口回填，缺席 = 凭据面异常）。
-    let entry = credentials
-        .credentials
-        .iter()
-        .find(|entry| entry.redemption_time == today)
-        .ok_or(TerminateError::Failed { status: None })?;
-    let response_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&entry.credential)
-        .map_err(|_| TerminateError::Failed { status: None })?;
-    let auth_credential_response =
-        presage::libsignal_service::zkgroup::auth::AuthCredentialWithPniResponse::new(
-            &response_bytes,
-        )
-        .map_err(|_| TerminateError::Failed { status: None })?;
-
-    let server_public_params = context.zkgroup_server_public_params();
-    let service_ids = context.service_ids();
-    let auth_credential = auth_credential_response
-        .receive(
-            &server_public_params,
-            Aci::from_uuid_bytes(service_ids.aci.into_bytes()),
-            Pni::from_uuid_bytes(service_ids.pni.into_bytes()),
-            Timestamp::from_epoch_seconds(today),
-        )
-        .map_err(|_| TerminateError::Failed { status: None })?;
-
-    let mut random_bytes = [0u8; 32];
-    use rand::RngCore as _;
-    rand::rng().fill_bytes(&mut random_bytes);
-    let presentation = presage::libsignal_service::zkgroup::serialize(&auth_credential.present(
-        &server_public_params,
-        &group_secret_params,
-        random_bytes,
-    ));
-
-    Ok(presage::libsignal_service::push_service::HttpAuth {
-        // zkgroup bincode 序列化（simpleapi.rs GroupSecretParams_
-        // getPublicParams 同构，官方凭据面同款）。
-        username: super::hex_encode(
-            &bincode::serialize(&group_secret_params.get_public_params())
-                .map_err(|_| TerminateError::UnknownGroup)?,
-        ),
-        password: super::hex_encode(&presentation),
-    })
+    Ok(super::call_links::group_authorization(context, &group_secret_params).await?)
 }
 
 impl StorageContext {
@@ -233,21 +143,13 @@ impl StorageContext {
     }
 
     /// zkgroup 服务器公共参数（Production 固定，PushService 同参；官方
-    /// configuration.rs 同源常量字节，bincode 反序列化）。
+    /// configuration.rs 同源常量字节，bincode 反序列化）。实现提升为
+    /// `zkgroup_consts::legacy_server_public_params` 单一真相源（P4c 切一）。
     pub(crate) fn zkgroup_server_public_params(
         &self,
     ) -> presage::libsignal_service::zkgroup::ServerPublicParams {
-        use presage::libsignal_service::configuration::{ServiceConfiguration, SignalServers};
-        let config: ServiceConfiguration = SignalServers::Production.into();
-        config.zkgroup_server_public_params
+        super::zkgroup_consts::legacy_server_public_params()
     }
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// 群终止 change 编码（纯函数，单测钉定形状）：version = revision + 1（官方
@@ -333,9 +235,10 @@ pub(crate) async fn patch_group(
 }
 
 /// 服务器群态拉取 + 解密（群读面：`GET v1/groups/` + decrypt_group 投影
-/// terminated——presage Group 模型丢位由本函数绕行）。网络失败 → Unavailable；
-/// 服务器拒绝 → Failed{status}；解密失败 → Failed{None}。
-async fn fetch_group_state(
+/// terminated——presage Group 模型丢位由本函数绕行；P4c 切一起 calls.
+/// groupMembers 材料面复用本函数）。网络失败 → Unavailable；服务器拒绝 →
+/// Failed{status}；解密失败 → Failed{None}。
+pub(crate) async fn fetch_group_state(
     context: &StorageContext,
     master_key: &[u8],
 ) -> Result<presage::libsignal_service::groups_v2::Group, TerminateError> {
@@ -547,6 +450,7 @@ pub(crate) fn project_expiration_from_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use presage::libsignal_service::protocol::Aci;
 
     /// 官方 buildTerminateChange 同构：version = revision + 1、只有
     /// terminate_group 一个 action、source_user_id/group_id 置空（服务器
@@ -890,23 +794,6 @@ mod tests {
             )
         )
         .is_none());
-    }
-
-    /// 群证书兑换窗口（官方 current_days_seconds 同语义）：UTC 天对齐整除，
-    /// 窗口 7 天（chrono dev-dep 计算固定日期的日界，不发明魔数）。
-    #[test]
-    fn redemption_window_is_day_aligned_seven_days() {
-        // 2026-10-06T12:00:00Z 当天中段时刻。
-        let noon = chrono::DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
-            .expect("parses")
-            .timestamp() as u64;
-        let (start, end) = redemption_window(noon);
-        assert_eq!(start % 86_400, 0, "日界零点对齐");
-        assert_eq!(end - start, 7 * 86_400, "窗口 7 天");
-        assert_eq!(noon / 86_400, start / 86_400, "当天中段归当天零点");
-        // 整零点入参同样对齐本天。
-        let (start2, _) = redemption_window(start);
-        assert_eq!(start2, start);
     }
 
     /// terminated 登记表：登记/判定/未登记 false（send 面拦截的会话内通道）。
