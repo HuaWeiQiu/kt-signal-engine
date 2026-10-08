@@ -110,6 +110,12 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `usernameReserve` | `{account, username}`（全名 `nick.disc` 或裸昵称——缺 disc = 引擎生成 20 候选轮转；wire 界 38 字符 = connector `USERNAME_MAX_WIRE_CHARS` 同源镜像，帧界而非语法界，语法面归官方 usernames crate 硬语法） | `{username, usernameHash}`（username = 采纳候选全名；usernameHash = b64url 无 padding 32B，confirm 回传值） | 参数缺失/非字符串/空/超 38 `-32603`；crate 硬语法不符（单数字 disc、0 打头非恰两位、超位、非法字符）`-32603`；未注册账号 `-32603`；服务器 409（批内全占）`USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方两相写面前相——候选 + 批 hash（crate 权威原语）→ `PUT v1/accounts/username_hash/reserve` `{usernameHashes:[…]}`（URL-safe 无 padding；200 `{usernameHash}` 采纳位，官方 AccountController 同码位）；reserve 无正式副作用（不落 username，官方同语义）；fake：本地候选 + hash 桩（真实 crate 原语）不触网，不落调度日志（storage 状态面纪律） |
 | `usernameConfirm` | `{account, username, usernameHash}`（usernameHash = reserve 采纳值回传；引擎重验语法 + hash 失配 fail-closed——两相调用面被撕裂即拒） | `{username, usernameLink}`（完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；entropy 系本端新生成，仅此响应与 storage 35 字段两处落地） | 参数缺失/形状错（三参缺失·非字符串·空、语法不符、hash 失配）`-32603`；未注册账号 `-32603`；服务器 409 `USERNAME_RESERVATION_GONE`（预约过期/被占）、410 `USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`；服务器已确认而 storage 33/35 落盘失败 → STORAGE 族（诚实部分成功：服务器态已变更，调用方按 STORAGE 语义处置，getUsername/多设备 sync 收敛）（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方后相同序——`Username::proof`（ZK，随机 32B）+ `create_for_username`（新 entropy 加密负载）→ `PUT v1/accounts/username_hash/confirm` `{usernameHash, zkProof, encryptedUsername}`（200 `{usernameLinkHandle}` 重建完整链接）→ AccountRecord 33/35 storage 落盘（官方 confirm 落盘同位）；fake：本地 link 桩（随机 handle）不触网不落盘，不落调度日志 |
 | `usernameDelete` | `{account}` | `{}`（幂等：本就未设照走服务器删除 + storage 清除，无写分支成功同形状） | 参数缺失 `-32603`；未注册账号 `-32603`；413/429 `USERNAME_RATE_LIMITED`、其余服务器失败 `USERNAME_SERVER_FAILED`；storage 33/35 清除失败 STORAGE 族（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方同序 `DELETE v1/accounts/username_hash`（服务器清 hash 并连带清 link 负载）→ AccountRecord 33/35 清除读改写；fake：`{}` 桩，不落调度日志 |
+| `listIdentities` | `{account, number}`（单引用窄读：号码/ACI/PNI 形态直通本引擎 resolve 阶梯；`number` 必填——账号全量清单形态不提供，§5 安全码引擎面块） | `[{number?, uuid?, fingerprint(hex 66 字符 = 对端 identity key 33B 序列), safetyNumber(12 组×5 位空格分隔), scannableSafetyNumber?(标准 base64 = CombinedFingerprints protobuf，官方 QR tab 码内容), trustLevel("UNTRUSTED"\|"TRUSTED_UNVERIFIED"\|"TRUSTED_VERIFIED"), addedTimestamp(ms)}]`；对端 identity 未知 → `[]`（官方 SafetyNumberNotReady 态，非错误） | 参数缺失/number 非字符串/未注册账号 `-32603`；号码不可解析 → `[]`（窄读不命中 = 无 identity，非错误） | **2026-10-08 real（KT 扩展，安全码引擎面批）**：pinned signal-cli 同名动词原生面（connector §4.61 `identities.get` 上游形状逐字对齐，engine-compat）——数字串与 scannable 同源（libsignal `Fingerprint::new(version=2, iterations=5200, own_aci_binary, own_aci_key, their_sid_binary, their_key)`，官方 safetyNumber.preload.ts:34-72 同参数链，§5）；trust 态引擎自有 sidecar（`identity-trust.json`），见 trust 行与 §5 |
+| `trust` | `{account, recipient, verifiedSafetyNumber? \| state?}`（**两臂恰一**：verified 臂 = `verifiedSafetyNumber` 字符串（空格剥离后 60 位数字串/66 位 hex fingerprint/base64 scannable 三形态，官方 IdentityVerificationCode.parse 同构）；clear 臂 = `state` 词表 `"unverified"\|"default"`（官方 setUnverified/setVerifiedDefault 语义）；两臂同置/双缺/`state` 其他值 `-32603`。pinned `trustAllKnownKeys` 测试模式不实现，§5） | `{}`（pinned 同款：命令无 JSON 输出） | verified 臂数字/指纹/scannable 与本端计算值不符或对端 identity 未知 `-1` + `Failed to set the trust for this number, make sure the number and the fingerprint/safety number are correct.`（pinned UserError 原文位）；clear 臂对端 identity 未知同上；参数面/未注册账号 `-32603` | **2026-10-08 real（KT 扩展，安全码引擎面批）**：verified 臂 = pinned `trust {verifiedSafetyNumber}` 原生面（connector §4.61 `identities.verify` 上游形状逐字，比对通过 → trust 态写 `verified`）；clear 臂 = 官方「将标记为已验证清除」补臂（KT 扩展，desktop `toggleVerified` 无 pinned 投影面的引擎侧闭合）——`unverified` → TrustLevel UNTRUSTED、`default` → TRUSTED_UNVERIFIED，无数字闸（官方 clear 同语义）；两臂成功后 best-effort 自发 `SyncMessage.verified{destinationAciBinary, identityKey, state}`（signal-cli SyncHelper.sendVerifiedMessage 同构，同步失败不回滚 store 写）；fake：成功 `{}`，不落调度日志 |
+| `chatFolders.list` | `{account}` | `{folders: [ChatFolderRecordJson...]}`（存储序 = manifest CHAT_FOLDER=8 identifiers 首现序；坏条目跳过不炸面；形状见 §5 Storage 记录面块） | 未注册账号 `-32603`；storage 链路 `STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，Storage 跨设备同步批）**：Storage Service manifest → 全部 type=8 identifier 批量原样读 → 官方 vendored proto 解码 → ChatFolderRecord JSON 投影（键名对齐官方 fromChatFolderRecord 输出面，recipients 投影 `{conversationId, kind}` 会话引用对象，§5）；无 master key 或 manifest 404 → `{folders: []}`；fake：恒 `{folders: []}`，不落调度日志（读面纪律） |
+| `chatFolders.setRecords` | `{account, records?: [ChatFolderRecordJson...], removeIds?: [uuid 字符串...]}`（**两参至少一非空**；record 形状 `{id(uuid), name, position(u32), showOnlyUnread, showMutedChats, includeAllIndividualChats, includeAllGroupChats, folderType("UNKNOWN"\|"ALL"\|"CUSTOM"), includedConversationIds?/excludedConversationIds?: [{conversationId, kind: contact\|group\|legacyGroup}...], deletedAtTimestampMs?(u64, 非 0 = 墓碑)}`；records 逐条按 id upsert——云上同 id 定位旧 identifier 则轮换新 16B item id 换写（官方同实体更新语义），无旧 = 新插；`deletedAtTimestampMs` 非 0 = 墓碑写（官方删除语义，24h 过期清理归调用方批）；removeIds = 官方 deleteKey 语义（identifier 出 manifest + deleteKey，expired-tombstone 清理面）；与云上现存完全同值的 record 幂等跳过不轮换 key） | `{folders: [...]}`（写后全量投影，存储序 = 写后 manifest identifiers 首现序，同 chatFolders.list 形状） | 参数缺失/形状错（records 非数组·条目非对象·id 非 UUID·name 缺失·position/布尔/词表/时间戳/recipient 条目形状错、removeIds 条目非 UUID、两参双缺或全空批）`-32603`；未注册账号 `-32603`；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED` | **2026-10-08 real（KT 扩展，Storage 跨设备同步批）**：官方 upload 语义（每实体独立 record + 新 16B item id 换入/旧 key deleteKey/version+1/source_device·record_ikm 透传 + 409 响应体采纳重放 [1s,5s,30s]，storage.preload.ts toChatFolderRecord 同构）；manifest 404 首写分支同置顶面（master key 播种 + version 1 最小 AccountRecord 同批）；record 内容不落引擎本地（读写直通，connector 持久化职责，§5）；fake：成功回 `{folders: []}`，不落调度日志（storage 状态面纪律） |
+| `notificationProfiles.list` | `{account}` | `{profiles: [NotificationProfileRecordJson...]}`（存储序 = manifest NOTIFICATION_PROFILE=9 identifiers 首现序；形状见 §5） | 未注册账号 `-32603`；storage 链路同 chatFolders.list 两码 | **2026-10-08 real（KT 扩展，Storage 跨设备同步批）**：同 chatFolders.list 链路，type=9 identifier + NotificationRecord 投影（键名对齐官方 mergeNotificationProfileRecord 输出面）；fake：恒 `{profiles: []}`，不落调度日志 |
+| `notificationProfiles.setRecords` | `{account, records?: [NotificationProfileRecordJson...], removeIds?: [32 位 hex id...]}`（语义与 chatFolders.setRecords 同构：id upsert/墓碑/removeIds/幂等跳过；record 形状 `{id(32 位小写 hex), name(非空), emoji?, color(u32 0xAARRGGBB), createdAtMs(u64), allowAllCalls, allowAllMentions, allowedMembers?: [{conversationId, kind}...], scheduleEnabled, scheduleStartTime?/scheduleEndTime?(u32 0000-2359), scheduleDaysEnabled?: [1..7 整数...], deletedAtTimestampMs?}`） | `{profiles: [...]}`（写后全量，同 notificationProfiles.list 形状） | 参数面同 chatFolders.setRecords（id 非 32 位 hex、scheduleDaysEnabled 条目非 1..7 等）`-32603`；错误面同 chatFolders.setRecords 四码 | **2026-10-08 real（KT 扩展，Storage 跨设备同步批）**：官方 toNotificationProfileRecord 同构写面（emoji/color/createdAtMs/allowAllCalls/allowAllMentions/allowedMembers/schedule 族全字段）；fake：成功回 `{profiles: []}`，不落调度日志 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -320,6 +326,82 @@ P5 扩面差异（2026-10-04，贴纸包安装状态 Storage Service 同步）�
 - **v1 单通道**：不做 legacy `syncMessage.stickerPackOperation` 同步
   通道；Storage Service 是贴纸包安装状态唯一真相源，connector 侧以
   `getStickerPackSyncs`/`setStickerPackSync` 为准。
+
+安全码引擎面差异（2026-10-08，`listIdentities`/`trust` 批）：
+
+- **数字串与 scannable 同源钉定**：`Fingerprint::new(version=2,
+  iterations=5200, own_id=本机 ACI service_id_binary(16B),
+  own_key=ACI identity key, their_id=对端 ServiceId service_id_binary,
+  their_key=对端 ACI identity key)`——官方 safetyNumber.preload.ts:16-18
+  （ITERATION_COUNT=5200/SERVICE_ID_VERSION=2）与 :34-72 生成链同参数，
+  signal-cli Utils.getFingerprint（NumericFingerprintGenerator(5200)
+  .createFor(version=2, …)）同构；`display_string()` 60 位 → 12 组×5 位
+  空格分隔（signal-cli Util.formatSafetyNumber:52-67 同排版），
+  `scannable.serialize()` = CombinedFingerprints protobuf
+  （官方 QR tab `QrCode data` 即该 bytes 的 base64，scannableSafetyNumber
+  字段同官方 JsonIdentity 键）。
+- **trust 态引擎自有 sidecar**：`<账号目录>/identity-trust.json`
+  （`{identities: {"<service id 串>": {state, addedAtMs, changedAtMs}}}`，
+  临时文件+rename 原子替换，storage-manifest-state.json 先例同构）。
+  presage store 无 trust 级别与 identity 时间戳位（OnNewIdentity::Trust
+  自动信任），因此：默认 trustLevel = `TRUSTED_UNVERIFIED`（入库即信任）；
+  `addedTimestamp` = 引擎首次投影到该 identity 的时刻（**非入库时刻**，
+  与 signal-cli dateAddedTimestamp 语义偏差如实登记——store 无历史可考，
+  首读建档）。trust 写面只动 sidecar（协议层 presage OnNewIdentity::Trust
+  语义不变），verified 臂以数字/scannable 比对为闸（signal-cli
+  IdentityHelper.trustIdentityVerifiedSafetyNumber 同构：比对不过不落
+  TRUSTED_VERIFIED）。
+- **trust 写面收窄**：pinned `trustAllKnownKeys` 测试模式不实现（connector
+  §4.61 从不发送，fail-closed）；`state` 臂无数字闸（官方 clear 语义）；
+  clear 臂对端 identity 未知同样报错（官方桌面 setVerified(DEFAULT) 对
+  未知 identity 亦可落，引擎要求 identity 已知——SafetyNumberNotReady 态
+  无可清除对象）。
+- **verified 同步面 best-effort**：trust 落 sidecar 后自发
+  `SyncMessage.verified{destinationAciBinary(16B), identityKey(对端 key
+  33B), state(VERIFIED=1/UNVERIFIED=2/DEFAULT=0)}`（signal-cli
+  SyncHelper.sendVerifiedMessage:254-264 同构；桌面 sendVerifySyncMessage
+  同语义）。同步发送失败不回滚、不报错（signal-cli trustIdentity 对
+  sendVerifiedMessage 返回值不消费——store 写为权威突变，多设备收敛由
+  下次 listIdentities 读面兜底）。
+- **receive 侧**：`syncMessage.verified` 下行投影本批不做（多设备信任态
+  下行收敛另行立项；读面 listIdentities 恒以引擎 sidecar 为准）。
+
+Storage 跨设备同步批差异（2026-10-08，chatFolders/notificationProfiles 记录面）：
+
+- **记录 proto = 官方 vendored 完整字段面**（`crate::proto::storage`
+  ChatFolderRecord/NotificationProfile）：钉定 presage rev 的
+  StorageService.proto 虽已有 CHAT_FOLDER=8/NOTIFICATION_PROFILE=9 臂，
+  载荷读写仍走 vendored proto + 本模块 item 加解密 shim（Account/贴纸/
+  拉黑面同一通道，字段保真铁面口径不变）。
+- **每实体独立 record**：官方 upload 语义 = 每个文件夹/档案一条独立
+  StorageRecord + 独立 manifest identifier（非全量混排单记录）；写面按
+  record id 定位云上同实体旧 identifier → 新 16B item id 换写（旧 key
+  进 deleteKey，官方同实体更新语义），无旧 = 新插。
+- **删除 = 墓碑 record**：`deletedAtTimestampMs` 非 0 即删除态（官方
+  markChatFolderDeleted 同语义：24h 窗口内墓碑照常上传，过期才由
+  chatFolderCleanupService 从 manifest 移除）；引擎 `removeIds` 参数提供
+  官方 deleteKey 面（identifier 出 manifest + deleteKey），过期清理由
+  调用方（connector/桌面清理作业）驱动，引擎无后台作业。
+- **recipients 投影口径**：record 内 Recipient 三形态与引擎会话引用双射
+  ——值形状复用引擎既有会话引用对象 `{conversationId, kind}`（§4.33 拉黑
+  面同款 taxonomy；键名仍对齐官方 includedConversationIds/
+  excludedConversationIds/allowedMembers）：contact{serviceIdBinary 16B
+  优先/serviceId 字符串} ↔ `{kind:"contact", id=ACI/PNI service id 串}`、
+  groupMasterKey ↔ `{kind:"group", id=master key 标准 base64}`、
+  legacyGroupId ↔ `{kind:"legacyGroup", id=原字节文本}`；e164-only
+  contact 条目非引擎会话标识口径，读面跳过该条目（宁缺勿错），写面
+  conversationId 解析不出对应形态整拒 `-32603`。
+- **record 内容不落引擎**：ChatFolder/NotificationProfile 是账号设置面
+  （非聊天内容），但引擎保持读写直通——读面每次 manifest+items 现读，
+  写面只写 storage service，引擎本地零缓存零持久化（AGENTS 引擎内容
+  纪律的保守面；桌面/connector 持久化职责）。唯一本地文件是既有
+  storage-manifest-state.json（best-effort 排查面，本批不扩字段）。
+- **幂等与字段保真**：与云上现存同值的 record 跳过不轮换 item id
+  （decode→re-encode 结构全等判据；整批全跳过 = 无 PUT 不 bump version，
+  重放安全）；record 变更 = 以调用方 JSON 重建整条 record（官方
+  toChatFolderRecord 同构全量写）——云端比本仓 vendored proto 更新的
+  未知字段在变更写时丢弃（官方桌面以 $unknown 字节往返保真，引擎以
+  vendored 官方现行 proto 为界，与 Account 面同姿态如实登记）。
 
 阅后即焚扩面差异（2026-10-04，官方 view-once 对齐 E1-E4）：
 

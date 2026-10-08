@@ -2641,3 +2641,187 @@ fn username_write_faces_fake_shapes_and_param_fail_closed() {
         );
     }
 }
+
+/// 安全码 + Storage 记录面六方法（安全码引擎面批 / Storage 跨设备同步批）：
+/// fake 模式形状与参数 fail-closed 契约钉（-32603；storage 四码只覆盖链路，
+/// 参数错误不占用——参数闸在引擎侧，fake 模式同样生效）。
+#[test]
+fn identities_trust_and_storage_records_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("identity-records-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 读：listIdentities 空表（SafetyNumberNotReady 非错误口径）；
+    // chatFolders/notificationProfiles 空列表成功面。
+    assert_eq!(
+        engine.request(
+            "listIdentities",
+            json!({ "account": "+15550000000", "number": "+15551234567" })
+        )["result"],
+        json!([])
+    );
+    assert_eq!(
+        engine.request("chatFolders.list", json!({ "account": "+15550000000" }))["result"],
+        json!({ "folders": [] })
+    );
+    assert_eq!(
+        engine.request(
+            "notificationProfiles.list",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({ "profiles": [] })
+    );
+
+    // fake 写：合法批成功回写后全量（空）；trust 成功 {}（pinned 同款
+    // 命令无 JSON 输出投影）。
+    assert_eq!(
+        engine.request(
+            "chatFolders.setRecords",
+            json!({
+                "account": "+15550000000",
+                "records": [{
+                    "id": "11111111-2222-4333-8444-555555555555",
+                    "name": "工作",
+                    "position": 0,
+                    "showOnlyUnread": false,
+                    "showMutedChats": false,
+                    "includeAllIndividualChats": true,
+                    "includeAllGroupChats": false,
+                    "folderType": "CUSTOM",
+                }],
+            }),
+        )["result"],
+        json!({ "folders": [] })
+    );
+    assert_eq!(
+        engine.request(
+            "notificationProfiles.setRecords",
+            json!({
+                "account": "+15550000000",
+                "records": [{
+                    "id": "0123456789abcdef0123456789abcdef",
+                    "name": "睡眠",
+                    "color": 0,
+                    "createdAtMs": 0,
+                    "allowAllCalls": false,
+                    "allowAllMentions": false,
+                    "scheduleEnabled": false,
+                }],
+                "removeIds": ["fedcba9876543210fedcba9876543210"],
+            }),
+        )["result"],
+        json!({ "profiles": [] })
+    );
+    assert_eq!(
+        engine.request(
+            "trust",
+            json!({ "account": "+15550000000", "recipient": "+15551234567", "state": "default" }),
+        )["result"],
+        json!({})
+    );
+
+    // ---- 参数面 fail-closed（fake 模式同闸）----
+
+    // listIdentities：account/number 缺失、number 非字符串。
+    for params in [
+        json!({}),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "number": 7 }),
+    ] {
+        let (code, _) = engine.error_of("listIdentities", params);
+        assert_eq!(code, -32603, "listIdentities params gate");
+    }
+
+    // trust：双臂同置/双缺、state 词表外、recipient 缺失。
+    for params in [
+        json!({ "account": "+15550000000", "recipient": "+15551234567" }),
+        json!({
+            "account": "+15550000000",
+            "recipient": "+15551234567",
+            "verifiedSafetyNumber": "012345678901234567890123456789012345678901234567890123456789",
+            "state": "default",
+        }),
+        json!({
+            "account": "+15550000000",
+            "recipient": "+15551234567",
+            "state": "bogus",
+        }),
+        json!({ "account": "+15550000000", "verifiedSafetyNumber": "x" }),
+    ] {
+        let (code, _) = engine.error_of("trust", params);
+        assert_eq!(code, -32603, "trust params gate");
+    }
+
+    // setRecords 共闸：account 缺失、两参双缺、全空批、records 非数组、
+    // 条目非对象、id 坏、重复 id、records∩removeIds 交集、removeIds 非 id。
+    let valid_folder = json!({
+        "id": "11111111-2222-4333-8444-555555555555",
+        "name": "工作",
+        "position": 0,
+        "showOnlyUnread": false,
+        "showMutedChats": false,
+        "includeAllIndividualChats": true,
+        "includeAllGroupChats": false,
+        "folderType": "CUSTOM",
+    });
+    for params in [
+        json!({ "records": [valid_folder.clone()] }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "records": [], "removeIds": [] }),
+        json!({ "account": "+15550000000", "records": "nope" }),
+        json!({ "account": "+15550000000", "records": [7] }),
+        json!({
+            "account": "+15550000000",
+            "records": [{ "id": "not-a-uuid", "name": "x", "position": 0,
+                "showOnlyUnread": false, "showMutedChats": false,
+                "includeAllIndividualChats": false, "includeAllGroupChats": false,
+                "folderType": "ALL" }],
+        }),
+        json!({
+            "account": "+15550000000",
+            "records": [valid_folder.clone(), valid_folder.clone()],
+        }),
+        json!({
+            "account": "+15550000000",
+            "records": [valid_folder.clone()],
+            "removeIds": ["11111111-2222-4333-8444-555555555555"],
+        }),
+        json!({
+            "account": "+15550000000",
+            "removeIds": ["not-a-uuid"],
+        }),
+    ] {
+        let (code, _) = engine.error_of("chatFolders.setRecords", params);
+        assert_eq!(code, -32603, "chatFolders.setRecords params gate");
+    }
+
+    // profile 面特有闸：id 非 32 位小写 hex、name 空串、scheduleDaysEnabled
+    // 超 1..=7。
+    let profile_base = json!({
+        "id": "0123456789abcdef0123456789abcdef",
+        "name": "睡眠",
+        "color": 0,
+        "createdAtMs": 0,
+        "allowAllCalls": false,
+        "allowAllMentions": false,
+        "scheduleEnabled": false,
+    });
+    let mut bad_hex = profile_base.clone();
+    bad_hex["id"] = json!("0123456789ABCDEF0123456789ABCDEF");
+    let mut empty_name = profile_base.clone();
+    empty_name["name"] = json!("");
+    let mut bad_day = profile_base.clone();
+    bad_day["scheduleDaysEnabled"] = json!([1, 8]);
+    for record in [bad_hex, empty_name, bad_day] {
+        let (code, _) = engine.error_of(
+            "notificationProfiles.setRecords",
+            json!({ "account": "+15550000000", "records": [record] }),
+        );
+        assert_eq!(code, -32603, "notificationProfiles.setRecords params gate");
+    }
+
+    // list 读面参数闸同款。
+    let (code, _) = engine.error_of("chatFolders.list", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("notificationProfiles.list", json!({}));
+    assert_eq!(code, -32603);
+}

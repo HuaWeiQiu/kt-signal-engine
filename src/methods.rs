@@ -1115,6 +1115,124 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 安全码引擎面（KT 扩展方法，pinned signal-cli 同名动词原生面，
+        // connector 契约 1.68 §4.61 上游形状逐字对位）：单引用窄读 +
+        // 三形态比对闸写面。参数 fail-closed -32603；-1 两码原文位
+        // （TrustCommand.java UserErrorException 逐字）见 identity.rs 常量。
+        "listIdentities" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            // number 必填（账号全量清单形态不提供，compat §3 行）。
+            let Some(number) = params.get("number").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service
+                .list_identities(account, number, Some(number.to_string()))
+                .await
+            {
+                Ok(identities) => jsonrpc::success_response(id, Value::Array(identities)),
+                Err(()) => internal_error(id),
+            }
+        }
+        "trust" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(recipient) = params.get("recipient").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            // 两臂恰一：verifiedSafetyNumber（三形态码比对闸）|
+            // state（clear 词表，无数字闸）。
+            let verified = params.get("verifiedSafetyNumber").and_then(Value::as_str);
+            let state = params.get("state").and_then(Value::as_str);
+            use crate::service::identity::{TrustIntent, TrustState};
+            let intent = match (verified, state) {
+                (Some(code), None) => TrustIntent::Verified {
+                    code: code.to_string(),
+                },
+                (None, Some("unverified")) => TrustIntent::SetState(TrustState::Unverified),
+                (None, Some("default")) => TrustIntent::SetState(TrustState::Default),
+                // 同置/双缺/state 词表外 fail-closed。
+                _ => return internal_error(id),
+            };
+            use crate::service::identity::TrustError;
+            match service.trust_identity(account, recipient, intent).await {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                Err(TrustError::Failed) => jsonrpc::error_response(
+                    id,
+                    &RpcError::new(-1, crate::service::identity::TRUST_FAILED_MESSAGE),
+                ),
+                Err(TrustError::InvalidCode) => jsonrpc::error_response(
+                    id,
+                    &RpcError::new(-1, crate::service::identity::TRUST_INVALID_CODE_MESSAGE),
+                ),
+                // 账号未注册 / sidecar 本地写失败：引擎通用内部错误。
+                Err(TrustError::UnknownAccount) | Err(TrustError::Io) => internal_error(id),
+            }
+        }
+        // Storage 跨设备同步批（KT 扩展方法；官方 chatFolder/
+        // notificationProfile 记录面 upload 语义，compat §3 行 + §5 块）：
+        // 参数 fail-closed -32603；storage 链路四码折叠 storage_error。
+        "chatFolders.list" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.chat_folders(account).await {
+                Ok(folders) => jsonrpc::success_response(id, json!({ "folders": folders })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "chatFolders.setRecords" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            use crate::service::storage_records;
+            let Some((records, remove_ids)) = parse_record_batch(
+                params,
+                storage_records::parse_folder,
+                storage_records::uuid_bytes,
+            ) else {
+                return internal_error(id);
+            };
+            match service.set_chat_folders(account, records, remove_ids).await {
+                Ok(folders) => jsonrpc::success_response(id, json!({ "folders": folders })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "notificationProfiles.list" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.notification_profiles(account).await {
+                Ok(profiles) => jsonrpc::success_response(id, json!({ "profiles": profiles })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "notificationProfiles.setRecords" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            use crate::service::storage_records;
+            let Some((records, remove_ids)) = parse_record_batch(
+                params,
+                storage_records::parse_profile,
+                storage_records::hex_id_bytes,
+            ) else {
+                return internal_error(id);
+            };
+            match service
+                .set_notification_profiles(account, records, remove_ids)
+                .await
+            {
+                Ok(profiles) => jsonrpc::success_response(id, json!({ "profiles": profiles })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 账号级设置（官方 updateConfiguration 等价，Storage Service 真相源，
         // 带 account 参数，风格对齐置顶/贴纸面）：只写提供的字段；形状错
         // fail-closed -32603（置顶面参数处理先例，不占用结构化码）。
@@ -1894,6 +2012,52 @@ fn has_image_or_video_mediatype(data_uri: &str) -> bool {
         .strip_prefix("data:")
         .and_then(|rest| rest.split(';').next())
         .is_some_and(|mediatype| mediatype.starts_with("image/") || mediatype.starts_with("video/"))
+}
+
+/// records/removeIds 双参批解析（chatFolders/notificationProfiles
+/// setRecords 共用，compat §3 两行错误面）：records 条目逐条过 parse 闸；
+/// removeIds 条目过 id 闸（folder=uuid 串 / profile=32 位小写 hex 串，
+/// 16B 实体 id 统一形态）；两参同缺或全空批 fail-closed；records 内重复
+/// id / records∩removeIds 交集冲突 fail-closed。任一形状错 → None →
+/// 调用方 -32603。
+fn parse_record_batch(
+    params: &serde_json::Map<String, Value>,
+    parse: fn(&Value) -> Option<crate::service::storage_records::RecordValue>,
+    parse_id: fn(&Value) -> Option<Vec<u8>>,
+) -> Option<(
+    Vec<crate::service::storage_records::RecordValue>,
+    Vec<Vec<u8>>,
+)> {
+    let records = match params.get("records") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items.iter().map(parse).collect::<Option<Vec<_>>>()?,
+        Some(_) => return None,
+    };
+    let remove_ids = match params.get("removeIds") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items.iter().map(parse_id).collect::<Option<Vec<_>>>()?,
+        Some(_) => return None,
+    };
+    // 两参至少一非空。
+    if records.is_empty() && remove_ids.is_empty() {
+        return None;
+    }
+    // 同批重复 id fail-closed。
+    let mut seen = std::collections::HashSet::new();
+    for record in &records {
+        if !seen.insert(record.entity_id().to_vec()) {
+            return None;
+        }
+    }
+    // records∩removeIds 交集冲突 fail-closed。
+    if records.iter().any(|record| {
+        remove_ids
+            .iter()
+            .any(|id| id.as_slice() == record.entity_id())
+    }) {
+        return None;
+    }
+    Some((records, remove_ids))
 }
 
 fn internal_error(id: &Value) -> Value {

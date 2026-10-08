@@ -43,10 +43,12 @@ use crate::state::EngineState;
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod groups;
+pub(crate) mod identity;
 pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
+pub(crate) mod storage_records;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 pub(crate) mod storage_write;
@@ -1794,6 +1796,160 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
+    }
+
+    /// listIdentities（安全码引擎面批，KT 扩展方法）：单引用窄读——号码/
+    /// ACI/PNI 形态直通 resolve 阶梯 → 对端 identity + 本机 identity 双方
+    /// 指纹（Fingerprint v2/5200）→ 数字串（12 组排版）+ scannable
+    /// （CombinedFingerprints base64）投影；trust 态读 identity-trust.json
+    /// sidecar（首读建档，compat §5）。对端 identity 未知 → 空表
+    /// （SafetyNumberNotReady 态非错误）；窄读不命中 → 空表。Err = 账号
+    /// 不指向已链接账号（-32603）。fake 模式空表桩。
+    pub(crate) async fn list_identities(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        number: Option<String>,
+    ) -> Result<Vec<serde_json::Value>, ()> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let (manager, account_dir) = open_registered_with_dir(self, account).await.ok_or(())?;
+        let Some(peer) = resolve_recipient(&manager, recipient).await else {
+            return Ok(Vec::new());
+        };
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        Ok(identity::identity_records(
+            &manager.store().aci_protocol_store(),
+            &own_aci,
+            peer,
+            number.as_deref(),
+            &account_dir,
+            now_ms(),
+        )
+        .await)
+    }
+
+    /// trust（安全码引擎面批，KT 扩展方法）：verified 臂三形态比对闸
+    /// （60 位数字/66 位 hex/base64 scannable）+ clear 臂（无数字闸）；
+    /// 落 identity-trust.json sidecar 后 best-effort 自发
+    /// SyncMessage.verified（Content oneof verified=7，signal-cli
+    /// sendVerifiedMessage 同构）——同步失败不回滚不报错，sidecar 写为
+    /// 权威突变（compat §5）。fake 模式成功桩。
+    pub(crate) async fn trust_identity(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        intent: identity::TrustIntent,
+    ) -> Result<(), identity::TrustError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (mut manager, account_dir) = open_registered_with_dir(self, account)
+            .await
+            .ok_or(identity::TrustError::UnknownAccount)?;
+        let Some(peer) = resolve_recipient(&manager, recipient).await else {
+            return Err(identity::TrustError::Failed);
+        };
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        let outcome = identity::write_trust(
+            &manager.store().aci_protocol_store(),
+            &own_aci,
+            peer,
+            &intent,
+            &account_dir,
+            now_ms(),
+        )
+        .await?;
+        let verified = presage::proto::Verified {
+            destination_aci_binary: Some(peer.service_id_binary()),
+            identity_key: Some(outcome.peer_key),
+            state: Some(outcome.state.sync_state() as i32),
+            ..Default::default()
+        };
+        let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+            content: Some(presage::proto::sync_message::Content::Verified(verified)),
+            ..Default::default()
+        });
+        let _ = manager.send_message(own_aci, body, now_ms()).await;
+        Ok(())
+    }
+
+    /// chatFolders.list（Storage 跨设备同步批）：ChatFolder 记录读投影
+    /// （存储序；坏条目跳过；读写直通不落引擎本地，compat §5）。
+    pub(crate) async fn chat_folders(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::read_records(&context, storage_sync::StorageRecordKind::ChatFolder).await
+    }
+
+    /// chatFolders.setRecords（Storage 跨设备同步批）：官方 upload 语义
+    /// 写面（每实体独立 record + 16B item id 换写 + 409 采纳重放 + 首写
+    /// 播种 Account）；返回写后全量投影（存储序）。
+    pub(crate) async fn set_chat_folders(
+        self: &Arc<Self>,
+        account: &str,
+        records: Vec<storage_records::RecordValue>,
+        remove_ids: Vec<Vec<u8>>,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::write_records(
+            &context,
+            storage_sync::StorageRecordKind::ChatFolder,
+            records,
+            remove_ids,
+        )
+        .await
+    }
+
+    /// notificationProfiles.list（Storage 跨设备同步批）：同 chatFolders
+    /// 读面，type=9。
+    pub(crate) async fn notification_profiles(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::read_records(
+            &context,
+            storage_sync::StorageRecordKind::NotificationProfile,
+        )
+        .await
+    }
+
+    /// notificationProfiles.setRecords（Storage 跨设备同步批）：同
+    /// chatFolders 写面，type=9。
+    pub(crate) async fn set_notification_profiles(
+        self: &Arc<Self>,
+        account: &str,
+        records: Vec<storage_records::RecordValue>,
+        remove_ids: Vec<Vec<u8>>,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::write_records(
+            &context,
+            storage_sync::StorageRecordKind::NotificationProfile,
+            records,
+            remove_ids,
+        )
+        .await
     }
 
     /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：
@@ -4113,14 +4269,24 @@ async fn open_registered(
     service: &Arc<Service>,
     account: &str,
 ) -> Option<Manager<SqliteStore, Registered>> {
-    let rel = {
+    open_registered_with_dir(service, account)
+        .await
+        .map(|(manager, _)| manager)
+}
+
+/// 注册管理器 + 账号目录（安全码 trust sidecar 等账号目录伴生文件所需）。
+pub(crate) async fn open_registered_with_dir(
+    service: &Arc<Service>,
+    account: &str,
+) -> Option<(Manager<SqliteStore, Registered>, std::path::PathBuf)> {
+    let dir = {
         let state = service.state.lock().await;
-        state
-            .account_dir(account)
-            .map(|rel| service.data_dir.join(rel))?
+        let rel = state.account_dir(account)?;
+        service.data_dir.join(rel)
     };
-    let store = open_store(&rel).await.ok()?;
-    Manager::load_registered(store).await.ok()
+    let store = open_store(&dir).await.ok()?;
+    let manager = Manager::load_registered(store).await.ok()?;
+    Some((manager, dir))
 }
 
 /// 收件人 → ServiceId：号码与 UUID 双形态都收（对齐 signal-cli 公开 JSON-RPC

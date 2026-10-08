@@ -363,7 +363,7 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
 }
 
 /// 写面记录类别（manifest identifier type：Account=4、StickerPack=6、
-/// Contact=1、GroupV1=2、GroupV2=3）。
+/// Contact=1、GroupV1=2、GroupV2=3、ChatFolder=8、NotificationProfile=9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageRecordKind {
     Account,
@@ -371,6 +371,8 @@ pub(crate) enum StorageRecordKind {
     Contact,
     GroupV1,
     GroupV2,
+    ChatFolder,
+    NotificationProfile,
 }
 
 impl StorageRecordKind {
@@ -384,6 +386,10 @@ impl StorageRecordKind {
             Self::Contact => manifest_record::identifier::Type::Contact as i32,
             Self::GroupV1 => manifest_record::identifier::Type::Groupv1 as i32,
             Self::GroupV2 => manifest_record::identifier::Type::Groupv2 as i32,
+            Self::ChatFolder => manifest_record::identifier::Type::ChatFolder as i32,
+            Self::NotificationProfile => {
+                manifest_record::identifier::Type::NotificationProfile as i32
+            }
         }
     }
 }
@@ -392,11 +398,13 @@ impl StorageRecordKind {
 /// 输入形状）：新 16B item id 换入 identifiers，`replaced_key`（同类型同
 /// 实体的旧 identifier raw）进 deleteKey。Account 恒单条：有旧 manifest
 /// 时调用方传其 Account key；StickerPack 按 packId 定位旧 key。
+/// `payload: None` = 纯删除（官方 deleteKey 语义：identifier 出 manifest +
+/// deleteKey，无新 item——expired-tombstone 清理面；new_key 恒空向量）。
 pub(crate) struct RecordUpsert {
     pub(crate) kind: StorageRecordKind,
     pub(crate) new_key: Vec<u8>,
     pub(crate) replaced_key: Option<Vec<u8>>,
-    pub(crate) payload: RecordPayload,
+    pub(crate) payload: Option<RecordPayload>,
 }
 
 // 瞬态写计划值：构造即编码、不批量持有，变体尺寸差不值得 Box 化波及全部构造点。
@@ -409,6 +417,10 @@ pub(crate) enum RecordPayload {
     Contact(storage_proto::ContactRecord),
     GroupV1(storage_proto::GroupV1Record),
     GroupV2(storage_proto::GroupV2Record),
+    /// 聊天文件夹/通知档案记录面（官方 vendored proto 完整字段面；
+    /// 每实体独立 record + identifier，Storage 跨设备同步批）。
+    ChatFolder(storage_proto::ChatFolderRecord),
+    NotificationProfile(storage_proto::NotificationProfile),
 }
 
 /// plan_record_writes 的产出：WriteOperation + 明文 manifest（调用方投影
@@ -452,12 +464,15 @@ pub(crate) fn plan_record_writes(
                     identifier.r#type() != manifest_record::identifier::Type::Account
                 });
             }
-            // 多条并存类别（贴纸包/联系人/GV1/GV2）：仅清除 replaced_key
-            // 对应标识（同类型同实体的旧 identifier 进 deleteKey）。
+            // 多条并存类别（贴纸包/联系人/GV1/GV2/聊天文件夹/通知档案）：
+            // 仅清除 replaced_key 对应标识（同类型同实体的旧 identifier 进
+            // deleteKey）。
             StorageRecordKind::StickerPack
             | StorageRecordKind::Contact
             | StorageRecordKind::GroupV1
-            | StorageRecordKind::GroupV2 => {
+            | StorageRecordKind::GroupV2
+            | StorageRecordKind::ChatFolder
+            | StorageRecordKind::NotificationProfile => {
                 if let Some(old_key) = &upsert.replaced_key {
                     identifiers.retain(|identifier| {
                         !(identifier.r#type == upsert.kind.identifier_type()
@@ -469,15 +484,22 @@ pub(crate) fn plan_record_writes(
         if let Some(old_key) = &upsert.replaced_key {
             delete_keys.push(old_key.clone());
         }
+        // payload=None = 纯删除（官方 deleteKey 语义）：identifier 出
+        // manifest + 旧 key 进 deleteKey，无新 identifier 无新 item。
+        let Some(payload) = upsert.payload.as_ref() else {
+            continue;
+        };
         identifiers.push(manifest_record::Identifier {
             raw: upsert.new_key.clone(),
             r#type: upsert.kind.identifier_type(),
         });
-        let item = match &upsert.payload {
+        let item = match payload {
             // Account 载荷用官方 vendored proto 编码（完整字段面），经本地
             // item 加解密 shim 上行（与上游 encrypt_item 派生一致，交叉
             // 验证单测钉定）；StickerPack 同 shim（上游 proto 缺该记录）；
-            // Contact/GV1/GV2 同 shim（拉黑写面，vendored 完整字段面保真）。
+            // Contact/GV1/GV2 同 shim（拉黑写面，vendored 完整字段面保真）；
+            // ChatFolder/NotificationProfile 同 shim（记录面批，vendored
+            // 完整字段面保真）。
             RecordPayload::Account(account) => encrypt_raw_item(
                 storage_key,
                 upsert.new_key.clone(),
@@ -522,6 +544,28 @@ pub(crate) fn plan_record_writes(
                 upsert.new_key.clone(),
                 &StorageRecord {
                     record: Some(storage_proto::storage_record::Record::GroupV2(
+                        record.clone(),
+                    )),
+                }
+                .encode_to_vec(),
+                record_ikm_opt,
+            ),
+            RecordPayload::ChatFolder(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::ChatFolder(
+                        record.clone(),
+                    )),
+                }
+                .encode_to_vec(),
+                record_ikm_opt,
+            ),
+            RecordPayload::NotificationProfile(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::NotificationProfile(
                         record.clone(),
                     )),
                 }
@@ -576,7 +620,7 @@ pub(crate) fn plan_write(
             kind: StorageRecordKind::Account,
             new_key: new_key.clone(),
             replaced_key,
-            payload: RecordPayload::Account(new_account_record.clone()),
+            payload: Some(RecordPayload::Account(new_account_record.clone())),
         }],
         source_device,
         storage_key,
@@ -1342,7 +1386,7 @@ pub(crate) async fn write_blocked(
                     kind: StorageRecordKind::Account,
                     new_key: key,
                     replaced_key: None,
-                    payload: RecordPayload::Account(minimal_account_record(Vec::new())),
+                    payload: Some(RecordPayload::Account(minimal_account_record(Vec::new()))),
                 });
                 None
             }
@@ -1352,7 +1396,7 @@ pub(crate) async fn write_blocked(
             kind,
             new_key: new_key.clone(),
             replaced_key: replaced_key.clone(),
-            payload,
+            payload: Some(payload),
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
@@ -2889,13 +2933,13 @@ mod tests {
                     kind: StorageRecordKind::Account,
                     new_key: vec![0xbbu8; 16],
                     replaced_key: Some(vec![0x22u8; 16]),
-                    payload: RecordPayload::Account(minimal_account_record(Vec::new())),
+                    payload: Some(RecordPayload::Account(minimal_account_record(Vec::new()))),
                 },
                 RecordUpsert {
                     kind: StorageRecordKind::StickerPack,
                     new_key: vec![0xccu8; 16],
                     replaced_key: Some(vec![0x44u8; 16]),
-                    payload: RecordPayload::StickerPack(sticker.clone()),
+                    payload: Some(RecordPayload::StickerPack(sticker.clone())),
                 },
             ],
             2,
@@ -2979,7 +3023,7 @@ mod tests {
                 kind: StorageRecordKind::StickerPack,
                 new_key: vec![0xddu8; 16],
                 replaced_key: None,
-                payload: RecordPayload::StickerPack(sticker.clone()),
+                payload: Some(RecordPayload::StickerPack(sticker.clone())),
             }],
             2,
             &storage_key,

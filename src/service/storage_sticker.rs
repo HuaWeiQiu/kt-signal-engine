@@ -377,7 +377,7 @@ pub(crate) async fn write_sticker_pack(
                     kind: StorageRecordKind::Account,
                     new_key: key,
                     replaced_key: None,
-                    payload: RecordPayload::Account(minimal_account_record(Vec::new())),
+                    payload: Some(RecordPayload::Account(minimal_account_record(Vec::new()))),
                 });
                 None
             }
@@ -387,7 +387,7 @@ pub(crate) async fn write_sticker_pack(
             kind: StorageRecordKind::StickerPack,
             new_key: new_key.clone(),
             replaced_key,
-            payload: RecordPayload::StickerPack(new_record.clone()),
+            payload: Some(RecordPayload::StickerPack(new_record.clone())),
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
