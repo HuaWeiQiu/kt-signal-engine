@@ -423,6 +423,13 @@ connector 消费，connector 契约 §4.38），本批是同一通道的反方�
   在此登记。MVP `files/` 为空（§5），无媒体解密影响；**未来附件批必须重
   审**（官方语义是账号恒定值，随链接 provisioning 的 linkedDeviceData 分发
   ——Signal-Android `applyAccountData`；届时改为随工件携带或持久化）。
+  **2026-10-08 翻案记档（云备份 upload 批，cloud-backup-contract §6.4）**：
+  重审完成——官方实锤为「账号恒定、客户端持久随机」（桌面
+  `crypto.preload.ts:33-39` itemStorage 取用、非派生），本节「随机生成」
+  与官方语义相悖确认成立；引擎侧因持久落点缺席（presage 无通用 kv、
+  provisioning 分发面未立项）+「密钥不落盘」纪律，v2 upload 产物维持
+  随机生成并如实登记差异（messages 档无媒体帧引用，消费端无影响），
+  恒定值落点归附件批。
 
 ### 10.6 快照生命周期
 
