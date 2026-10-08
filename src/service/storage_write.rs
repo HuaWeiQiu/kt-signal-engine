@@ -5,8 +5,9 @@
 //!
 //! 与既有语义级写面（置顶/拉黑/账号设置/贴纸包，各自封装官方
 //! toXxxRecord 语义）并存：本面调用方自带 StorageRecord 明文与 item key，
-//! 引擎只做协议面翻译——arm 白名单闸（Contact/GroupV1/GroupV2/StickerPack，
-//! Account 归专用写面）→ 幂等比较（读现存 item 明文）→ WriteOperation
+//! 引擎只做协议面翻译——arm 白名单闸（Contact/GroupV1/GroupV2/
+//! StoryDistributionList/StickerPack，Account 归专用写面）→ 幂等比较（读
+//! 现存 item 明文）→ WriteOperation
 //! 组装（version+1、UPDATE 轮换新 16B item id、旧 key 进 deleteKey）→
 //! 单次 PUT。409 版本冲突答 `STORAGE_VERSION_CONFLICT`（`retryable:
 //! false`）且**不自动重试**——mutating 语义且引擎不可重推调用方 record，
@@ -201,14 +202,17 @@ fn decode_item_key(text: &str) -> Result<Vec<u8>, ()> {
 }
 
 /// record 白名单闸（官方 vendored proto 解码 + arm 白名单）：Contact=1 /
-/// GroupV1=2 / GroupV2=3 / StickerPack=6 → 类别；Account=4（归专用写面）与
-/// 其余 arm（StoryDistributionList/CallLink/ChatFolder/NotificationProfile）、
-/// 解码失败、无 arm → None。
+/// GroupV1=2 / GroupV2=3 / StoryDistributionList=5 / StickerPack=6 → 类别；
+/// Account=4（归专用写面）与其余 arm（CallLink/ChatFolder/
+/// NotificationProfile）、解码失败、无 arm → None。
 pub(crate) fn record_kind_of(record: &[u8]) -> Option<StorageRecordKind> {
     match StorageRecord::decode(record).ok()?.record? {
         storage_proto::storage_record::Record::Contact(_) => Some(StorageRecordKind::Contact),
         storage_proto::storage_record::Record::GroupV1(_) => Some(StorageRecordKind::GroupV1),
         storage_proto::storage_record::Record::GroupV2(_) => Some(StorageRecordKind::GroupV2),
+        storage_proto::storage_record::Record::StoryDistributionList(_) => {
+            Some(StorageRecordKind::StoryDistributionList)
+        }
         storage_proto::storage_record::Record::StickerPack(_) => {
             Some(StorageRecordKind::StickerPack)
         }
@@ -802,8 +806,9 @@ mod tests {
         }
     }
 
-    /// record 白名单闸：四类白名单 arm 通过；Account/StoryDistributionList/
-    /// 垃圾 bytes/空 bytes 拒。
+    /// record 白名单闸：五类白名单 arm 通过；Account/CallLink/垃圾 bytes/
+    /// 空 bytes 拒（StoryDistributionList=5 随名单面批放开，其余 arm
+    /// fail-closed 不变）。
     #[test]
     fn record_kind_of_whitelist() {
         assert_eq!(
@@ -833,10 +838,23 @@ mod tests {
             Some(StorageRecordKind::GroupV2)
         );
         assert_eq!(
+            record_kind_of(
+                &StorageRecord {
+                    record: Some(
+                        storage_proto::storage_record::Record::StoryDistributionList(
+                            storage_proto::StoryDistributionListRecord::default(),
+                        )
+                    ),
+                }
+                .encode_to_vec()
+            ),
+            Some(StorageRecordKind::StoryDistributionList)
+        );
+        assert_eq!(
             record_kind_of(&sticker_wire(&[7u8; 16])),
             Some(StorageRecordKind::StickerPack)
         );
-        // Account 归专用写面。
+        // Account 归专用写面；CallLink 白名单外。
         assert_eq!(
             record_kind_of(
                 &StorageRecord {
@@ -851,11 +869,9 @@ mod tests {
         assert_eq!(
             record_kind_of(
                 &StorageRecord {
-                    record: Some(
-                        storage_proto::storage_record::Record::StoryDistributionList(
-                            storage_proto::StoryDistributionListRecord::default(),
-                        )
-                    ),
+                    record: Some(storage_proto::storage_record::Record::CallLink(
+                        storage_proto::CallLinkRecord::default(),
+                    )),
                 }
                 .encode_to_vec()
             ),

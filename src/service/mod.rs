@@ -1998,6 +1998,44 @@ impl Service {
         .await
     }
 
+    /// storyDistributionLists.list（Stories 跨设备名单同步批）：同
+    /// chatFolders 读面，type=5（STORY_DISTRIBUTION_LIST）。
+    pub(crate) async fn story_distribution_lists(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::read_records(
+            &context,
+            storage_sync::StorageRecordKind::StoryDistributionList,
+        )
+        .await
+    }
+
+    /// storyDistributionLists.setRecords（Stories 跨设备名单同步批）：同
+    /// chatFolders 写面（upsert/墓碑/幂等/409 采纳重放），type=5。
+    pub(crate) async fn set_story_distribution_lists(
+        self: &Arc<Self>,
+        account: &str,
+        records: Vec<storage_records::RecordValue>,
+        remove_ids: Vec<Vec<u8>>,
+    ) -> Result<Vec<serde_json::Value>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_records::write_records(
+            &context,
+            storage_sync::StorageRecordKind::StoryDistributionList,
+            records,
+            remove_ids,
+        )
+        .await
+    }
+
     /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：
     /// 账号级 readReceipts/typingIndicators/手机号可见性 → Storage Service
     /// AccountRecord 写面（读改写仅动提供字段）+ 409 采纳重放；全部提供

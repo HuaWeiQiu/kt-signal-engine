@@ -1301,6 +1301,40 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // Stories 分布名单面（KT 扩展方法，官方 storyDistributionList 记录
+        // 面 upload 语义，compat §3 行 + §5 名单面块）：参数 fail-closed
+        // -32603；storage 链路四码折叠 storage_error。
+        "storyDistributionLists.list" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.story_distribution_lists(account).await {
+                Ok(lists) => jsonrpc::success_response(id, json!({ "lists": lists })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "storyDistributionLists.setRecords" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            use crate::service::storage_records;
+            let Some((records, remove_ids)) = parse_record_batch(
+                params,
+                storage_records::parse_story_list,
+                storage_records::uuid_bytes,
+            ) else {
+                return internal_error(id);
+            };
+            match service
+                .set_story_distribution_lists(account, records, remove_ids)
+                .await
+            {
+                Ok(lists) => jsonrpc::success_response(id, json!({ "lists": lists })),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 账号级设置（官方 updateConfiguration 等价，Storage Service 真相源，
         // 带 account 参数，风格对齐置顶/贴纸面）：只写提供的字段；形状错
         // fail-closed -32603（置顶面参数处理先例，不占用结构化码）。
@@ -2137,12 +2171,12 @@ fn has_image_or_video_mediatype(data_uri: &str) -> bool {
         .is_some_and(|mediatype| mediatype.starts_with("image/") || mediatype.starts_with("video/"))
 }
 
-/// records/removeIds 双参批解析（chatFolders/notificationProfiles
-/// setRecords 共用，compat §3 两行错误面）：records 条目逐条过 parse 闸；
-/// removeIds 条目过 id 闸（folder=uuid 串 / profile=32 位小写 hex 串，
-/// 16B 实体 id 统一形态）；两参同缺或全空批 fail-closed；records 内重复
-/// id / records∩removeIds 交集冲突 fail-closed。任一形状错 → None →
-/// 调用方 -32603。
+/// records/removeIds 双参批解析（chatFolders/notificationProfiles/
+/// storyDistributionLists setRecords 共用，compat §3 各行错误面）：records
+/// 条目逐条过 parse 闸；removeIds 条目过 id 闸（folder/story list=uuid 串 /
+/// profile=32 位小写 hex 串，16B 实体 id 统一形态）；两参同缺或全空批
+/// fail-closed；records 内重复 id / records∩removeIds 交集冲突 fail-closed。
+/// 任一形状错 → None → 调用方 -32603。
 fn parse_record_batch(
     params: &serde_json::Map<String, Value>,
     parse: fn(&Value) -> Option<crate::service::storage_records::RecordValue>,

@@ -2672,9 +2672,10 @@ fn username_write_faces_fake_shapes_and_param_fail_closed() {
     }
 }
 
-/// 安全码 + Storage 记录面六方法（安全码引擎面批 / Storage 跨设备同步批）：
-/// fake 模式形状与参数 fail-closed 契约钉（-32603；storage 四码只覆盖链路，
-/// 参数错误不占用——参数闸在引擎侧，fake 模式同样生效）。
+/// 安全码 + Storage 记录面八方法（安全码引擎面批 / Storage 跨设备同步批 /
+/// Stories 名单同步批）：fake 模式形状与参数 fail-closed 契约钉（-32603；
+/// storage 四码只覆盖链路，参数错误不占用——参数闸在引擎侧，fake 模式同样
+/// 生效）。
 #[test]
 fn identities_trust_and_storage_records_fake_shapes_and_param_fail_closed() {
     let dir = temp_dir("identity-records-fake");
@@ -2740,6 +2741,33 @@ fn identities_trust_and_storage_records_fake_shapes_and_param_fail_closed() {
             }),
         )["result"],
         json!({ "profiles": [] })
+    );
+    // fake 读：storyDistributionLists 空列表成功面。
+    assert_eq!(
+        engine.request(
+            "storyDistributionLists.list",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({ "lists": [] })
+    );
+    // fake 写：合法批（成员双面齐发）成功回写后全量（空）。
+    assert_eq!(
+        engine.request(
+            "storyDistributionLists.setRecords",
+            json!({
+                "account": "+15550000000",
+                "records": [{
+                    "identifier": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "name": "好友",
+                    "recipientServiceIds": ["6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"],
+                    "recipientServiceIdsBinary": ["aiyxf+98Sl2caW+LKx+Irg=="],
+                    "deletedAtTimestamp": 0,
+                    "allowsReplies": true,
+                    "isBlockList": false,
+                }],
+            }),
+        )["result"],
+        json!({ "lists": [] })
     );
     assert_eq!(
         engine.request(
@@ -2854,4 +2882,47 @@ fn identities_trust_and_storage_records_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603);
     let (code, _) = engine.error_of("notificationProfiles.list", json!({}));
     assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("storyDistributionLists.list", json!({}));
+    assert_eq!(code, -32603);
+
+    // storyDistributionLists.setRecords 参数闸：account 缺失、双参双缺、
+    // identifier 非 UUID、allowsReplies 缺失、成员串面解析不出、binary 面
+    // 坏 base64、removeIds 非 UUID。
+    let valid_list = json!({
+        "identifier": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "name": "好友",
+        "allowsReplies": true,
+        "isBlockList": false,
+    });
+    let mut no_replies = valid_list.clone();
+    no_replies
+        .as_object_mut()
+        .expect("obj")
+        .remove("allowsReplies");
+    let mut bad_member = valid_list.clone();
+    bad_member["recipientServiceIds"] = json!(["x"]);
+    let mut bad_binary = valid_list.clone();
+    bad_binary["recipientServiceIdsBinary"] = json!(["%%%"]);
+    for params in [
+        json!({ "records": [valid_list.clone()] }),
+        json!({ "account": "+15550000000" }),
+        json!({
+            "account": "+15550000000",
+            "records": [{ "identifier": "not-a-uuid", "name": "x",
+                "allowsReplies": false, "isBlockList": false }],
+        }),
+        json!({ "account": "+15550000000", "records": [no_replies] }),
+        json!({ "account": "+15550000000", "records": [bad_member] }),
+        json!({ "account": "+15550000000", "records": [bad_binary] }),
+        json!({
+            "account": "+15550000000",
+            "removeIds": ["not-a-uuid"],
+        }),
+    ] {
+        let (code, _) = engine.error_of("storyDistributionLists.setRecords", params);
+        assert_eq!(
+            code, -32603,
+            "storyDistributionLists.setRecords params gate"
+        );
+    }
 }

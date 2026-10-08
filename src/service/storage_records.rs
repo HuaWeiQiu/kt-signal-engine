@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Storage Service 跨设备同步记录面：ChatFolder（聊天文件夹）与
-//! NotificationProfile（通知档案）——compat §3 `chatFolders.list`/
-//! `chatFolders.setRecords`/`notificationProfiles.list`/
-//! `notificationProfiles.setRecords` 四方法的 storage 侧。
+//! Storage Service 跨设备同步记录面：ChatFolder（聊天文件夹）、
+//! NotificationProfile（通知档案）与 StoryDistributionList（Stories 分布
+//! 名单）——compat §3 `chatFolders.list`/`chatFolders.setRecords`/
+//! `notificationProfiles.list`/`notificationProfiles.setRecords`/
+//! `storyDistributionLists.list`/`storyDistributionLists.setRecords` 六方法
+//! 的 storage 侧。
 //!
 //! 记录 proto = 官方 vendored（`crate::proto::storage`，字段保真口径同
 //! Account/Contact 面）；每实体独立 record + 独立 manifest identifier
@@ -18,8 +20,10 @@
 //!
 //! 读写直通纪律：record 内容不落引擎本地（读面每次 manifest+items 现读，
 //! 写面只写 storage service；唯一本地文件是既有 storage-manifest-state.json
-//! 排查面，本面不扩字段不登记）。recipients 与引擎会话引用双射
-//! （`{conversationId, kind}`；e164-only 条目读面跳过宁缺勿错、写面整拒）。
+//! 排查面，本面不扩字段不登记）。ChatFolder/NotificationProfile 的
+//! recipients 与引擎会话引用双射（`{conversationId, kind}`；e164-only 条目
+//! 读面跳过宁缺勿错、写面整拒）；StoryDistributionList 成员是官方 record
+//! 原生 service id 双面（字符串/binary，无会话引用包装，见 §5 名单面块）。
 
 use base64::Engine as _;
 use presage::libsignal_service::master_key::StorageServiceKey;
@@ -45,12 +49,13 @@ pub(crate) struct CloudEntry {
     pub(crate) value: RecordValue,
 }
 
-/// 记录值（两类别共用判等面；PartialEq 供幂等跳过判定——与云上现存
+/// 记录值（三类别共用判等面；PartialEq 供幂等跳过判定——与云上现存
 /// decode→re-encode 结构全等即跳过，不轮换 item id）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RecordValue {
     Folder(storage_proto::ChatFolderRecord),
     Profile(storage_proto::NotificationProfile),
+    List(storage_proto::StoryDistributionListRecord),
 }
 
 impl RecordValue {
@@ -58,6 +63,7 @@ impl RecordValue {
         match self {
             Self::Folder(_) => StorageRecordKind::ChatFolder,
             Self::Profile(_) => StorageRecordKind::NotificationProfile,
+            Self::List(_) => StorageRecordKind::StoryDistributionList,
         }
     }
 
@@ -66,6 +72,7 @@ impl RecordValue {
         match self {
             Self::Folder(record) => &record.identifier,
             Self::Profile(record) => &record.id,
+            Self::List(record) => &record.identifier,
         }
     }
 
@@ -73,6 +80,7 @@ impl RecordValue {
         match self {
             Self::Folder(record) => project_folder(record),
             Self::Profile(record) => project_profile(record),
+            Self::List(record) => project_story_list(record),
         }
     }
 }
@@ -243,6 +251,72 @@ pub(crate) fn parse_profile(value: &serde_json::Value) -> Option<RecordValue> {
     }))
 }
 
+/// JSON 字段收 service id 字符串数组（可选；条目 = ACI uuid / PNI:uuid，
+/// 解析不出整批整拒——契约口径）。
+fn service_id_strings_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<Vec<String>> {
+    use presage::libsignal_service::protocol::ServiceId;
+    match map.get(key) {
+        None | Some(serde_json::Value::Null) => Some(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                ServiceId::parse_from_service_id_string(item.as_str()?.trim())
+                    .map(|id| id.service_id_string())
+            })
+            .collect::<Option<Vec<_>>>(),
+        Some(_) => None,
+    }
+}
+
+/// JSON 字段收 service id binary 数组（可选；条目 = 标准 base64，16B ACI /
+/// 17B PNI，写入前按 ServiceId 归一化；形状错整批整拒）。
+fn service_id_binaries_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<Vec<Vec<u8>>> {
+    use base64::Engine as _;
+    use presage::libsignal_service::protocol::ServiceId;
+    match map.get(key) {
+        None | Some(serde_json::Value::Null) => Some(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(item.as_str()?)
+                    .ok()?;
+                ServiceId::parse_from_service_id_binary(&raw).map(|id| id.service_id_binary())
+            })
+            .collect::<Option<Vec<_>>>(),
+        Some(_) => None,
+    }
+}
+
+/// `storyDistributionLists.setRecords` records 条目 → StoryDistributionList
+/// Record（严格形状闸；键名对齐官方 record 字段面：identifier/name/
+/// recipientServiceIds/recipientServiceIdsBinary/deletedAtTimestamp/
+/// allowsReplies/isBlockList。name 必填在场但可空串——软删墓碑形态官方
+/// 就是「清名 + 清成员 + 置 deletedAtTimestamp」）。
+pub(crate) fn parse_story_list(value: &serde_json::Value) -> Option<RecordValue> {
+    let map = value.as_object()?;
+    Some(RecordValue::List(
+        storage_proto::StoryDistributionListRecord {
+            identifier: uuid_bytes(map.get("identifier")?)?,
+            name: map.get("name")?.as_str()?.to_string(),
+            recipient_service_ids: service_id_strings_field(map, "recipientServiceIds")?,
+            deleted_at_timestamp: u64_optional(map, "deletedAtTimestamp")?,
+            allows_replies: bool_field(map, "allowsReplies")?,
+            is_block_list: bool_field(map, "isBlockList")?,
+            recipient_service_ids_binary: service_id_binaries_field(
+                map,
+                "recipientServiceIdsBinary",
+            )?,
+        },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // proto → JSON（读投影；键名对齐官方 fromChatFolderRecord /
 // mergeNotificationProfileRecord 输出面）
@@ -386,6 +460,63 @@ pub(crate) fn project_profile(
     Some(serde_json::Value::Object(object))
 }
 
+/// service id 字符串面投影（解析失败条目跳过，宁缺勿错——813 e164 纪律）。
+fn service_ids_json(values: &[String]) -> serde_json::Value {
+    use presage::libsignal_service::protocol::ServiceId;
+    serde_json::Value::Array(
+        values
+            .iter()
+            .filter_map(|text| {
+                ServiceId::parse_from_service_id_string(text)
+                    .map(|id| serde_json::Value::String(id.service_id_string()))
+            })
+            .collect(),
+    )
+}
+
+/// service id binary 面投影（16B ACI / 17B PNI → 标准 base64；解析失败
+/// 条目跳过。合法条目 ServiceId 归一化与原字节恒等）。
+fn service_id_binaries_json(values: &[Vec<u8>]) -> serde_json::Value {
+    use presage::libsignal_service::protocol::ServiceId;
+    serde_json::Value::Array(
+        values
+            .iter()
+            .filter_map(|raw| {
+                ServiceId::parse_from_service_id_binary(raw).map(|id| {
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(id.service_id_binary()),
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
+/// StoryDistributionListRecord → JSON（identifier 非 16B → None，调用方
+/// 跳过该条目不炸面；deletedAtTimestamp 恒在，0 = 未删；成员双面各自独立
+/// 投影——官方读面 binary 优先/字符串兜底是合并成本地面，引擎两面原样
+/// 透出调用方择面；My Story = 全零 uuid 同普通名单投影，不特判）。
+pub(crate) fn project_story_list(
+    record: &storage_proto::StoryDistributionListRecord,
+) -> Option<serde_json::Value> {
+    use presage::libsignal_service::prelude::Uuid;
+    if record.identifier.len() != 16 {
+        return None;
+    }
+    let identifier = Uuid::from_slice(&record.identifier).ok()?;
+    Some(serde_json::json!({
+        "identifier": identifier.to_string(),
+        "name": record.name,
+        "recipientServiceIds": service_ids_json(&record.recipient_service_ids),
+        "recipientServiceIdsBinary": service_id_binaries_json(
+            &record.recipient_service_ids_binary,
+        ),
+        "deletedAtTimestamp": record.deleted_at_timestamp,
+        "allowsReplies": record.allows_replies,
+        "isBlockList": record.is_block_list,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // 批计划纯函数（幂等/替换/删除闸）
 // ---------------------------------------------------------------------------
@@ -441,6 +572,7 @@ fn record_payload(value: &RecordValue) -> RecordPayload {
     match value {
         RecordValue::Folder(record) => RecordPayload::ChatFolder(record.clone()),
         RecordValue::Profile(record) => RecordPayload::NotificationProfile(record.clone()),
+        RecordValue::List(record) => RecordPayload::StoryDistributionList(record.clone()),
     }
 }
 
@@ -494,6 +626,10 @@ async fn read_cloud_entries(
             (StorageRecordKind::NotificationProfile, Some(Record::NotificationProfile(inner))) => {
                 RecordValue::Profile(inner)
             }
+            (
+                StorageRecordKind::StoryDistributionList,
+                Some(Record::StoryDistributionList(inner)),
+            ) => RecordValue::List(inner),
             _ => continue,
         };
         out.push(CloudEntry { key, value });
@@ -518,7 +654,8 @@ async fn fetch_manifest(
 // 编排（Service 调用入口；网络面，不做网络测试）
 // ---------------------------------------------------------------------------
 
-/// 读面：`chatFolders.list` / `notificationProfiles.list` 存储序投影。
+/// 读面：`chatFolders.list` / `notificationProfiles.list` /
+/// `storyDistributionLists.list` 存储序投影。
 /// master key 缺失或 manifest 404 → 空表（账号从未有过 storage 状态）。
 pub(crate) async fn read_records(
     context: &StorageContext,
@@ -550,7 +687,8 @@ pub(crate) async fn read_records(
     .collect())
 }
 
-/// 写面：`chatFolders.setRecords` / `notificationProfiles.setRecords`
+/// 写面：`chatFolders.setRecords` / `notificationProfiles.setRecords` /
+/// `storyDistributionLists.setRecords`
 /// （官方 upload 语义 + 409 采纳重放；首写分支播种 Account——服务器要求
 /// manifest 恒含一条 Account 记录）。返回写后全量投影（存储序 = 写后
 /// manifest 本类别 identifiers 首现序）；整批幂等 = 无 PUT 直接返回当前
@@ -667,6 +805,9 @@ pub(crate) async fn write_records(
                             }
                             Some(RecordPayload::NotificationProfile(record)) => {
                                 Some(RecordValue::Profile(record.clone()))
+                            }
+                            Some(RecordPayload::StoryDistributionList(record)) => {
+                                Some(RecordValue::List(record.clone()))
                             }
                             _ => None,
                         });
@@ -1087,5 +1228,203 @@ mod tests {
             RecordValue::Folder(inner) => inner.identifier,
             _ => panic!("folder"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // StoryDistributionList（Stories 分布名单批）
+    // -------------------------------------------------------------------
+
+    const LIST_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    fn service_id_binary_of(service_id: &str) -> Vec<u8> {
+        use presage::libsignal_service::protocol::ServiceId;
+        ServiceId::parse_from_service_id_string(service_id)
+            .expect("service id")
+            .service_id_binary()
+    }
+
+    #[test]
+    fn story_list_roundtrip_full_face_both_service_id_forms() {
+        use base64::Engine as _;
+        let aci_binary = service_id_binary_of(CONTACT_ID);
+        let pni_binary = service_id_binary_of(CONTACT_PNI);
+        assert_eq!(aci_binary.len(), 16, "ACI binary = 16B uuid");
+        assert_eq!(pni_binary.len(), 17, "PNI binary = 前缀 + 16B uuid");
+        let input = json!({
+            "identifier": LIST_ID,
+            "name": "好友",
+            "recipientServiceIds": [CONTACT_ID, CONTACT_PNI],
+            "recipientServiceIdsBinary": [
+                base64::engine::general_purpose::STANDARD.encode(&aci_binary),
+                base64::engine::general_purpose::STANDARD.encode(&pni_binary),
+            ],
+            "deletedAtTimestamp": 0,
+            "allowsReplies": true,
+            "isBlockList": false,
+        });
+        let record = parse_story_list(&input).expect("parse");
+        // proto 中介：StorageRecord 包裹 encode → decode（官方线格式位）。
+        let wire = crate::proto::storage::StorageRecord {
+            record: Some(
+                crate::proto::storage::storage_record::Record::StoryDistributionList(
+                    match &record {
+                        RecordValue::List(inner) => inner.clone(),
+                        _ => panic!("story list"),
+                    },
+                ),
+            ),
+        }
+        .encode_to_vec();
+        let decoded =
+            crate::proto::storage::StorageRecord::decode(wire.as_slice()).expect("decode");
+        let Some(crate::proto::storage::storage_record::Record::StoryDistributionList(inner)) =
+            decoded.record
+        else {
+            panic!("story distribution list arm");
+        };
+        let projected = project_story_list(&inner).expect("project");
+        assert_eq!(projected, input, "七字段全投影双射");
+        assert_eq!(inner.identifier.len(), 16);
+        assert_eq!(inner.recipient_service_ids, vec![CONTACT_ID, CONTACT_PNI]);
+        assert_eq!(
+            inner.recipient_service_ids_binary,
+            vec![aci_binary, pni_binary]
+        );
+    }
+
+    #[test]
+    fn story_list_defaults_and_tombstone_form() {
+        // 缺省形态：成员双面/deletedAtTimestamp 缺省空表与 0；投影键恒在。
+        let minimal = json!({
+            "identifier": LIST_ID,
+            "name": "My Story",
+            "allowsReplies": false,
+            "isBlockList": true,
+        });
+        let RecordValue::List(inner) = &parse_story_list(&minimal).expect("parse") else {
+            panic!("story list");
+        };
+        assert!(inner.recipient_service_ids.is_empty());
+        assert!(inner.recipient_service_ids_binary.is_empty());
+        assert_eq!(inner.deleted_at_timestamp, 0);
+        let projected = project_story_list(inner).expect("project");
+        assert_eq!(projected["deletedAtTimestamp"], 0, "恒在键（0 = 未删）");
+        assert_eq!(projected["recipientServiceIds"], json!([]));
+        assert_eq!(projected["recipientServiceIdsBinary"], json!([]));
+        // 软删墓碑形态：非 0 时间戳 + 清名 + 清成员（官方 delete
+        //DistributionList 同形）原样往返。
+        let tombstone = json!({
+            "identifier": LIST_ID,
+            "name": "",
+            "recipientServiceIds": [],
+            "recipientServiceIdsBinary": [],
+            "deletedAtTimestamp": 1700000000000u64,
+            "allowsReplies": false,
+            "isBlockList": false,
+        });
+        let record = parse_story_list(&tombstone).expect("parse");
+        let projected = record.project().expect("project");
+        assert_eq!(projected, tombstone);
+    }
+
+    #[test]
+    fn story_list_parse_gates_reject_malformed() {
+        use base64::Engine as _;
+        let valid = json!({
+            "identifier": LIST_ID,
+            "name": "x",
+            "allowsReplies": false,
+            "isBlockList": false,
+        });
+        // identifier 非 UUID / 缺失。
+        let mut bad = valid.clone();
+        bad["identifier"] = json!("not-a-uuid");
+        assert!(parse_story_list(&bad).is_none());
+        let mut bad = valid.clone();
+        bad.as_object_mut().expect("obj").remove("identifier");
+        assert!(parse_story_list(&bad).is_none());
+        // name 缺失（墓碑清名是空串在场，不是缺席）。
+        let mut bad = valid.clone();
+        bad.as_object_mut().expect("obj").remove("name");
+        assert!(parse_story_list(&bad).is_none());
+        // allowsReplies / isBlockList 缺失或非布尔。
+        for key in ["allowsReplies", "isBlockList"] {
+            let mut bad = valid.clone();
+            bad.as_object_mut().expect("obj").remove(key);
+            assert!(parse_story_list(&bad).is_none(), "{key} 缺失拒");
+            let mut bad = valid.clone();
+            bad[key] = json!("yes");
+            assert!(parse_story_list(&bad).is_none(), "{key} 非布尔拒");
+        }
+        // 字符串面条目解析不出。
+        let mut bad = valid.clone();
+        bad["recipientServiceIds"] = json!(["x"]);
+        assert!(parse_story_list(&bad).is_none());
+        // binary 面：坏 base64、长度错（既非 16B 也非 17B）。
+        let mut bad = valid.clone();
+        bad["recipientServiceIdsBinary"] = json!(["%%%"]);
+        assert!(parse_story_list(&bad).is_none());
+        let mut bad = valid.clone();
+        bad["recipientServiceIdsBinary"] =
+            json!([base64::engine::general_purpose::STANDARD.encode([1u8; 3])]);
+        assert!(parse_story_list(&bad).is_none());
+        // 双面非数组。
+        let mut bad = valid.clone();
+        bad["recipientServiceIds"] = json!("nope");
+        assert!(parse_story_list(&bad).is_none());
+        // deletedAtTimestamp 负数（非负整数闸）。
+        let mut bad = valid.clone();
+        bad["deletedAtTimestamp"] = json!(-1);
+        assert!(parse_story_list(&bad).is_none());
+        // 条目非对象整体拒。
+        assert!(parse_story_list(&json!(7)).is_none());
+    }
+
+    #[test]
+    fn plan_record_batch_story_list_upsert_and_remove() {
+        use crate::service::storage_sync::StorageRecordKind;
+        let existing = parse_story_list(&json!({
+            "identifier": LIST_ID,
+            "name": "原有",
+            "recipientServiceIds": [CONTACT_ID],
+            "allowsReplies": false,
+            "isBlockList": false,
+        }))
+        .expect("parse");
+        let folder = folder_value(FOLDER_ID, "夹", 1);
+        let cloud = vec![
+            CloudEntry {
+                key: vec![1],
+                value: folder.clone(),
+            },
+            CloudEntry {
+                key: vec![2],
+                value: existing.clone(),
+            },
+        ];
+        // 同值幂等（folder + 名单都不出批）。
+        assert!(plan_record_batch(&cloud, &[folder, existing.clone()], &[]).is_empty());
+        // 名单变更 → 换写 upsert（kind 正确 + replaced_key 指旧 key）。
+        let changed = parse_story_list(&json!({
+            "identifier": LIST_ID,
+            "name": "改名",
+            "recipientServiceIds": [CONTACT_ID],
+            "allowsReplies": true,
+            "isBlockList": false,
+        }))
+        .expect("parse");
+        let upserts = plan_record_batch(&cloud, &[changed], &[]);
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].kind, StorageRecordKind::StoryDistributionList);
+        assert_eq!(
+            upserts[0].replaced_key.as_deref(),
+            Some(cloud[1].key.as_slice())
+        );
+        // removeIds 命中 → 纯删除 upsert（payload None）。
+        let remove_id = uuid_bytes(&json!(LIST_ID)).expect("id bytes");
+        let upserts = plan_record_batch(&cloud, &[], &[remove_id]);
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].kind, StorageRecordKind::StoryDistributionList);
+        assert!(upserts[0].payload.is_none());
     }
 }
