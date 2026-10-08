@@ -651,16 +651,25 @@ async fn dispatch(
         }
         // sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
         // 信封。协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
-        //（-32603）：recipient/data 缺失或形状错、data 非 base64/空、urgency
+        //（-32603）：recipient/group 两腿恰一闸、data 非 base64/空、urgency
         // 非法枚举、destinationDeviceId 超 u32、legacy/opacity 两面同置或都缺。
         // legacy 面（1.53 批）：`legacy: {kind: "busy", id}` / `{kind: "hangup",
         // id, type?, deviceId?}` 按官方 proto Busy{id}/Hangup{id,type,deviceId}
-        // 裸帧族构造（无 opaque 字段）。群组通话走 SFU 面明确不做（groupId
-        // 形态 fail-closed，compat §5 通话消息块）。
+        // 裸帧族构造（无 opaque 字段）。
+        // 群臂（P4b 群信令出网批，connector 契约 1.82 wire 面）：可选 `group`
+        // = 32B 群 master key 标准 base64（listGroups/terminateGroup/updateGroup
+        // 的 groupId 同源口径）与 `recipient` 互斥恰一；官方群信令恒 opaque
+        //（桌面 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 构
+        // CallingMessage{opaque} sender-key 群发）——群腿仅 modern 面放行，
+        // legacy 面/非空 destinationDeviceId 与 group 同置 fail-closed；
+        // `groupId` 键维持禁入（历史 fail-closed 面，wire 参数名是 `group`）。
         "sendCallMessage" => {
+            enum CallTarget<'a> {
+                Recipient(&'a str),
+                Group(&'a str),
+            }
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
-            let recipient = params.get("recipient").and_then(Value::as_str);
             let legacy = parse_legacy_call_face(params.get("legacy"));
             let data = params
                 .get("data")
@@ -689,6 +698,44 @@ async fn dispatch(
             if params.get("groupId").is_some() {
                 return internal_error(id);
             }
+            // 寻址两腿恰一：群腿（group，32B master key 闸）与单收件人腿
+            //（recipient）同置/都缺/任一腿形状非法全拒。
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("group").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) if !text.is_empty() => Some(Some(text.as_str())),
+                Some(_) => None,
+            };
+            let group = match params.get("group") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(|_| text.as_str()))
+                }
+                Some(_) => None,
+            };
+            let target = match (recipient, group) {
+                (Some(Some(recipient)), None) => Some(CallTarget::Recipient(recipient)),
+                (None, Some(Some(group_id))) => Some(CallTarget::Group(group_id)),
+                _ => None,
+            };
+            // 群臂面闸：官方群信令恒 opaque——legacy 裸帧族群向无官方先例；
+            // sender-key 群发无设备定向位（destinationDeviceId 仅 1:1 臂）。
+            if matches!(target, Some(CallTarget::Group(_)))
+                && (legacy.is_some() || destination.is_some_and(|device| device.is_some()))
+            {
+                return internal_error(id);
+            }
             // 两面解析：modern（data）与 legacy 互斥——同置或都缺都 fail-closed
             //（busy/hangup 官方裸帧无 opaque 字段，混面无官方语义）。
             let face = match (data, legacy) {
@@ -698,15 +745,36 @@ async fn dispatch(
                 (None, Some(legacy)) => Some(legacy),
                 _ => None,
             };
-            match (account, recipient, face, destination) {
-                (Some(account), Some(recipient), Some(face), Some(destination)) => {
+            match (account, target, face, destination) {
+                (
+                    Some(account),
+                    Some(CallTarget::Recipient(recipient)),
+                    Some(face),
+                    Some(destination),
+                ) => match service
+                    .send_call_message(
+                        account,
+                        recipient,
+                        crate::service::SendCallMessage {
+                            face,
+                            destination_device_id: destination,
+                        },
+                    )
+                    .await
+                {
+                    Ok(timestamp) => {
+                        jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                    }
+                    Err(error) => send_error(id, error),
+                },
+                (Some(account), Some(CallTarget::Group(group_id)), Some(face), _) => {
                     match service
-                        .send_call_message(
+                        .send_call_message_group(
                             account,
-                            recipient,
+                            group_id,
                             crate::service::SendCallMessage {
                                 face,
-                                destination_device_id: destination,
+                                destination_device_id: None,
                             },
                         )
                         .await
@@ -714,7 +782,7 @@ async fn dispatch(
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
                         }
-                        Err(_) => internal_error(id),
+                        Err(error) => send_error(id, error),
                     }
                 }
                 _ => internal_error(id),

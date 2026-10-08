@@ -206,6 +206,42 @@ pub(crate) fn decode_call_data(data: &str) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+/// sendCallMessage 信封构造（1:1/群两臂共用单点）：face 逐面映射官方
+/// CallMessage proto——opaque 面 {data, urgency}（urgency 写 Opaque.urgency，
+/// 桌面 callingMessageToProto 同构）、legacy 面官方裸帧族无 opaque 字段；
+/// destinationDeviceId 为 1:1 臂透传位（群臂 sender-key 群发无设备定向，
+/// 参数层 fail-closed，群构面恒 None）。
+fn build_call_message(payload: &SendCallMessage) -> presage::proto::CallMessage {
+    match &payload.face {
+        CallMessageFace::Opaque { data, urgency } => presage::proto::CallMessage {
+            opaque: Some(presage::proto::call_message::Opaque {
+                data: Some(data.clone()),
+                urgency: Some(*urgency as i32),
+            }),
+            destination_device_id: payload.destination_device_id,
+            ..presage::proto::CallMessage::default()
+        },
+        CallMessageFace::LegacyBusy { id } => presage::proto::CallMessage {
+            busy: Some(presage::proto::call_message::Busy { id: Some(*id) }),
+            destination_device_id: payload.destination_device_id,
+            ..presage::proto::CallMessage::default()
+        },
+        CallMessageFace::LegacyHangup {
+            id,
+            kind,
+            device_id,
+        } => presage::proto::CallMessage {
+            hangup: Some(presage::proto::call_message::Hangup {
+                id: Some(*id),
+                r#type: Some(*kind as i32),
+                device_id: *device_id,
+            }),
+            destination_device_id: payload.destination_device_id,
+            ..presage::proto::CallMessage::default()
+        },
+    }
+}
+
 /// 附件条数上限：与接收投影 §4.13/compat receive 32 条同口径，超出
 /// fail-closed。
 const ATTACHMENT_MAX_COUNT: usize = 32;
@@ -1226,21 +1262,21 @@ impl Service {
         Ok(())
     }
 
-    /// sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
-    /// 信封。modern 面构造 CallMessage{opaque{data, urgency}}（destinationDeviceId
-    /// 在场才写）——opaque 为 Signal-RTC 层信令负载，引擎不解析只透传（桌面
-    /// callingMessage 面同构：offer/answer/ice/hangup/busy 都封装在 opaque
-    /// 内）；legacy 面按官方 proto 裸帧族构造——`CallMessage{busy{id}}` /
+    /// sendCallMessage 1:1 臂（通话消息面，KT 扩展方法）：官方
+    /// Content.callMessage=3 信封。构造面 = build_call_message 单点（opaque
+    /// 为 Signal-RTC 层信令负载，引擎不解析只透传，桌面 callingMessage 面
+    /// 同构：offer/answer/ice/hangup/busy 都封装在 opaque 内；legacy 面按
+    /// 官方 proto 裸帧族构造——`CallMessage{busy{id}}` /
     /// `CallMessage{hangup{id, type, deviceId?}}`，无 opaque 字段（官方桌面
     /// callingMessageToProto 同款：busy={id}、hangup={id,type}；RingRTC
     /// 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7/0.14.8
     /// CallManager.sendBusyViaSignal/sendHangupViaSignal 同构裸帧族）。收件人
-    /// 号码/UUID 双形态解析（send 系同口径）。发送面偏差（compat §5 通话消息
-    /// 块登记）：官方 call 消息 online=true 不排队，presage send_message 硬编码
-    /// online_only=false（上游 TODO issue #252）——引擎发出的 call 信封离线可
-    /// 排队，属可接受偏差；CallMessage 无 sent transcript（上游
-    /// create_multi_device_sent_transcript_content 对 CallMessage 返回 None），
-    /// 本机其他设备不同步自发 call 记录。
+    /// 号码/UUID 双形态解析（send 系同口径）；群臂见 send_call_message_group。
+    /// 发送面偏差（compat §5 通话消息块登记）：官方 call 消息 online=true 不
+    /// 排队，presage send_message 硬编码 online_only=false（上游 TODO issue
+    /// #252）——引擎发出的 call 信封离线可排队，属可接受偏差；CallMessage 无
+    /// sent transcript（上游 create_multi_device_sent_transcript_content 对
+    /// CallMessage 返回 None），本机其他设备不同步自发 call 记录。
     pub(crate) async fn send_call_message(
         self: &Arc<Self>,
         account: &str,
@@ -1258,36 +1294,38 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         let timestamp = now_ms();
-        let body = match payload.face {
-            CallMessageFace::Opaque { data, urgency } => presage::proto::CallMessage {
-                opaque: Some(presage::proto::call_message::Opaque {
-                    data: Some(data),
-                    urgency: Some(urgency as i32),
-                }),
-                destination_device_id: payload.destination_device_id,
-                ..presage::proto::CallMessage::default()
-            },
-            CallMessageFace::LegacyBusy { id } => presage::proto::CallMessage {
-                busy: Some(presage::proto::call_message::Busy { id: Some(id) }),
-                destination_device_id: payload.destination_device_id,
-                ..presage::proto::CallMessage::default()
-            },
-            CallMessageFace::LegacyHangup {
-                id,
-                kind,
-                device_id,
-            } => presage::proto::CallMessage {
-                hangup: Some(presage::proto::call_message::Hangup {
-                    id: Some(id),
-                    r#type: Some(kind as i32),
-                    device_id,
-                }),
-                destination_device_id: payload.destination_device_id,
-                ..presage::proto::CallMessage::default()
-            },
-        };
+        let body = build_call_message(&payload);
         manager
             .send_message(service_id, body, timestamp)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(timestamp)
+    }
+
+    /// sendCallMessage 群臂（P4b 群信令出网批，connector 契约 1.82 wire 面
+    /// 对位）：官方桌面 #handleSendCallMessageToGroup（calling.preload.ts:
+    /// 3338-3407）同构——信令字节包成 `CallMessage{opaque{data, urgency}}`
+    /// sender-key 加密群发（官方群发落网 sendCallingMessage.preload.ts:
+    /// 99-118 isGroup 臂 sendContentMessageToGroup；官方群信令恒 opaque，
+    /// legacy 裸帧族群向无先例、sender-key 群发无设备定向位，参数层
+    /// fail-closed）。群头 = open_group_sender（群可解 + terminated 硬拒
+    /// `SEND_TARGET_TERMINATED`，send 系群组形态同纪律）+ 群向
+    /// `send_message_to_group`（sendTyping 群臂同原语；服务器群态不在库
+    /// UnknownGroup → Internal 折叠 -32603）。fake 模式成功应答 {timestamp}
+    /// 与 1:1 同口径（伪群 id 在参数层拒绝，不到此处）。
+    pub(crate) async fn send_call_message_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        payload: SendCallMessage,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+        manager
+            .send_message_to_group(&master_key, build_call_message(&payload), timestamp)
             .await
             .map_err(|_| SendError::Internal)?;
         Ok(timestamp)
@@ -6953,6 +6991,59 @@ mod tests {
             !modern.contains(&0x2au8) && !modern.contains(&0x3au8),
             "modern 无 busy/hangup 位"
         );
+    }
+
+    /// 群臂构造面（P4b 群信令出网批）：群向信封 = `CallMessage{opaque{data,
+    /// urgency}}` 单点（官方桌面 #handleSendCallMessageToGroup
+    /// calling.preload.ts:3338-3407 构 CallingMessage{opaque} 群发，恒
+    /// opaque 无裸帧、无设备定向位）；prost wire 逐字节钉 opaque 字段10
+    ///（tag 0x52 长度分隔）内 data 字段1 + urgency 字段2，无 busy/hangup
+    /// 位、无 destinationDeviceId（字段9 缺席）。
+    #[test]
+    fn group_call_arm_builds_opaque_envelope_only() {
+        use base64::Engine as _;
+        use presage::proto::call_message::opaque::Urgency;
+
+        let payload = SendCallMessage {
+            face: CallMessageFace::Opaque {
+                data: decode_call_data(
+                    &base64::engine::general_purpose::STANDARD.encode(b"signal-rtc"),
+                )
+                .expect("valid opaque data"),
+                urgency: Urgency::HandleImmediately,
+            },
+            destination_device_id: None,
+        };
+        let message = build_call_message(&payload);
+        assert!(message.opaque.is_some(), "群臂信封含 opaque 材料");
+        assert!(message.busy.is_none(), "群臂无 busy 位");
+        assert!(message.hangup.is_none(), "群臂无 hangup 位");
+        assert_eq!(message.destination_device_id, None, "群臂无设备定向位");
+
+        // wire 逐字节：字段10(tag 0x52) + len 14 内 data(0x0a,len 10,
+        // "signal-rtc") + urgency(0x10, varint 1)；无 busy(0x2a)/hangup
+        // (0x3a)/destinationDeviceId(字段9 tag 0x48) 位。
+        use prost::Message as _;
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes).expect("proto encodes");
+        assert_eq!(
+            bytes,
+            [
+                0x52, 0x0e, 0x0a, 0x0a, b's', b'i', b'g', b'n', b'a', b'l', b'-', b'r', b't', b'c',
+                0x10, 0x01
+            ],
+            "群臂 wire = 字段10{{data,urgency}}"
+        );
+        assert!(
+            !bytes.contains(&0x2au8) && !bytes.contains(&0x3au8) && !bytes.contains(&0x48u8),
+            "群臂 wire 无裸帧/设备定向位"
+        );
+
+        // 字段投影面：opaque 材料 + urgency=HANDLE_IMMEDIATELY(1) 原样写入
+        //（桌面 callingMessageToProto 值透传同构）。
+        let opaque = message.opaque.expect("opaque present");
+        assert_eq!(opaque.data.as_deref(), Some(b"signal-rtc".as_slice()));
+        assert_eq!(opaque.urgency, Some(Urgency::HandleImmediately as i32));
     }
 
     /// legacy 参数面（parse_legacy_call_face）：官方形状接受、投影词汇收齐、

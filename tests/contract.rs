@@ -1632,7 +1632,10 @@ fn send_text_style_param_faces_and_dispatch_log() {
 /// 通话消息面（sendCallMessage，KT 扩展批）：fake 形状成功 {"timestamp":u64}；
 /// 参数面 fail-closed 逐形状（-32603：account/recipient/data 缺失、data 非
 /// base64/空、urgency 非法/非字符串、destinationDeviceId 超 u32/非数值、
-/// groupId 形态禁入——群组通话走 SFU 不在本面）；协议上行面落调度日志。
+/// groupId 键禁入——wire 群参数名是 `group`）；群臂（P4b 群信令出网批）：
+/// `group`（32B master key 标准 base64）与 `recipient` 互斥恰一，fake 成功
+/// {timestamp} 与 1:1 同口径，伪群 id（非法 base64/≠32B）/同置/legacy 或
+/// destinationDeviceId 与 group 同置全拒；协议上行面落调度日志。
 #[test]
 fn call_message_fake_shape_and_param_fail_closed() {
     let dir = temp_dir("call-message");
@@ -1650,13 +1653,18 @@ fn call_message_fake_shape_and_param_fail_closed() {
         .to_owned();
 
     let data = "c2lnbmFsLXJ0Yw=="; // base64("signal-rtc")
+                                   // 32 字节群 master key 的标准 base64（44 字符，terminateGroup/updateGroup
+                                   // 的 groupId 同源口径）。
+    let group = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
 
     // fake 成功面：直聊单收件人 {"timestamp": u64}；urgency/destinationDeviceId
-    // 缺省（droppable/不定向）与显式同形。
+    // 缺省（droppable/不定向）与显式同形。群臂同口径（sender-key 群发面）。
     for params in [
         json!({ "account": number, "recipient": "+15555550101", "data": data }),
         json!({ "account": number, "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "data": data, "urgency": "handleImmediately" }),
         json!({ "account": number, "recipient": "+15555550101", "data": data, "urgency": "droppable", "destinationDeviceId": 2 }),
+        json!({ "account": number, "group": group, "data": data }),
+        json!({ "account": number, "group": group, "data": data, "urgency": "handleImmediately" }),
     ] {
         let ok = engine.request("sendCallMessage", params.clone());
         assert!(
@@ -1676,7 +1684,17 @@ fn call_message_fake_shape_and_param_fail_closed() {
         json!({ "account": number, "recipient": "+15555550101", "data": data, "urgency": 1 }),
         json!({ "account": number, "recipient": "+15555550101", "data": data, "destinationDeviceId": 4_294_967_296u64 }),
         json!({ "account": number, "recipient": "+15555550101", "data": data, "destinationDeviceId": "2" }),
-        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "data": data }),
+        json!({ "account": number, "groupId": group, "data": data }),
+        // 群臂闸：group/recipient 同置；伪群 id（非法 base64/≠32B/空串/非
+        // 字符串）；legacy 裸帧族群向（官方群信令恒 opaque）；设备定向位群向
+        //（sender-key 群发无 per-device 寻址）。
+        json!({ "account": number, "recipient": "+15555550101", "group": group, "data": data }),
+        json!({ "account": number, "group": "not-base64!!", "data": data }),
+        json!({ "account": number, "group": "QUJDREVG", "data": data }),
+        json!({ "account": number, "group": "", "data": data }),
+        json!({ "account": number, "group": 42, "data": data }),
+        json!({ "account": number, "group": group, "data": data, "legacy": { "kind": "busy", "id": 7 } }),
+        json!({ "account": number, "group": group, "data": data, "destinationDeviceId": 2 }),
     ];
     for params in &rejects {
         let response = engine.request("sendCallMessage", params.clone());
@@ -1686,7 +1704,8 @@ fn call_message_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：data/urgency/destinationDeviceId 逐字保留（协议上行面纪律）。
+    // 调度日志：data/urgency/destinationDeviceId/group 逐字保留（协议上行
+    // 面纪律）。
     let log_path = dir.join("engine-send-log.jsonl");
     let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
     let entries: Vec<Value> = log
@@ -1709,6 +1728,17 @@ fn call_message_fake_shape_and_param_fail_closed() {
         .expect("explicit urgency+device call logged");
     assert_eq!(explicit["params"]["urgency"], json!("droppable"));
     assert_eq!(explicit["params"]["destinationDeviceId"], json!(2));
+    let group_entry = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "sendCallMessage" && entry["params"].get("group").is_some()
+        })
+        .expect("group arm call logged");
+    assert_eq!(group_entry["params"]["group"], json!(group));
+    assert!(
+        group_entry["params"].get("recipient").is_none(),
+        "群臂 wire 面无 recipient 键"
+    );
 }
 
 /// setExpirationTimer（消失消息 E 批）：fake 形状成功 {"timestamp":u64}
