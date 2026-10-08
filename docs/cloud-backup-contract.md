@@ -16,6 +16,23 @@
   `net/chat/src/registration/service.rs:16-73`。连接参数（chat.signal.org WS endpoint/TLS/keepalive）
   实施首日以 libsignal-net connect 入口实测钉定（本契约唯一机械未知项）。
 
+> **§0.1 实测钉定（2026-10-08，worktree feat/cloud-restore）**：依赖已入 Cargo.toml 并
+> cargo fetch 解析——`libsignal-net`/`libsignal-net-chat` 均解析至 tag v0.99.0 实树
+> （checkout 439f035，注意与早先行为参照的 e8cc2dd 不同树，API 以 439f035 为准）。
+> **连接配方实读（439f035 树）**：`ChatConnection`（rust/net/src/chat.rs:170）→
+> `ChatConnection::start_connect_with(connection_resources, service, http_route_provider,
+> endpoint_path, user_agent, ws_config, headers, log_tag)`（:269-286，返回
+> PendingChatConnection）；`ConnectionResources` 构造同款先例 =
+> **rust/net/examples/cdsi_lookup.rs:89-95**（`ConnectState::new(SUGGESTED_CONNECT_CONFIG)`
+> + DnsResolver + `no_network_change_events()` + confirmation_header_name），
+> 路由提供方 DirectOrProxyProvider（example :16 同款直连路由）；
+> backups gRPC 面 439f035 在位：`grpc/backups.rs:242 get_backup_cdn_credentials` /
+> `:393 get_message_backup_info`（BackupsAnonymousClient 路径 :408）。
+> endpoint_path = chat WS 路径（`/v1/websocket`，与 presage 收发同端点），
+> unauth 模式 headers=None（ChatHeaders::Auth 缺席）。
+> **剩余实施项**：cloud_backup.rs 本体（REST+zkgroup+gRPC+CDN+解密）、methods.rs
+> 两方法注册、进度快照面、单测三链——按 §1-§4 契约直写。
+
 ## 1. 凭据链（全部官方实锤）
 
 1. **签发**：`GET v1/certificate/auth/group?redemptionStartSeconds=&redemptionEndSeconds=`

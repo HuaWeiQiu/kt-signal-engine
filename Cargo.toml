@@ -45,6 +45,12 @@ rand = "0.9"
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
 # BackupKey/BackupId 派生（ADR 0005 S2，同 tag 直接依赖）。
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+# 云备份 restore gRPC 面（cloud-backup-contract.md §0，2026-10-08 批）：
+# chat 未鉴权 gRPC-over-WS（get_backup_cdn_credentials/get_message_backup_info，
+# rust/net/chat/src/grpc/backups.rs:284/:436）+ WS 传输栈（ChatConnection）。
+# 同 tag 同源，AGPL-3.0-only 与本仓一致；许可与用途按 AGENTS.md 报备在案。
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 thiserror = "2"
 
