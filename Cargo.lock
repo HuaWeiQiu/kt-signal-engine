@@ -2037,6 +2037,7 @@ dependencies = [
  "futures",
  "hkdf",
  "hmac",
+ "http",
  "libsignal-account-keys",
  "libsignal-message-backup",
  "libsignal-net",

@@ -35,6 +35,8 @@ reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 # 仅 backup5-spike bin（ADR 0005 S1）生成链接密码用；与 presage 传递的 rand
 # 0.9 同源，许可 MIT/Apache-2.0。
 rand = "0.9"
+# libsignal-net chat gRPC 头构造（confirmation_header_name from_static）。
+http = "1"
 
 # ADR 0005 S2：存量历史迁移（backup5）接收侧。
 # - libsignal-message-backup（官方，v0.99.0 与传递钉定同 tag）：frame（HMAC+AES-CBC+gzip

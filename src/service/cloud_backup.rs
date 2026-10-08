@@ -232,3 +232,85 @@ fn use_base64_encode(value: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(value)
 }
+
+// —— 第三片：chat gRPC 传输面 + CDN 下载 + 解密导入（契约 §0.2/§1.4/§1.5/§1.6）——
+
+use std::time::Duration;
+
+use libsignal_net::chat::ws;
+use libsignal_net::chat::{ChatConnection, ConnectError};
+use libsignal_net::connect_state::{
+    ConnectState, DefaultConnectorFactory, PreconnectingFactory, SUGGESTED_CONNECT_CONFIG,
+};
+use libsignal_net::env::constants::CHAT_WEBSOCKET_PATH;
+use libsignal_net::env::{StaticIpOrder, UserAgent};
+use libsignal_net::infra::dns::DnsResolver;
+use libsignal_net::infra::route::{DirectOrProxyMode, DirectOrProxyProvider};
+use libsignal_net::infra::utils::no_network_change_events;
+use libsignal_net::infra::{EnableDomainFronting, OverrideNagleAlgorithm};
+use rand::Rng as _;
+
+/// 生产 chat WS 连接（官方 simple_chat_connection 逐行复刻，chat.rs:510-573：
+/// env::PROD 直连、无域前端、无代理、headers=None=未鉴权）。
+///
+/// # Errors
+/// 连接失败（DNS/TLS/WS 握手）原样映射，调用方按 CONNECT 族呈现。
+pub async fn connect_production_chat() -> Result<ChatConnection, ConnectError> {
+    let env = &libsignal_net::env::PROD;
+    let dns_resolver = DnsResolver::new_with_static_fallback(
+        env.static_fallback(StaticIpOrder::HARDCODED),
+        &no_network_change_events(),
+    );
+    let route_provider = DirectOrProxyProvider {
+        inner: env.chat_domain_config.connect.route_provider(
+            EnableDomainFronting::No,
+            OverrideNagleAlgorithm::UseSystemDefault,
+        ),
+        mode: DirectOrProxyMode::DirectOnly,
+    };
+    let connect = ConnectState::new_with_transport_connector(
+        SUGGESTED_CONNECT_CONFIG,
+        PreconnectingFactory::new(DefaultConnectorFactory, Duration::ZERO),
+    );
+    let user_agent = UserAgent::with_libsignal_version(concat!(
+        env!("CARGO_PKG_NAME"),
+        " ",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let ws_config = ws::Config {
+        initial_request_id: 0,
+        local_idle_timeout: Duration::from_secs(60),
+        post_request_interface_check_timeout: Duration::MAX,
+        remote_idle_timeout: Duration::from_secs(60),
+    };
+    let connection_resources = libsignal_net::connect_state::ConnectionResources {
+        connect_state: &connect,
+        dns_resolver: &dns_resolver,
+        network_change_event: &no_network_change_events(),
+        confirmation_header_name: env
+            .chat_domain_config
+            .connect
+            .confirmation_header_name
+            .map(http::HeaderName::from_static),
+    };
+    let pending = ChatConnection::start_connect_with(
+        connection_resources,
+        env.chat_domain_config.connect.service,
+        route_provider,
+        CHAT_WEBSOCKET_PATH,
+        &user_agent,
+        ws_config,
+        None,
+        "cloud-backup",
+    )
+    .await?;
+    let listener: ws::EventListener = Box::new(|_event| {});
+    let tokio_runtime = tokio::runtime::Handle::try_current()
+        .expect("cloud restore runs on the engine LocalSet tokio runtime");
+    Ok(ChatConnection::finish_connect(
+        tokio_runtime,
+        pending,
+        Default::default(),
+        listener,
+    ))
+}
