@@ -70,7 +70,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `listGroups` | `{account}` | `[{id(base64), name, isMember, members:[{number}], terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现） |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
 | `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, previewUrl?, previewTitle?, previewDescription?, previewImage?, mentions?: [{number, start, length}], textStyle?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/mentions 条目缺字段/textStyle 条目词表外（五值白名单；NONE 一并拒——官方 composer 永不发出的 no-op 标记）·缺字段·style 非字符串·start/length 超 u32·>64 条（cap 镜像整拒不截断）·非数组/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5） | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；textStyle→BodyRange.Style 五值词表单点映射（2026-10-06 透传批，connector 契约 1.69 §4.62 引擎侧缺口闭合：UTF-16 offsets 透传不查 body 边界——官方 parseTextStyles 同口径，与 mentions 同款调用方纪律，详见 §5）；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags（presage voice_note 同构，2026-10-04））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立 |
-| `sendStory` | `{account, message(非空), recipients(非空字符串数组——名单展开集，成员解析归 connector), distributionListId?(非空字符串，缺省官方 MY_STORY_ID 零 UUID), allowsReplies?(布尔，缺省 false=线上 proto 缺席位), textStyle?(单词 DEFAULT\|REGULAR\|BOLD\|SERIF\|SCRIPT\|CONDENSED，缺省 DEFAULT=proto 字段省略), bodyRanges?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64, previewImage?(非空 data URI)}` | `{timestamp, results:[{recipientNumber, success:{timestamp}}]}`（fake `results` 恒空） | account/message 缺失或空串/recipients 缺失·空批·单字符串形态·条目非字符串·空串/distributionListId 空串·非字符串/allowsReplies 非布尔/textStyle 词表外（含内联样式词与大小写漂移）·非字符串/bodyRanges 条目缺字段·style 词表外·>64 条（cap 镜像整拒不截断）·非数组/previewImage 非字符串·空串 `-32603`；号码不可解析/收件人发送失败/未注册账号 同 send 折叠 `-32603` | **2026-10-08 real（KT 扩展，Stories 发送批）**：官方 sendStory 行为对齐——text story 单面（群 story/文件 story v1 不做）；textAttachment{text, textStyle, preview.image=previewImage 随批 CDN 上行} 构造 + profileKey 由 fork send 面注入；解析全量前置→按解析后 ServiceId 去重保首现序→单时间戳逐收件人 sealed-sender `?story=true` 分发（任一失败整体 `-32603`，per-recipient 部分失败形状未对齐纪律 §5）→≥1 成功后 best-effort 自同步 `SyncMessage.Sent{story_message, story_message_recipients}`（官方「≥1 成功且有其他设备」同闸，同步失败不回滚）；urgent 位钉定 rev proto 无此字段（偏差登记 §5）；详见 §5 Stories 发送批 |
+| `sendStory` | `{account, message(非空), recipients(非空字符串数组——名单展开集，成员解析归 connector), distributionListId?(非空字符串，缺省官方 MY_STORY_ID 零 UUID), allowsReplies?(布尔，缺省 false=线上 proto 缺席位), textStyle?(单词 DEFAULT\|REGULAR\|BOLD\|SERIF\|SCRIPT\|CONDENSED，缺省 DEFAULT=proto 字段省略), bodyRanges?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64, previewImage?(非空 data URI), previewUrl?(非空 ≤2048 字符且 https:// 开头), previewTitle?(非空 ≤1024 UTF-8 字节)}` | `{timestamp, results:[{recipientNumber, success:{timestamp}}]}`（fake `results` 恒空） | account/message 缺失或空串/recipients 缺失·空批·单字符串形态·条目非字符串·空串/distributionListId 空串·非字符串/allowsReplies 非布尔/textStyle 词表外（含内联样式词与大小写漂移）·非字符串/bodyRanges 条目缺字段·style 词表外·>64 条（cap 镜像整拒不截断）·非数组/previewImage 非字符串·空串/previewUrl 非字符串·空串·非 `https://` 开头·>2048 字符/previewTitle 非字符串·空串·>1024 UTF-8 字节 `-32603`；号码不可解析/收件人发送失败/未注册账号 同 send 折叠 `-32603` | **2026-10-08 real（KT 扩展，Stories 发送批）**：官方 sendStory 行为对齐——text story 单面（群 story/文件 story v1 不做）；textAttachment{text, textStyle, preview.image=previewImage 随批 CDN 上行} 构造 + profileKey 由 fork send 面注入；preview 面 2026-10-09 扩：previewUrl/previewTitle 如实进 proto preview.url/preview.title（两键互相独立可选，image/url/title 三件任一在场即成 Preview——官方 preview 面 image 可空同构 `hydratedPreview.image && upload`；接收面投影见 Stories 接收批）；解析全量前置→按解析后 ServiceId 去重保首现序→单时间戳逐收件人 sealed-sender `?story=true` 分发（任一失败整体 `-32603`，per-recipient 部分失败形状未对齐纪律 §5）→≥1 成功后 best-effort 自同步 `SyncMessage.Sent{story_message, story_message_recipients}`（官方「≥1 成功且有其他设备」同闸，同步失败不回滚）；urgent 位钉定 rev proto 无此字段（偏差登记 §5）；详见 §5 Stories 发送批 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
@@ -1609,8 +1609,14 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   allows_replies, body_ranges, attachment: TextAttachment}`；textStyle 六值
   词表（官方 TextAttachment.Style 枚举词表同构）DEFAULT=字段省略；
   bodyRanges 五值内联样式与 send textStyle 同款双层闸（methods 词表白名单
-  + 服务层 from_str_name 防御）；preview.image = previewImage data URI 随
-  批 CDN 上行指针（官方 preview 同批上传同构）。
+  + 服务层 from_str_name 防御）；preview = image/url/title 三件组装
+  （2026-10-09 扩面）：previewImage data URI 随批 CDN 上行指针（官方
+  preview 同批上传同构）+ previewUrl/previewTitle 如实透传（methods 参数
+  闸：url 非空 ≤2048 字符且 `https://` 开头——官方 isValidLink https-only
+  同构 LinkPreview.std.ts:54-65，字符面计数；title 非空 ≤1024 UTF-8 字节，
+  字节面计数；违规整拒不静默丢键）；三件任一在场即成 Preview，官方
+  preview 面 image 可空同构（`hydratedPreview.image && uploadAttachment`）；
+  description/date 官方 story 预览面无源恒缺席。
 - **分发面**：解析全量前置（任何号码不可解析=无上行整拒）→解析后
   ServiceId 去重保首现序（号码/UUID 双形态收敛同一会话）→单时间戳逐收件
   人分发。per-recipient 失败整体 `-32603`（部分失败 result 形状未对齐，
@@ -1654,14 +1660,17 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   键不在（零 stderr 纪律，位面如实不发明）。
 - **storyMessage 投影**（信封级 `storyMessage` 键，story 不落普通会话流，
   connector 据此走 story 时间线）：`textAttachment{text, textStyle?,
-  preview.image 指针投影}` / `fileAttachment` → 附件指针投影（locator 面
-  同款，connector §4.54 媒体边界：元数据 only 字节永不下载）；
+  preview{image 指针, url?, title?}}` / `fileAttachment` → 附件指针投影
+  （locator 面同款，connector §4.54 媒体边界：元数据 only 字节永不下载）；
   `allowsReplies` 恒投（bool 缺席=线上缺省 false 如实）；`profileKey`/
   `group` 群 story 母钥 base64（有值才投）。textStyle 缺席/未知枚举值不投
   键；DEFAULT=0 线上在场照投词（与发送面缺省省略的不对称是线上形状的
-  如实两面）。无 attachment 位 = 官方发送面不可能产出的 malformed 行，
-  整信封丢弃（宁缺勿错）。群 story（group 母钥位）接收面照投——发送面
-  v1 不做的不对称是既定边界（收得到、发不出）。
+  如实两面）。preview.url/preview.title 引擎扩展键往返面（2026-10-09 批，
+  发送面 previewUrl/previewTitle 对端回声）：Some 且非空才投字符串键，与
+  image 同一 preview 对象并列；None/空串省键（缺席键不在）；preview 面全
+  空 = preview 键不在。无 attachment 位 = 官方发送面不可能产出的
+  malformed 行，整信封丢弃（宁缺勿错）。群 story（group 母钥位）接收面
+  照投——发送面 v1 不做的不对称是既定边界（收得到、发不出）。
 - **storyReply 投影**（dataMessage 级 `storyReply` 键）：
   `storyContext → {authorAci, sentTimestamp}`；author binary 16B UUID 优先、
   string 兜底（mentions 同款二进制优先纪律），两者皆缺/不可解析 = 整键
@@ -1675,9 +1684,9 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
 - **偏差登记**：①「stories 功能禁用即丢弃」官方腿不设（引擎无账号设置
   读面，闸归 connector 宿主侧）；②envelope 级 `story` 原始 bool 不透出
   （以 `isStory: true` 在场性表达，缺席键=无位——proto 只投影不发明）；
-  ③storyMessage 的 textAttachment.preview 只投 image 指针（url/title/
-  description/date 官方 story 预览面未消费，缺席键不在——需要时按
-  previews 投影同款扩）。
+  ③storyMessage 的 textAttachment.preview 原「只投 image 指针」已在
+  2026-10-09 批扩为 url/title 同投（发送面扩展键往返面，Some 且非空才
+  投——description/date 官方 story 预览面仍未消费，缺席键不在）。
 - **边界（本批红线）**：24h 过期纯客户端语义不做（story 时间线过期归
   connector/宿主，引擎只投影不计时）；不做 story 删除（remoteDelete story
   形态）/已读回执/查看回执面；引擎零 stderr（官方两条 story warn 路径

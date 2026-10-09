@@ -798,7 +798,11 @@ async fn dispatch(
         // TextAttachment.Style 词表，DEFAULT = proto 字段省略）、bodyRanges
         // 五值内联样式 {style,start,length} ≤64（send textStyle 同款
         // fail-closed 闸 + 服务层防御双保险）、previewImage 非空字符串
-        //（缺失/null = 无预览，其他类型 fail-closed 不静默丢弃）。
+        //（缺失/null = 无预览，其他类型 fail-closed 不静默丢弃）、
+        // previewUrl 非空 ≤2048 字符且 https:// 开头（官方 isValidLink
+        // https-only 同构，LinkPreview.std.ts:54-65）、previewTitle 非空
+        // ≤1024 UTF-8 字节——两键独立可选，任一在场即成 Preview（官方
+        // preview 面 image 可空同构），违规 fail-closed 不静默丢键。
         "sendStory" => {
             state.lock().await.append_dispatch(method, params);
             let account = params
@@ -884,6 +888,27 @@ async fn dispatch(
                 Some(Value::String(uri)) if !uri.is_empty() => Some(uri.as_str()),
                 Some(_) => return internal_error(id),
             };
+            // previewUrl/previewTitle 扩面（2026-10-09 批）：url 官方
+            // isValidLink https-only 同构 ≤2048 字符；title ≤1024 UTF-8
+            // 字节（Rust str.len 即字节面）。违规整拒不静默丢键。
+            let preview_url = match params.get("previewUrl") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(url))
+                    if !url.is_empty()
+                        && url.chars().count() <= 2048
+                        && url.starts_with("https://") =>
+                {
+                    Some(url.clone())
+                }
+                Some(_) => return internal_error(id),
+            };
+            let preview_title = match params.get("previewTitle") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(title)) if !title.is_empty() && title.len() <= 1024 => {
+                    Some(title.clone())
+                }
+                Some(_) => return internal_error(id),
+            };
             match (account, message) {
                 (Some(account), Some(message)) => {
                     match service
@@ -896,6 +921,8 @@ async fn dispatch(
                             text_style,
                             &body_ranges,
                             preview_image,
+                            preview_url,
+                            preview_title,
                         )
                         .await
                     {

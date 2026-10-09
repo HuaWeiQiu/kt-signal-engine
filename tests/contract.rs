@@ -1175,7 +1175,8 @@ fn send_story_fake_shape_and_param_fail_closed() {
     let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
 
     // fake 合法批：成功形状 {timestamp, results: []}（send 系 fake 纪律：
-    // 参数闸全量生效后成功桩，results 恒空）。全参数在场。
+    // 参数闸全量生效后成功桩，results 恒空）。全参数在场（previewUrl/
+    // previewTitle 2026-10-09 扩面，双在场合法形态）。
     assert_eq!(
         engine
             .request(
@@ -1188,7 +1189,9 @@ fn send_story_fake_shape_and_param_fail_closed() {
                     "allowsReplies": true,
                     "textStyle": "BOLD",
                     "bodyRanges": [{ "style": "BOLD", "start": 0, "length": 5 }],
-                    "previewImage": "data:image/png;base64,iVBORw0KGgo="
+                    "previewImage": "data:image/png;base64,iVBORw0KGgo=",
+                    "previewUrl": "https://example.com/a",
+                    "previewTitle": "Example"
                 })
             )
             .pointer("/result/results"),
@@ -1338,6 +1341,68 @@ fn send_story_fake_shape_and_param_fail_closed() {
     );
     assert_eq!(code, -32603);
 
+    // previewUrl/previewTitle 参数闸（2026-10-09 扩面）：url 族——非字符串/
+    // 空串/非 https（官方 isValidLink https-only 同构）/超 2048 字符；
+    // title 族——非字符串/空串/超 1024 UTF-8 字节（342×「中」= 1026 字节，
+    // 字符数 342 在帽内——钉字节面不是字符面）。
+    for preview_url in [
+        json!(42),
+        json!(""),
+        json!("http://example.com/a"),
+        json!(format!("https://{}", "a".repeat(2041))),
+    ] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "message": "story",
+                "recipients": ["+15555550101"],
+                "previewUrl": preview_url
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    for preview_title in [
+        json!(42),
+        json!(""),
+        json!("a".repeat(1025)),
+        json!("中".repeat(342)),
+    ] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "message": "story",
+                "recipients": ["+15555550101"],
+                "previewTitle": preview_title
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // 边界内合法：url 恰 2048 字符 + title 恰 1024 字节（双在场）成功；
+    // previewUrl 单独在场（无 previewImage）亦成功——两键互相独立可选。
+    let boundary = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "previewUrl": format!("https://{}", "a".repeat(2040)),
+            "previewTitle": "a".repeat(1024)
+        }),
+    );
+    assert!(boundary["result"]["timestamp"].is_u64(), "timestamp is u64");
+    let url_only = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"],
+            "previewUrl": "https://example.com/a"
+        }),
+    );
+    assert_eq!(url_only["result"]["results"], json!([]));
+
     // 调度日志纪律：成功与被拒调用都落日志（send 系同款，updateGroup
     // 同构断言）；params 形状供 connector 侧依赖断言。
     let log_path = dir.join("engine-send-log.jsonl");
@@ -1352,13 +1417,19 @@ fn send_story_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         story_entries.len(),
-        24,
-        "成功两条 + 拒绝二十二条均落日志（append_dispatch 在参数闸之前）"
+        34,
+        "成功四条 + 拒绝三十条均落日志（append_dispatch 在参数闸之前）"
     );
     assert_eq!(
         story_entries[0]["params"]["recipients"],
         json!(["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
     );
+    assert_eq!(
+        story_entries[0]["params"]["previewUrl"],
+        json!("https://example.com/a"),
+        "previewUrl/previewTitle 原样进日志（connector 侧依赖断言）"
+    );
+    assert_eq!(story_entries[0]["params"]["previewTitle"], json!("Example"));
     assert_eq!(
         story_entries[1]["params"]["distributionListId"],
         json!(null),

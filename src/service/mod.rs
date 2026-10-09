@@ -879,6 +879,8 @@ impl Service {
         text_style: Option<i32>,
         body_ranges: &[SendTextStyle],
         preview_image: Option<&str>,
+        preview_url: Option<String>,
+        preview_title: Option<String>,
     ) -> Result<(u64, Vec<Value>), SendError> {
         stories::send_story(
             self,
@@ -890,6 +892,8 @@ impl Service {
             text_style,
             body_ranges,
             preview_image,
+            preview_url,
+            preview_title,
         )
         .await
     }
@@ -3751,14 +3755,17 @@ fn story_reply_author(context: &presage::proto::data_message::StoryContext) -> O
 }
 
 /// story 投影（Stories 接收批，E2，compat §5 Stories 接收批块）：proto 只
-/// 投影不发明，缺席键不在。textAttachment{text, textStyle?, preview.image
-/// 指针}/fileAttachment → 附件指针投影（connector 媒体边界同口径：元数据
-/// only，字节永不下载）；allowsReplies 恒投（proto bool 缺席 = 线上缺省
-/// false 如实）；profileKey/group 群 story 母钥 base64（有值才投）。
-/// textStyle 缺席/未知枚举值不投键（词表纪律同 textStyles 收投影）；
-/// DEFAULT=0 线上在场照投词——与发送面缺省省略的不对称是线上形状的如实
-/// 两面。无 attachment 位 = 官方发送面不可能产出的 malformed 行，返回
-/// None（调用方整信封丢弃）。
+/// 投影不发明，缺席键不在。textAttachment{text, textStyle?, preview{image
+/// 指针, url?, title?}}/fileAttachment → 附件指针投影（connector 媒体边界
+/// 同口径：元数据 only，字节永不下载）；allowsReplies 恒投（proto bool 缺
+/// 席 = 线上缺省 false 如实）；profileKey/group 群 story 母钥 base64（有值
+/// 才投）。textStyle 缺席/未知枚举值不投键（词表纪律同 textStyles 收投
+/// 影）；DEFAULT=0 线上在场照投词——与发送面缺省省略的不对称是线上形状的
+/// 如实两面。preview.url/preview.title 引擎扩展键往返面（2026-10-09 批，
+/// 发送面 previewUrl/previewTitle 对端回声）：Some 且非空才投，同一
+/// preview 对象内与 image 并列（description/date 官方 story 预览面未消
+/// 费，仍不投）。无 attachment 位 = 官方发送面不可能产出的 malformed 行，
+/// 返回 None（调用方整信封丢弃）。
 fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> {
     use base64::Engine as _;
     let attachment = story.attachment.as_ref()?;
@@ -3774,15 +3781,20 @@ fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> 
                     value.insert("textStyle".into(), json!(word.as_str_name()));
                 }
             }
-            if let Some(image) = text
-                .preview
-                .as_ref()
-                .and_then(|preview| preview.image.as_ref())
-            {
-                value.insert(
-                    "preview".into(),
-                    json!({ "image": project_attachment_pointer(image) }),
-                );
+            if let Some(preview) = text.preview.as_ref() {
+                let mut face = serde_json::Map::new();
+                if let Some(url) = preview.url.as_deref().filter(|url| !url.is_empty()) {
+                    face.insert("url".into(), json!(url));
+                }
+                if let Some(title) = preview.title.as_deref().filter(|title| !title.is_empty()) {
+                    face.insert("title".into(), json!(title));
+                }
+                if let Some(image) = preview.image.as_ref() {
+                    face.insert("image".into(), project_attachment_pointer(image));
+                }
+                if !face.is_empty() {
+                    value.insert("preview".into(), Value::Object(face));
+                }
             }
             out.insert("textAttachment".into(), Value::Object(value));
         }
@@ -6218,6 +6230,10 @@ mod tests {
             preview["image"]["locator"]["key"].is_string(),
             "preview.image 走附件指针投影（locator.key base64）"
         );
+        assert!(
+            preview.get("url").is_none() && preview.get("title").is_none(),
+            "url/title proto 缺席不投键（缺席键不在）"
+        );
         assert_eq!(face["allowsReplies"], json!(true));
         assert_eq!(
             face["profileKey"],
@@ -6245,6 +6261,106 @@ mod tests {
         assert_eq!(
             envelope["storyMessage"]["textAttachment"]["textStyle"],
             json!("DEFAULT")
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Stories 接收批（E2）preview.url/preview.title 扩面（2026-10-09 批，
+    /// 发送面 previewUrl/previewTitle 对端回声）：Some 且非空投字符串键（与
+    /// image 同一 preview 对象并列；无 image 的 preview 面照投）；空串省键
+    /// （缺席键不在），preview 面全空 = preview 键不在。
+    #[tokio::test]
+    async fn receive_story_message_projects_preview_url_and_title() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{Preview, TextAttachment};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-preview-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = || Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: Some(true),
+        };
+        let story = |url: Option<&str>, title: Option<&str>| presage::proto::StoryMessage {
+            profile_key: None,
+            group: None,
+            allows_replies: Some(true),
+            body_ranges: Vec::new(),
+            attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                TextAttachment {
+                    text: Some("preview face".to_owned()),
+                    text_style: None,
+                    text_foreground_color: None,
+                    text_background_color: None,
+                    preview: Some(Preview {
+                        url: url.map(str::to_owned),
+                        title: title.map(str::to_owned),
+                        image: None,
+                        description: None,
+                        date: None,
+                    }),
+                    background: None,
+                },
+            )),
+        };
+
+        // 双在场：url/title 投字符串键，同一 preview 对象；image 缺席键不在
+        //（url-only story 的对端回声形状）。
+        let content = Content::from_body(
+            ContentBody::StoryMessage(story(Some("https://example.com/a"), Some("Example"))),
+            metadata(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story projects",
+        )["params"]["envelope"]
+            .clone();
+        let preview = &envelope["storyMessage"]["textAttachment"]["preview"];
+        assert_eq!(preview["url"], json!("https://example.com/a"));
+        assert_eq!(preview["title"], json!("Example"));
+        assert!(
+            preview.get("image").is_none(),
+            "image 缺席键不在（preview 对象不发明 image）"
+        );
+
+        // 空串：省键；preview 面全空 = preview 键不在（缺席键不在纪律）。
+        let content = Content::from_body(
+            ContentBody::StoryMessage(story(Some(""), Some(""))),
+            metadata(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(
+            envelope["storyMessage"]["textAttachment"]
+                .get("preview")
+                .is_none(),
+            "preview 面全空不投键"
         );
 
         let _ = std::fs::remove_dir_all(&store_dir);

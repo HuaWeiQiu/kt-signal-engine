@@ -4,8 +4,9 @@
 //! 分发 + best-effort 自同步。
 //!
 //! 官方行为参照（Signal-Desktop，行为对齐不抄码）：`ts/jobs/helpers/
-//! sendStory.preload.ts`——textAttachment 构造（text/textStyle/preview.image
-//! 随批 CDN 上行）、跨名单按 conversation 去重（`recipientsByServiceId`
+//! sendStory.preload.ts`——textAttachment 构造（text/textStyle/preview 面
+//! 随批 CDN 上行，preview.url/preview.title 引擎扩展键 2026-10-09 批）、
+//! 跨名单按 conversation 去重（`recipientsByServiceId`
 //! Map 保首现序）、自同步仅在 ≥1 收件人成功且有其他设备时发送
 //! （`storyMessageRecipients` 空 / 单设备即跳过）；story 恒走 sealed sender
 //! 通道（fork 已接线，见 vendor/libsignal-service
@@ -82,8 +83,10 @@ fn build_body_ranges(styles: &[SendTextStyle]) -> Result<Vec<BodyRange>, SendErr
 ///   发送者 profile key（与 presage `send_message` 注入 DataMessage 同构；
 ///   官方 sendStory profileKey 必需）；
 /// - `attachment` 恒 TextAttachment（文件 story v1 不做）；
-/// - preview.image = 调用方已上行的 CDN 指针（官方 sendStory 同构：
-///   preview 数据随正文附件同批上传）；
+/// - preview = 三件套组装（见 build_story_preview）：preview.image = 调用
+///   方已上行的 CDN 指针（官方 sendStory 同构：preview 数据随正文附件同批
+///   上行），url/title = previewUrl/previewTitle 扩展键如实透传（解析闸
+///   在 methods 参数面：https-only ≤2048 字符 / 非空 ≤1024 UTF-8 字节）；
 /// - `allows_replies` 透传（官方值源 = distribution list 属性，缺省线上
 ///   false；connector 从名单记录展开后显式传入）。
 pub(crate) fn build_story_message(
@@ -92,6 +95,8 @@ pub(crate) fn build_story_message(
     allows_replies: bool,
     body_ranges: &[SendTextStyle],
     preview_image: Option<presage::proto::AttachmentPointer>,
+    preview_url: Option<String>,
+    preview_title: Option<String>,
 ) -> Result<StoryMessage, SendError> {
     Ok(StoryMessage {
         profile_key: None,
@@ -103,15 +108,31 @@ pub(crate) fn build_story_message(
             text_style,
             text_foreground_color: None,
             text_background_color: None,
-            preview: preview_image.map(|image| Preview {
-                url: None,
-                title: None,
-                image: Some(image),
-                description: None,
-                date: None,
-            }),
+            preview: build_story_preview(preview_image, preview_url, preview_title),
             background: None,
         })),
+    })
+}
+
+/// story preview 组装（纯函数，单测钉形状）：image/url/title 三件任一在场
+/// 即成 Preview（官方 sendStory preview 面 image 可空同构——
+/// `hydratedPreview.image && uploadAttachment`，url/title 独立席位）；全缺
+/// = None（线上缺席位，现状形态）。description/date 官方 story 预览面无
+/// 源，恒缺席。
+fn build_story_preview(
+    image: Option<presage::proto::AttachmentPointer>,
+    url: Option<String>,
+    title: Option<String>,
+) -> Option<Preview> {
+    if image.is_none() && url.is_none() && title.is_none() {
+        return None;
+    }
+    Some(Preview {
+        url,
+        title,
+        image,
+        description: None,
+        date: None,
     })
 }
 
@@ -144,6 +165,8 @@ pub(crate) async fn send_story(
     text_style: Option<i32>,
     body_ranges: &[SendTextStyle],
     preview_image: Option<&str>,
+    preview_url: Option<String>,
+    preview_title: Option<String>,
 ) -> Result<(u64, Vec<Value>), SendError> {
     if !service.real {
         return Ok((super::now_ms(), Vec::new()));
@@ -166,6 +189,8 @@ pub(crate) async fn send_story(
         allows_replies,
         body_ranges,
         preview_pointer,
+        preview_url,
+        preview_title,
     )?;
 
     // 解析全量前置（不可解析 = 无上行整拒），随后按解析序去重。
@@ -257,7 +282,8 @@ mod tests {
 
     #[test]
     fn story_message_shape() {
-        let story = build_story_message("hello", Some(2), true, &[], None).expect("shape");
+        let story =
+            build_story_message("hello", Some(2), true, &[], None, None, None).expect("shape");
         assert_eq!(story.profile_key, None, "profileKey 由 send 面注入");
         assert_eq!(story.group, None, "群 story v1 不做");
         assert_eq!(story.allows_replies, Some(true));
@@ -266,7 +292,7 @@ mod tests {
             Some(story_message::Attachment::TextAttachment(text)) => {
                 assert_eq!(text.text.as_deref(), Some("hello"));
                 assert_eq!(text.text_style, Some(2), "textStyle 透传线上 i32");
-                assert!(text.preview.is_none(), "无 previewImage 不携 preview");
+                assert!(text.preview.is_none(), "preview 三件全缺不携 preview");
                 assert!(text.text_foreground_color.is_none());
                 assert!(text.text_background_color.is_none());
                 assert!(text.background.is_none());
@@ -277,7 +303,7 @@ mod tests {
 
     #[test]
     fn story_message_default_style_omits_field() {
-        let story = build_story_message("hi", None, false, &[], None).expect("shape");
+        let story = build_story_message("hi", None, false, &[], None, None, None).expect("shape");
         let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
             panic!("text attachment expected");
         };
@@ -297,6 +323,8 @@ mod tests {
             true,
             &[style("BOLD", 0, 4), style("SPOILER", 5, 2)],
             Some(pointer),
+            None,
+            None,
         )
         .expect("shape");
         assert_eq!(story.body_ranges.len(), 2);
@@ -319,7 +347,57 @@ mod tests {
         };
         let preview = text.preview.expect("preview projected");
         assert_eq!(preview.image.as_ref().unwrap().cdn_number, Some(3));
+        // 未携 previewUrl/previewTitle 参：url/title 仍 None（现状形态）。
         assert!(preview.url.is_none() && preview.title.is_none());
+    }
+
+    #[test]
+    fn story_message_preview_url_title_faces() {
+        // previewUrl/previewTitle 三态进 Preview（2026-10-09 扩面）：双在场
+        // 如实透传、仅 url 独立成 Preview（image 缺席，官方 preview 面
+        // image 可空同构）、缺席不发明。
+        let pointer = presage::proto::AttachmentPointer {
+            cdn_number: Some(3),
+            ..Default::default()
+        };
+        let url = "https://example.com/a".to_owned();
+        let title = "Example".to_owned();
+
+        let story = build_story_message(
+            "both",
+            None,
+            true,
+            &[],
+            Some(pointer.clone()),
+            Some(url.clone()),
+            Some(title.clone()),
+        )
+        .expect("shape");
+        let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
+            panic!("text attachment expected");
+        };
+        let preview = text.preview.expect("preview projected");
+        assert_eq!(preview.url.as_deref(), Some("https://example.com/a"));
+        assert_eq!(preview.title.as_deref(), Some("Example"));
+        assert_eq!(preview.image.as_ref().unwrap().cdn_number, Some(3));
+        assert!(preview.description.is_none() && preview.date.is_none());
+
+        // 仅 url：无 previewImage 也独立成 Preview，image 缺席。
+        let story = build_story_message("url only", None, true, &[], None, Some(url.clone()), None)
+            .expect("shape");
+        let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
+            panic!("text attachment expected");
+        };
+        let preview = text.preview.expect("preview projected");
+        assert_eq!(preview.url.as_deref(), Some("https://example.com/a"));
+        assert!(preview.title.is_none() && preview.image.is_none());
+
+        // 缺席：不发明 Preview。
+        let story = build_story_message("bare", None, true, &[], None, None, None).expect("shape");
+        let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
+            panic!("text attachment expected");
+        };
+        assert!(text.preview.is_none());
     }
 
     #[test]
