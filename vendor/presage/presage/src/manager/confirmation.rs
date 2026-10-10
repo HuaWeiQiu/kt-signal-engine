@@ -103,6 +103,8 @@ impl<S: Store> Manager<S, Confirmation> {
                         spqr: true,
                         profiles_v2: false,
                         username_change_sync_message: true,
+                        versioned_expiration_timer: false,
+                        optional_phone_number: false,
                     }),
                     discoverable_by_phone_number: true,
                     recovery_password: None,

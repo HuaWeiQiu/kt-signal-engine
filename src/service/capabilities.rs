@@ -16,6 +16,11 @@
 //!    `LinkCapabilities::default()`（vendor/libsignal-service/src/
 //!    provisioning/mod.rs 构造点，push_service/linking.rs Default 实现）。
 //!    构造器可 pub 调用，运行时 **live 复用**，零镜像。
+//! 3. 设备面注册 `CapabilitiesUpload`——接收管线建流时 best-effort
+//!    `PUT /v1/devices/capabilities`（官方桌面每次链接启动
+//!    afterEveryLinkedStartup → registerCapabilities 同位，D5 批）；
+//!    vendor 构造器可 pub 调用，运行时 **live 复用**（常量经
+//!    `DEVICE_CAPABILITIES_UPLOAD` 钉定位值）。
 //!
 //! 依赖基线（presage rev / libsignal 版本）由 build.rs 从本仓 Cargo.toml/
 //! Cargo.lock 解析注入 `KT_ENGINE_*` env 常量。防漂移闸四层：镜像位值
@@ -25,12 +30,16 @@
 //! 死（依赖升级必须撞闸重走能力位复核）——不允许无人知晓。
 
 use presage::libsignal_service::push_service::linking::LinkCapabilities;
-use presage::libsignal_service::websocket::account::DeviceCapabilities;
+use presage::libsignal_service::websocket::account::{CapabilitiesUpload, DeviceCapabilities};
 use serde_json::{json, Value};
 
 /// 账号属性面声明镜像：registered.rs `set_account_attributes`（与
-/// confirmation.rs 主注册链同值）的六位字面值。vendor 升级改位 = 单测
+/// confirmation.rs 主注册链同值）的八位字面值。vendor 升级改位 = 单测
 /// `device_capabilities_bits_match_vendor_chain` 红灯，复核后同步此处。
+/// D5 起补齐 server 真相（Signal-Server DeviceCapability.java 全集）的
+/// 两位：`versioned_expiration_timer`（官方桌面设备面不上传，引擎不声明
+/// 特性支持）、`optional_phone_number`（官方上传值 = 账号码共享状态位
+/// `getOptionalNumber() == null`；KT 引擎账号号码恒共享态 = false）。
 pub(crate) const DEVICE_CAPABILITIES: DeviceCapabilities = DeviceCapabilities {
     storage: true,
     transfer: false,
@@ -38,6 +47,21 @@ pub(crate) const DEVICE_CAPABILITIES: DeviceCapabilities = DeviceCapabilities {
     spqr: true,
     profiles_v2: false,
     username_change_sync_message: true,
+    versioned_expiration_timer: false,
+    optional_phone_number: false,
+};
+
+/// 设备面注册位镜像（官方 `CapabilitiesUploadType` 四位，
+/// `ts/types/Capabilities.std.ts`；`PUT /v1/devices/capabilities` body
+/// 逐键同形）：spqr/usernameChangeSyncMessage 与账号属性面同位 true；
+/// attachmentBackfill 官方桌面恒 true（已实现 backfill），引擎未实现
+/// backfill 接收语义宁缺勿错声明 false（compat §5 偏差登记）；optional
+/// _phoneNumber 状态位同 DEVICE_CAPABILITIES 口径 false。
+pub(crate) const DEVICE_CAPABILITIES_UPLOAD: CapabilitiesUpload = CapabilitiesUpload {
+    attachment_backfill: false,
+    spqr: true,
+    username_change_sync_message: true,
+    optional_phone_number: false,
 };
 
 /// 镜像位值编译期钉定：位值或 vendor 字段集漂移直接断编译，不进运行时。
@@ -48,6 +72,12 @@ const _: () = {
     assert!(DEVICE_CAPABILITIES.spqr);
     assert!(!DEVICE_CAPABILITIES.profiles_v2);
     assert!(DEVICE_CAPABILITIES.username_change_sync_message);
+    assert!(!DEVICE_CAPABILITIES.versioned_expiration_timer);
+    assert!(!DEVICE_CAPABILITIES.optional_phone_number);
+    assert!(!DEVICE_CAPABILITIES_UPLOAD.attachment_backfill);
+    assert!(DEVICE_CAPABILITIES_UPLOAD.spqr);
+    assert!(DEVICE_CAPABILITIES_UPLOAD.username_change_sync_message);
+    assert!(!DEVICE_CAPABILITIES_UPLOAD.optional_phone_number);
 };
 
 /// `engine.protocolCapabilities` 应答体：只读、零网络、账号无关，未绑定
@@ -57,6 +87,7 @@ const _: () = {
 pub(crate) fn protocol_capabilities_payload() -> Value {
     json!({
         "deviceCapabilities": vendor_json(&DEVICE_CAPABILITIES),
+        "deviceCapabilitiesUpload": vendor_json(&DEVICE_CAPABILITIES_UPLOAD),
         "linkCapabilities": vendor_json(&LinkCapabilities::default()),
         "baseline": {
             "presageRev": env!("KT_ENGINE_PRESAGE_REV"),
@@ -69,6 +100,13 @@ pub(crate) fn protocol_capabilities_payload() -> Value {
 /// vendor 结构体按其 serde 属性出 JSON（布尔位结构体序列化不可失败）。
 fn vendor_json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).expect("capability structs serialize infallibly")
+}
+
+/// 设备面注册上传体（engine.deviceCapabilities 回读面）：wire 逐键同
+/// 官方 CapabilitiesUploadType serde 输出，位值 = DEVICE_CAPABILITIES_
+/// UPLOAD 钉定镜像（PUT body 与此同形）。
+pub(crate) fn device_capabilities_upload_payload() -> Value {
+    vendor_json(&DEVICE_CAPABILITIES_UPLOAD)
 }
 
 #[cfg(test)]
@@ -135,6 +173,8 @@ mod tests {
                 "spqr: true,",
                 "profiles_v2: false,",
                 "username_change_sync_message: true,",
+                "versioned_expiration_timer: false,",
+                "optional_phone_number: false,",
             ] {
                 assert!(
                     block.contains(field),
@@ -170,7 +210,12 @@ mod tests {
         let obj = payload.as_object().expect("payload object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["baseline", "deviceCapabilities", "linkCapabilities"]
+            [
+                "baseline",
+                "deviceCapabilities",
+                "deviceCapabilitiesUpload",
+                "linkCapabilities"
+            ]
         );
 
         let device = obj["deviceCapabilities"].as_object().expect("object");
@@ -178,11 +223,13 @@ mod tests {
             device.keys().collect::<Vec<_>>().as_slice(),
             [
                 "attachmentBackfill",
+                "optionalPhoneNumber",
                 "profiles_v2",
                 "spqr",
                 "storage",
                 "transfer",
-                "usernameChangeSyncMessage"
+                "usernameChangeSyncMessage",
+                "versionedExpirationTimer"
             ]
         );
         assert_eq!(device["spqr"], json!(true));
@@ -191,6 +238,24 @@ mod tests {
         assert_eq!(device["attachmentBackfill"], json!(false));
         assert_eq!(device["profiles_v2"], json!(false));
         assert_eq!(device["usernameChangeSyncMessage"], json!(true));
+        assert_eq!(device["versionedExpirationTimer"], json!(false));
+        assert_eq!(device["optionalPhoneNumber"], json!(false));
+
+        // 设备面注册位（官方 CapabilitiesUploadType 四键，wire 逐键同形）。
+        let upload = obj["deviceCapabilitiesUpload"].as_object().expect("object");
+        assert_eq!(
+            upload.keys().collect::<Vec<_>>().as_slice(),
+            [
+                "attachmentBackfill",
+                "optionalPhoneNumber",
+                "spqr",
+                "usernameChangeSyncMessage"
+            ]
+        );
+        assert_eq!(upload["spqr"], json!(true));
+        assert_eq!(upload["usernameChangeSyncMessage"], json!(true));
+        assert_eq!(upload["attachmentBackfill"], json!(false));
+        assert_eq!(upload["optionalPhoneNumber"], json!(false));
 
         let link = obj["linkCapabilities"].as_object().expect("object");
         assert_eq!(

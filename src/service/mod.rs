@@ -514,6 +514,14 @@ pub(crate) enum UserStatusError {
     Internal,
 }
 
+/// engine.deviceCapabilities（D5 设备面注册）错误归型：401 解绑判据与
+/// UserStatusError 同源，其余折叠 Internal（参数面无独立错误）。
+#[derive(Debug)]
+pub(crate) enum DeviceCapabilitiesError {
+    Unbound,
+    Internal,
+}
+
 /// 链接结果共享槽：finishLink 可被连接器超时重试（connector service.rs 语义），
 /// 多个等待者共享同一次结果。
 struct LinkResultSlot {
@@ -1834,6 +1842,34 @@ impl Service {
         }
     }
 
+    /// engine.deviceCapabilities（D5 设备面能力注册）：PUT
+    /// /v1/devices/capabilities（官方 registerCapabilities 同端点，位值 =
+    /// capabilities::DEVICE_CAPABILITIES_UPLOAD 钉定镜像）。fake 恒已注册
+    /// （getUserStatus 同款）；仅 401 判解绑，其余折叠 Internal。宿主手动
+    /// 触发 + 上传面回读；接收管线建流另有自动注册（同一常量）。
+    pub(crate) async fn register_device_capabilities(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<(), DeviceCapabilitiesError> {
+        if !self.real {
+            return Ok(());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(DeviceCapabilitiesError::Internal)?;
+        let manager = lock_registered_for_send(&shared).await;
+        match manager
+            .register_device_capabilities(capabilities::DEVICE_CAPABILITIES_UPLOAD)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(presage::Error::ServiceError(
+                presage::libsignal_service::prelude::ServiceError::Unauthorized,
+            )) => Err(DeviceCapabilitiesError::Unbound),
+            Err(_) => Err(DeviceCapabilitiesError::Internal),
+        }
+    }
+
     /// updateContact：P1b 仅在本地 store 命中该号码时改名（uuid 归属需要
     /// contacts 同步，P2 补服务器面）；未命中为幂等 no-op（compat §3）。
     pub(crate) async fn update_contact(
@@ -2940,6 +2976,9 @@ async fn receive_pipeline(
     // D1 自动 delivery receipt 批量缓冲（管线生命周期，跨流重启存活：
     // 未发批次等下一条流的批量窗续发，不随重连丢失）。
     let mut receipts = delivery_receipt::AutoDeliveryReceipts::default();
+    // D5 设备面能力注册：每管线运行成功一次即止（官方 afterEveryLinked
+    // Startup 每次链接启动同位，不随重连重发）；失败随建流重试。
+    let mut capabilities_registered = false;
     // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
@@ -2974,6 +3013,7 @@ async fn receive_pipeline(
                 &mut last_contacts_sync,
                 &mut derm_guard,
                 &mut receipts,
+                &mut capabilities_registered,
             ) => outcome,
         };
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
@@ -3084,6 +3124,7 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
 /// 语义）；建流遇服务端 401 凭据拒绝（vendored
 /// `ServiceError::Unauthorized`）返回 Unbound（停环等重链，B4）。
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn serve_account_stream(
     service: &Arc<Service>,
     number: &str,
@@ -3092,6 +3133,7 @@ async fn serve_account_stream(
     last_contacts_sync: &mut Option<std::time::Instant>,
     derm_guard: &mut DermRetryGuard,
     receipts: &mut delivery_receipt::AutoDeliveryReceipts,
+    capabilities_registered: &mut bool,
 ) -> StreamOutcome {
     let Ok(store) = open_store(dir).await else {
         return StreamOutcome::Recoverable;
@@ -3099,6 +3141,17 @@ async fn serve_account_stream(
     let Ok(mut manager) = Manager::load_registered(store).await else {
         return StreamOutcome::Recoverable;
     };
+    // D5 设备面能力注册（官方 afterEveryLinkedStartup → registerCapabilities
+    // 同位）：best-effort，失败静默（官方 catch+log 对位，引擎零 stderr 纪律）
+    // 下一轮建流重试；成功置位，重连不再重发。
+    if !*capabilities_registered
+        && manager
+            .register_device_capabilities(capabilities::DEVICE_CAPABILITIES_UPLOAD)
+            .await
+            .is_ok()
+    {
+        *capabilities_registered = true;
+    }
     let mut stream = match manager.receive_messages().await {
         Ok(stream) => stream,
         Err(error) if receive_stream_unbound(&error) => return StreamOutcome::Unbound,

@@ -3363,7 +3363,12 @@ fn engine_protocol_capabilities_self_report_shape() {
         let obj = result.as_object().expect("result object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["baseline", "deviceCapabilities", "linkCapabilities"]
+            [
+                "baseline",
+                "deviceCapabilities",
+                "deviceCapabilitiesUpload",
+                "linkCapabilities"
+            ]
         );
 
         let device = obj["deviceCapabilities"]
@@ -3373,11 +3378,13 @@ fn engine_protocol_capabilities_self_report_shape() {
             device.keys().collect::<Vec<_>>().as_slice(),
             [
                 "attachmentBackfill",
+                "optionalPhoneNumber",
                 "profiles_v2",
                 "spqr",
                 "storage",
                 "transfer",
-                "usernameChangeSyncMessage"
+                "usernameChangeSyncMessage",
+                "versionedExpirationTimer"
             ]
         );
         assert_eq!(device["spqr"], json!(true));
@@ -3386,9 +3393,29 @@ fn engine_protocol_capabilities_self_report_shape() {
         assert_eq!(device["attachmentBackfill"], json!(false));
         assert_eq!(device["profiles_v2"], json!(false));
         assert_eq!(device["usernameChangeSyncMessage"], json!(true));
+        assert_eq!(device["versionedExpirationTimer"], json!(false));
+        assert_eq!(device["optionalPhoneNumber"], json!(false));
         // vendor serde 的 profiles_v2 字面拼写（线上声明即此形状）不得被
         // "纠正"成 camelCase。
         assert!(device.get("profilesV2").is_none());
+
+        // 设备面注册位（D5，官方 CapabilitiesUploadType 四键 wire 同形）。
+        let upload = obj["deviceCapabilitiesUpload"]
+            .as_object()
+            .expect("upload object");
+        assert_eq!(
+            upload.keys().collect::<Vec<_>>().as_slice(),
+            [
+                "attachmentBackfill",
+                "optionalPhoneNumber",
+                "spqr",
+                "usernameChangeSyncMessage"
+            ]
+        );
+        assert_eq!(upload["spqr"], json!(true));
+        assert_eq!(upload["usernameChangeSyncMessage"], json!(true));
+        assert_eq!(upload["attachmentBackfill"], json!(false));
+        assert_eq!(upload["optionalPhoneNumber"], json!(false));
 
         let link = obj["linkCapabilities"].as_object().expect("link object");
         assert_eq!(
@@ -3428,4 +3455,49 @@ fn engine_protocol_capabilities_self_report_shape() {
     let fake_dir = temp_dir("capabilities-fake");
     let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
     assert_shape(&fake_engine.request("engine.protocolCapabilities", json!({}))["result"]);
+}
+
+/// engine.deviceCapabilities（D5 设备面能力注册，KT 扩展方法）：fake 模式
+/// 恒已注册（getUserStatus 同款，不触网）回读上传面；real 模式未知账号
+/// -32603 折叠（open_registered 未命中，解绑判定只属 401）。不落调度日志。
+#[test]
+fn engine_device_capabilities_register_and_report() {
+    // fake：registered true + 上传面四键回读（位值 = 钉定镜像）。
+    let fake_dir = temp_dir("device-caps-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    let result = &fake_engine.request(
+        "engine.deviceCapabilities",
+        json!({ "account": "+15550001111" }),
+    )["result"];
+    assert_eq!(result["registered"], json!(true));
+    assert_eq!(result["account"], json!("+15550001111"));
+    let capabilities = result["capabilities"].as_object().expect("upload object");
+    assert_eq!(
+        capabilities.keys().collect::<Vec<_>>().as_slice(),
+        [
+            "attachmentBackfill",
+            "optionalPhoneNumber",
+            "spqr",
+            "usernameChangeSyncMessage"
+        ]
+    );
+    assert_eq!(capabilities["spqr"], json!(true));
+    assert_eq!(capabilities["attachmentBackfill"], json!(false));
+    assert_eq!(capabilities["usernameChangeSyncMessage"], json!(true));
+    assert_eq!(capabilities["optionalPhoneNumber"], json!(false));
+    drop(fake_engine);
+    assert!(
+        !fake_dir.join("engine-send-log.jsonl").exists(),
+        "capability registration must not write the dispatch log"
+    );
+
+    // real + 全新数据目录（无账号）：open_registered 未命中折叠 -32603，
+    // 不触网（无 manager 可建）。
+    let real_dir = temp_dir("device-caps-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, _) = real_engine.error_of(
+        "engine.deviceCapabilities",
+        json!({ "account": "+15550001111" }),
+    );
+    assert_eq!(code, -32603, "unknown account folds to internal error");
 }

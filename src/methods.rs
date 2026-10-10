@@ -14,9 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    capabilities, parse_legacy_call_face, storage_sync, storage_write, LinkError,
-    MessageRequestTarget, SendMention, SendPreview, SendQuote, SendSticker, SendTextStyle, Service,
-    UserStatusError, MAX_SEND_TEXT_STYLES,
+    capabilities, parse_legacy_call_face, storage_sync, storage_write, DeviceCapabilitiesError,
+    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendSticker,
+    SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -2218,6 +2218,32 @@ async fn dispatch(
         // 常量面同款）。
         "engine.protocolCapabilities" => {
             jsonrpc::success_response(id, capabilities::protocol_capabilities_payload())
+        }
+        // engine.deviceCapabilities（D5 设备面能力注册）：PUT
+        // /v1/devices/capabilities（官方 registerCapabilities 同端点）并回
+        // 读上传面。触网方法（fake 恒已注册，getUserStatus 同款）；仅 401
+        // 判解绑（getUserStatus 解绑原文同款），其余失败折叠 -32603。幂等
+        // 声明面：重复调用 = 服务器侧重复 PUT（官方每次启动同语义）。不落
+        // 调度日志（engine.protocolCapabilities 同纪律）。
+        "engine.deviceCapabilities" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match service.register_device_capabilities(account).await {
+                Ok(()) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "account": account,
+                        "registered": true,
+                        "capabilities": capabilities::device_capabilities_upload_payload(),
+                    }),
+                ),
+                Err(DeviceCapabilitiesError::Unbound) => {
+                    jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+                }
+                Err(DeviceCapabilitiesError::Internal) => internal_error(id),
+            }
         }
         _ => jsonrpc::error_response(
             id,

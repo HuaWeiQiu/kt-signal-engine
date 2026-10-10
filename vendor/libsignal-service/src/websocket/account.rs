@@ -92,6 +92,10 @@ pub struct DeviceCapabilities {
     pub profiles_v2: bool,
     #[serde(default)]
     pub username_change_sync_message: bool,
+    #[serde(default)]
+    pub versioned_expiration_timer: bool,
+    #[serde(default)]
+    pub optional_phone_number: bool,
 }
 
 impl Default for DeviceCapabilities {
@@ -103,8 +107,22 @@ impl Default for DeviceCapabilities {
             spqr: true,
             profiles_v2: false,
             username_change_sync_message: false,
+            versioned_expiration_timer: false,
+            optional_phone_number: false,
         }
     }
+}
+
+/// Upload face of `PUT /v1/devices/capabilities`, kept in sync with
+/// Signal-Desktop `CapabilitiesUploadType`.
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilitiesUpload {
+    pub attachment_backfill: bool,
+    pub spqr: bool,
+    pub username_change_sync_message: bool,
+    #[serde(default)]
+    pub optional_phone_number: bool,
 }
 
 #[cfg(test)]
@@ -180,6 +198,21 @@ impl SignalWebSocket<websocket::Identified> {
     ) -> Result<(), ServiceError> {
         self.http_request(Method::PUT, "/v1/accounts/attributes")?
             .send_json(&attributes)
+            .await?
+            .service_error_for_status()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Registers this device's protocol capabilities with the server.
+    /// Linked clients re-register on every startup.
+    pub async fn register_capabilities(
+        &mut self,
+        capabilities: CapabilitiesUpload,
+    ) -> Result<(), ServiceError> {
+        self.http_request(Method::PUT, "/v1/devices/capabilities")?
+            .send_json(&capabilities)
             .await?
             .service_error_for_status()
             .await?;

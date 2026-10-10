@@ -136,7 +136,8 @@ send message: Signal server unavailable.
 | `backups.cloudStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 restore） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`downloading`=在途（字节计数有效，total 缺席不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺，产物走 NDJSON 消费链——transfer_archive「无论成败收尾清快照」同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，transfer.downloadStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 restore 批）**：只读轮询面（backup.exportStatus/transfer.downloadStatus 同语义，无推送事件轮询到终态）；快照进程内存不跨重启；只读不落调度日志零 stderr |
 | `backups.uploadToCloud` | `{account}` | `{"status": "started"}`（全链后台化：装配段=专用 OS 线程（§10.3 同款，工件→main 容器流式写→临时产物 `<account_dir>/cloud-upload-main-tmp`）→上行段=LocalSet watcher：凭据拉取（restore §1 链同源，404 引导自愈）→zkgroup 兑换呈现→生产 chat 未鉴权 gRPC `get_upload_form`（cdn===3 强制）→TUS create-with-upload 单发 POST（`Tus-Resumable: 1.0.0` + `Upload-Length` + `Upload-Metadata: filename <b64(form.key)>` + form headers，body=密文产物 128 KiB 块流式读盘，请求级超时 900 s）→`refresh_backup`；终态经 `backups.uploadStatus` 观测；upload 面=官方桌面 `Backups.upload` 同链，产物 remote 型与一期 local 容器逐字节同构，派生钥=`derive_keys`+remote 臂（Some(forward-secrecy token)→NEW_DST），契约钉定 cloud-backup-contract §6.1） | account 缺失/非字符串 `-32603`；结构化码八族均 `-1` + message 码位（`CloudUploadError::rpc_code` 单一映射源，带 detail 时附 `data.detail`；uploadStatus failed 相位同表两端不漂）：同步段 `BACKUP_AUTH_FAILED`（未注册/fake 账号、AEP/registration/身份密钥缺席或 zkgroup 兑换被拒，retryable=false）、`BACKUP_UPLOAD_ALREADY_RUNNING`（同引擎已有在途 upload 重入，**新码位，白名单登记归 connector 透传批**，retryable=false）、`BACKUP_ARTIFACT_MISSING`/`BACKUP_ARTIFACT_INVALID`（工件缺席/首行非法，非法当场删工件，retryable=false）；后台段失败经 uploadStatus failed 相位透出：`BACKUP_NOT_PROVISIONED`（引导自愈后仍无档，retryable=false）/`BACKUP_TRANSPORT_FAILED`（凭据/form gRPC/refresh_backup，retryable=true）/`BACKUP_UPLOAD_FAILED`（**新码位，白名单登记归 connector 透传批**：cdn≠3/非 2xx/超帽/上行读盘，retryable=true——上传 POST 已离站=unknown-outcome 窗口，重试=整链重来）/`BACKUP_IO_FAILED`（临时产物写面，retryable=false）（cloud-backup-contract §6.2） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：官方 TUS 单发协议实锤（桌面 tusProtocol.node.ts create-with-upload：`POST {signedUploadLocation}` 2xx=完成，无断点续传——引擎同口径单发，失败=failed 终态不自动重试）；上传 POST 用 `HttpAuthOverride::Unidentified`（预签名 URL 不附账号 basic auth）；凭据/header 不落日志不落盘；临时产物任何终态必删（官方 finally unlink 同款），崩溃残留由下次上传覆盖写收敛；产物 1 GiB 帽 fail-closed（form 段 `UploadTooLarge` 同映射 `BACKUP_TRANSPORT_FAILED`，契约 §6.1 裁定）；media 档出范围（messages 档密文归档；mediaRootBackupKey 每次随机 32B，契约差异登记同 §10.5）；运行闸进程级单槽 CAS；send lane mutating；fake 账号无 store 同未注册答 `BACKUP_AUTH_FAILED`；不落调度日志零 stderr |
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
-| `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的两处声明如实自报——账号属性面 DeviceCapabilities（接收管线首步 presage set_account_attributes 推送的六位）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr |
+| `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
+| `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -2366,6 +2367,46 @@ makeQuote（`ts/util/makeQuote.preload.ts`），wire additive。
   传（对端真实出的缩略指针，metadata-only 不渲染）。附件 wire 键
   `filename` 同引擎附件面（signal-cli 键形），非官方桌面
   `fileName` 驼峰——消费方以 connector 既有附件面键形为准。
+
+### 协议能力补齐与设备面注册（engine.deviceCapabilities，D 批 D5，2026-10-11，官方对齐）
+
+引擎能力自证面（2026-10-10 批）此后缺两件事：vendor `DeviceCapabilities`
+结构体只有六位（server 真相 Signal-Server `DeviceCapability.java` 全集
+还有 `versionedExpirationTimer`/`optionalPhoneNumber` 两位，vendor 注释
+自证的 keep-in-sync 面缺口）；且引擎从未走官方**设备面注册**端点——
+官方桌面每次链接启动（`background.preload.ts:2021`
+afterEveryLinkedStartup → `registerCapabilities`，端点
+`PUT v1/devices/capabilities`，WebAPI.preload.ts:811/:2301）都全量重登
+记能力位，上游 2026-03 无预告批量注销 capability 不达标客户端的教训
+正依赖该面保持最新。本批补齐（wire additive）。
+
+- **结构体补齐**：vendored `DeviceCapabilities` 加
+  `versioned_expiration_timer`/`optional_phone_number`（serde default
+  false，JSON 形 `versionedExpirationTimer`/`optionalPhoneNumber`）；
+  presage 主注册链构造点同值补齐（编译期断强制）；引擎
+  `DEVICE_CAPABILITIES` 镜像与 vendor 扫描单测同步扩两位。
+  `engine.protocolCapabilities.deviceCapabilities` 面 additive 出两键。
+- **位值裁定（不发明）**：`versionedExpirationTimer` = false——官方桌
+  面 CapabilitiesUploadType 不含该位（desktop 不声明，引擎同位）；
+  `optionalPhoneNumber` = false——官方上传值是账号状态位
+  （`getOptionalNumber() == null`，号码 unshare 态才 true），KT 引擎账
+  号号码恒共享态。
+- **设备面注册**：vendor 新 `CapabilitiesUpload`（官方
+  CapabilitiesUploadType 四键 wire 同形：attachmentBackfill/spqr/
+  usernameChangeSyncMessage/optionalPhoneNumber）+ `PUT
+  v1/devices/capabilities` 客户端调用 + presage Manager
+  `register_device_capabilities`。引擎两处触发：① 接收管线建流时
+  best-effort 自动注册（官方每次链接启动同位；失败静默随重连重试，
+  成功置位每管线运行一次即止——官方 afterEveryAuthConnect 不重发同
+  口径）；② 新 KT 扩展方法 `engine.deviceCapabilities {account}`（宿
+  主可查询/手动重发，成功回 `{account, registered, capabilities}` 上
+  传面，错误面 = getUserStatus 同款解绑原文/折叠）。
+- **偏差登记**：① `attachmentBackfill` 引擎设备面声明 false，官方桌
+  面恒 true（desktop 已实现 backfill 语义）——引擎未实现 backfill 接
+  收，宁缺勿错不声明未实现的特性（服务器不再向本设备派发 backfill
+  面，恰为引擎所需）；② 设备面 body 复用四键官方形状，不携带账号属
+  性面六位（官方两面本就不同型，不并面）；③ optionalPhoneNumber 状
+  态位引擎无用户号共享模型，恒 false（账号号码共享态如实声明）。
 
 ## 6. fake 服务模式（仅测试）
 

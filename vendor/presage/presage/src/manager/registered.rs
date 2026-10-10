@@ -37,7 +37,7 @@ use libsignal_service::{
     utils::TryIntoE164,
     websocket::{
         self,
-        account::{DeviceInfo, WhoAmIResponse},
+        account::{CapabilitiesUpload, DeviceInfo, WhoAmIResponse},
         SignalWebSocket,
     },
     zkgroup::{
@@ -383,6 +383,20 @@ impl<S: Store> Manager<S, Registered> {
     /// Fetches basic information on the registered device.
     pub async fn whoami(&self) -> Result<WhoAmIResponse, Error<S::Error>> {
         Ok(self.identified_websocket(false).await?.whoami().await?)
+    }
+
+    /// Registers this device's protocol capabilities with the server
+    /// (`PUT /v1/devices/capabilities`). Linked clients re-register on
+    /// every startup.
+    pub async fn register_device_capabilities(
+        &self,
+        capabilities: CapabilitiesUpload,
+    ) -> Result<(), Error<S::Error>> {
+        self.identified_websocket(false)
+            .await?
+            .register_capabilities(capabilities)
+            .await?;
+        Ok(())
     }
 
     pub fn device_id(&self) -> DeviceId {
