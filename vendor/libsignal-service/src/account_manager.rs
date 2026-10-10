@@ -209,6 +209,36 @@ impl AccountManager {
             tracing::info!("Available keys sufficient; forcing refresh.");
         }
 
+        self.publish_fresh_pre_keys(protocol_store, service_id_kind, use_last_resort_key)
+            .await
+    }
+
+    /// KT (pre-key maintenance): time-based signed pre-key rotation.
+    ///
+    /// The server-watermark gates above mean `update_pre_key_bundle` never
+    /// rotates while the one-time counts are healthy, so a published signed
+    /// pre-key would otherwise live forever (official clients rotate by age).
+    /// Bypasses the gates and publishes a fresh signed pre-key with a
+    /// one-time/pq top-up batch; the last-resort key is left untouched (the
+    /// server keeps whatever is already registered).
+    #[tracing::instrument(skip(self, protocol_store))]
+    pub async fn rotate_signed_pre_key_bundle<P: PreKeysStore>(
+        &mut self,
+        protocol_store: &mut P,
+        service_id_kind: ServiceIdKind,
+    ) -> Result<(), ServiceError> {
+        self.publish_fresh_pre_keys(protocol_store, service_id_kind, false)
+            .await
+    }
+
+    /// The unconditional replenish+publish path shared by the watermark-gated
+    /// bundle update and the age-based rotation (refresh+PUT in one step).
+    async fn publish_fresh_pre_keys<P: PreKeysStore>(
+        &mut self,
+        protocol_store: &mut P,
+        service_id_kind: ServiceIdKind,
+        use_last_resort_key: bool,
+    ) -> Result<(), ServiceError> {
         let identity_key_pair = protocol_store
             .get_identity_key_pair()
             .instrument(tracing::trace_span!("get identity key pair"))

@@ -1459,6 +1459,44 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// KT (pre-key maintenance): server-watermark pre-key refresh — the same
+    /// gated path the receive stream runs on open (official RefreshPreKeysJob
+    /// semantics), exposed for the engine's periodic maintenance ticker so a
+    /// long-lived connection still tops up one-time keys.
+    pub async fn refresh_pre_keys(&mut self) -> Result<(), Error<S::Error>> {
+        let mut account_manager = self.account_manager().await?;
+        register_pre_keys(&self.store, &mut account_manager).await
+    }
+
+    /// KT (pre-key maintenance): age-based signed pre-key rotation for both
+    /// identity kinds (official clients rotate by age; the server-watermark
+    /// gates otherwise pin a signed pre-key forever on healthy counts).
+    pub async fn rotate_signed_pre_keys(&mut self) -> Result<(), Error<S::Error>> {
+        let mut account_manager = self.account_manager().await?;
+        account_manager
+            .rotate_signed_pre_key_bundle(
+                &mut self.store.aci_protocol_store(),
+                ServiceIdKind::Aci,
+            )
+            .await?;
+        account_manager
+            .rotate_signed_pre_key_bundle(
+                &mut self.store.pni_protocol_store(),
+                ServiceIdKind::Pni,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn account_manager(&self) -> Result<AccountManager, Error<S::Error>> {
+        let identified_websocket = self.identified_websocket(true).await?;
+        Ok(AccountManager::new(
+            self.identified_push_service(),
+            identified_websocket,
+            None,
+        ))
+    }
+
     /// Downloads and decrypts a single attachment.
     pub async fn get_attachment(
         &self,

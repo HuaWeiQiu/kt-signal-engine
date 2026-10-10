@@ -832,6 +832,31 @@ impl SqliteStore {
         let content: Content = message.try_into()?;
         Ok(Some((thread, content)))
     }
+
+    /// KT (pre-key maintenance): generic kv read for engine-side cadence
+    /// bookmarks (the `kv` table predates the fork; account_entropy_pool is
+    /// the in-tree consumer). Values are plain text blobs.
+    pub async fn kt_kv_get(&self, key: &str) -> Result<Option<String>, SqliteStoreError> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value FROM kv WHERE key = ?1")
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await
+                .into_protocol_error()?;
+        Ok(row.map(|(value,)| String::from_utf8_lossy(&value).to_string()))
+    }
+
+    /// KT (pre-key maintenance): generic kv write, same table as
+    /// [`SqliteStore::kt_kv_get`].
+    pub async fn kt_kv_set(&self, key: &str, value: &str) -> Result<(), SqliteStoreError> {
+        sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
+            .bind(key)
+            .bind(value.as_bytes())
+            .execute(&self.db)
+            .await
+            .into_protocol_error()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -48,6 +48,7 @@ pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
 pub(crate) mod groups;
 pub(crate) mod identity;
+pub(crate) mod prekey;
 pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod snapshot_import;
@@ -2969,6 +2970,10 @@ async fn serve_account_stream(
         Some(at) if at.elapsed() < Duration::from_secs(60) => None,
         _ => Some(tokio::time::Instant::now() + Duration::from_secs(2)),
     };
+    // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
+    // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
+    // tick 内部自读书签判到期，重连重开不重复轰服务器。
+    let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     loop {
         tokio::select! {
             _ = shutdown.changed() => return true,
@@ -2982,6 +2987,19 @@ async fn serve_account_stream(
                 }
             }, if sync_pending.is_some() => {
                 sync_pending = None;
+            }
+            _ = async {
+                if let Some(at) = maint_at {
+                    tokio::time::sleep_until(at).await;
+                }
+            }, if maint_at.is_some() => {
+                // 下一拍固定 +2 天（tick 内书签判到期，短拍只做本地判定）。
+                // manager 调用放臂体：select 其他 future 已弃，借用不冲突。
+                prekey::maintenance_tick(&mut manager).await;
+                maint_at = Some(
+                    tokio::time::Instant::now()
+                        + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
+                );
             }
             item = stream.next() => match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
@@ -5060,6 +5078,8 @@ async fn open_registered(
 }
 
 /// 注册管理器 + 账号目录（安全码 trust sidecar 等账号目录伴生文件所需）。
+/// 发送前 14 天超龄闸挂点（B 批 prekey 维护）：开管理器即本地判龄，超龄
+/// best-effort 按龄轮换（fail-open，prekey::send_gate）。
 pub(crate) async fn open_registered_with_dir(
     service: &Arc<Service>,
     account: &str,
@@ -5070,7 +5090,8 @@ pub(crate) async fn open_registered_with_dir(
         service.data_dir.join(rel)
     };
     let store = open_store(&dir).await.ok()?;
-    let manager = Manager::load_registered(store).await.ok()?;
+    let mut manager = Manager::load_registered(store).await.ok()?;
+    prekey::send_gate(&mut manager).await;
     Some((manager, dir))
 }
 
