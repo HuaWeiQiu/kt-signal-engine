@@ -36,6 +36,21 @@ pub enum ProvisioningStep {
     Message(ProvisionMessage),
 }
 
+/// QR link URI handed to the provisioning main device. Numberless accounts
+/// require `nopni,nopni2` (Signal-Android `LinkDeviceViewModel.kt`
+/// `onQrCodeScanned`, Signal-Desktop `Provisioner.preload.ts`) — see
+/// docs/upstream-capability-nopni2.md in kt-signal-engine.
+pub fn link_uri(address: &str, public_key: &str) -> Url {
+    let mut provisioning_url =
+        Url::parse("sgnl://linkdevice").expect("static URL parses");
+    provisioning_url
+        .query_pairs_mut()
+        .append_pair("uuid", address)
+        .append_pair("pub_key", public_key)
+        .append_pair("capabilities", "nopni,nopni2");
+    provisioning_url
+}
+
 impl ProvisioningPipe {
     pub fn from_socket<R: Rng + CryptoRng>(
         ws: SignalWebSocket<websocket::Unidentified>,
@@ -97,19 +112,12 @@ impl ProvisioningPipe {
                 let address: ProvisioningAddress =
                     prost::Message::decode(Bytes::from(body.unwrap()))?;
 
-                let mut provisioning_url = Url::parse("sgnl://linkdevice")
-                    .map_err(|e| ProvisioningError::WsError {
-                        reason: e.to_string(),
-                    })?;
-                provisioning_url
-                    .query_pairs_mut()
-                    .append_pair("uuid", address.address())
-                    .append_pair(
-                        "pub_key",
-                        &BASE64_RELAXED.encode(
-                            self.provisioning_cipher.public_key().serialize(),
-                        ),
-                    );
+                let provisioning_url = link_uri(
+                    address.address(),
+                    &BASE64_RELAXED.encode(
+                        self.provisioning_cipher.public_key().serialize(),
+                    ),
+                );
 
                 // acknowledge
                 responder

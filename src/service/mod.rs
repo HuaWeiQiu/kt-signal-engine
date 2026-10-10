@@ -8181,4 +8181,27 @@ mod tests {
         // padded sync message：其他字段为 padding 面（presage
         // with_padding 同源），oneof 恰一个变体由上方模式匹配钉定。
     }
+
+    /// 链接 URI 的 numberless capability 门（取证 docs/upstream-capability-nopni2.md）：
+    /// Android 8.30+/8.31 扫码侧对无 PNI 账号强制 `nopni2`、旧版强制 `nopni`，
+    /// 缺失即 OUTDATED_DEVICE 拒连；双报对齐官方桌面，`backup5` 不报
+    /// （引擎未实现 link-and-sync，报了手机会走 archive 同步链接流）。
+    #[test]
+    fn link_uri_advertises_numberless_capabilities() {
+        use presage::libsignal_service::provisioning::link_uri;
+
+        let url = link_uri("uuid-1234", "PUBKEY=");
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert!(pairs.contains(&("uuid".to_owned(), "uuid-1234".to_owned())));
+        assert!(pairs.contains(&("pub_key".to_owned(), "PUBKEY=".to_owned())));
+        let capabilities = pairs
+            .iter()
+            .find(|(key, _)| key == "capabilities")
+            .map(|(_, value)| value.as_str())
+            .expect("link URI carries capabilities");
+        let names: Vec<&str> = capabilities.split(',').collect();
+        assert!(names.contains(&"nopni"), "{capabilities}");
+        assert!(names.contains(&"nopni2"), "{capabilities}");
+        assert!(!names.contains(&"backup5"), "{capabilities}");
+    }
 }

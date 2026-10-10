@@ -22,6 +22,7 @@ use url::Url;
 use uuid::Uuid;
 use zkgroup::profiles::ProfileKey;
 
+pub use pipe::link_uri;
 use pipe::{ProvisioningPipe, ProvisioningStep};
 
 use crate::messagepipe::ServiceCredentials;

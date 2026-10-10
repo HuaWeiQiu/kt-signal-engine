@@ -43,6 +43,17 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   MessageReceiver.preload.ts:1517）。
 - `src/cipher.rs` — `decrypt` 唯一 Metadata 构造点填
   `story: envelope.story`（E2）。
+- `src/provisioning/pipe.rs`（2026-10-10 nopni2 批）— ①QR link URI 构造
+  抽成 pub `link_uri`（原 process_request 内联拆出，UUID/pub_key 形状不变）；
+  ②URI 补 `capabilities=nopni,nopni2`：Signal-Android 8.30+/8.31 扫码侧对
+  numberless（无 PNI）账号强制 nopni2（LinkDeviceViewModel.kt
+  onQrCodeScanned，上游 commit cdd27e08fa 把枚举值 "nopni"→"nopni2"），
+  缺失即 OUTDATED_DEVICE 拒连；双报对齐官方桌面
+  Provisioner.preload.ts:429-433。backup5 不报（引擎未实现 link-and-sync，
+  报了手机会走 archive 同步链接流）。取证 docs/upstream-capability-nopni2.md；
+  门禁测试 src/service/mod.rs tests::link_uri_advertises_numberless_capabilities。
+- `src/provisioning/mod.rs`（2026-10-10 nopni2 批）— `pub use pipe::link_uri`
+  （引擎侧门禁测试入口）。
 
 `vendor/presage/`（rev 33dd149）：
 
