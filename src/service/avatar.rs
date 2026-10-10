@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use super::profile::AVATAR_MAX_BYTES;
 use super::stickers::sniff_image_mime_type;
-use super::{decode_group_id, find_contact_by_number, open_registered, Service};
+use super::{
+    decode_group_id, find_contact_by_number, lock_registered_for_send, open_registered, Service,
+};
 use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::protocol::ServiceId;
 
@@ -119,9 +121,10 @@ pub(crate) async fn get_avatar(
     if !service.real {
         return Err(AvatarError::Unavailable);
     }
-    let mut manager = open_registered(service, account)
+    let shared = open_registered(service, account)
         .await
         .ok_or(AvatarError::UnknownAccount)?;
+    let mut manager = lock_registered_for_send(&shared).await;
     let bytes = match target {
         AvatarTarget::ServiceId(service_id) => profile_avatar(&mut manager, service_id).await?,
         AvatarTarget::Number(number) => {

@@ -31,8 +31,8 @@ use presage::proto::{
 use serde_json::{json, Value};
 
 use super::{
-    open_registered, resolve_recipient, send_error_of, upload_attachments_for_send, SendError,
-    SendTextStyle, Service,
+    lock_registered_for_send, open_registered, resolve_recipient, send_error_of,
+    upload_attachments_for_send, SendError, SendTextStyle, Service,
 };
 
 /// 官方 MY_STORY_ID（`ts/types/Stories.std.ts:114-115`）：distributionListId
@@ -171,10 +171,10 @@ pub(crate) async fn send_story(
     if !service.real {
         return Ok((super::now_ms(), Vec::new()));
     }
-    let manager = open_registered(service, account)
+    let shared = open_registered(service, account)
         .await
         .ok_or(SendError::UnknownAccount)?;
-    let mut manager = manager;
+    let mut manager = lock_registered_for_send(&shared).await;
     let timestamp = super::now_ms();
 
     // previewImage 随批上行（官方 preview.image 同批 CDN 上行同构）；story

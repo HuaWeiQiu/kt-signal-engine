@@ -37,7 +37,7 @@ use rand::rng;
 use rand::Rng;
 use reqwest::Method;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 
 use crate::state::EngineState;
 
@@ -582,7 +582,19 @@ pub(crate) struct Service {
     /// 群凭据双族缓存（进程内存 per-account ACI 键控，不落盘不跨重启；
     /// P4c 切一 call_links 模块契约，官方 groupCredentialFetcher 对位件）。
     group_credentials: Arc<call_links::GroupCredentialCache>,
+    /// 账号级常驻发送管理器（C 批提速）：号码 → 共享互斥管理器。发送取用
+    /// 命中即复用（presage Manager 内部 identified/unidentified websocket
+    /// 同生命周期常驻），死亡自愈重建在 vendor 侧（closed → 重开）；惰性
+    /// 建连 + 空闲保留，不逐消息冷启动。同账号取用互斥串行（Manager 方法
+    /// 需 &mut 且跨 await 持有），跨账号互不阻塞；delete/relink 摘除。
+    send_managers: AsyncMutex<SendManagerCache>,
 }
+
+/// 常驻发送管理器缓存：号码 → 共享互斥管理器（Service 同型，单测可断言）。
+type SendManagerCache = HashMap<String, SharedSendManager>;
+
+/// 常驻发送管理器共享句柄（取用方持句柄 + `lock_registered_for_send` 锁定）。
+type SharedSendManager = Arc<AsyncMutex<Manager<SqliteStore, Registered>>>;
 
 struct Inner {
     pending: Option<PendingLink>,
@@ -613,6 +625,7 @@ impl Service {
             cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
+            send_managers: AsyncMutex::new(HashMap::new()),
         })
     }
 
@@ -782,6 +795,8 @@ impl Service {
             .await
             .add_account(number.clone(), Some(rel))
             .map_err(|_| LinkError::Internal)?;
+        // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
+        self.send_managers.lock().await.remove(&number);
         self.spawn_pipeline(number.clone(), pending.store_dir).await;
         Ok(number)
     }
@@ -814,6 +829,8 @@ impl Service {
         if let Some(shutdown) = self.pipelines.lock().await.remove(account) {
             let _ = shutdown.send(true);
         }
+        // 摘除常驻发送管理器（若有在途发送，guard 释放后管理器随 Arc 落弃）。
+        self.send_managers.lock().await.remove(account);
         Ok(had_dir || !self.real)
     }
 
@@ -834,10 +851,10 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
         // 同样多收件人共享指针。
@@ -904,10 +921,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
@@ -973,10 +990,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
         // 协议字段是 targetAuthorAci（UUID）：本机号走注册数据（回应自己发的
         // 消息），其余经 contacts 映射解析（ADR 0004）；都未命中按内部失败，
@@ -1072,7 +1089,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         // 官方语义 targetAuthor 一律 ACI；群内兼容号码/UUID 解析，未命中
         // 原样透传（协议侧报错，不在此编造）。
         let target_aci = resolve_author_aci(manager.store(), target_author)
@@ -1104,7 +1122,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let target_aci = resolve_author_aci(manager.store(), target_author)
             .await
             .unwrap_or_else(|| target_author.trim().to_owned());
@@ -1134,7 +1153,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let target_aci = resolve_author_aci(manager.store(), target_author)
             .await
             .unwrap_or_else(|| target_author.trim().to_owned());
@@ -1167,10 +1187,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
         // 直聊回应用自己发的消息时 targetAuthor 是本机号（不在 contacts），
         // resolve_author_aci 已含注册数据回退。
@@ -1199,10 +1219,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
@@ -1244,10 +1264,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
@@ -1283,10 +1303,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let sender_aci = resolve_author_aci(manager.store(), sender)
             .await
             .ok_or(SendError::Internal)?;
@@ -1333,10 +1353,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
             manager.registration_data().service_ids.aci.into(),
         );
@@ -1374,10 +1394,10 @@ impl Service {
         if !self.real {
             return Ok(now_ms());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
@@ -1410,7 +1430,8 @@ impl Service {
         if !self.real {
             return Ok(now_ms());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
         manager
             .send_message_to_group(&master_key, build_call_message(&payload), timestamp)
@@ -1429,9 +1450,10 @@ impl Service {
         if !self.real {
             return Ok(Vec::new());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
         let contacts = manager
             .store()
             .contacts()
@@ -1465,9 +1487,10 @@ impl Service {
         if !self.real {
             return Ok(Vec::new());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
         let numbers = contacts_number_map(manager.store()).await;
         let groups = manager
             .store()
@@ -1518,7 +1541,8 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let (pointers, preview_image) = upload_attachments_for_send(
             &manager,
             attachments,
@@ -1564,7 +1588,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let body = DataMessage {
             timestamp: Some(timestamp),
             delete: Some(presage::proto::data_message::Delete {
@@ -1589,7 +1614,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         // 群内 targetAuthor 兼容号码与 ACI：本机号/contacts 命中转 UUID，
         // UUID 形状直通；都未命中原样透传，协议侧报错，不在此编造。
         let target_aci = resolve_author_aci(manager.store(), target_author)
@@ -1620,7 +1646,8 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
         let body = ContentBody::TypingMessage(typing_group_body(&master_key, timestamp, stop));
         manager
@@ -1637,15 +1664,15 @@ impl Service {
         self: &Arc<Self>,
         account: &str,
         group_id: &str,
-    ) -> Result<(Manager<SqliteStore, Registered>, u64), SendError> {
-        let manager = open_registered(self, account)
+    ) -> Result<(SharedSendManager, u64), SendError> {
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         decode_group_id(group_id).ok_or(SendError::Internal)?;
         if self.send_target_terminated(account, group_id).await {
             return Err(SendError::TargetTerminated);
         }
-        Ok((manager, now_ms()))
+        Ok((shared, now_ms()))
     }
 
     /// 发送面终止判定：进程内登记表（本进程见过 terminated change/写面
@@ -1784,9 +1811,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(UserStatusError::Internal)?;
+        let manager = lock_registered_for_send(&shared).await;
         match manager.whoami().await {
             Ok(_) => Ok(()),
             Err(presage::Error::ServiceError(
@@ -1807,9 +1835,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
         let existing = find_contact_by_number(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
@@ -1848,10 +1877,10 @@ impl Service {
         if !self.real {
             return Ok(now_ms());
         }
-        let manager = open_registered(self, account)
+        let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
-        let mut manager = manager;
+        let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
@@ -2023,7 +2052,8 @@ impl Service {
         if !self.real {
             return Ok(Vec::new());
         }
-        let (manager, account_dir) = open_registered_with_dir(self, account).await.ok_or(())?;
+        let (shared, account_dir) = open_registered_with_dir(self, account).await.ok_or(())?;
+        let manager = lock_registered_for_send(&shared).await;
         let Some(peer) = resolve_recipient(&manager, recipient).await else {
             return Ok(Vec::new());
         };
@@ -2056,9 +2086,10 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let (mut manager, account_dir) = open_registered_with_dir(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(identity::TrustError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
         let Some(peer) = resolve_recipient(&manager, recipient).await else {
             return Err(identity::TrustError::Failed);
         };
@@ -5252,31 +5283,56 @@ async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
         })
 }
 
-async fn open_registered(
-    service: &Arc<Service>,
-    account: &str,
-) -> Option<Manager<SqliteStore, Registered>> {
-    open_registered_with_dir(service, account)
-        .await
-        .map(|(manager, _)| manager)
-}
-
-/// 注册管理器 + 账号目录（安全码 trust sidecar 等账号目录伴生文件所需）。
-/// 发送前 14 天超龄闸挂点（B 批 prekey 维护）：开管理器即本地判龄，超龄
-/// best-effort 按龄轮换（fail-open，prekey::send_gate）。
-pub(crate) async fn open_registered_with_dir(
-    service: &Arc<Service>,
-    account: &str,
-) -> Option<(Manager<SqliteStore, Registered>, std::path::PathBuf)> {
+/// 发送路径取用账号常驻管理器共享句柄（C 批提速单一漏斗）：缓存命中即复用
+/// （presage Manager 内部 websocket 常驻，closed 自愈重建）；未命中惰性建
+/// 连（open store + load_registered）入缓存。同账号取用互斥串行（`lock_
+/// registered_for_send`），跨账号并行；delete/relink 摘除句柄。缓存 map 锁
+/// 只包查找/插入，绝不跨 guard 锁持有。
+async fn open_registered(service: &Arc<Service>, account: &str) -> Option<SharedSendManager> {
+    let cached = {
+        let cache = service.send_managers.lock().await;
+        cache.get(account).cloned()
+    };
+    if let Some(shared) = cached {
+        return Some(shared);
+    }
     let dir = {
         let state = service.state.lock().await;
         let rel = state.account_dir(account)?;
         service.data_dir.join(rel)
     };
     let store = open_store(&dir).await.ok()?;
-    let mut manager = Manager::load_registered(store).await.ok()?;
+    let manager = Manager::load_registered(store).await.ok()?;
+    let mut cache = service.send_managers.lock().await;
+    let shared = cache
+        .entry(account.to_owned())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(manager)));
+    Some(Arc::clone(shared))
+}
+
+/// 常驻管理器取用锁定：互斥 guard + 每次取用 prekey 14 天超龄闸（B 批语义
+/// 按次保住，本地零网络读，fail-open）。guard 借用调用方持有的句柄。
+async fn lock_registered_for_send(
+    shared: &SharedSendManager,
+) -> AsyncMutexGuard<'_, Manager<SqliteStore, Registered>> {
+    let mut manager = shared.lock().await;
     prekey::send_gate(&mut manager).await;
-    Some((manager, dir))
+    manager
+}
+
+/// 取用常驻管理器共享句柄 + 账号目录（安全码 trust sidecar 等账号目录伴生
+/// 文件所需）。取用纪律与 [`open_registered`] 同一漏斗同闸。
+pub(crate) async fn open_registered_with_dir(
+    service: &Arc<Service>,
+    account: &str,
+) -> Option<(SharedSendManager, std::path::PathBuf)> {
+    let dir = {
+        let state = service.state.lock().await;
+        let rel = state.account_dir(account)?;
+        service.data_dir.join(rel)
+    };
+    let shared = open_registered(service, account).await?;
+    Some((shared, dir))
 }
 
 /// 收件人 → ServiceId：号码与 UUID 双形态都收（对齐 signal-cli 公开 JSON-RPC
