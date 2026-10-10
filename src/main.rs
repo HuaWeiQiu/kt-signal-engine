@@ -6,7 +6,10 @@
 //! `--data-dir <dir> jsonRpc [--receive-mode on-start] [--ignore-attachments]
 //! --ignore-stories --ignore-stickers` 拉起本进程；JVM 相关环境变量必须被
 //! 忽略。可选 `KT_SIGNAL_SOCKS_PROXY=host:port`（connector 与桌面探测链路
-//! 注入的同一变量）映射为 `ALL_PROXY=socks5://…`，由 libsignal-service 的
+//! 注入的同一变量）映射为 `ALL_PROXY=socks5h://…`——必须用 socks5h（远端
+//! 解析）而非 socks5（本地解析）：被墙环境下本地 DNS 对 Signal 域名投毒，
+//! 本地解析拿到假 IP 再经代理 CONNECT 仍连到假地址（JVM signal-cli 同坑）；
+//! 远端解析把域名交给代理出口侧解析。由 libsignal-service 的
 //! reqwest 传输面（HTTP + WebSocket 同一 client）统一走 SOCKS5 出口；非法
 //! 值 exit 2。stdin EOF 是唯一干净退出路径（exit 0）；argv 非法 exit 2；
 //! 内部致命 exit 1。stderr 保持安静（connector watchdog 以 stderr ERROR 行
@@ -83,9 +86,10 @@ fn parse_launch_args<I: Iterator<Item = std::ffi::OsString>>(args: I) -> Result<
 /// signal-cli JVM 形态共用环境面），桌面探测链路也写它。
 const SOCKS_PROXY_ENV: &str = "KT_SIGNAL_SOCKS_PROXY";
 
-/// 校验 host:port 并返回 `socks5://host:port` 代理 URL。口径与 connector
+/// 校验 host:port 并返回 `socks5h://host:port` 代理 URL。口径与 connector
 /// 侧 `SocksProxy::parse` 一致：host 非空、无空白与 ':'、≤253 字节；端口
-/// 1-65535。
+/// 1-65535。socks5h = 域名在代理侧远端解析（reqwest 语义），防本地 DNS
+/// 污染把 CONNECT 指到假 IP。
 fn socks_proxy_url(value: &str) -> Result<String, &'static str> {
     let (host, port) = value.trim().split_once(':').ok_or("expected host:port")?;
     if host.is_empty() || host.len() > 253 || host.chars().any(|c| c.is_whitespace() || c == ':') {
@@ -95,7 +99,7 @@ fn socks_proxy_url(value: &str) -> Result<String, &'static str> {
     if port == 0 {
         return Err("invalid proxy port");
     }
-    Ok(format!("socks5://{host}:{port}"))
+    Ok(format!("socks5h://{host}:{port}"))
 }
 
 /// `KT_SIGNAL_SOCKS_PROXY` → `ALL_PROXY`。必须在任何 libsignal-service
@@ -265,11 +269,11 @@ mod tests {
     fn socks_proxy_url_accepts_host_port() {
         assert_eq!(
             socks_proxy_url("127.0.0.1:7890").as_deref(),
-            Ok("socks5://127.0.0.1:7890")
+            Ok("socks5h://127.0.0.1:7890")
         );
         assert_eq!(
             socks_proxy_url(" relay.example.com:1080 ").as_deref(),
-            Ok("socks5://relay.example.com:1080")
+            Ok("socks5h://relay.example.com:1080")
         );
     }
 
