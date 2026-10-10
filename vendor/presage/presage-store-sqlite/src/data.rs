@@ -182,6 +182,11 @@ impl SqlGroup<'_> {
             requesting_members,
             invite_link_password: invite_link_password.unwrap_or_default(),
             description,
+            // KT (group send semantics): the row schema carries no
+            // announcements-only column — rebuilt rows default to false, and
+            // the send-path group refresh overwrites it from the server
+            // (fetch failure degrades to this value: fail-open by design).
+            announcements_only: false,
         };
         Ok((master_key, group))
     }

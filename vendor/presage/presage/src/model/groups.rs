@@ -34,6 +34,11 @@ pub struct Group {
     pub requesting_members: Vec<RequestingMember>,
     pub invite_link_password: Vec<u8>,
     pub description: Option<String>,
+    /// KT (group send semantics): announcements-only flag carried through for
+    /// the send-side non-admin gate; `default` keeps previously stored rows
+    /// deserializable.
+    #[serde(default)]
+    pub announcements_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -89,6 +94,7 @@ impl From<libsignal_service::groups_v2::Group> for Group {
                 .collect(),
             invite_link_password: val.invite_link_password,
             description: val.description_text,
+            announcements_only: val.announcements_only,
         }
     }
 }

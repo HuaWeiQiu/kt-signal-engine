@@ -376,6 +376,11 @@ pub(crate) enum SendError {
     /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
     /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
     TargetTerminated,
+    /// 目标群为 announcements-only 且发送方无 ADMINISTRATOR 角色（官方客户端
+    /// 侧闸，服务器不拦；错误面 `-1` + `SEND_TARGET_ANNOUNCEMENTS_ONLY`，
+    /// compat §3 群发送语义批）。群态完全取不到时不走此臂（UnknownGroup
+    /// 既有行为），fail-open 不新增失败面。
+    AnnouncementsOnly,
     /// 服务端凭据拒绝（HTTP 401/403 → ServiceError::Unauthorized，vendored
     /// push_service/response.rs 归型）：账号在 Signal 侧已解绑。确定性失败，
     /// 标失败不重试（unknown-send 纪律同向）；错误面 -32603 + 解绑原文
@@ -394,6 +399,7 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
     use presage::libsignal_service::sender::MessageSenderError;
     match error {
         presage::Error::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
+        presage::Error::GroupAnnouncementsOnly => SendError::AnnouncementsOnly,
         presage::Error::MessageSenderError(sender_error) => match *sender_error {
             MessageSenderError::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
             _ => SendError::Internal,
@@ -1049,7 +1055,9 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await
+        dispatch_group(&mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     /// sendPinMessage（群组）：目标消息置顶跨群发（官方群内置顶同字段）。
@@ -1078,7 +1086,9 @@ impl Service {
             )),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await
+        dispatch_group(&mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     /// sendUnpinMessage（群组）。
@@ -1105,7 +1115,9 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await
+        dispatch_group(&mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     /// 直聊 targeted dataMessage 公共头（pin/unpin 共用）：解析作者 ACI、
@@ -1371,7 +1383,8 @@ impl Service {
         manager
             .send_message_to_group(&master_key, build_call_message(&payload), timestamp)
             .await
-            .map_err(send_error_of)?;
+            .map_err(send_error_of)
+            .map(|_| ())?;
         Ok(timestamp)
     }
 
@@ -1502,8 +1515,12 @@ impl Service {
                 .await?
             }
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await?;
-        Ok((timestamp, Vec::new()))
+        let outcomes = dispatch_group(&mut manager, group_id, body, timestamp).await?;
+        let numbers = contacts_number_map(manager.store()).await;
+        Ok((
+            timestamp,
+            group_send_result_entries(outcomes, timestamp, &numbers),
+        ))
     }
 
     pub(crate) async fn send_remote_delete_group(
@@ -1523,7 +1540,9 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await
+        dispatch_group(&mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn send_reaction_group(
@@ -1555,7 +1574,9 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp).await
+        dispatch_group(&mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn send_typing_group(
@@ -1574,6 +1595,7 @@ impl Service {
             .send_message_to_group(&master_key, body, timestamp)
             .await
             .map_err(send_error_of)
+            .map(|_| ())
     }
 
     /// 群组发送公共头：账号/群可解校验 + 终止面硬拒（官方
@@ -4601,12 +4623,66 @@ fn typing_group_body(
     }
 }
 
+/// 群发送 per-recipient 结果向量（B 批群发送语义，compat §3 wire additive）：
+/// `(收件人 ServiceId, 该收件人失败)`——`None` = 已送达。单个成员失败
+/// （含未注册）不再整体炸批（官方 per-recipient 结果同语义），transcript
+/// 照落库。
+pub(crate) type GroupSendOutcomes = Vec<(
+    ServiceId,
+    Option<presage::libsignal_service::sender::MessageSenderError>,
+)>;
+
+/// 群发送 per-recipient 失败词表（connector additive 消费面，compat §3）：
+/// NotFound=未注册（signal-cli UnregisteredFailure 同语义）、
+/// UntrustedIdentity=身份钥不匹配、Unauthorized=凭据失效（SendError::Unbound
+/// 同因）、其余（网络/协议）折叠 NetworkFailure。
+fn group_send_failure_word(
+    error: &presage::libsignal_service::sender::MessageSenderError,
+) -> &'static str {
+    use presage::libsignal_service::prelude::ServiceError;
+    use presage::libsignal_service::sender::MessageSenderError as Error;
+    match error {
+        Error::NotFound { .. } => "UnregisteredFailure",
+        Error::UntrustedIdentity { .. } => "UntrustedIdentityFailure",
+        Error::ServiceError(ServiceError::Unauthorized) => "AuthorizationFailedFailure",
+        _ => "NetworkFailure",
+    }
+}
+
+/// 群发送结果条目组装（send 群形态 `results` 数组 additive 面，条目形状
+/// 与直聊同构：成功 `{recipientNumber, success:{timestamp}}`，失败
+/// `{recipientNumber, failure:{type}}`；号码经 contacts 映射，未命中回退
+/// ACI uuid 串——listGroups 成员面同纪律）。
+fn group_send_result_entries(
+    outcomes: GroupSendOutcomes,
+    timestamp: u64,
+    numbers: &HashMap<String, String>,
+) -> Vec<Value> {
+    outcomes
+        .into_iter()
+        .map(|(service_id, outcome)| {
+            let key = service_id.service_id_string().to_owned();
+            let number = numbers.get(&key).cloned().unwrap_or(key);
+            match outcome {
+                None => json!({
+                    "recipientNumber": number,
+                    "success": { "timestamp": timestamp },
+                }),
+                Some(error) => json!({
+                    "recipientNumber": number,
+                    "failure": { "type": group_send_failure_word(&error) },
+                }),
+            }
+        })
+        .collect()
+}
+
 async fn dispatch_group(
     manager: &mut Manager<SqliteStore, Registered>,
     group_id: &str,
     body: DataMessage,
     timestamp: u64,
-) -> Result<(), SendError> {
+) -> Result<GroupSendOutcomes, SendError> {
     let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
     manager
         .send_message_to_group(&master_key, body, timestamp)
@@ -8700,6 +8776,173 @@ mod tests {
             &Thread::Group([0u8; 32]),
             &requester,
             None
+        ));
+    }
+
+    /// 群发送失败词表（per-recipient failure.type additive 面）：NotFound=
+    /// UnregisteredFailure、UntrustedIdentity=UntrustedIdentityFailure、
+    /// Unauthorized=AuthorizationFailedFailure、其余折叠 NetworkFailure。
+    #[test]
+    fn group_send_failure_word_matrix() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError as Error;
+
+        let not_found = Error::NotFound {
+            service_id: ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+                presage::libsignal_service::prelude::Uuid::nil(),
+            )),
+        };
+        assert_eq!(group_send_failure_word(&not_found), "UnregisteredFailure");
+        let untrusted = Error::UntrustedIdentity {
+            address: ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+                presage::libsignal_service::prelude::Uuid::nil(),
+            )),
+        };
+        assert_eq!(
+            group_send_failure_word(&untrusted),
+            "UntrustedIdentityFailure"
+        );
+        assert_eq!(
+            group_send_failure_word(&Error::ServiceError(ServiceError::Unauthorized)),
+            "AuthorizationFailedFailure"
+        );
+        assert_eq!(
+            group_send_failure_word(&Error::ServiceError(ServiceError::RateLimitExceeded {
+                retry_after: None
+            })),
+            "NetworkFailure"
+        );
+        assert_eq!(
+            group_send_failure_word(&Error::NoMessagesToSend),
+            "NetworkFailure"
+        );
+    }
+
+    /// 群发送结果条目组装形状（send 群形态 `results` additive 面）：成功
+    /// `{recipientNumber, success:{timestamp}}`、失败 `{recipientNumber,
+    /// failure:{type}}`；contacts 未命中回退 ACI uuid 串。
+    #[test]
+    fn group_send_result_entries_shapes() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError as Error;
+
+        let aci = ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+            presage::libsignal_service::prelude::Uuid::parse_str(
+                "11111111-2222-4333-8444-555555555555",
+            )
+            .expect("aci"),
+        ));
+        let outcomes: GroupSendOutcomes = vec![
+            (aci, None),
+            (aci, Some(Error::NotFound { service_id: aci })),
+        ];
+        let mut numbers = HashMap::new();
+        numbers.insert(
+            aci.service_id_string().to_owned(),
+            "+15550001111".to_owned(),
+        );
+        let entries = group_send_result_entries(outcomes, 1_700_000_000_000_u64, &numbers);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            json!({
+                "recipientNumber": "+15550001111",
+                "success": { "timestamp": 1_700_000_000_000_u64 },
+            })
+        );
+        assert_eq!(
+            entries[1],
+            json!({
+                "recipientNumber": "+15550001111",
+                "failure": { "type": "UnregisteredFailure" },
+            })
+        );
+        // contacts 未命中：recipientNumber 回退 ACI uuid 串（listGroups 同纪律）。
+        let fallback = group_send_result_entries(
+            vec![(aci, Some(Error::ServiceError(ServiceError::Unauthorized)))],
+            7,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            fallback[0]["recipientNumber"],
+            json!(aci.service_id_string())
+        );
+        assert_eq!(
+            fallback[0]["failure"]["type"],
+            json!("AuthorizationFailedFailure")
+        );
+    }
+
+    /// 群发送语义三件的两个 vendor 纯函数契约：typing 不触发群态刷新
+    /// （官方 typing 不刷群态），其余发送强刷；announcements-only 闸判
+    /// ADMINISTRATOR 角色（Default/缺席皆非 admin）。
+    #[test]
+    fn group_refresh_and_announcements_gate_contract() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::libsignal_service::prelude::{ProfileKey, Uuid};
+        use presage::libsignal_service::protocol::Aci;
+        use presage::manager::{group_member_is_admin, group_refresh_needed};
+        use presage::model::groups::{Group, Member};
+        use presage::proto::DataMessage;
+
+        // 刷新决策：typing 免刷，DataMessage 强刷。
+        assert!(!group_refresh_needed(&ContentBody::TypingMessage(
+            presage::proto::TypingMessage::default()
+        )));
+        assert!(group_refresh_needed(&ContentBody::DataMessage(
+            DataMessage::default()
+        )));
+
+        let own = Aci::from(Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("own"));
+        let other =
+            Aci::from(Uuid::parse_str("99999999-2222-4333-8444-555555555555").expect("other"));
+        let member = |aci: Aci, role: Role| Member {
+            aci,
+            role,
+            profile_key: ProfileKey::create([7u8; 32]),
+            joined_at_revision: 1,
+            label: None,
+            label_emoji: None,
+        };
+        let group = |members: Vec<Member>| Group {
+            title: "g".to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 1,
+            members,
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+            announcements_only: true,
+        };
+
+        // 本机为 ADMINISTRATOR → 闸放行；Default 角色/缺席 → 闸拦下。
+        assert!(group_member_is_admin(
+            &group(vec![
+                member(other, Role::Default),
+                member(own, Role::Administrator)
+            ]),
+            &own
+        ));
+        assert!(!group_member_is_admin(
+            &group(vec![member(own, Role::Default)]),
+            &own
+        ));
+        assert!(!group_member_is_admin(
+            &group(vec![member(other, Role::Administrator)]),
+            &own
+        ));
+    }
+
+    /// send_error_of announcements 归型：vendor GroupAnnouncementsOnly →
+    /// SendError::AnnouncementsOnly（不经 Internal 折叠）。
+    #[test]
+    fn send_errors_classify_announcements_only() {
+        assert!(matches!(
+            send_error_of(presage::Error::GroupAnnouncementsOnly),
+            SendError::AnnouncementsOnly
         ));
     }
 

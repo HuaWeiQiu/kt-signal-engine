@@ -2527,6 +2527,9 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         SendError::TargetTerminated => {
             jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_TERMINATED"))
         }
+        SendError::AnnouncementsOnly => {
+            jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"))
+        }
         SendError::Unbound => {
             jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
         }

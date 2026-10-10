@@ -1307,7 +1307,7 @@ impl<S: Store> Manager<S, Registered> {
         master_key_bytes: &[u8],
         message: impl Into<ContentBody>,
         timestamp: u64,
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<GroupSendOutcomes, Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
             .try_into()
@@ -1320,11 +1320,30 @@ impl<S: Store> Manager<S, Registered> {
         let mut sender = self.new_message_sender().await?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        // KT (group send semantics): message sends refresh the group state
+        // first (the u32::MAX revision comparison always triggers the fetch),
+        // so the recipient list no longer eats stale memberships; a failed
+        // fetch falls back to the stored group (fail-open). Typing stays on
+        // the local state — official typing carries no group fetch.
+        let revision = if group_refresh_needed(&content_body) {
+            u32::MAX
+        } else {
+            0
+        };
         let Some(group) =
-            upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &0).await?
+            upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &revision).await?
         else {
             return Err(Error::UnknownGroup);
         };
+
+        // KT (group send semantics): official clients block non-admin posts
+        // into announcement groups client-side (the server would not); a
+        // group with no state at all fails earlier as UnknownGroup, so the
+        // gate adds no new failure face.
+        let own_aci = self.state.data.service_ids.aci();
+        if group.announcements_only && !group_member_is_admin(&group, &own_aci) {
+            return Err(Error::GroupAnnouncementsOnly);
+        }
 
         // KT (identified fuse): same fallback as the 1:1 path — per-member
         // access drops to None (identified) when the certificate is missing.
@@ -1335,17 +1354,26 @@ impl<S: Store> Manager<S, Registered> {
                 None
             }
         };
+        let mut recipient_ids = Vec::new();
         let mut recipients = Vec::new();
         for member in group
             .members
             .into_iter()
             .filter(|m| m.aci != self.state.data.service_ids.aci())
         {
-            let unidentified_access = unidentified_access_or_identified(
-                self.store.profile_key(&member.aci.into()).await?,
-                sender_certificate.clone(),
-            );
+            // KT (group send semantics): an unreadable profile row degrades
+            // the member to the identified channel instead of failing the
+            // whole batch.
+            let profile_key = self
+                .store
+                .profile_key(&member.aci.into())
+                .await
+                .ok()
+                .flatten();
+            let unidentified_access =
+                unidentified_access_or_identified(profile_key, sender_certificate.clone());
             let include_pni_signature = false;
+            recipient_ids.push(member.aci.into());
             recipients.push((
                 member.aci.into(),
                 unidentified_access,
@@ -1358,20 +1386,16 @@ impl<S: Store> Manager<S, Registered> {
             .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
             .await;
 
-        // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
-        results
+        // KT (group send semantics): per-recipient outcomes — individual
+        // failures (unregistered members included) no longer fail the whole
+        // send (official per-recipient result semantics); the transcript is
+        // saved regardless, so even the first message to a group lands in
+        // the store.
+        let outcomes: GroupSendOutcomes = recipient_ids
             .into_iter()
-            .find(|res| match res {
-                Ok(_) => false,
-                // Ignore any NotFound errors, those mean that e.g. some contact in a group deleted his account.
-                Err(MessageSenderError::NotFound { service_id }) => {
-                    debug!(service_id = %service_id.service_id_string(), "recipient not found, skipping sent message result");
-                    false
-                }
-                // return first error if any
-                Err(_) => true,
-            })
-            .transpose()?;
+            .zip(results)
+            .map(|(service_id, result)| (service_id, result.err()))
+            .collect();
 
         let content = Content {
             metadata: Metadata {
@@ -1400,7 +1424,7 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
-        Ok(())
+        Ok(outcomes)
     }
 
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {
@@ -1834,6 +1858,29 @@ impl RetryReceiptMaterial {
             receipt.serialized().to_vec(),
         ))
     }
+}
+
+/// KT (group send semantics): per-recipient group send outcome — `None` =
+/// delivered, `Some` = that recipient's failure. Official clients report
+/// per-recipient results; individual failures don't fail the whole send.
+pub type GroupSendOutcomes = Vec<(ServiceId, Option<MessageSenderError>)>;
+
+/// KT (group send semantics): typing skips the group-state refresh (official
+/// typing carries no group fetch); real sends refresh before dispatch.
+/// `pub` so the engine workspace (this fork's only consumer) can pin the
+/// refresh contract in its test gate; not part of the upstream API surface.
+pub fn group_refresh_needed(body: &ContentBody) -> bool {
+    !matches!(body, ContentBody::TypingMessage(_))
+}
+
+/// KT (group send semantics): sender holds the ADMINISTRATOR role in this
+/// group — the announcements-only send gate predicate. `pub` so the engine
+/// workspace (this fork's only consumer) can pin the gate contract in its
+/// test gate; not part of the upstream API surface.
+pub fn group_member_is_admin(group: &Group, aci: &Aci) -> bool {
+    group.members.iter().any(|member| {
+        member.aci == *aci && member.role == libsignal_service::groups_v2::Role::Administrator
+    })
 }
 
 async fn upsert_group<S: Store>(

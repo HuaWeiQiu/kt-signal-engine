@@ -59,6 +59,11 @@ pub enum Error<S: std::error::Error> {
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
     #[error("unknown group")]
     UnknownGroup,
+    /// KT (group send semantics): announcements-only group and the sender
+    /// holds no ADMINISTRATOR role — official clients block the post
+    /// client-side, the server would not.
+    #[error("group is announcements-only; sender is not an admin")]
+    GroupAnnouncementsOnly,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]
