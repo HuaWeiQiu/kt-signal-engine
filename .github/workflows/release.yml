@@ -1,0 +1,100 @@
+# Release 构建矩阵（R5 跨平台交付）：三平台 release 二进制 + SHA-256 校验文件。
+#
+# action 主版本基线：2026-10-10 实查 GitHub releases API
+#   checkout v7.0.1 / upload-artifact v7.0.2 / Swatinem/rust-cache v2.9.2 /
+#   dtolnay/rust-toolchain v1（Node24 运行时，无 Node20-only 弃用面）。
+# 来源：gh api repos/actions/<repo>/releases/latest。
+#
+# 构建前置：vendor/libsignal-service/build.rs 经 prost-build 编译自持
+# protobuf/ 目录，构建期需要 protoc（与 ci.yml 同款前置，三 runner 均装）。
+# sqlite 依赖走 libsqlite3-sys bundled（全图 feature 归一生效，见根
+# Cargo.toml），编译期静态链接进二进制，runner 无需系统 sqlite。
+#
+# 触发：tag push（v*）正式发版；workflow_dispatch 供手工自证/补产物。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y --no-progress
+
+      # Windows：静态链接 CRT（+crt-static），产物单 exe，免 VC redist。
+      - name: cargo build (Windows, crt-static)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: cargo build (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: package with sha256 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -v dist
+          cp -v "target/${{ matrix.target }}/release/kt-signal-engine" \
+            "dist/kt-signal-engine-${{ matrix.target }}"
+          (
+            cd dist
+            shasum -a 256 "kt-signal-engine-${{ matrix.target }}" \
+              > "kt-signal-engine-${{ matrix.target }}.sha256"
+            cat "kt-signal-engine-${{ matrix.target }}.sha256"
+          )
+
+      - name: package with sha256 (Windows, crt-static)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bin = "kt-signal-engine-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/kt-signal-engine.exe" "dist/$bin"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$bin").Hash.ToLower()
+          "$hash  $bin" | Out-File -Encoding ascii "dist/$bin.sha256"
+          Get-Content "dist/$bin.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kt-signal-engine-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
