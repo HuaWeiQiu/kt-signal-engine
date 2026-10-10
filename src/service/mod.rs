@@ -2636,6 +2636,144 @@ fn decryption_error_notification(
     })
 }
 
+// ---------------------------------------------------------------------------
+// DERM 收发自愈（B 批，官方 Android MessageDecryptor / Desktop handleRetry
+// 行为对齐）：解密失败回发 DecryptionErrorMessage；收到重试请求按原始
+// 时间戳重发已发消息，找不到/超龄/超限 → clear_sessions 会话重建。
+// ---------------------------------------------------------------------------
+
+/// 同一 (来源, 原始时间戳) 重试请求放行上限（官方 Desktop handleRetry
+/// RETRY_LIMIT = 5 同值）。
+const DERM_RETRY_LIMIT: u32 = 5;
+/// 重试请求新鲜度窗口（官方 Desktop retryRespondMaxAge 缺省 14 天同值）：
+/// 原始消息超龄不再重发，转会话重建档。
+const DERM_RESPOND_MAX_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
+
+/// 防环计数器（进程内存，接收管线生命周期；键 = 来源 ACI + 原始时间戳，
+/// 与官方 getRetryKey 同形）。
+#[derive(Default)]
+struct DermRetryGuard {
+    attempts: HashMap<(String, u64), u32>,
+}
+
+impl DermRetryGuard {
+    /// 计入一次并判定是否放行（超限 false，官方 retryCount > RETRY_LIMIT
+    /// early-return 同语义）。
+    fn admit(&mut self, sender: &str, original_ts: u64) -> bool {
+        let count = self
+            .attempts
+            .entry((sender.to_owned(), original_ts))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        *count <= DERM_RETRY_LIMIT
+    }
+}
+
+/// 新鲜度判定（纯函数）：原始消息不晚于当下且在窗口内。
+fn derm_request_fresh(now_ms: u64, original_ts: u64) -> bool {
+    now_ms >= original_ts && now_ms - original_ts <= DERM_RESPOND_MAX_AGE_MS
+}
+
+/// 重发资格判定（纯函数面）：直聊线程须恰指向请求者；群线程须请求者在
+/// 成员名单内（官方 getSentProtoByRecipient 按 recipient 查同语义——
+/// 非收件人请求重发一律转会话重建档，不向他方泄露群消息）。
+fn derm_resend_allowed(
+    thread: &presage::store::Thread,
+    requester: &ServiceId,
+    group_members: Option<&[presage::model::groups::Member]>,
+) -> bool {
+    match thread {
+        presage::store::Thread::Contact(service_id) => service_id == requester,
+        presage::store::Thread::Group(_) => group_members.is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| ServiceId::from(member.aci) == *requester)
+        }),
+    }
+}
+
+/// DERM 分发：两档失败面（我方解密失败 → 回发重试回执；对端重试请求 →
+/// 重发/会话重建）。全链路 best-effort：任何失败静默，绝不影响原信封 ack。
+async fn derm_handle(
+    manager: &mut Manager<SqliteStore, Registered>,
+    sender: ServiceId,
+    failure: presage::model::messages::DecryptionFailure,
+    guard: &mut DermRetryGuard,
+) {
+    use presage::model::messages::DecryptionFailure as Failure;
+    match failure {
+        Failure::RetryReceipt(bytes) => {
+            derm_send_receipt(manager, sender, &bytes).await;
+        }
+        Failure::RetryRequest(original_ts) => {
+            derm_on_retry_request(manager, sender, original_ts, guard).await;
+        }
+    }
+}
+
+/// 档一：把重试回执（DecryptionErrorMessage 序列化 proto）经发送通道回原
+/// 发送者。回执发送失败静默（事件面已上抛，官方 requestResend 队列失败
+/// 同样落会话重置兜底）。
+async fn derm_send_receipt(
+    manager: &mut Manager<SqliteStore, Registered>,
+    sender: ServiceId,
+    receipt: &[u8],
+) {
+    use prost::Message as _;
+    let Ok(body) = presage::proto::DecryptionErrorMessage::decode(receipt) else {
+        return;
+    };
+    let _ = manager
+        .send_message(sender, ContentBody::DecryptionErrorMessage(body), now_ms())
+        .await;
+}
+
+/// 档二：对端重试请求（DERM.RetryRequest）。闸序：防环计数 → 新鲜度 →
+/// 已发消息找回（含群成员资格）；可重发则重发原始内容，否则
+/// clear_sessions（会话重建在下一轮收发自然发生）。
+async fn derm_on_retry_request(
+    manager: &mut Manager<SqliteStore, Registered>,
+    requester: ServiceId,
+    original_ts: u64,
+    guard: &mut DermRetryGuard,
+) {
+    if !guard.admit(&requester.service_id_string(), original_ts)
+        || !derm_request_fresh(now_ms(), original_ts)
+    {
+        let _ = manager.clear_sessions(&requester).await;
+        return;
+    }
+    let lookup = manager
+        .store()
+        .sent_message_by_timestamp(&requester, original_ts)
+        .await
+        .ok()
+        .flatten();
+    let Some((thread, content)) = lookup else {
+        let _ = manager.clear_sessions(&requester).await;
+        return;
+    };
+    let group_members = match &thread {
+        presage::store::Thread::Group(master_key) => manager
+            .store()
+            .group(*master_key)
+            .await
+            .ok()
+            .flatten()
+            .map(|group| group.members),
+        presage::store::Thread::Contact(_) => None,
+    };
+    if !derm_resend_allowed(&thread, &requester, group_members.as_deref()) {
+        let _ = manager.clear_sessions(&requester).await;
+        return;
+    }
+    // 重发原始内容（原始时间戳保序；本地 store INSERT OR REPLACE 同行
+    // 幂等）。resend 失败静默（请求方下轮重试或会话重建档兜底）。
+    let _ = manager
+        .send_message(requester, content.body, original_ts)
+        .await;
+}
+
 async fn receive_pipeline(
     service: &Service,
     number: String,
@@ -2644,6 +2782,9 @@ async fn receive_pipeline(
 ) {
     // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
     let mut last_contacts_sync: Option<std::time::Instant> = None;
+    // DERM 重试防环计数（同管线生命周期；断连重开不清——防环窗口以
+    // 原始消息时间戳为键，跨重连持续有效）。
+    let mut derm_guard = DermRetryGuard::default();
     // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
@@ -2676,6 +2817,7 @@ async fn receive_pipeline(
                 &dir,
                 &mut serve_rx,
                 &mut last_contacts_sync,
+                &mut derm_guard,
             ) => connected,
         };
         // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
@@ -2783,6 +2925,7 @@ async fn serve_account_stream(
     dir: &Path,
     shutdown: &mut watch::Receiver<bool>,
     last_contacts_sync: &mut Option<std::time::Instant>,
+    derm_guard: &mut DermRetryGuard,
 ) -> bool {
     let Ok(store) = open_store(dir).await else {
         return false;
@@ -2829,11 +2972,18 @@ async fn serve_account_stream(
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
                 // 落库事务后逐条 ack，解密失败也 ack），否则服务器队列堆积；
-                // 同时结构化上抛 connector（不再静默丢弃）。DERM 回发属 B 批。
-                Some(Received::DecryptionError(sender, timestamp, ack)) => {
+                // 同时结构化上抛 connector（不再静默丢弃）。DERM 自愈两档
+                // （官方 Android MessageDecryptor / Desktop handleRetry 同型）：
+                // 我方解密失败 → 回发 DecryptionErrorMessage；收到对端重试
+                // 请求 → 按原始时间戳找回已发消息重发，找不到/超龄/超限 →
+                // clear_sessions 触发会话重建。全链路失败静默，绝不影响 ack。
+                Some(Received::DecryptionError(sender, timestamp, failure, ack)) => {
                     let _ = service
                         .outbound
                         .send(decryption_error_notification(number, &sender, timestamp));
+                    if let Some(failure) = failure {
+                        derm_handle(&mut manager, sender, failure, derm_guard).await;
+                    }
                     ack.ack();
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
@@ -8465,6 +8615,112 @@ mod tests {
             json!("11111111-2222-4333-8444-555555555555")
         );
         assert_eq!(envelope["decryptionError"], json!({}));
+    }
+
+    /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内
+    /// 放行，边界外（超龄/未来时间戳）转会话重建档。
+    #[test]
+    fn derm_request_freshness_window_matches_official_14d() {
+        let now = 1_700_000_000_000_u64;
+        let day: u64 = 24 * 60 * 60 * 1_000;
+        assert!(derm_request_fresh(now, now));
+        assert!(derm_request_fresh(now, now - 13 * day));
+        assert!(derm_request_fresh(now, now - 14 * day));
+        assert!(!derm_request_fresh(now, now - 14 * day - 1));
+        // 未来时间戳（时钟偏差）不放行。
+        assert!(!derm_request_fresh(now, now + 1));
+    }
+
+    /// DERM 防环计数（官方 RETRY_LIMIT=5 同值）：同 (来源, 原始时间戳)
+    /// 第 6 次起不放行；不同键互不挤占。
+    #[test]
+    fn derm_retry_guard_caps_repeats_per_key() {
+        let mut guard = DermRetryGuard::default();
+        for _ in 0..DERM_RETRY_LIMIT {
+            assert!(guard.admit("sender-a", 1000));
+        }
+        assert!(!guard.admit("sender-a", 1000));
+        // 另一来源/另一时间戳不受同键计数牵连。
+        assert!(guard.admit("sender-b", 1000));
+        assert!(guard.admit("sender-a", 2000));
+    }
+
+    /// DERM 重发资格矩阵：直聊线程须恰指向请求者；群线程须请求者在成员
+    /// 名单内（非收件人请求不重发，防群内容外泄）。
+    #[test]
+    fn derm_resend_allowed_matrix() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::Aci;
+        use presage::model::groups::Member;
+        use presage::store::Thread;
+
+        let requester_aci = Aci::from(
+            Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("requester aci"),
+        );
+        let stranger_aci = Aci::from(
+            Uuid::parse_str("99999999-2222-4333-8444-555555555555").expect("stranger aci"),
+        );
+        let requester = ServiceId::from(requester_aci);
+        let stranger = ServiceId::from(stranger_aci);
+        let member = |aci: Aci| Member {
+            aci,
+            role: Role::Default,
+            profile_key: presage::libsignal_service::prelude::ProfileKey::create([7u8; 32]),
+            joined_at_revision: 1,
+            label: None,
+            label_emoji: None,
+        };
+
+        // 直聊：请求者本人 → 重发；他人借道同线程键 → 拒。
+        assert!(derm_resend_allowed(
+            &Thread::Contact(requester),
+            &requester,
+            None
+        ));
+        assert!(!derm_resend_allowed(
+            &Thread::Contact(requester),
+            &stranger,
+            None
+        ));
+        // 群：成员 → 重发；非成员（仅他人/请求者在名单时第三方借道同拒）/
+        // 名单不可得 → 会话重建档。
+        let members = vec![member(requester_aci)];
+        assert!(derm_resend_allowed(
+            &Thread::Group([0u8; 32]),
+            &requester,
+            Some(&members)
+        ));
+        assert!(!derm_resend_allowed(
+            &Thread::Group([0u8; 32]),
+            &stranger,
+            Some(&members)
+        ));
+        assert!(!derm_resend_allowed(
+            &Thread::Group([0u8; 32]),
+            &requester,
+            None
+        ));
+    }
+
+    /// 重试回执解码形状（derm_send_receipt 入参面）：序列化
+    /// DecryptionErrorMessage proto 往返后 timestamp/device_id 保真——
+    /// 请求方按这两个位找回原消息。
+    #[test]
+    fn derm_receipt_roundtrip_keeps_timestamp_and_device() {
+        use presage::proto::DecryptionErrorMessage;
+        use prost::Message as _;
+
+        let receipt = DecryptionErrorMessage {
+            timestamp: Some(1_700_000_000_000),
+            ratchet_key: Some(vec![1, 2, 3]),
+            device_id: Some(2),
+        };
+        let bytes = receipt.encode_to_vec();
+        let decoded = DecryptionErrorMessage::decode(bytes.as_slice()).expect("roundtrip");
+        assert_eq!(decoded.timestamp, Some(1_700_000_000_000));
+        assert_eq!(decoded.device_id, Some(2));
+        assert_eq!(decoded.ratchet_key, Some(vec![1, 2, 3]));
     }
 
     /// 投影去重键（止血批①③）：presage unfold 以

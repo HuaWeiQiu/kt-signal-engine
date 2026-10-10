@@ -58,6 +58,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::model::contacts::Contact;
+use crate::model::messages::DecryptionFailure;
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
@@ -661,6 +662,10 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     match state.encrypted_messages.next().await {
                         Some(Ok(Incoming::Envelope(envelope, ack))) => {
+                            // KT (DERM): retry-receipt material captured before the
+                            // envelope is consumed by decryption; only spent on the
+                            // failure path below.
+                            let retry_material = RetryReceiptMaterial::of(&envelope);
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
@@ -699,10 +704,16 @@ impl<S: Store> Manager<S, Registered> {
                                                 .timestamp_millis(),
                                         )
                                         .ok();
+                                        // KT (DERM): the embedded timestamp names the
+                                        // peer's original message that failed here.
+                                        let failure = e
+                                            .timestamp
+                                            .map(DecryptionFailure::RetryRequest);
                                         return Some((
                                             Received::DecryptionError(
                                                 content.metadata.sender,
                                                 timestamp,
+                                                failure,
                                                 ack,
                                             ),
                                             state,
@@ -1017,10 +1028,11 @@ impl<S: Store> Manager<S, Registered> {
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
+                                    let failure = retry_material.and_then(|m| m.into_failure());
                                     if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
                                         if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
                                             return Some((
-                                                Received::DecryptionError(sender, None, ack),
+                                                Received::DecryptionError(sender, None, failure, ack),
                                                 state,
                                             ));
                                         }
@@ -1772,6 +1784,55 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
             data_message.timestamp = Some(timestamp);
         }
         _ => (),
+    }
+}
+
+/// KT (DERM): what is needed to build a retry receipt for a failed envelope,
+/// captured before the envelope is consumed by decryption (Android
+/// MessageDecryptor buildSendRetryReceiptJob: original content bytes, cipher
+/// type, client timestamp, sender device).
+struct RetryReceiptMaterial {
+    content: Vec<u8>,
+    message_type: libsignal_service::protocol::CiphertextMessageType,
+    timestamp: u64,
+    sender_device: u32,
+}
+
+impl RetryReceiptMaterial {
+    fn of(envelope: &libsignal_service::proto::Envelope) -> Option<Self> {
+        use libsignal_service::proto::envelope::Type;
+        use libsignal_service::protocol::CiphertextMessageType;
+        let content = envelope.content.as_ref()?.clone();
+        let message_type = match envelope.r#type() {
+            Type::DoubleRatchet => CiphertextMessageType::Whisper,
+            Type::PrekeyMessage => CiphertextMessageType::PreKey,
+            Type::UnidentifiedSender => CiphertextMessageType::SenderKey,
+            _ => return None,
+        };
+        Some(Self {
+            content,
+            message_type,
+            timestamp: envelope.client_timestamp(),
+            sender_device: envelope.source_device_id(),
+        })
+    }
+
+    /// The receipt names the original message (ratchet key + timestamp) so
+    /// the sender can re-send it into a session we can actually decrypt.
+    /// Plaintext / malformed originals yield None (no receipt, official
+    /// fallback is the consumer's automatic session reset).
+    fn into_failure(self) -> Option<DecryptionFailure> {
+        use libsignal_service::protocol::{DecryptionErrorMessage, Timestamp};
+        let receipt = DecryptionErrorMessage::for_original(
+            &self.content,
+            self.message_type,
+            Timestamp::from_epoch_millis(self.timestamp),
+            self.sender_device,
+        )
+        .ok()?;
+        Some(DecryptionFailure::RetryReceipt(
+            receipt.serialized().to_vec(),
+        ))
     }
 }
 

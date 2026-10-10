@@ -751,6 +751,89 @@ impl BoundExt for Bound<&u64> {
     }
 }
 
+impl SqliteStore {
+    /// KT (DERM): outgoing-message lookup for retry requests, mirroring the
+    /// official Desktop `getSentProtoByRecipient` shape (by sending account +
+    /// timestamp, thread recovered alongside). Retry receipts name the
+    /// original message by timestamp only, so the consumer pairs the hit with
+    /// its own requester/membership checks before re-sending.
+    pub async fn sent_message_by_timestamp(
+        &self,
+        sender: &ServiceId,
+        timestamp: u64,
+    ) -> Result<Option<(Thread, Content)>, SqliteStoreError> {
+        let timestamp: i64 = timestamp
+            .try_into()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<Vec<u8>>,
+                Option<String>,
+                i64,
+                Option<i64>,
+                String,
+                i64,
+                String,
+                bool,
+                bool,
+                Vec<u8>,
+                bool,
+                Option<String>,
+            ),
+        >(
+            r#"SELECT t.group_master_key, t.recipient_id,
+                      m.ts, m.server_ts, m.sender_service_id, m.sender_device_id,
+                      m.destination_service_id, m.needs_receipt, m.unidentified_sender,
+                      m.content_body, m.was_plaintext, m.pni_verified
+            FROM thread_messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE m.ts = ? AND m.sender_service_id = ?"#,
+        )
+        .bind(timestamp)
+        .bind(sender.service_id_string())
+        .fetch_optional(&self.db)
+        .await
+        .into_protocol_error()?;
+        let Some((group_master_key, recipient_id, ts, server_ts, sender_service_id,
+                  sender_device_id, destination_service_id, needs_receipt, unidentified_sender,
+                  content_body, was_plaintext, pni_verified)) = row
+        else {
+            return Ok(None);
+        };
+        let thread = match (group_master_key, recipient_id) {
+            (Some(key), _) => Thread::Group(
+                key.try_into()
+                    .map_err(|_| SqliteStoreError::InvalidFormat)?,
+            ),
+            (None, Some(recipient_id)) => {
+                let service_id = ServiceId::parse_from_service_id_string(&recipient_id)
+                    .ok_or(SqliteStoreError::InvalidFormat)?;
+                Thread::Contact(service_id)
+            }
+            (None, None) => return Err(SqliteStoreError::InvalidFormat),
+        };
+        let message = SqlMessage {
+            ts: u64::try_from(ts).map_err(|_| SqliteStoreError::InvalidFormat)?,
+            server_ts: server_ts
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| SqliteStoreError::InvalidFormat)?,
+            sender_service_id,
+            sender_device_id: u8::try_from(sender_device_id)
+                .map_err(|_| SqliteStoreError::InvalidFormat)?,
+            destination_service_id,
+            needs_receipt,
+            unidentified_sender,
+            content_body,
+            was_plaintext,
+            pni_verified,
+        };
+        let content: Content = message.try_into()?;
+        Ok(Some((thread, content)))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
