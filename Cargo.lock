@@ -2030,6 +2030,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "bincode",
+ "bytes",
  "cbc",
  "chrono",
  "ctr 0.10.1",
@@ -2055,6 +2056,7 @@ dependencies = [
  "tokio",
  "url",
  "usernames",
+ "uuid",
  "zkgroup",
 ]
 

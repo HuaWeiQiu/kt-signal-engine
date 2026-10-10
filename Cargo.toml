@@ -32,11 +32,24 @@ libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 # additive 归一，不改变上游用法；reqwest 许可 MIT/Apache-2.0。
 reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 
+# 群发 MRM 发后落库时间戳（C 批：Metadata.client/server_timestamp 构造）；
+# presage 传递同版，MIT/Apache-2.0。
+chrono = "0.4"
+# 群 sender key 分发台账 distribution id（C 批 SenderKeyInfo，官方
+# distributionId 同形 v4）；uuid 1.26 已在图（presage 传递），v4 feature
+# 开启生成面，MIT/Apache-2.0。
+uuid = { version = "1", features = ["v4"] }
+
 # 仅 backup5-spike bin（ADR 0005 S1）生成链接密码用；与 presage 传递的 rand
 # 0.9 同源，许可 MIT/Apache-2.0。
 rand = "0.9"
 # libsignal-net chat gRPC 头构造（confirmation_header_name from_static）。
 http = "1"
+
+# 群发 MRM 单请求面（C 批）：PUT /v1/messages/multi_recipient 载荷类型
+# bytes::Bytes（libsignal-net-chat send_multi_recipient_message 入参）；
+# 同 crate 已在依赖图（libsignal-net/reqwest 传递），许可 MIT/Apache-2.0。
+bytes = "1"
 
 # ADR 0005 S2：存量历史迁移（backup5）接收侧。
 # - libsignal-message-backup（官方，v0.99.0 与传递钉定同 tag）：frame（HMAC+AES-CBC+gzip
@@ -101,9 +114,6 @@ usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", d
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false, features = ["test-util"] }
-# 测试专用（receive 投影单测构造 Metadata 时间戳）：presage 传递依赖同版，
-# MIT/Apache-2.0，不进运行时依赖图。
-chrono = "0.4"
 
 # Stories 发送面（E1/E2 批，2026-10-08）：presage 与 libsignal-service 以
 # 原样拷贝进 `vendor/`（上表 git 依赖行保留作来源锚点），经 [patch] 指向

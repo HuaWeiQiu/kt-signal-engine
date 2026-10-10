@@ -61,6 +61,10 @@ pub(crate) mod stories;
 pub(crate) mod username;
 pub(crate) mod zkgroup_consts;
 
+/// C 批群发提速：sender-key + 单请求 MRM 发送链（vendored 逐收件人路径
+/// 作官方合法 failover 兜底）。
+pub(crate) mod group_mrm;
+
 /// startLink 时刻的占位设备名（ADR 0004）：finishLink 拿到用户输入的名字后
 /// 改写 store 注册数据，接收管线首推 attributes 时覆盖为真名。
 const PLACEHOLDER_DEVICE_NAME: &str = "KT Signal Engine";
@@ -588,6 +592,10 @@ pub(crate) struct Service {
     /// 建连 + 空闲保留，不逐消息冷启动。同账号取用互斥串行（Manager 方法
     /// 需 &mut 且跨 await 持有），跨账号互不阻塞；delete/relink 摘除。
     send_managers: AsyncMutex<SendManagerCache>,
+    /// 群发 MRM 单请求面（C 批提速）：进程级未鉴权 chat WS 连接单槽缓存
+    /// （PUT /v1/messages/multi_recipient 不带账号凭据，跨账号共用）；
+    /// 传输失败摘除重连一次（group_mrm::send_mrm），惰性建连。
+    mrm_chat: AsyncMutex<Option<libsignal_net::chat::ChatConnection>>,
 }
 
 /// 常驻发送管理器缓存：号码 → 共享互斥管理器（Service 同型，单测可断言）。
@@ -626,6 +634,7 @@ impl Service {
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
             send_managers: AsyncMutex::new(HashMap::new()),
+            mrm_chat: AsyncMutex::new(None),
         })
     }
 
@@ -1105,7 +1114,7 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp)
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
             .await
             .map(|_| ())
     }
@@ -1137,7 +1146,7 @@ impl Service {
             )),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp)
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
             .await
             .map(|_| ())
     }
@@ -1167,7 +1176,7 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp)
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
             .await
             .map(|_| ())
     }
@@ -1571,7 +1580,7 @@ impl Service {
                 .await?
             }
         };
-        let outcomes = dispatch_group(&mut manager, group_id, body, timestamp).await?;
+        let outcomes = dispatch_group(self, &mut manager, group_id, body, timestamp).await?;
         let numbers = contacts_number_map(manager.store()).await;
         Ok((
             timestamp,
@@ -1597,7 +1606,7 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp)
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
             .await
             .map(|_| ())
     }
@@ -1632,7 +1641,7 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(&mut manager, group_id, body, timestamp)
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
             .await
             .map(|_| ())
     }
@@ -4914,16 +4923,15 @@ fn group_send_result_entries(
 }
 
 async fn dispatch_group(
+    service: &Arc<Service>,
     manager: &mut Manager<SqliteStore, Registered>,
     group_id: &str,
     body: DataMessage,
     timestamp: u64,
 ) -> Result<GroupSendOutcomes, SendError> {
-    let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
-    manager
-        .send_message_to_group(&master_key, body, timestamp)
-        .await
-        .map_err(send_error_of)
+    // C 批提速：sender-key + 单请求 MRM 主路径；目标过少/MRM 链路不可用
+    // 时内部 failover 回 vendored 逐收件人路径（官方合法 fallback）。
+    group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp).await
 }
 
 /// contacts 的 uuid 字符串 → E.164 映射（群组成员/作者号批量解析共用）。

@@ -300,7 +300,9 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    async fn sender_certificate(&self) -> Result<SenderCertificate, Error<S::Error>> {
+    // KT (group MRM): pub — the engine's single-request MRM path builds the
+    // USMC from this uuid-only certificate (Desktop sendToGroup same face).
+    pub async fn sender_certificate(&self) -> Result<SenderCertificate, Error<S::Error>> {
         let needs_renewal = |sender_certificate: Option<&SenderCertificate>| -> bool {
             if sender_certificate.is_none() {
                 return true;
