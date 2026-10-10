@@ -649,7 +649,7 @@ impl<S: Store> Manager<S, Registered> {
             async move {
                 loop {
                     match state.encrypted_messages.next().await {
-                        Some(Ok(Incoming::Envelope(envelope))) => {
+                        Some(Ok(Incoming::Envelope(envelope, ack))) => {
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
@@ -664,6 +664,7 @@ impl<S: Store> Manager<S, Registered> {
                                             && envelope.source_service_id.is_none()
                                         {
                                             warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
+                                            ack.ack();
                                             continue;
                                         }
                                         state
@@ -680,8 +681,19 @@ impl<S: Store> Manager<S, Registered> {
                                             error = ?e,
                                             "got error decrypting a message"
                                         );
+                                        let timestamp = u64::try_from(
+                                            content
+                                                .metadata
+                                                .client_timestamp
+                                                .timestamp_millis(),
+                                        )
+                                        .ok();
                                         return Some((
-                                            Received::DecryptionError(content.metadata.sender),
+                                            Received::DecryptionError(
+                                                content.metadata.sender,
+                                                timestamp,
+                                                ack,
+                                            ),
                                             state,
                                         ));
                                     }
@@ -812,7 +824,7 @@ impl<S: Store> Manager<S, Registered> {
                                             }
                                         }
 
-                                        return Some((Received::Contacts, state));
+                                        return Some((Received::Contacts(ack), state));
                                     }
 
                                     // sticker pack operations
@@ -947,6 +959,31 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                     }
 
+                                    // Redelivery gate (KT): a (sender, client_timestamp) row
+                                    // already in the store means this envelope was stored and
+                                    // projected once; re-store/re-project would duplicate
+                                    // downstream notifications. Ack the handle instead.
+                                    let redelivered = {
+                                        match u64::try_from(
+                                            content.metadata.client_timestamp.timestamp_millis(),
+                                        ) {
+                                            Ok(timestamp) => state
+                                                .store
+                                                .thread_for_sender_and_timestamp(
+                                                    &content.metadata.sender,
+                                                    timestamp,
+                                                )
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .is_some(),
+                                            Err(_) => false,
+                                        }
+                                    };
+                                    if redelivered {
+                                        return Some((Received::Duplicate(ack), state));
+                                    }
+
                                     if let Err(error) = save_message(
                                         &mut state.store,
                                         &mut state.identified_websocket,
@@ -958,18 +995,26 @@ impl<S: Store> Manager<S, Registered> {
                                         error!(%error, "error saving message to store");
                                     }
 
-                                    return Some((Received::Content(Box::new(content)), state));
+                                    return Some((
+                                        Received::Content(Box::new(content), ack),
+                                        state,
+                                    ));
                                 }
                                 Ok(None) => {
-                                    debug!("empty envelope, message will be skipped!")
+                                    debug!("empty envelope, message will be skipped!");
+                                    ack.ack();
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
                                     if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
                                         if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
-                                            return Some((Received::DecryptionError(sender), state));
+                                            return Some((
+                                                Received::DecryptionError(sender, None, ack),
+                                                state,
+                                            ));
                                         }
                                     }
+                                    ack.ack();
                                 }
                             }
                         }

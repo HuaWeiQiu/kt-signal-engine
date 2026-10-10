@@ -2615,6 +2615,34 @@ async fn storage_context(
 // 接收管线与投影
 // ---------------------------------------------------------------------------
 
+/// DecryptionError 结构化事件（止血批①：解密失败不再静默丢弃）。加面不改
+/// 既有投影字段；形状 = receive 事件族同构（{account, envelope:{...}}），
+/// 信封面带 sourceUuid 与（已知时）发送方 client timestamp。官方语义：
+/// 解密失败也 ack + 记录（AndroidIncomingMessageObserver 落库后逐条 ack），
+/// DERM 回发属 B 批不做。
+fn decryption_error_notification(
+    account: &str,
+    sender: &ServiceId,
+    timestamp: Option<u64>,
+) -> Value {
+    let envelope = match timestamp {
+        Some(timestamp) => json!({
+            "timestamp": timestamp,
+            "sourceUuid": sender.service_id_string(),
+            "decryptionError": {},
+        }),
+        None => json!({
+            "sourceUuid": sender.service_id_string(),
+            "decryptionError": {},
+        }),
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": { "account": account, "envelope": envelope },
+    })
+}
+
 async fn receive_pipeline(
     service: &Service,
     number: String,
@@ -2688,13 +2716,32 @@ async fn serve_account_stream(
                 sync_pending = None;
             }
             item = stream.next() => match item {
-                // QueueEmpty：历史队列排空，流继续保持。
+                // QueueEmpty：历史队列排空，流继续保持（queue 标记在
+                // messagepipe 层已就地 ack）。
                 Some(Received::QueueEmpty) => {}
-                // contacts 由 presage 自动入库（号码/名字面随之可用）。
-                Some(Received::Contacts) => {}
-                // 解密失败按事件丢弃（零日志；会话重置治理 P2）。
-                Some(Received::DecryptionError(_)) => {}
-                Some(Received::Content(content)) => {
+                // contacts 由 presage 自动入库（号码/名字面随之可用），
+                // 源信封处理完成 → 补 ack。
+                Some(Received::Contacts(ack)) => {
+                    ack.ack();
+                }
+                // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
+                // 落库事务后逐条 ack，解密失败也 ack），否则服务器队列堆积；
+                // 同时结构化上抛 connector（不再静默丢弃）。DERM 回发属 B 批。
+                Some(Received::DecryptionError(sender, timestamp, ack)) => {
+                    let _ = service
+                        .outbound
+                        .send(decryption_error_notification(number, &sender, timestamp));
+                    ack.ack();
+                }
+                // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
+                Some(Received::Duplicate(ack)) => {
+                    ack.ack();
+                }
+                Some(Received::Content(content, ack)) => {
+                    // 官方契约：解密+落库+投影完成后才 ack（Android
+                    // IncomingMessageObserver.kt 事务提交后逐条 ack；
+                    // SignalWebSocket.kt「处理成功后由你 ack」）。两条路
+                    // （投影成功/失败）都必达 ack，防服务器队列堆积。
                     for notification in
                         project_content(
                             number,
@@ -2706,6 +2753,7 @@ async fn serve_account_stream(
                     {
                         let _ = service.outbound.send(notification);
                     }
+                    ack.ack();
                 }
                 None => return,
             }
@@ -8264,5 +8312,102 @@ mod tests {
         assert!(names.contains(&"nopni"), "{capabilities}");
         assert!(names.contains(&"nopni2"), "{capabilities}");
         assert!(!names.contains(&"backup5"), "{capabilities}");
+    }
+
+    /// DecryptionError 结构化事件形状（止血批①，加面）：receive 事件族
+    /// 同构，sourceUuid + decryptionError 恒在；timestamp 仅在已知时出现
+    /// （sealed sender 失败路径无时间戳）。不改任何既有投影字段。
+    #[test]
+    fn decryption_error_event_shape_is_additive_receive_face() {
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+
+        let with_ts = decryption_error_notification("acct", &sender, Some(1_700_000_000_000));
+        assert_eq!(with_ts["jsonrpc"], json!("2.0"));
+        assert_eq!(with_ts["method"], json!("receive"));
+        assert_eq!(with_ts["params"]["account"], json!("acct"));
+        let envelope = &with_ts["params"]["envelope"];
+        assert_eq!(envelope["timestamp"], json!(1_700_000_000_000_u64));
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(envelope["decryptionError"], json!({}));
+
+        let without_ts = decryption_error_notification("acct", &sender, None);
+        let envelope = &without_ts["params"]["envelope"];
+        assert!(envelope.get("timestamp").is_none());
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(envelope["decryptionError"], json!({}));
+    }
+
+    /// 投影去重键（止血批①③）：presage unfold 以
+    /// `thread_for_sender_and_timestamp(sender, client_ts)` 判重复投递，
+    /// 本测试钉定该判重键与 store 落库行的对齐（同 sender+ts 命中，
+    /// 换 ts/换 sender 不命中）——命中即 Duplicate（不再投影/通知）。
+    #[tokio::test]
+    async fn dedupe_key_hits_store_row_for_redelivered_envelope() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::libsignal_service::protocol::DeviceId;
+        use presage::proto::NullMessage;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-dedupe-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let other = ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+            .expect("other aci");
+        let metadata = |sender| Metadata {
+            sender,
+            destination: sender,
+            sender_device: DeviceId::new(1).expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        // NullMessage 走 save_message 落库面（receipt/call 同族，typing 不落库
+        // ——瞬态面不去重，与 unfold 注释一致）。
+        let content = Content::from_body(
+            ContentBody::NullMessage(NullMessage::default()),
+            metadata(sender),
+        );
+        let thread = presage::store::Thread::Contact(sender);
+        store.save_message(&thread, content).await.unwrap();
+
+        // 同 (sender, client_ts)：重复投递 → 命中 → Duplicate。
+        let ts = 1_700_000_000_000_u64;
+        assert!(store
+            .thread_for_sender_and_timestamp(&sender, ts)
+            .await
+            .unwrap()
+            .is_some());
+        // 换 sender / 换 ts：真新消息 → 不命中 → 照常投影。
+        assert!(store
+            .thread_for_sender_and_timestamp(&other, ts)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .thread_for_sender_and_timestamp(&sender, ts + 1)
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

@@ -23,8 +23,26 @@ use crate::{
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Incoming {
-    Envelope(Envelope),
+    /// The ack is deferred: the [`EnvelopeAck`] handle must be completed by the
+    /// consumer after processing (Java: ack after "you handled it", by the caller).
+    Envelope(Envelope, EnvelopeAck),
     QueueEmpty,
+}
+
+/// Deferred ack handle for one envelope. The 200 response is only written
+/// when [`EnvelopeAck::ack`] is called; dropping the handle without acking
+/// leaves the request unanswered so the server redelivers it later.
+#[derive(Debug)]
+pub struct EnvelopeAck {
+    response: WebSocketResponseMessage,
+    responder: oneshot::Sender<WebSocketResponseMessage>,
+}
+
+impl EnvelopeAck {
+    /// Send the 200 ack. Returns false when the socket is already gone.
+    pub fn ack(self) -> bool {
+        self.responder.send(self.response).is_ok()
+    }
 }
 
 pub struct MessagePipe {
@@ -76,7 +94,7 @@ impl MessagePipe {
         let response = WebSocketResponseMessage::from_request(&request);
 
         // XXX Change the signature of this method to yield an enum of Envelope and EndOfQueue
-        let result = if request.is_signal_service_envelope() {
+        if request.is_signal_service_envelope() {
             let body = if let Some(body) = request.body.as_ref() {
                 body
             } else {
@@ -84,8 +102,20 @@ impl MessagePipe {
                     reason: "request without body.",
                 });
             };
-            Some(Incoming::Envelope(Envelope::decode(body.as_slice())?))
-        } else if request.is_queue_empty() {
+            // Envelopes yield unacked; the consumer acks via the handle once the
+            // envelope is decrypted, stored and projected (Java: MessagePipe::read
+            // acks after "you handled it").
+            let envelope = Envelope::decode(body.as_slice())?;
+            return Ok(Some(Incoming::Envelope(
+                envelope,
+                EnvelopeAck {
+                    response,
+                    responder,
+                },
+            )));
+        }
+
+        let result = if request.is_queue_empty() {
             Some(Incoming::QueueEmpty)
         } else {
             None
@@ -102,7 +132,8 @@ impl MessagePipe {
 
     /// Returns the stream of `Envelope`s
     ///
-    /// Envelopes yielded are acknowledged.
+    /// Envelopes yield an [`EnvelopeAck`] handle; the consumer acks after
+    /// processing. Queue markers ack immediately.
     pub fn stream(self) -> impl Stream<Item = Result<Incoming, ServiceError>> {
         let (sink, stream) = mpsc::channel(1);
 
@@ -114,5 +145,34 @@ impl MessagePipe {
 
         let combined = futures::stream::select(stream, runner.into_stream());
         combined.filter_map(|x| async { x })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_ack_writes_the_response_exactly_once() {
+        let (responder, receiver) = oneshot::channel();
+        let ack = EnvelopeAck {
+            response: WebSocketResponseMessage::default(),
+            responder,
+        };
+
+        assert!(ack.ack());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn envelope_ack_reports_false_once_the_socket_is_gone() {
+        let (responder, receiver) = oneshot::channel();
+        let ack = EnvelopeAck {
+            response: WebSocketResponseMessage::default(),
+            responder,
+        };
+        drop(receiver);
+
+        assert!(!ack.ack());
     }
 }

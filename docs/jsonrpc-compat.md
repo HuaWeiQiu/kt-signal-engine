@@ -2088,6 +2088,36 @@ response.rs：401/403 同归型）。此前 send 链把 presage 错误一律折�
   报）钉 `send_error_of`；sendError 解绑臂形状（-32603 + 原文 + 分类器
   锚词 AuthorizationFailedException/Authorization failed）钉 methods 面。
 
+### 收信 ack 后移 + 投影去重 + 解密失败上抛（A 止血批，2026-10-11）
+
+对齐官方收信契约（Signal-Android `IncomingMessageObserver.kt` 落库事务
+提交后逐条 ack、`SignalWebSocket.kt`「处理成功后由你 ack」）：此前
+vendored messagepipe 在信封 yield 即回 200，engine 解密失败静默丢弃，
+服务器重复投递会重复投影 + 重复通知 connector。本批改三面，JSON-RPC
+既有方法与字段零改动（仅新增事件面）。
+
+- **ack 时序**：信封 ack 句柄（vendored `EnvelopeAck`）自 messagepipe
+  穿 presage unfold 到引擎；引擎在解密 + presage 落库 + 投影/通知完成
+  后 ack。成功/失败两条路都必达 ack（防服务器队列堆积）；句柄被丢弃
+  （进程崩溃）= 不应答，服务器按未确认重投，与官方崩溃语义一致。
+  queue-empty 标记非消息，仍在 messagepipe 层就地 ack。
+- **投影去重**：presage unfold 在落库前查 store 既有行
+  （`thread_for_sender_and_timestamp(sender, client_timestamp)`，即
+  thread_messages 落库主键面）；命中 = 重复投递 → `Received::Duplicate`
+  （仅 ack，不再投影/不再通知）。判重键 = (sender, client_ts)，与
+  thread_messages INSERT OR REPLACE 行同源；typing/story 等不落库的
+  瞬态体不去重（重复通知无害瞬态面）。serverGuid 不作为判重键：presage
+  落库不持久化 server_guid（content.rs 解构丢弃），无账本可查，穿透
+  无从判重（如实现见本登记为准）。
+- **解密失败事件面**：`Received::DecryptionError` 不再静默——引擎 ack
+  （官方解密失败同样 ack+记录）并上抛加面事件：
+  `{method: "receive", params: {account, envelope: {sourceUuid,
+  decryptionError: {}, timestamp?}}}`——timestamp 仅在已知时出现（DERM
+  路径带发送方 client ts，sealed sender 失败路径无）。DERM（解密失败
+  回发）属 B 批不做；事件为加面，连接器白名单投影不消费则零影响。
+- **边界**：不动发送面；不做 DERM 回发；contacts 载荷不去重（presage
+  幂等落库）；QueueEmpty 行为不变。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
