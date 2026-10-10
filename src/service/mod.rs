@@ -1568,16 +1568,8 @@ impl Service {
             return Ok(());
         }
         let (mut manager, timestamp) = self.open_group_sender(account, group_id).await?;
-        let body = ContentBody::TypingMessage(presage::proto::TypingMessage {
-            timestamp: Some(timestamp),
-            action: Some(if stop {
-                presage::proto::typing_message::Action::Stopped as i32
-            } else {
-                presage::proto::typing_message::Action::Started as i32
-            }),
-            group_id: None,
-        });
         let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+        let body = ContentBody::TypingMessage(typing_group_body(&master_key, timestamp, stop));
         manager
             .send_message_to_group(&master_key, body, timestamp)
             .await
@@ -4438,6 +4430,25 @@ pub(crate) fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
         .decode(group_id.trim())
         .ok()?;
     (key.len() == 32).then_some(key)
+}
+
+/// 群 typing 体（止血批④）：groupId 携带 32 字节群 master key（proto tag
+/// 3；官方 Desktop conversations.preload.ts:1510-1516 群 typing 同语义——
+/// 群体缺 groupId 会被接收方当直聊 typing 识别失败）。
+fn typing_group_body(
+    master_key: &[u8],
+    timestamp: u64,
+    stop: bool,
+) -> presage::proto::TypingMessage {
+    presage::proto::TypingMessage {
+        timestamp: Some(timestamp),
+        action: Some(if stop {
+            presage::proto::typing_message::Action::Stopped as i32
+        } else {
+            presage::proto::typing_message::Action::Started as i32
+        }),
+        group_id: Some(master_key.to_vec()),
+    }
 }
 
 async fn dispatch_group(
@@ -8583,5 +8594,33 @@ mod tests {
             unidentified_access_or_identified(Some(ProfileKey::create([7u8; 32])), None).is_none()
         );
         assert!(unidentified_access_or_identified(None, None).is_none());
+    }
+
+    /// 群 typing wire 形状（止血批④，官方 conversations.preload.ts
+    /// :1510-1516 对齐）：groupId（proto tag 3, bytes）= 32 字节群 master
+    /// key，编码级钉定；action Started/Stopped 两态同体携带。
+    #[test]
+    fn group_typing_wire_carries_group_master_key() {
+        use presage::proto::typing_message::Action;
+        use prost::Message as _;
+
+        let master_key = [0xABu8; 32];
+        let body = typing_group_body(&master_key, 1_700_000_000_000, false);
+        assert_eq!(body.timestamp, Some(1_700_000_000_000));
+        assert_eq!(body.action, Some(Action::Started as i32));
+        assert_eq!(body.group_id.as_deref(), Some(master_key.as_slice()));
+
+        // wire 级：encode → groupId 字段（tag 3, wire type 2 → 0x1A）在位
+        // 且载荷恰为 master key 字节；反解码回同值。
+        let bytes = typing_group_body(&master_key, 5, true).encode_to_vec();
+        let pos = bytes
+            .windows(2)
+            .position(|w| w == [0x1A, 0x20])
+            .expect("groupId tag3 length-delimited in wire");
+        assert_eq!(&bytes[pos + 2..pos + 34], &master_key);
+        let decoded = presage::proto::TypingMessage::decode(bytes.as_slice()).expect("decodes");
+        assert_eq!(decoded.group_id.as_deref(), Some(master_key.as_slice()));
+        assert_eq!(decoded.action, Some(Action::Stopped as i32));
+        assert_eq!(decoded.timestamp, Some(5));
     }
 }
