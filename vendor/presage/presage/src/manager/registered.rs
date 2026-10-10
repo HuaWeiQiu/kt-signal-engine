@@ -337,6 +337,17 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// Sender certificate renewal, for background pre-rotation (KT): renews
+    /// and persists per the `needs_renewal` threshold (600s); a fresh cache
+    /// makes this a pure read with no network round trip. The send path never
+    /// depends on this succeeding — see the identified fallback in
+    /// `unidentified_access_or_identified`.
+    pub async fn refresh_sender_certificate(
+        &mut self,
+    ) -> Result<SenderCertificate, Error<S::Error>> {
+        self.sender_certificate().await
+    }
+
     async fn account_entropy_pool(&self) -> Result<Option<AccountEntropyPool>, Error<S::Error>> {
         let from_store = self.store().fetch_account_entropy_pool().await?;
 
@@ -1128,15 +1139,21 @@ impl<S: Store> Manager<S, Registered> {
 
         self.restore_thread_timer(&thread, &mut content_body).await;
 
-        let sender_certificate = self.sender_certificate().await?;
-        let unidentified_access = self
-            .store
-            .profile_key(&recipient)
-            .await?
-            .map(|profile_key| UnidentifiedAccess {
-                key: profile_key.derive_access_key().to_vec(),
-                certificate: sender_certificate.clone(),
-            });
+        // KT (identified fuse): a certificate acquisition failure must not take
+        // down the whole send — fall back to the identified path (official
+        // Desktop same semantics). Background pre-rotation keeps the cache
+        // fresh; sends normally hit the cache only.
+        let sender_certificate = match self.sender_certificate().await {
+            Ok(sender_certificate) => Some(sender_certificate),
+            Err(error) => {
+                warn!(%error, "sender certificate unavailable; falling back to identified send");
+                None
+            }
+        };
+        let unidentified_access = unidentified_access_or_identified(
+            self.store.profile_key(&recipient).await?,
+            sender_certificate,
+        );
 
         // we need to put our profile key in DataMessage
         if let ContentBody::DataMessage(message) = &mut content_body {
@@ -1297,21 +1314,25 @@ impl<S: Store> Manager<S, Registered> {
             return Err(Error::UnknownGroup);
         };
 
-        let sender_certificate = self.sender_certificate().await?;
+        // KT (identified fuse): same fallback as the 1:1 path — per-member
+        // access drops to None (identified) when the certificate is missing.
+        let sender_certificate = match self.sender_certificate().await {
+            Ok(sender_certificate) => Some(sender_certificate),
+            Err(error) => {
+                warn!(%error, "sender certificate unavailable; falling back to identified send");
+                None
+            }
+        };
         let mut recipients = Vec::new();
         for member in group
             .members
             .into_iter()
             .filter(|m| m.aci != self.state.data.service_ids.aci())
         {
-            let unidentified_access =
-                self.store
-                    .profile_key(&member.aci.into())
-                    .await?
-                    .map(|profile_key| UnidentifiedAccess {
-                        key: profile_key.derive_access_key().to_vec(),
-                        certificate: sender_certificate.clone(),
-                    });
+            let unidentified_access = unidentified_access_or_identified(
+                self.store.profile_key(&member.aci.into()).await?,
+                sender_certificate.clone(),
+            );
             let include_pni_signature = false;
             recipients.push((
                 member.aci.into(),
@@ -2183,3 +2204,23 @@ async fn register_pre_keys<S: Store>(
     trace!("registered pre keys");
     Ok(())
 }
+
+/// Identified fuse (KT): (recipient profile key, acquired certificate) →
+/// unidentified access. A missing certificate (acquisition error mapped to
+/// `None` by the caller) yields `None`, which routes MessageSender through
+/// its identified branch — an expired/unreachable certificate must not fail
+/// the send. A missing profile key yields `None` as before.
+/// `pub` so the engine workspace (this fork's only consumer) can pin the
+/// fallback contract in its test gate; not part of the upstream API surface.
+pub fn unidentified_access_or_identified(
+    profile_key: Option<ProfileKey>,
+    sender_certificate: Option<SenderCertificate>,
+) -> Option<UnidentifiedAccess> {
+    profile_key
+        .zip(sender_certificate)
+        .map(|(profile_key, certificate)| UnidentifiedAccess {
+            key: profile_key.derive_access_key().to_vec(),
+            certificate,
+        })
+}
+

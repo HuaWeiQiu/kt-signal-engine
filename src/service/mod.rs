@@ -2656,6 +2656,21 @@ async fn receive_pipeline(
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
     let mut backoff_step: u32 = 0;
+    // 发送证书后台预轮换任务（止血批③）：与接收循环同生命周期（shutdown
+    // 即止），周期检查 store 持久证书临期并刷新，发送路径只读缓存。
+    let mut cert_shutdown = shutdown.clone();
+    let cert_dir = dir.clone();
+    tokio::spawn(async move {
+        let mut maintenance = CertificateMaintenance::new();
+        loop {
+            tokio::select! {
+                _ = cert_shutdown.changed() => return,
+                _ = tokio::time::sleep(maintenance.delay()) => {
+                    certificate_maintenance_tick(&cert_dir, &mut maintenance).await;
+                }
+            }
+        }
+    });
     loop {
         if *shutdown.borrow() {
             return;
@@ -2706,6 +2721,66 @@ fn reconnect_jittered_delay(base: Duration) -> Duration {
     let jitter: i64 = rng().random_range(-JITTER_MS..=JITTER_MS);
     let ms = base.as_millis() as i64 + jitter;
     Duration::from_millis(ms.clamp(FLOOR_MS as i64, i64::MAX) as u64)
+}
+
+/// 发送证书后台预轮换（止血批③，官方 Desktop 1h 轮换缓冲同语义）：周期
+/// （10min）检查 store 持久证书临期情况，1h 内到期/缺失/不可解析才触发
+/// 刷新（presage 内部按 needs_renewal 续期并落库）；失败退避重试
+/// （1→16min，封顶轮询间隔）。发送路径只读缓存：刷新失败由发送侧
+/// identified 保险丝兜底（vendor presage unidentified_access_or_identified）。
+/// 刷新走 presage 既有发送路径同款短命 identified websocket（随取随弃，
+/// 与现有每发送续期同形态，不新增常驻第二连接）。
+const CERT_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+const CERT_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+/// 提前量 1h（官方 Desktop 证书轮换缓冲同值）。
+const CERT_REFRESH_BUFFER_MS: u64 = 60 * 60 * 1_000;
+
+struct CertificateMaintenance {
+    failures: u32,
+}
+
+impl CertificateMaintenance {
+    fn new() -> Self {
+        Self { failures: 0 }
+    }
+
+    /// 正常 = 轮询间隔；失败后 1,2,4,8,16min 指数退避，封顶轮询间隔。
+    fn delay(&self) -> Duration {
+        if self.failures == 0 {
+            return CERT_CHECK_INTERVAL;
+        }
+        CERT_FAILURE_BACKOFF
+            .saturating_mul(1u32 << (self.failures - 1).min(4))
+            .min(CERT_CHECK_INTERVAL)
+    }
+}
+
+/// 单轮检查：证书健康即不动（清退避）；不健康 → 刷新。零 stderr（接收
+/// 面纪律），失败只记退避态，下一轮自愈。
+async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateMaintenance) {
+    let Ok(store) = open_store(dir).await else {
+        maintenance.failures += 1;
+        return;
+    };
+    let needs_refresh = match store.sender_certificate().await {
+        Ok(Some(cert)) => match cert.expiration() {
+            Ok(expiration) => expiration.epoch_millis() <= now_ms() + CERT_REFRESH_BUFFER_MS,
+            Err(_) => true,
+        },
+        Ok(None) => true,
+        Err(_) => true,
+    };
+    if !needs_refresh {
+        maintenance.failures = 0;
+        return;
+    }
+    if let Ok(mut manager) = Manager::load_registered(store).await {
+        if manager.refresh_sender_certificate().await.is_ok() {
+            maintenance.failures = 0;
+            return;
+        }
+    }
+    maintenance.failures += 1;
 }
 
 /// 建流失败返回 false（退避步进）；流建立后结束（对端断/关停）返回
@@ -8479,5 +8554,34 @@ mod tests {
                 assert!(delay.as_millis() <= cap, "base={base_ms} delay={delay:?}");
             }
         }
+    }
+
+    /// 证书预轮换退避（止血批③）：健康 = 10min 轮询；失败 1→16min 指数，
+    /// 封顶轮询间隔。
+    #[test]
+    fn certificate_maintenance_backoff_interval_and_cap() {
+        let delay = |failures| CertificateMaintenance { failures }.delay();
+        assert_eq!(delay(0).as_secs(), 600);
+        assert_eq!(delay(1).as_secs(), 60);
+        assert_eq!(delay(2).as_secs(), 120);
+        assert_eq!(delay(3).as_secs(), 240);
+        assert_eq!(delay(4).as_secs(), 480);
+        assert_eq!(delay(5).as_secs(), 600, "封顶轮询间隔");
+        assert_eq!(delay(20).as_secs(), 600);
+    }
+
+    /// identified 保险丝（止血批③，官方 Desktop identified fallback 同
+    /// 语义）：证书获取失败（调用方映射 None）→ 无 unidentified access →
+    /// MessageSender 走 identified 分支（sender.rs "sending identified"），
+    /// 发送不再被证书临期/续期失败打死；key 缺席维持既有 None 语义。
+    #[test]
+    fn sender_certificate_failure_falls_back_to_identified_access() {
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+        use presage::manager::unidentified_access_or_identified;
+
+        assert!(
+            unidentified_access_or_identified(Some(ProfileKey::create([7u8; 32])), None).is_none()
+        );
+        assert!(unidentified_access_or_identified(None, None).is_none());
     }
 }

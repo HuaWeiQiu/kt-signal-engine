@@ -10,6 +10,9 @@ use std::fmt;
 pub use self::confirmation::Confirmation;
 pub use self::linking::Linking;
 pub use self::registered::{Registered, RegistrationData, RegistrationType};
+// KT fuse contract re-export: the engine test gate pins the identified
+// fallback helper (see registered::unidentified_access_or_identified).
+pub use self::registered::unidentified_access_or_identified;
 pub use self::registration::{Registration, RegistrationOptions};
 
 /// Signal manager
