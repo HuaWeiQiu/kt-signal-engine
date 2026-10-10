@@ -3445,7 +3445,7 @@ async fn project_content(
         }
         ContentBody::SynchronizeMessage(sync) => {
             // sent/viewOnceOpen 在 SyncMessage.content oneof 里（read/viewed
-            // 等其他面 P2+）。
+            // 是直接 repeated 字段，兜底臂承接，D2）。
             match sync.content.as_ref() {
                 Some(presage::proto::sync_message::Content::Sent(sent)) => {
                     let Some(data_message) = sent.message.as_ref() else {
@@ -3502,7 +3502,38 @@ async fn project_content(
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
                 }
-                _ => return Vec::new(),
+                // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
+                // #handleViewed「read 专信封」调度序同位——content 面分支
+                // 不动，兜底臂承接直接 repeated 字段 read=5/viewed=16）。
+                // 条目对 (senderAci, timestamp) 全保留（比聚合
+                // read{timestamps[]} 忠实：多发送方各自独立，官方语义同）。
+                _ => {
+                    let read = project_sync_read_entries(store, &sync.read, |entry| {
+                        entry
+                            .parse_sender_aci()
+                            .map(ServiceId::from)
+                            .zip(entry.timestamp)
+                    })
+                    .await;
+                    let viewed = project_sync_read_entries(store, &sync.viewed, |entry| {
+                        entry
+                            .parse_sender_aci()
+                            .map(ServiceId::from)
+                            .zip(entry.timestamp)
+                    })
+                    .await;
+                    if read.is_empty() && viewed.is_empty() {
+                        return Vec::new();
+                    }
+                    let mut sync_json = serde_json::Map::new();
+                    if !read.is_empty() {
+                        sync_json.insert("read".to_owned(), Value::Array(read));
+                    }
+                    if !viewed.is_empty() {
+                        sync_json.insert("viewed".to_owned(), Value::Array(viewed));
+                    }
+                    envelope["syncMessage"] = Value::Object(sync_json);
+                }
             }
         }
         ContentBody::CallMessage(call) => {
@@ -3718,6 +3749,40 @@ fn project_view_once_open(open: &presage::proto::sync_message::ViewOnceOpen) -> 
             .service_id_string(),
         "timestamp": open.timestamp.unwrap_or(0),
     }))
+}
+
+/// D2：syncMessage.read / viewed 收包投影条目（官方桌面 #handleRead /
+/// #handleViewed 行为面，MessageReceiver.preload.ts:3437/:3472）。
+/// SyncMessage 直接 repeated 字段 read=5 / viewed=16（不在 content
+/// oneof），Read/Viewed 双形字段同构 → 闭包取 (senderAci, timestamp)
+/// 对。senderAci 解析与官方 fromAciUuidBytesOrString 同构
+/// （senderAciBinary 16B 优先、senderAci 字符串兜底，vendored
+/// parse_sender_aci）；senderNumber contacts 命中补面（receive 信封作者
+/// 号同口径）。timestamp 缺席或发送方不可解析丢条目（宁缺勿错；官方
+/// toNumber ?? 0 / senderAci null 由上层过滤同位），全丢/空 = 键缺席。
+/// connector 现今两者都不消费，纯 additive（compat §5）。
+async fn project_sync_read_entries<T>(
+    store: &SqliteStore,
+    entries: &[T],
+    parse: impl Fn(&T) -> Option<(presage::libsignal_service::protocol::ServiceId, u64)>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some((service_id, timestamp)) = parse(entry) else {
+            continue;
+        };
+        let mut item = json!({
+            "senderUuid": service_id.service_id_string(),
+            "timestamp": timestamp,
+        });
+        if let Some(peer) = describe_peer(store, &service_id).await {
+            if let Some(number) = peer.number {
+                item["senderNumber"] = json!(number);
+            }
+        }
+        out.push(item);
+    }
+    out
 }
 
 /// 消息请求收包投影（messageRequestResponse 批，compat §5）：SyncMessage.
@@ -8740,6 +8805,112 @@ mod tests {
         )
         .await;
         assert!(notifications.is_empty(), "unroutable: dropped");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// D2 syncMessage.read/viewed 收包投影：条目对 (senderUuid, timestamp)
+    /// 逐条保留 + senderAci 双形解析（binary 优先 string 兜底）；坏条目
+    /// （发送方不可解析/时间戳缺席）丢；空 viewed/read 键缺席；全空整信封
+    /// 零投影（官方「read 专信封」兜底臂承接）。
+    #[tokio::test]
+    async fn sync_read_viewed_projection_entries() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-readsync-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let sync_of = |read: Vec<sync_message::Read>, viewed: Vec<sync_message::Viewed>| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    read,
+                    viewed,
+                    ..SyncMessage::with_padding(&mut rng())
+                }),
+                envelope_metadata(),
+            )
+        };
+
+        // read：binary 16B 优先 + string 兜底，条目对逐条保留。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(
+                vec![
+                    sync_message::Read {
+                        sender_aci: None,
+                        timestamp: Some(111),
+                        sender_aci_binary: Some(uuid_bytes(sender)),
+                    },
+                    sync_message::Read {
+                        sender_aci: Some(sender.to_owned()),
+                        timestamp: Some(222),
+                        sender_aci_binary: None,
+                    },
+                ],
+                Vec::new(),
+            ),
+            &registry,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "read: single 投影");
+        let envelope = &notifications[0]["params"]["envelope"];
+        let read = envelope["syncMessage"]["read"]
+            .as_array()
+            .expect("read array");
+        assert_eq!(read.len(), 2, "条目对逐条保留");
+        assert_eq!(read[0]["senderUuid"], json!(sender));
+        assert_eq!(read[0]["timestamp"], json!(111));
+        assert_eq!(read[1]["senderUuid"], json!(sender), "string 兜底同解析");
+        assert_eq!(read[1]["timestamp"], json!(222));
+        assert!(
+            read[0].get("senderNumber").is_none(),
+            "contacts 未命中无号码面"
+        );
+        assert!(
+            envelope["syncMessage"].get("viewed").is_none(),
+            "空 viewed 键缺席"
+        );
+
+        // viewed 同构 + 坏条目丢（发送方双缺 + 时间戳缺席）。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(
+                Vec::new(),
+                vec![
+                    sync_message::Viewed {
+                        sender_aci: None,
+                        timestamp: Some(333),
+                        sender_aci_binary: Some(uuid_bytes(sender)),
+                    },
+                    sync_message::Viewed {
+                        sender_aci: None,
+                        timestamp: None,
+                        sender_aci_binary: None,
+                    },
+                ],
+            ),
+            &registry,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "viewed: single 投影");
+        let face = &notifications[0]["params"]["envelope"]["syncMessage"];
+        assert!(face.get("read").is_none(), "空 read 键缺席");
+        let viewed = face["viewed"].as_array().expect("viewed array");
+        assert_eq!(viewed.len(), 1, "坏条目丢");
+        assert_eq!(viewed[0]["timestamp"], json!(333));
+
+        // 全空：整信封零投影。
+        let notifications =
+            project_content("acct", &store, &sync_of(Vec::new(), Vec::new()), &registry).await;
+        assert!(notifications.is_empty(), "空 read/viewed 不投影");
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }

@@ -2271,6 +2271,32 @@ vendored messagepipe 在信封 yield 即回 200，engine 解密失败静默丢�
   件的入站行一律排队回执；若需该闸，由连接器在会话层断开
   autoReceipt 开关语义承接（未来加连接器侧开关属加面，另行登记）。
 
+### syncMessage.read / viewed 收包投影（D 批 D2，2026-10-11，官方对齐）
+
+官方桌面把多设备的已读/已看同步当独立事件消费
+（`MessageReceiver.preload.ts:3075/:3117` → `#handleRead` :3437 /
+`#handleViewed` :3472）；引擎此前在 SynchronizeMessage 投影兜底臂整体
+丢弃（presage 亦不落库，多设备 read 同步无引擎面）。本批加投影面，
+wire additive，既有方法/字段零改动。
+
+- **线面**：`SyncMessage` 直接 repeated 字段 `read = 5` /
+  `viewed = 16`（不在 content oneof；vendored proto 已有，无 vendor
+  改动）。官方「read 专信封」调度序同位——既有 content oneof 各分支
+  不动，投影由兜底臂承接（content 与 read/viewed 并存时官方同样 read
+  优先独占处理）。
+- **投影形状**：`envelope.syncMessage.read[]` / `.viewed[]` 条目对数组
+  `{senderUuid, senderNumber?, timestamp}`——官方语义就是
+  (senderAci, timestamp) 对（逐条独立、多发送方各占一条），比聚合成
+  `read{timestamps[]}` 形状忠实；条目内 senderUuid 双形解析与官方
+  `fromAciUuidBytesOrString` 同构（senderAciBinary 16B 优先、senderAci
+  字符串兜底），senderNumber contacts 命中补面（receive 信封作者号同
+  口径）。timestamp 缺席或发送方不可解析丢条目（宁缺勿错；官方
+  `toNumber ?? 0` / senderAci null 由上层过滤同位）；空数组键缺席；
+  read/viewed 全空整信封零投影（既有行为不变）。
+- **消费面**：connector 现今两者都不消费（其 implementation-plan
+  §read-sync 记档在案），纯加面待其接入；接收侧 presage 不落库
+  （read/viewed 无引擎落库语义，投影即全部）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
