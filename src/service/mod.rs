@@ -46,6 +46,7 @@ pub(crate) mod backup_task;
 pub(crate) mod call_links;
 pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
+pub(crate) mod delivery_receipt;
 pub(crate) mod groups;
 pub(crate) mod identity;
 pub(crate) mod prekey;
@@ -2926,7 +2927,7 @@ async fn derm_on_retry_request(
 }
 
 async fn receive_pipeline(
-    service: &Service,
+    service: &Arc<Service>,
     number: String,
     dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
@@ -2936,6 +2937,9 @@ async fn receive_pipeline(
     // DERM 重试防环计数（同管线生命周期；断连重开不清——防环窗口以
     // 原始消息时间戳为键，跨重连持续有效）。
     let mut derm_guard = DermRetryGuard::default();
+    // D1 自动 delivery receipt 批量缓冲（管线生命周期，跨流重启存活：
+    // 未发批次等下一条流的批量窗续发，不随重连丢失）。
+    let mut receipts = delivery_receipt::AutoDeliveryReceipts::default();
     // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
@@ -2969,6 +2973,7 @@ async fn receive_pipeline(
                 &mut serve_rx,
                 &mut last_contacts_sync,
                 &mut derm_guard,
+                &mut receipts,
             ) => outcome,
         };
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
@@ -3080,12 +3085,13 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
 /// `ServiceError::Unauthorized`）返回 Unbound（停环等重链，B4）。
 #[allow(clippy::too_many_lines)]
 async fn serve_account_stream(
-    service: &Service,
+    service: &Arc<Service>,
     number: &str,
     dir: &Path,
     shutdown: &mut watch::Receiver<bool>,
     last_contacts_sync: &mut Option<std::time::Instant>,
     derm_guard: &mut DermRetryGuard,
+    receipts: &mut delivery_receipt::AutoDeliveryReceipts,
 ) -> StreamOutcome {
     let Ok(store) = open_store(dir).await else {
         return StreamOutcome::Recoverable;
@@ -3139,6 +3145,18 @@ async fn serve_account_stream(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
                 );
+            }
+            // D1 自动 delivery receipt 批量窗：到期即取批直发（官方
+            // deliveryReceiptBatcher wait=500ms 语义）。发送 spawn_local
+            // 承载，臂内即刻返回不阻塞收流。
+            _ = async {
+                if let Some(at) = receipts.due_at() {
+                    tokio::time::sleep_until(at).await;
+                }
+            }, if receipts.due_at().is_some() => {
+                if let Some(batch) = receipts.take_ready() {
+                    delivery_receipt::spawn_delivery_receipt_flush(service, number, batch);
+                }
             }
             item = stream.next() => match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
@@ -3215,6 +3233,18 @@ async fn serve_account_stream(
                         .await
                     {
                         let _ = service.outbound.send(notification);
+                    }
+                    // D1 自动 delivery receipt 排队闸（官方 handleDataMessage
+                    // / handleEditMessage 条件面，见 delivery_receipt 模块注）。
+                    // IdentityChange 臂不排队（官方 hasErrors 同位）；批满
+                    // 100 即发不等窗口。
+                    if let Some((sender, timestamp)) = delivery_receipt::candidate_of(&content) {
+                        receipts.queue(sender, timestamp);
+                        if let Some(batch) = receipts.take_ready() {
+                            delivery_receipt::spawn_delivery_receipt_flush(
+                                service, number, batch,
+                            );
+                        }
                     }
                     ack.ack();
                 }

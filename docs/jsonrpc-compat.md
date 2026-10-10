@@ -2238,6 +2238,39 @@ vendored messagepipe 在信封 yield 即回 200，engine 解密失败静默丢�
 - **边界**：不动发送面；不做 DERM 回发；contacts 载荷不去重（presage
   幂等落库）；QueueEmpty 行为不变。
 
+### 自动 delivery receipt（D 批 D1，2026-10-11，官方对齐）
+
+官方桌面收到 sealed sender 消息后自动回发 DELIVERY 回执
+（`ts/messages/handleDataMessage.preload.ts:374-398` +
+`ts/util/handleEditMessage.preload.ts:267-286`），连接器此前经
+`sendDeliveryReceipt` 手动补面。引擎现为入站行自动排队回执，行为加面、
+既有方法/字段零改动；连接器侧改不改用自动面由其自行决定（其显式调用
+仍有效，两者不互斥）。
+
+- **排队闸**（官方条件面同位）：入站 DataMessage / EditMessage（sync/
+  sent 自发回声不回）、sealed sender 信封
+  （`unidentifiedDeliveryReceived` ← Metadata.unidentified_sender，明信封
+  不回）、解密成功（引擎侧 = `Received::Content` 路径，对位官方
+  `!hasErrors`；`Received::IdentityChange` 臂不排队，官方 hasErrors 同
+  位）、非 story（`metadata.story`）、发送方为 ACI（官方
+  `isAciString` strictAssert，PNI 不回）。回执时间戳 =
+  dataMessage.timestamp（edit 用内层 dataMessage.timestamp，官方
+  `editAttributes.message.timestamp` 同位；内层缺席 = unprocessable
+  不回；dataMessage 时间戳缺席回退信封 client timestamp）。
+- **批量**（官方 deliveryReceiptBatcher `wait: 500` / `maxSize: 100`，
+  `ts/util/deliveryReceipt.preload.ts`）：500ms 批量窗 / 批满 100 即发，
+  按发送方归组逐作者直发 `ReceiptMessage{DELIVERY, timestamps[]}`（原
+  会话是群组也直发原作者，官方从不整组广播回执），经 sendReceipt 公共
+  发送面（CHUNK_SIZE=100 分帧）。批量缓冲为管线生命周期——流断开重连
+  不丢待发批次（下一条流批量窗续发）；flush 发送走 spawn_local 不阻塞
+  收流，失败静默弃批（官方 sendReceipt 失败不重试同位；引擎零 stderr
+  纪律，compat §1）。
+- **偏差登记（引擎侧不可得的官方闸）**：官方发送回执前查
+  `conversation.getAccepted()`（会话接受态）与拉黑会话——两者都是宿主
+  /connector 侧会话模型状态，引擎无会话模型不可得。引擎对满足上述条
+  件的入站行一律排队回执；若需该闸，由连接器在会话层断开
+  autoReceipt 开关语义承接（未来加连接器侧开关属加面，另行登记）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
