@@ -387,24 +387,55 @@ pub(crate) enum SendError {
     /// 标失败不重试（unknown-send 纪律同向）；错误面 -32603 + 解绑原文
     /// （getUserStatus 同款，compat §3）。
     Unbound,
+    /// 服务端限流（HTTP 429/413 → ServiceError::RateLimitExceeded，vendored
+    /// push_service/response.rs 归型，retry-after 不上 wire）。引擎不自动
+    /// 重试；错误面 -32603 + 限流分类原文（compat §3）。
+    RateLimited,
+    /// 服务端要求人机验证（HTTP 428 → ServiceError::ProofRequiredError；
+    /// send 链 sender 同因再包层 MessageSenderError::ProofRequired，
+    /// token/options 不出归型面）。不自动重试；错误面 -32603（compat §3）。
+    ProofRequired,
+    /// Signal 服务端不可用（HTTP 5xx → ServiceError::UnhandledResponseCode
+    /// 兜底臂 status≥500；vendored 无独立 ServerError 变体）。建议可重试，
+    /// 重试决策在 connector/desktop；错误面 -32603（compat §3）。
+    ServerUnavailable,
     Internal,
 }
 
 /// presage 发送/上行面错误归型：服务端 401/403（凭据吊销/解绑）同归
 /// `SendError::Unbound`——直接 ServiceError 面（whoami 等推送服务调用）
 /// 与 MessageSenderError 面（send_message 内 sender 上行同源再包一层）
-/// 两处归型点都覆盖；其余（网络/协议/存储）折叠 `SendError::Internal`。
+/// 两处归型点都覆盖；限流（429/413 → RateLimited）、人机验证（428 →
+/// ProofRequired）、服务端 5xx 不可用（→ ServerUnavailable）同以
+/// ServiceError 面单点归型（compat §3 结构化三分类）；其余（网络/协议/
+/// 存储）折叠 `SendError::Internal`。
 /// send 链各触网点单点共用（getUserStatus 的 whoami 面同归型先行）。
 pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
     use presage::libsignal_service::prelude::ServiceError;
     use presage::libsignal_service::sender::MessageSenderError;
+
+    /// ServiceError 面单点归型（直接推送服务调用与 sender 再包层两触点
+    /// 共用；vendored push_service/response.rs 归型路径）。
+    fn service_error_face(error: ServiceError) -> SendError {
+        match error {
+            ServiceError::Unauthorized => SendError::Unbound,
+            ServiceError::RateLimitExceeded { .. } => SendError::RateLimited,
+            ServiceError::ProofRequiredError(..) => SendError::ProofRequired,
+            ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
+                SendError::ServerUnavailable
+            }
+            _ => SendError::Internal,
+        }
+    }
+
     match error {
-        presage::Error::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
         presage::Error::GroupAnnouncementsOnly => SendError::AnnouncementsOnly,
         presage::Error::MessageSenderError(sender_error) => match *sender_error {
-            MessageSenderError::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
+            MessageSenderError::ServiceError(service_error) => service_error_face(service_error),
+            MessageSenderError::ProofRequired { .. } => SendError::ProofRequired,
             _ => SendError::Internal,
         },
+        presage::Error::ServiceError(service_error) => service_error_face(service_error),
         _ => SendError::Internal,
     }
 }
@@ -5407,6 +5438,68 @@ mod tests {
             send_error_of(presage::Error::UnknownGroup),
             SendError::Internal
         ));
+    }
+
+    /// 发送链结构化三分类（compat §3）：限流 429/413（两触点面）、人机
+    /// 验证 428（直接 ServiceError 臂 + sender 再包层臂，token/options
+    /// 归型即弃不上 wire）、服务端 5xx 不可用（UnhandledResponseCode 兜底
+    /// 臂，vendored 无独立 ServerError 变体）；<500 的 UnhandledResponseCode
+    /// 不算不可用，维持 Internal 折叠。
+    #[test]
+    fn send_errors_classify_structured_server_faces() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError;
+
+        // 限流：429/413 同归型 RateLimitExceeded（vendored response.rs）。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(
+                ServiceError::RateLimitExceeded { retry_after: None }
+            )),
+            SendError::RateLimited
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::ServiceError(ServiceError::RateLimitExceeded {
+                    retry_after: None
+                })
+            ))),
+            SendError::RateLimited
+        ));
+
+        // 人机验证 428：直接臂 + sender 再包层臂（token/options 不出归型面）。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(
+                ServiceError::ProofRequiredError(
+                    presage::libsignal_service::push_service::ProofRequired {
+                        token: String::new(),
+                        options: Vec::new(),
+                    }
+                )
+            )),
+            SendError::ProofRequired
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::ProofRequired {
+                    token: "proof-token".to_owned(),
+                    options: vec!["captcha".to_owned()],
+                }
+            ))),
+            SendError::ProofRequired
+        ));
+
+        // 服务端 5xx → ServerUnavailable；<500（如 400）不算不可用。
+        let unhandled = |status: u16| {
+            send_error_of(presage::Error::ServiceError(
+                ServiceError::UnhandledResponseCode {
+                    status: reqwest::StatusCode::from_u16(status).unwrap(),
+                    body: String::new(),
+                },
+            ))
+        };
+        assert!(matches!(unhandled(500), SendError::ServerUnavailable));
+        assert!(matches!(unhandled(503), SendError::ServerUnavailable));
+        assert!(matches!(unhandled(400), SendError::Internal));
     }
 
     /// project_content 现返通知向量：契约测试形状 = 恰一条投影，取首条

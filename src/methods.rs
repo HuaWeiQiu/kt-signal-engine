@@ -28,6 +28,18 @@ const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
 const USER_UNBOUND_MESSAGE: &str =
     "Failed to send message: Authorization failed! (AuthorizationFailedException)";
 
+/// 服务端限流错误原文（wire 字面量与 connector 侧配套；锚词
+/// "(RateLimitExceeded)" 供分类器命中）。
+const RATE_LIMITED_MESSAGE: &str = "Failed to send message: Rate limited. (RateLimitExceeded)";
+/// 人机验证（proof required）错误原文（wire 字面量与 connector 侧配套；
+/// 锚词 "(ProofRequiredException)" 供分类器命中）。
+const PROOF_REQUIRED_MESSAGE: &str =
+    "Failed to send message: Proof required. (ProofRequiredException)";
+/// 服务端不可用错误原文（wire 字面量与 connector 侧配套；锚词
+/// "(ServerUnavailableException)" 供分类器命中）。
+const SERVER_UNAVAILABLE_MESSAGE: &str =
+    "Failed to send message: Signal server unavailable. (ServerUnavailableException)";
+
 pub(crate) enum Inbound {
     Line(String),
     Overlong,
@@ -2519,8 +2531,11 @@ fn username_write_error(id: &Value, error: &crate::service::username::UsernameWr
 /// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation
 /// terminated 位硬拒同语义）→ `-1` + `SEND_TARGET_TERMINATED`；服务端凭据
 /// 拒绝（401 解绑，确定性失败不重试）→ `-32603` + getUserStatus 同款解绑
-/// 原文（同一常量，connector 分类器按 message 直接命中）；其余（账号
-/// 不可达/内部失败）→ -32603 细节不外泄。
+/// 原文（同一常量，connector 分类器按 message 直接命中）；限流（429/413）/
+/// 人机验证（428）/服务端 5xx 不可用 → `-32603` + 对应分类原文（锚词括注
+/// 异常类名，connector 分类器命中；5xx 建议可重试，限流/验证不自动重试
+/// ——决策在 connector/desktop，compat §3/§5）；其余（账号不可达/内部
+/// 失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     use crate::service::SendError;
     match error {
@@ -2532,6 +2547,15 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         }
         SendError::Unbound => {
             jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+        }
+        SendError::RateLimited => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, RATE_LIMITED_MESSAGE))
+        }
+        SendError::ProofRequired => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, PROOF_REQUIRED_MESSAGE))
+        }
+        SendError::ServerUnavailable => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, SERVER_UNAVAILABLE_MESSAGE))
         }
         SendError::UnknownAccount | SendError::Internal => internal_error(id),
     }
@@ -2558,5 +2582,37 @@ mod tests {
         );
         assert!(USER_UNBOUND_MESSAGE.contains("AuthorizationFailedException"));
         assert!(USER_UNBOUND_MESSAGE.contains("Authorization failed"));
+    }
+
+    /// 发送链结构化三面（限流/人机验证/服务端不可用）wire 形状：均
+    /// `-32603` + 常量逐字 + 异常类名锚词在场（connector 分类器按锚词
+    /// 命中分类——message 形状即契约，改动即断）。
+    #[test]
+    fn send_error_structured_faces_wire_shape() {
+        let cases = [
+            (
+                crate::service::SendError::RateLimited,
+                RATE_LIMITED_MESSAGE,
+                "(RateLimitExceeded)",
+            ),
+            (
+                crate::service::SendError::ProofRequired,
+                PROOF_REQUIRED_MESSAGE,
+                "(ProofRequiredException)",
+            ),
+            (
+                crate::service::SendError::ServerUnavailable,
+                SERVER_UNAVAILABLE_MESSAGE,
+                "(ServerUnavailableException)",
+            ),
+        ];
+        for (error, message, anchor) in cases {
+            let response = send_error(&Value::from(9), error);
+            assert_eq!(response.get("id").and_then(Value::as_i64), Some(9));
+            let face = response.get("error").expect("error face");
+            assert_eq!(face.get("code").and_then(Value::as_i64), Some(-32603));
+            assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
+            assert!(message.contains(anchor));
+        }
     }
 }
