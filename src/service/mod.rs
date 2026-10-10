@@ -34,6 +34,7 @@ use presage::store::{ContentsStore, StateStore, Store};
 use presage_store_sqlite::SqliteStore;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
+use rand::Rng;
 use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
@@ -2651,44 +2652,79 @@ async fn receive_pipeline(
 ) {
     // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
     let mut last_contacts_sync: Option<std::time::Instant> = None;
+    // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
+    // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
+    // （open store/manager/websocket 失败）按步进退避，连接成功清零。
+    let mut backoff_step: u32 = 0;
     loop {
         if *shutdown.borrow() {
             return;
         }
         let mut serve_rx = shutdown.clone();
-        tokio::select! {
+        let connected = tokio::select! {
             _ = shutdown.changed() => return,
-            _ = serve_account_stream(
+            connected = serve_account_stream(
                 service,
                 &number,
                 &dir,
                 &mut serve_rx,
                 &mut last_contacts_sync,
-            ) => {}
-        }
-        // 流断开：短暂退避后重开（重连治理 P2 精化）。
+            ) => connected,
+        };
+        // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
+        backoff_step = if connected {
+            0
+        } else {
+            backoff_step.saturating_add(1)
+        };
+        let delay = reconnect_jittered_delay(reconnect_backoff_delay(backoff_step));
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
     }
 }
 
+/// Fibonacci 退避基值（官方 Desktop BackOff.std.ts 同序列）：1,1,2,3,5,8,
+/// 13,21,34,55，封顶 55s。step=0 → 1s。
+fn reconnect_backoff_delay(step: u32) -> Duration {
+    const STEP_MS: u64 = 1_000;
+    const CAP_MS: u64 = 55_000;
+    let (mut a, mut b) = (0u64, STEP_MS);
+    for _ in 0..step {
+        let next = (a + b).min(CAP_MS);
+        a = b;
+        b = next;
+    }
+    Duration::from_millis(b.min(CAP_MS))
+}
+
+/// 退避 ±5s jitter（官方 BackOff.std 同幅度），下限 500ms 防 0/负间隔。
+fn reconnect_jittered_delay(base: Duration) -> Duration {
+    const JITTER_MS: i64 = 5_000;
+    const FLOOR_MS: u64 = 500;
+    let jitter: i64 = rng().random_range(-JITTER_MS..=JITTER_MS);
+    let ms = base.as_millis() as i64 + jitter;
+    Duration::from_millis(ms.clamp(FLOOR_MS as i64, i64::MAX) as u64)
+}
+
+/// 建流失败返回 false（退避步进）；流建立后结束（对端断/关停）返回
+/// true（连接成功 → 退避 reset，官方 BackOff.reset 同语义）。
 async fn serve_account_stream(
     service: &Service,
     number: &str,
     dir: &Path,
     shutdown: &mut watch::Receiver<bool>,
     last_contacts_sync: &mut Option<std::time::Instant>,
-) {
+) -> bool {
     let Ok(store) = open_store(dir).await else {
-        return;
+        return false;
     };
     let Ok(mut manager) = Manager::load_registered(store).await else {
-        return;
+        return false;
     };
     let Ok(mut stream) = manager.receive_messages().await else {
-        return;
+        return false;
     };
     // 存量联系人/会话补同步（欠账 §10-1，官方行为对齐：signal-cli/桌面
     // 链接后同样向主设备要一轮 contacts sync）：链路建立 2s 沉降后
@@ -2703,7 +2739,7 @@ async fn serve_account_stream(
     };
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return,
+            _ = shutdown.changed() => return true,
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
@@ -2755,7 +2791,7 @@ async fn serve_account_stream(
                     }
                     ack.ack();
                 }
-                None => return,
+                None => return true,
             }
         }
     }
@@ -8409,5 +8445,39 @@ mod tests {
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 重连退避序列（止血批②，官方 Desktop ts/backoff/BackOff.std.ts 同
+    /// 序列钉定）：Fibonacci 1,1,2,3,5,8,13,21,34,55 封顶 55s，之后不再
+    /// 增长；step=0（连接成功 reset 后）从 1s 重来。
+    #[test]
+    fn reconnect_backoff_follows_official_fibonacci_sequence() {
+        let ms = |step| reconnect_backoff_delay(step).as_millis();
+        assert_eq!(ms(0), 1_000);
+        assert_eq!(ms(1), 1_000);
+        assert_eq!(ms(2), 2_000);
+        assert_eq!(ms(3), 3_000);
+        assert_eq!(ms(4), 5_000);
+        assert_eq!(ms(5), 8_000);
+        assert_eq!(ms(6), 13_000);
+        assert_eq!(ms(7), 21_000);
+        assert_eq!(ms(8), 34_000);
+        assert_eq!(ms(9), 55_000);
+        assert_eq!(ms(10), 55_000, "官方 MAX_BACKOFF 封顶");
+        assert_eq!(ms(50), 55_000, "封顶后不增长");
+    }
+
+    /// 退避 jitter ±5s 界内（官方 BackOff.std 同幅度），下限 500ms。
+    #[test]
+    fn reconnect_jitter_stays_bounded_with_floor() {
+        for base_ms in [0u64, 500, 1_000, 55_000] {
+            for _ in 0..50 {
+                let delay = reconnect_jittered_delay(Duration::from_millis(base_ms));
+                let floor = 500u128;
+                let cap = (base_ms as u128 + 5_000).max(floor);
+                assert!(delay.as_millis() >= floor, "base={base_ms} delay={delay:?}");
+                assert!(delay.as_millis() <= cap, "base={base_ms} delay={delay:?}");
+            }
+        }
     }
 }
