@@ -2338,6 +2338,35 @@ change 批内含**非 timer/terminate** change 时投影
   群态落库不因本批变化（presage registered 收到 groupV2 即
   upsert_group 拉服务器态，既有行为）。
 
+### quote 附件元数据（quote.attachments[]，D 批 D4，2026-10-11，官方对齐）
+
+引用消息此前只有文本/作者/id 三面：接收投影丢弃被引
+`quote.attachments[]`（缩略占位不出，缩略图位永远空）；发送组装不出附
+件条目（被引行即使带图，quote 也无缩略位）。本批双面对齐官方
+makeQuote（`ts/util/makeQuote.preload.ts`），wire additive。
+
+- **接收投影**：`envelope.dataMessage.quote.attachments[]` 条目投影
+  `{contentType?, filename?, thumbnail?}`——官方 QuotedAttachment wire
+  三键形，键缺席即协议缺省；thumbnail = AttachmentPointer 全投影
+  （`project_attachment_pointer` 同源，引擎附件面同形）；空数组
+  `attachments` 键缺席。
+- **发送组装**：`send` 行 quote 找回被引消息后按官方
+  `getQuoteAttachment`（makeQuote.preload.ts:69-138）优先级取一条出
+  `attachments[]`：被引消息**首附件**（contentType/fileName 原值透传）
+  > **preview 首图**（无 filename，官方 preview 图同位）> **sticker
+  data**（无 filename）；各级各 take 1。view-once 被引行走官方
+  isTapToView 短路（makeQuote.preload.ts:50-52）：固定
+  `[{contentType: "image/jpeg"}]` 占位，不查附件面。被引消息找回失败
+  （store 无该行）→ text 与 attachments 一并缺席，quote 仍有 id/author
+  面（§3 既有降级同位，官方 quotedMessageNotFound 同款）。
+- **偏差登记（metadata-only gap）**：官方 thumbnail 随 quote 上传本
+  地缩略图数据（loadAttachmentData + url）；引擎无图像管线（无缩略
+  图生成/无上传），发送侧 `thumbnail` 恒缺 = 收端引用行少缩略预览，
+  文本/作者/附件类型面完整，协议面合法。接收侧 thumbnail 照投影透
+  传（对端真实出的缩略指针，metadata-only 不渲染）。附件 wire 键
+  `filename` 同引擎附件面（signal-cli 键形），非官方桌面
+  `fileName` 驼峰——消费方以 connector 既有附件面键形为准。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

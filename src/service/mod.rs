@@ -4243,6 +4243,30 @@ fn project_data_message(
         if let Some(text) = quote.text.as_deref() {
             quote_json["text"] = json!(text);
         }
+        // D4：quote.attachments[] 附件元数据面（官方 QuotedAttachment wire
+        // 三键形；wire 键 filename 同引擎附件面）。thumbnail =
+        // AttachmentPointer 全投影（project_attachment_pointer 同源；引擎
+        // metadata-only 透传指针，可定位不可渲染）。空数组键缺席。
+        let attachments: Vec<Value> = quote
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let mut item = serde_json::Map::new();
+                if let Some(content_type) = attachment.content_type.as_deref() {
+                    item.insert("contentType".into(), json!(content_type));
+                }
+                if let Some(file_name) = attachment.file_name.as_deref() {
+                    item.insert("filename".into(), json!(file_name));
+                }
+                if let Some(thumbnail) = attachment.thumbnail.as_ref() {
+                    item.insert("thumbnail".into(), project_attachment_pointer(thumbnail));
+                }
+                Value::Object(item)
+            })
+            .collect();
+        if !attachments.is_empty() {
+            quote_json["attachments"] = Value::Array(attachments);
+        }
         out["quote"] = quote_json;
     }
     if let Some(reaction) = data_message.reaction.as_ref() {
@@ -5212,9 +5236,13 @@ async fn build_text_data_message(
     Ok(dm)
 }
 
-/// 被引消息正文找回：author ACI + upstream 时间戳定位 presage 线程消息，
-/// 直聊/群组 thread 都命中；任何环节失败 = 引用缺 text（官方降级同款）。
-async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> Option<String> {
+/// 被引消息找回：author ACI + upstream 时间戳定位 presage 线程消息，
+/// 直聊/群组 thread 都命中；任何环节失败 = None（官方降级同款）。
+async fn quoted_data_message(
+    store: &SqliteStore,
+    author_aci: &str,
+    timestamp: u64,
+) -> Option<DataMessage> {
     let sender = ServiceId::parse_from_service_id_string(author_aci)?;
     let thread = store
         .thread_for_sender_and_timestamp(&sender, timestamp)
@@ -5222,9 +5250,53 @@ async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> O
         .ok()??;
     let content = store.message(&thread, timestamp).await.ok()??;
     match content.body {
-        ContentBody::DataMessage(dm) => dm.body,
+        ContentBody::DataMessage(dm) => Some(dm),
         _ => None,
     }
+}
+
+/// D4：quote 附件元数据找回（官方 makeQuote → getQuoteAttachment 行为对
+/// 齐，`ts/util/makeQuote.preload.ts:69-138`）：被引消息首附件 > preview
+/// 首图 > sticker data（官方优先级同序，各 take 1）。view-once 被引行
+/// 同官方 isTapToView 短路固定 image/jpeg 占位（无 filename）。仅
+/// metadata-only：thumbnail 不出——引擎无图像管线（无上传/无缩略图生成，
+/// compat §5 gap 登记）；contentType/fileName 取被引指针原值不发明。
+fn quoted_attachment_of(
+    data_message: &DataMessage,
+) -> Option<presage::proto::data_message::quote::QuotedAttachment> {
+    use presage::proto::data_message::quote::QuotedAttachment;
+    if data_message.is_view_once == Some(true) {
+        return Some(QuotedAttachment {
+            content_type: Some("image/jpeg".to_owned()),
+            ..QuotedAttachment::default()
+        });
+    }
+    data_message
+        .attachments
+        .first()
+        .map(|attachment| QuotedAttachment {
+            content_type: attachment.content_type.clone(),
+            file_name: attachment.file_name.clone(),
+            thumbnail: None,
+        })
+        .or_else(|| {
+            data_message.preview.iter().find_map(|preview| {
+                preview.image.as_ref().map(|image| QuotedAttachment {
+                    content_type: image.content_type.clone(),
+                    file_name: None,
+                    thumbnail: None,
+                })
+            })
+        })
+        .or_else(|| {
+            data_message.sticker.as_ref().and_then(|sticker| {
+                sticker.data.as_ref().map(|data| QuotedAttachment {
+                    content_type: data.content_type.clone(),
+                    file_name: None,
+                    thumbnail: None,
+                })
+            })
+        })
 }
 
 /// quote 组装（文本/贴纸分支共用单点，compat §3 send 行 quote 语义）：
@@ -5232,7 +5304,8 @@ async fn quoted_text(store: &SqliteStore, author_aci: &str, timestamp: u64) -> O
 /// resolve_author_aci，不可解析 fail-closed = SendError::Internal，与
 /// mentions 同口径）；text 从本机 store 找回——presage 官方接收路径已落库
 /// 的消息（引擎无新增落库面），找不到按官方/上游同款降级缺省 text（收端
-/// 仅少预览文案，协议面合法）。
+/// 仅少预览文案，协议面合法）。附件元数据同 store 找回（D4，官方
+/// makeQuote 优先级面见 quoted_attachment_of）。
 async fn assemble_quote(
     store: &SqliteStore,
     quote: &SendQuote,
@@ -5245,8 +5318,13 @@ async fn assemble_quote(
         author_aci: Some(author_aci.clone()),
         ..presage::proto::data_message::Quote::default()
     };
-    if let Some(text) = quoted_text(store, &author_aci, quote.timestamp).await {
-        q.text = Some(text);
+    if let Some(quoted) = quoted_data_message(store, &author_aci, quote.timestamp).await {
+        if let Some(text) = quoted.body.clone() {
+            q.text = Some(text);
+        }
+        if let Some(attachment) = quoted_attachment_of(&quoted) {
+            q.attachments.push(attachment);
+        }
     }
     Ok(q)
 }
@@ -5838,6 +5916,129 @@ mod tests {
         assert_eq!(out["attachments"][0]["size"], json!(2048));
         assert_eq!(out["mentions"][0]["number"], json!(author));
         assert_eq!(out["mentions"][0]["start"], json!(3));
+    }
+
+    /// D4 quote 附件元数据双面：接收投影（quote.attachments[] 条目
+    /// contentType/filename/thumbnail 三键形，空条目空对象，无附件键缺席）
+    /// 与发送找回 quoted_attachment_of 官方 makeQuote 优先级（首附件 >
+    /// preview 首图 > sticker data，各 take 1；view-once 短路固定
+    /// image/jpeg 无 filename；thumbnail 不出 = metadata-only）。
+    #[test]
+    fn quote_attachment_metadata_faces() {
+        use presage::proto::data_message::quote::QuotedAttachment;
+
+        // —— 接收投影面 ——
+        let author = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let mut numbers = HashMap::new();
+        numbers.insert(author.to_owned(), "+15551230000".to_owned());
+
+        let dm = DataMessage {
+            quote: Some(data_message::Quote {
+                id: Some(1_699_999_000_000),
+                author_aci: Some(author.to_owned()),
+                attachments: vec![
+                    QuotedAttachment {
+                        content_type: Some("image/png".to_owned()),
+                        file_name: Some("shot.png".to_owned()),
+                        thumbnail: Some(AttachmentPointer {
+                            width: Some(16),
+                            ..Default::default()
+                        }),
+                    },
+                    QuotedAttachment::default(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = project_data_message(&dm, &numbers);
+        let first = &out["quote"]["attachments"][0];
+        assert_eq!(first["contentType"], json!("image/png"));
+        assert_eq!(first["filename"], json!("shot.png"));
+        assert_eq!(first["thumbnail"]["width"], json!(16));
+        assert_eq!(out["quote"]["attachments"][1], json!({}));
+
+        let bare = DataMessage {
+            quote: Some(data_message::Quote {
+                id: Some(1_699_999_000_000),
+                author_aci: Some(author.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out_bare = project_data_message(&bare, &numbers);
+        assert!(out_bare["quote"].get("attachments").is_none());
+
+        // —— 发送找回优先级面 ——
+        // attachments[0] take 1：contentType/fileName 取被引指针原值。
+        let with_attachments = DataMessage {
+            attachments: vec![
+                AttachmentPointer {
+                    content_type: Some("video/mp4".to_owned()),
+                    file_name: Some("clip.mp4".to_owned()),
+                    ..Default::default()
+                },
+                AttachmentPointer {
+                    content_type: Some("image/png".to_owned()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let picked = quoted_attachment_of(&with_attachments).expect("first attachment");
+        assert_eq!(picked.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(picked.file_name.as_deref(), Some("clip.mp4"));
+        assert!(picked.thumbnail.is_none(), "metadata-only: thumbnail 不出");
+
+        // preview 首图：无 filename（官方 preview 图无文件名语义）。
+        let with_preview = DataMessage {
+            preview: vec![Preview {
+                url: Some("https://example.com/a".to_owned()),
+                image: Some(AttachmentPointer {
+                    content_type: Some("image/jpeg".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let picked = quoted_attachment_of(&with_preview).expect("preview image");
+        assert_eq!(picked.content_type.as_deref(), Some("image/jpeg"));
+        assert!(picked.file_name.is_none());
+        assert!(picked.thumbnail.is_none());
+
+        // sticker data：image/webp。
+        let with_sticker = DataMessage {
+            sticker: Some(data_message::Sticker {
+                data: Some(AttachmentPointer {
+                    content_type: Some("image/webp".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let picked = quoted_attachment_of(&with_sticker).expect("sticker data");
+        assert_eq!(picked.content_type.as_deref(), Some("image/webp"));
+        assert!(picked.file_name.is_none());
+
+        // view-once 短路：固定 image/jpeg 占位，覆盖 attachments 命中。
+        let view_once = DataMessage {
+            is_view_once: Some(true),
+            attachments: vec![AttachmentPointer {
+                content_type: Some("video/mp4".to_owned()),
+                file_name: Some("clip.mp4".to_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let picked = quoted_attachment_of(&view_once).expect("view-once placeholder");
+        assert_eq!(picked.content_type.as_deref(), Some("image/jpeg"));
+        assert!(picked.file_name.is_none());
+        assert!(picked.thumbnail.is_none());
+
+        // 全缺 → None（quote 不出 attachments 条目，收端仅少缩略占位）。
+        assert!(quoted_attachment_of(&DataMessage::default()).is_none());
     }
 
     #[test]
