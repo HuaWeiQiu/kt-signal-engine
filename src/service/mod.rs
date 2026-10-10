@@ -3481,6 +3481,9 @@ async fn project_content(
             None => return Vec::new(),
         },
         ContentBody::NullMessage(_) | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
+        // SKDM（群发 sender-key 分发，C 批）：协议内部握手行，永不投影到
+        // connector（接收侧已在 cipher 层消费）。
+        ContentBody::SenderKeyDistributionMessage(_) => return Vec::new(),
     }
 
     // 群变更投影放开（最小面）：群更新消息携带 terminated change →

@@ -249,6 +249,20 @@ impl<C: CredentialsCache> GroupsManager<C> {
         csprng: &mut R,
         master_key_bytes: &[u8],
     ) -> Result<crate::proto::Group, ServiceError> {
+        Ok(self
+            .fetch_encrypted_group_response(csprng, master_key_bytes)
+            .await?
+            .group
+            .unwrap_or_default())
+    }
+
+    // KT (groups fetch): full GroupResponse wrapper, carrying the
+    // group-send-endorsements blob alongside the encrypted group.
+    pub async fn fetch_encrypted_group_response<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        master_key_bytes: &[u8],
+    ) -> Result<crate::proto::GroupResponse, ServiceError> {
         let group_master_key = GroupMasterKey::new(
             master_key_bytes
                 .try_into()
@@ -259,7 +273,9 @@ impl<C: CredentialsCache> GroupsManager<C> {
         let authorization = self
             .get_authorization_for_today(csprng, group_secret_params)
             .await?;
-        self.identified_push_service.get_group(authorization).await
+        self.identified_push_service
+            .get_group_response(authorization)
+            .await
     }
 
     #[tracing::instrument(

@@ -578,6 +578,47 @@ impl<S: Store> Manager<S, Registered> {
         Ok(groups_manager)
     }
 
+    /// KT (group MRM): fetch a group together with its
+    /// group-send-endorsements blob, saving the decrypted group exactly
+    /// like `upsert_group`. A fetch failure falls back to the cached
+    /// group, with the endorsements reported as `None`.
+    pub async fn fetch_group_with_endorsements(
+        &mut self,
+        master_key_bytes: &[u8],
+    ) -> Result<Option<(Group, Option<Vec<u8>>)>, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let response = groups_manager
+            .fetch_encrypted_group_response(&mut rand::rng(), master_key_bytes)
+            .await;
+        let endorsements = response
+            .as_ref()
+            .ok()
+            .map(|response| response.group_send_endorsements_response.clone())
+            .filter(|bytes| !bytes.is_empty());
+        match response {
+            Ok(response) => {
+                if let Some(encrypted_group) = response.group {
+                    let group = decrypt_group(master_key_bytes, encrypted_group)?;
+                    if let Err(error) = self
+                        .store
+                        .save_group(master_key_bytes.try_into()?, group.clone())
+                        .await
+                    {
+                        error!(%error, "failed to save group");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to fetch encrypted group with endorsements")
+            }
+        }
+        Ok(self
+            .store
+            .group(master_key_bytes.try_into()?)
+            .await?
+            .map(|group| (group, endorsements)))
+    }
+
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages
@@ -2237,6 +2278,13 @@ async fn save_message<S: Store>(
         ContentBody::ReceiptMessage(_) => Some(message),
         ContentBody::TypingMessage(msg) => {
             debug!(?msg, "skipping saving typing message");
+            None
+        }
+        ContentBody::SenderKeyDistributionMessage(msg) => {
+            debug!(
+                distribution_id = ?msg.distribution_id().ok(),
+                "skipping saving sender key distribution message"
+            );
             None
         }
         ContentBody::StoryMessage(msg) => {

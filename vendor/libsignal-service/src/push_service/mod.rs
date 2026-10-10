@@ -188,10 +188,14 @@ impl PushService {
         Ok(ws)
     }
 
-    pub(crate) async fn get_group(
+    // KT (groups fetch): GET /v1/groups/ answers GroupResponse{group=1,
+    // group_send_endorsements_response=2} (Android GroupsV2Api.getGroup);
+    // decoding it as a bare Group lands the inner group bytes in
+    // `publicKey` and drops the endorsements needed for group-send tokens.
+    pub(crate) async fn get_group_response(
         &mut self,
         credentials: HttpAuth,
-    ) -> Result<crate::proto::Group, ServiceError> {
+    ) -> Result<crate::proto::GroupResponse, ServiceError> {
         self.request(
             Method::GET,
             Endpoint::storage("/v1/groups/"),

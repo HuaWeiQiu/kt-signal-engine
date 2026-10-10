@@ -1,6 +1,6 @@
 use chrono::Utc;
 use libsignal_core::DeviceId;
-use libsignal_protocol::{Pni, ProtocolAddress, ServiceId};
+use libsignal_protocol::{Pni, ProtocolAddress, ServiceId, SenderKeyDistributionMessage};
 use prost::Message;
 use std::fmt;
 use uuid::Uuid;
@@ -142,7 +142,9 @@ impl fmt::Display for ContentBody {
             Self::CallMessage(_) => write!(f, "CallMessage"),
             Self::ReceiptMessage(_) => write!(f, "ReceiptMessage"),
             Self::TypingMessage(_) => write!(f, "TypingMessage"),
-            // Self::SenderKeyDistributionMessage(_) => write!(f, "SenderKeyDistributionMessage"),
+            Self::SenderKeyDistributionMessage(_) => {
+                write!(f, "SenderKeyDistributionMessage")
+            },
             Self::DecryptionErrorMessage(_) => {
                 write!(f, "DecryptionErrorMessage")
             },
@@ -161,7 +163,10 @@ pub enum ContentBody {
     CallMessage(CallMessage),
     ReceiptMessage(ReceiptMessage),
     TypingMessage(TypingMessage),
-    // SenderKeyDistributionMessage(SenderKeyDistributionMessage),
+    // KT (group MRM): upstream left this variant commented out; group sends
+    // distribute their sender key over 1:1 sessions first (Signal-Desktop
+    // sendToGroup SKDM step).
+    SenderKeyDistributionMessage(SenderKeyDistributionMessage),
     DecryptionErrorMessage(DecryptionErrorMessage),
     StoryMessage(StoryMessage),
     EditMessage(EditMessage),
@@ -183,26 +188,36 @@ impl ContentBody {
     pub fn into_proto(self) -> crate::proto::Content {
         use crate::proto::content::Content;
 
-        let inner = match self {
-            Self::NullMessage(msg) => Content::NullMessage(msg),
-            Self::DataMessage(msg) => Content::DataMessage(msg),
-            Self::SynchronizeMessage(msg) => Content::SyncMessage(msg),
-            Self::CallMessage(msg) => Content::CallMessage(msg),
-            Self::ReceiptMessage(msg) => Content::ReceiptMessage(msg),
-            Self::TypingMessage(msg) => Content::TypingMessage(msg),
-            Self::DecryptionErrorMessage(msg) => {
-                Content::DecryptionErrorMessage(msg.encode_to_vec())
+        // The proto carries the SKDM as bytes outside the content oneof;
+        // the receive side parses it back from the same field (cipher.rs).
+        match self {
+            Self::SenderKeyDistributionMessage(msg) => crate::proto::Content {
+                content: None,
+                sender_key_distribution_message: Some(msg.serialized().to_vec()),
+                pni_signature_message: None,
             },
-            Self::StoryMessage(msg) => Content::StoryMessage(msg),
-            Self::EditMessage(msg) => Content::EditMessage(msg),
-        };
-        crate::proto::Content {
-            content: Some(inner),
-            // TODO: handle SKDM; ideally this is also "tacked on" when needed,
-            // and not handled as a separate message.
-            sender_key_distribution_message: None,
-            // PNI signature gets added down the message sender stream
-            pni_signature_message: None,
+            body => {
+                let inner = match body {
+                    Self::NullMessage(msg) => Content::NullMessage(msg),
+                    Self::DataMessage(msg) => Content::DataMessage(msg),
+                    Self::SynchronizeMessage(msg) => Content::SyncMessage(msg),
+                    Self::CallMessage(msg) => Content::CallMessage(msg),
+                    Self::ReceiptMessage(msg) => Content::ReceiptMessage(msg),
+                    Self::TypingMessage(msg) => Content::TypingMessage(msg),
+                    Self::SenderKeyDistributionMessage(_) => unreachable!(),
+                    Self::DecryptionErrorMessage(msg) => {
+                        Content::DecryptionErrorMessage(msg.encode_to_vec())
+                    },
+                    Self::StoryMessage(msg) => Content::StoryMessage(msg),
+                    Self::EditMessage(msg) => Content::EditMessage(msg),
+                };
+                crate::proto::Content {
+                    content: Some(inner),
+                    sender_key_distribution_message: None,
+                    // PNI signature gets added down the message sender stream
+                    pni_signature_message: None,
+                }
+            },
         }
     }
 }
@@ -223,9 +238,9 @@ impl_from_for_content_body!(SynchronizeMessage(SyncMessage));
 impl_from_for_content_body!(CallMessage(CallMessage));
 impl_from_for_content_body!(ReceiptMessage(ReceiptMessage));
 impl_from_for_content_body!(TypingMessage(TypingMessage));
-// impl_from_for_content_body!(SenderKeyDistributionMessage(
-//     SenderKeyDistributionMessage
-// ));
+impl_from_for_content_body!(SenderKeyDistributionMessage(
+    SenderKeyDistributionMessage
+));
 // impl_from_for_content_body!(DecryptionErrorMessage(DecryptionErrorMessage));
 impl_from_for_content_body!(StoryMessage(StoryMessage));
 impl_from_for_content_body!(EditMessage(EditMessage));
