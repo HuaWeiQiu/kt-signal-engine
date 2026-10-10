@@ -570,6 +570,206 @@ pub(crate) fn project_expiration_from_context(
     })
 }
 
+/// receive 投影面（D 批 D3）：群态 change 全投影 → `groupChanged` 事件
+/// （groupId = master key 标准 base64、revision = change version、editor? =
+/// 编辑者 ACI 串、changes[] = 官方桌面 GroupV2ChangeDetailType 词表条目、
+/// expireTimerSeconds? = 批内夹带 timer 时的既有键形，0 = 关闭）。
+pub(crate) struct GroupChangesProjection {
+    pub(crate) group_id: String,
+    pub(crate) revision: u32,
+    pub(crate) editor: Option<String>,
+    pub(crate) changes: Vec<serde_json::Value>,
+    pub(crate) expire_timer_seconds: Option<u32>,
+}
+
+/// 解密 GroupContextV2.group_change 密文并全量投影（同 decrypt_group_change
+/// 公共 API；terminate/timer 两既有面互斥在外）。批内含非 timer/terminate
+/// change 才投影（纯 timer = 既有 groupUpdated 承接；terminate 优先级不变，
+/// 批内在场时本投影不被调用）；epoch ≤ 7 闸沿用。
+pub(crate) fn project_changes_from_context(
+    master_key: &[u8],
+    group_change: Option<&[u8]>,
+) -> Option<GroupChangesProjection> {
+    use base64::Engine as _;
+    use presage::libsignal_service::groups_v2::GroupChange;
+
+    let group_change = group_change?;
+    let key: [u8; 32] = master_key.try_into().ok()?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+    let encrypted = presage::proto::GroupChange::decode(group_change).ok()?;
+    let changes = GroupOperations::new(secret_params)
+        .decrypt_group_change(encrypted)
+        .ok()?;
+    // change epoch 闸（官方 isChangeEpochSupported 同语义）：epoch > 7 的
+    // change 含未知语义，不处理。
+    if changes.change_epoch > SUPPORTED_CHANGE_EPOCH {
+        return None;
+    }
+    let mut details = Vec::new();
+    let mut expire_timer_seconds = None;
+    for change in &changes.changes {
+        match change {
+            // terminate 优先级不变：project_terminate_from_context 先行，
+            // 本投影不重复出 terminate 条目。
+            GroupChange::TerminateGroup => {}
+            // timer 夹带：不进 changes[]，走既有 expireTimerSeconds 键形
+            // （0 = 关闭，groupUpdated 同语义）。
+            GroupChange::Timer(timer) => {
+                expire_timer_seconds =
+                    Some(timer.as_ref().map(|timer| timer.duration).unwrap_or(0));
+            }
+            // 官方桌面不渲染面（groups.preload extractDiffs 的 detail 词表
+            // 无对应类）：profile key 内务、ban 两族、PNI promote 内务、
+            // member label 内务——跳过，compat §5 登记。
+            GroupChange::ModifyMemberProfileKey { .. }
+            | GroupChange::AddBannedMember(_)
+            | GroupChange::DeleteBannedMember(_)
+            | GroupChange::PromotePendingPniAciMemberProfileKey(_)
+            | GroupChange::MemberLabel { .. } => {}
+            GroupChange::Title(title) => {
+                // 空串零信息量同缺席（history.rs title 同纪律）。
+                let mut detail = serde_json::json!({ "type": "title" });
+                if !title.is_empty() {
+                    detail["newTitle"] = serde_json::json!(title);
+                }
+                details.push(detail);
+            }
+            GroupChange::Avatar(avatar) => {
+                // 官方 avatar detail 只有 removed 位（空 = removed）。
+                details.push(serde_json::json!({
+                    "type": "avatar",
+                    "removed": avatar.is_empty(),
+                }));
+            }
+            GroupChange::Description(description) => {
+                // 官方：description 缺席/空串 → removed:true（history.rs
+                // description 同纪律）。
+                let mut detail = serde_json::json!({ "type": "description" });
+                match description.as_deref().filter(|d| !d.is_empty()) {
+                    Some(text) => detail["description"] = serde_json::json!(text),
+                    None => detail["removed"] = serde_json::json!(true),
+                }
+                details.push(detail);
+            }
+            GroupChange::AttributeAccess(access) => details.push(serde_json::json!({
+                "type": "access-attributes",
+                "newPrivilege": access_level_name(access),
+            })),
+            GroupChange::MemberAccess(access) => details.push(serde_json::json!({
+                "type": "access-members",
+                "newPrivilege": access_level_name(access),
+            })),
+            GroupChange::InviteLinkAccess(access) => details.push(serde_json::json!({
+                "type": "access-invite-link",
+                "newPrivilege": access_level_name(access),
+            })),
+            GroupChange::MemberLabelAccess(access) => details.push(serde_json::json!({
+                "type": "access-member-label",
+                "newPrivilege": access_level_name(access),
+            })),
+            GroupChange::NewMember(member) => details.push(serde_json::json!({
+                "type": "member-add",
+                "aci": member.aci.service_id_string(),
+            })),
+            GroupChange::DeleteMember(aci) => details.push(serde_json::json!({
+                "type": "member-remove",
+                "aci": aci.service_id_string(),
+            })),
+            GroupChange::ModifyMemberRole { aci, role } => details.push(serde_json::json!({
+                "type": "member-privilege",
+                "aci": aci.service_id_string(),
+                "newPrivilege": role_name(role),
+            })),
+            GroupChange::NewPendingMember(member) => details.push(serde_json::json!({
+                "type": "pending-add-one",
+                "serviceId": member.address.service_id_string(),
+            })),
+            GroupChange::DeletePendingMember(service_id) => details.push(serde_json::json!({
+                "type": "pending-remove-one",
+                "serviceId": service_id.service_id_string(),
+            })),
+            GroupChange::PromotePendingMember { address, .. } => {
+                // 官方 member-add-from-invite {aci, pni?, inviter?}：inviter
+                // 位 wire change 无（官方取自旧态 diff），引擎不发明（compat
+                // §5 偏差）。
+                match address {
+                    presage::libsignal_service::protocol::ServiceId::Aci(aci) => {
+                        details.push(serde_json::json!({
+                            "type": "member-add-from-invite",
+                            "aci": aci.service_id_string(),
+                        }));
+                    }
+                    presage::libsignal_service::protocol::ServiceId::Pni(pni) => {
+                        details.push(serde_json::json!({
+                            "type": "member-add-from-invite",
+                            "pni": pni.service_id_string(),
+                        }));
+                    }
+                }
+            }
+            GroupChange::NewRequestingMember(member) => details.push(serde_json::json!({
+                "type": "admin-approval-add-one",
+                "aci": member.aci.service_id_string(),
+            })),
+            GroupChange::DeleteRequestingMember(aci) => details.push(serde_json::json!({
+                "type": "admin-approval-remove-one",
+                "aci": aci.service_id_string(),
+            })),
+            GroupChange::PromoteRequestingMember { aci, .. } => details.push(serde_json::json!({
+                "type": "member-add-from-admin-approval",
+                "aci": aci.service_id_string(),
+            })),
+            GroupChange::InviteLinkPassword(_) => {
+                details.push(serde_json::json!({ "type": "group-link-reset" }));
+            }
+            GroupChange::AnnouncementOnly(value) => details.push(serde_json::json!({
+                "type": "announcements-only",
+                "announcementsOnly": value,
+            })),
+        }
+    }
+    // 纯 timer/terminate 批（或全跳过）：既有 groupUpdated/groupTerminated
+    // 面承接，groupChanged 不重复发。
+    if details.is_empty() {
+        return None;
+    }
+    let editor = changes.editor.service_id_string();
+    Some(GroupChangesProjection {
+        group_id: base64::engine::general_purpose::STANDARD.encode(master_key),
+        revision: changes.version,
+        editor: (!editor.is_empty()).then_some(editor),
+        changes: details,
+        expire_timer_seconds,
+    })
+}
+
+/// AccessRequired → GroupV2AccessLevel 词表名（官方 detail.newPrivilege
+/// 字符串名形态；backup proto 枚举与解密侧 AccessRequired 五值一一对应，
+/// UNKNOWN 兜底，history.rs group_v2_access_level_name 同词表）。
+fn access_level_name(
+    access: &presage::libsignal_service::groups_v2::AccessRequired,
+) -> &'static str {
+    use presage::libsignal_service::groups_v2::AccessRequired;
+    match access {
+        AccessRequired::Unknown => "UNKNOWN",
+        AccessRequired::Any => "ANY",
+        AccessRequired::Member => "MEMBER",
+        AccessRequired::Administrator => "ADMINISTRATOR",
+        AccessRequired::Unsatisfiable => "UNSATISFIABLE",
+    }
+}
+
+/// Role → 官方 detail.newPrivilege 字符串名（history.rs member-privilege
+/// 同词表：UNKNOWN/DEFAULT/ADMINISTRATOR）。
+fn role_name(role: &presage::libsignal_service::groups_v2::Role) -> &'static str {
+    use presage::libsignal_service::groups_v2::Role;
+    match role {
+        Role::Unknown => "UNKNOWN",
+        Role::Default => "DEFAULT",
+        Role::Administrator => "ADMINISTRATOR",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1117,390 @@ mod tests {
             )
         )
         .is_none());
+    }
+
+    /// D3 群态 change 全投影：混合批出 `groupChanged` 条目词表（官方桌面
+    /// GroupV2ChangeDetailType 对齐 + history.rs 既有键形；decrypt 侧链序
+    /// 断言）；timer 夹带不进 changes[] 走既有 expireTimerSeconds 键形；
+    /// 官方不渲染类（ban/profile-key 内务）跳过；纯 timer 批 / epoch 超面 /
+    /// 缺密文 → None（既有面与宁缺勿错口径承接）。
+    #[test]
+    fn group_changes_projection_faces() {
+        use base64::Engine as _;
+        use presage::libsignal_service::zkgroup;
+        use presage::proto::access_control::AccessRequired as ProtoAccess;
+        use presage::proto::group_change::actions;
+        use presage::proto::member::Role as ProtoRole;
+
+        let master_key = [0x47u8; 32];
+        let group_id = base64::engine::general_purpose::STANDARD.encode(master_key);
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let editor = Aci::parse_from_service_id_string("33333333-4444-4555-9666-777777777777")
+            .expect("editor aci");
+        let member = Aci::parse_from_service_id_string("44444444-5555-4666-9777-888888888888")
+            .expect("member aci");
+        let editor_uid = zkgroup::serialize(&secret_params.encrypt_service_id(editor.into()));
+        let member_uid = zkgroup::serialize(&secret_params.encrypt_service_id(member.into()));
+        // 成员/申请者 action 的 profile key 解密闸：zkgroup 加密往返真值
+        // （presentation 空 = 解密侧 decrypt_aci + decrypt_profile_key 回退
+        // 路径，引擎不造 USMC 演示结构）。
+        let profile_key = zkgroup::profiles::ProfileKey::generate([0x99u8; 32]);
+        let profile_key_ct =
+            zkgroup::serialize(&secret_params.encrypt_profile_key(profile_key, member));
+
+        let encrypt_blob = |content: presage::proto::group_attribute_blob::Content| {
+            let mut randomness = [0u8; 32];
+            use rand::RngCore as _;
+            rand::rng().fill_bytes(&mut randomness);
+            let blob = presage::proto::GroupAttributeBlob {
+                content: Some(content),
+            }
+            .encode_to_vec();
+            secret_params.encrypt_blob_with_padding(randomness, &blob, 0)
+        };
+        let encrypted = |actions: presage::proto::group_change::Actions| {
+            presage::proto::GroupChange {
+                actions: actions.encode_to_vec(),
+                server_signature: Vec::new(),
+                change_epoch: SUPPORTED_CHANGE_EPOCH,
+            }
+            .encode_to_vec()
+        };
+
+        // 混合批：member-add + title + timer 夹带 + access-members。
+        let mixed = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: zkgroup::serialize(
+                &secret_params.encrypt_service_id(
+                    Aci::parse_from_service_id_string("33333333-4444-4555-9666-777777777777")
+                        .expect("editor aci")
+                        .into(),
+                ),
+            ),
+            version: 9,
+            add_members: vec![actions::AddMemberAction {
+                added: Some(presage::proto::Member {
+                    user_id: member_uid.clone(),
+                    role: ProtoRole::Default as i32,
+                    profile_key: profile_key_ct.clone(),
+                    ..Default::default()
+                }),
+                join_from_invite_link: false,
+            }],
+            modify_title: Some(actions::ModifyTitleAction {
+                title: encrypt_blob(presage::proto::group_attribute_blob::Content::Title(
+                    "renamed".to_owned(),
+                )),
+            }),
+            modify_disappearing_message_timer: Some(
+                actions::ModifyDisappearingMessageTimerAction {
+                    timer: encrypt_blob(
+                        presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(
+                            3600,
+                        ),
+                    ),
+                },
+            ),
+            modify_member_access: Some(actions::ModifyMembersAccessControlAction {
+                members_access: ProtoAccess::Administrator as i32,
+            }),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(mixed).as_slice()))
+                .expect("mixed batch projects");
+        assert_eq!(projection.group_id, group_id);
+        assert_eq!(projection.revision, 9);
+        assert_eq!(
+            projection.editor.as_deref(),
+            Some("33333333-4444-4555-9666-777777777777")
+        );
+        assert_eq!(
+            projection.expire_timer_seconds,
+            Some(3600),
+            "timer 夹带走既有 expireTimerSeconds 键形"
+        );
+        assert_eq!(projection.changes.len(), 3, "timer 不入 changes[]");
+        // decrypt 侧链序：add_members → modify_title → modify_member_access。
+        assert_eq!(
+            projection.changes[0],
+            serde_json::json!({
+                "type": "member-add",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[1],
+            serde_json::json!({ "type": "title", "newTitle": "renamed" })
+        );
+        assert_eq!(
+            projection.changes[2],
+            serde_json::json!({
+                "type": "access-members",
+                "newPrivilege": "ADMINISTRATOR",
+            })
+        );
+
+        // 词表宽度批：remove/privilege/pending/admin-approval 四族 + avatar
+        // /description/access 两面 + link-reset/announcements-only + ban 跳
+        // 过（官方不渲染类）。
+        let wide = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 10,
+            delete_members: vec![actions::DeleteMemberAction {
+                deleted_user_id: member_uid.clone(),
+            }],
+            modify_member_roles: vec![actions::ModifyMemberRoleAction {
+                user_id: member_uid.clone(),
+                role: ProtoRole::Administrator as i32,
+            }],
+            add_members_pending_profile_key: vec![actions::AddMemberPendingProfileKeyAction {
+                added: Some(presage::proto::MemberPendingProfileKey {
+                    member: Some(presage::proto::Member {
+                        user_id: member_uid.clone(),
+                        role: ProtoRole::Default as i32,
+                        ..Default::default()
+                    }),
+                    added_by_user_id: editor_uid.clone(),
+                    timestamp: 0,
+                }),
+            }],
+            delete_members_pending_profile_key: vec![
+                actions::DeleteMemberPendingProfileKeyAction {
+                    deleted_user_id: member_uid.clone(),
+                },
+            ],
+            modify_avatar: Some(actions::ModifyAvatarAction {
+                avatar: "avatars/new.g".to_owned(),
+            }),
+            modify_attributes_access: Some(actions::ModifyAttributesAccessControlAction {
+                attributes_access: ProtoAccess::Any as i32,
+            }),
+            modify_description: Some(actions::ModifyDescriptionAction {
+                description: encrypt_blob(
+                    presage::proto::group_attribute_blob::Content::DescriptionText(
+                        "group bio".to_owned(),
+                    ),
+                ),
+            }),
+            add_members_banned: vec![actions::AddMemberBannedAction {
+                added: Some(presage::proto::MemberBanned {
+                    user_id: member_uid.clone(),
+                    timestamp: 0,
+                }),
+            }],
+            modify_add_from_invite_link_access: Some(
+                actions::ModifyAddFromInviteLinkAccessControlAction {
+                    add_from_invite_link_access: ProtoAccess::Unsatisfiable as i32,
+                },
+            ),
+            add_members_pending_admin_approval: vec![
+                actions::AddMemberPendingAdminApprovalAction {
+                    added: Some(presage::proto::MemberPendingAdminApproval {
+                        user_id: member_uid.clone(),
+                        profile_key: profile_key_ct.clone(),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            delete_members_pending_admin_approval: vec![
+                actions::DeleteMemberPendingAdminApprovalAction {
+                    deleted_user_id: member_uid.clone(),
+                },
+            ],
+            promote_members_pending_admin_approval: vec![
+                actions::PromoteMemberPendingAdminApprovalAction {
+                    user_id: member_uid.clone(),
+                    role: ProtoRole::Administrator as i32,
+                },
+            ],
+            modify_invite_link_password: Some(actions::ModifyInviteLinkPasswordAction {
+                invite_link_password: vec![1, 2, 3, 4],
+            }),
+            modify_announcements_only: Some(actions::ModifyAnnouncementsOnlyAction {
+                announcements_only: true,
+            }),
+            modify_member_label_access: Some(actions::ModifyMemberLabelAccessControlAction {
+                member_label_access: ProtoAccess::Unknown as i32,
+            }),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(wide).as_slice()))
+                .expect("wide batch projects");
+        assert_eq!(projection.changes.len(), 14, "ban 跳过、其余逐类投影");
+        assert_eq!(
+            projection.changes[0],
+            serde_json::json!({
+                "type": "member-remove",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[1],
+            serde_json::json!({
+                "type": "member-privilege",
+                "aci": "44444444-5555-4666-9777-888888888888",
+                "newPrivilege": "ADMINISTRATOR",
+            })
+        );
+        assert_eq!(
+            projection.changes[2],
+            serde_json::json!({
+                "type": "pending-add-one",
+                "serviceId": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[3],
+            serde_json::json!({
+                "type": "pending-remove-one",
+                "serviceId": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[4],
+            serde_json::json!({ "type": "avatar", "removed": false })
+        );
+        assert_eq!(
+            projection.changes[5],
+            serde_json::json!({
+                "type": "access-attributes",
+                "newPrivilege": "ANY",
+            })
+        );
+        assert_eq!(
+            projection.changes[6],
+            serde_json::json!({
+                "type": "description",
+                "description": "group bio",
+            })
+        );
+        assert_eq!(
+            projection.changes[7],
+            serde_json::json!({
+                "type": "access-invite-link",
+                "newPrivilege": "UNSATISFIABLE",
+            })
+        );
+        assert_eq!(
+            projection.changes[8],
+            serde_json::json!({
+                "type": "admin-approval-add-one",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[9],
+            serde_json::json!({
+                "type": "admin-approval-remove-one",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[10],
+            serde_json::json!({
+                "type": "member-add-from-admin-approval",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[11],
+            serde_json::json!({ "type": "group-link-reset" })
+        );
+        assert_eq!(
+            projection.changes[12],
+            serde_json::json!({
+                "type": "announcements-only",
+                "announcementsOnly": true,
+            })
+        );
+        assert_eq!(
+            projection.changes[13],
+            serde_json::json!({
+                "type": "access-member-label",
+                "newPrivilege": "UNKNOWN",
+            })
+        );
+        assert_eq!(projection.revision, 10);
+        assert_eq!(projection.expire_timer_seconds, None, "无 timer 批该键缺席");
+
+        // avatar 移除面（空串 = removed）与 description 移除面（空/缺席 =
+        // removed:true，decrypt 侧空串归 None）。
+        let removals = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid,
+            version: 11,
+            modify_avatar: Some(actions::ModifyAvatarAction {
+                avatar: String::new(),
+            }),
+            modify_description: Some(actions::ModifyDescriptionAction {
+                description: encrypt_blob(
+                    presage::proto::group_attribute_blob::Content::DescriptionText(String::new()),
+                ),
+            }),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(removals).as_slice()))
+                .expect("removal batch projects");
+        assert_eq!(
+            projection.changes,
+            vec![
+                serde_json::json!({ "type": "avatar", "removed": true }),
+                serde_json::json!({ "type": "description", "removed": true }),
+            ]
+        );
+
+        // 纯 timer 批（无其他 change）→ None（既有 groupUpdated 面承接）。
+        let timer_only = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: zkgroup::serialize(
+                &secret_params.encrypt_service_id(
+                    Aci::parse_from_service_id_string("33333333-4444-4555-9666-777777777777")
+                        .expect("editor aci")
+                        .into(),
+                ),
+            ),
+            version: 12,
+            modify_disappearing_message_timer: Some(
+                actions::ModifyDisappearingMessageTimerAction {
+                    timer: encrypt_blob(
+                        presage::proto::group_attribute_blob::Content::DisappearingMessagesDuration(
+                            60,
+                        ),
+                    ),
+                },
+            ),
+            ..presage::proto::group_change::Actions::default()
+        };
+        assert!(
+            project_changes_from_context(&master_key, Some(encrypted(timer_only).as_slice()))
+                .is_none()
+        );
+
+        // epoch 超面 / 缺密文 / 坏密文 → None（闸沿用）。
+        let over_epoch = presage::proto::GroupChange {
+            actions: presage::proto::group_change::Actions {
+                version: 13,
+                modify_avatar: Some(actions::ModifyAvatarAction {
+                    avatar: "x".to_owned(),
+                }),
+                ..presage::proto::group_change::Actions::default()
+            }
+            .encode_to_vec(),
+            server_signature: Vec::new(),
+            change_epoch: SUPPORTED_CHANGE_EPOCH + 1,
+        };
+        assert!(project_changes_from_context(
+            &master_key,
+            Some(over_epoch.encode_to_vec().as_slice())
+        )
+        .is_none());
+        assert!(project_changes_from_context(&master_key, None).is_none());
+        assert!(project_changes_from_context(&master_key, Some(&[0u8; 8])).is_none());
     }
 
     /// 群头像 change（群头像上行面批）：换新 = modify_avatar 携上行 path；

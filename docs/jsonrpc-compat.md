@@ -2297,6 +2297,47 @@ wire additive，既有方法/字段零改动。
   §read-sync 记档在案），纯加面待其接入；接收侧 presage 不落库
   （read/viewed 无引擎落库语义，投影即全部）。
 
+### 群态 change 全投影（groupChanged，D 批 D3，2026-10-11，官方对齐）
+
+群更新事件面此前只放开了两类：terminate → `groupTerminated`、
+expiration timer → `groupUpdated`；其余群态 change（成员/权限/链接/
+公告面）整体跳过。本批加 `groupChanged` 全投影：群更新消息携带的
+change 批内含**非 timer/terminate** change 时投影
+
+```
+{method: "receive", params: {account, envelope: {timestamp, groupChanged:
+ {groupId, revision, editor?, changes[], expireTimerSeconds?}}}}
+```
+
+- **词表**：`changes[]` 条目对齐官方桌面 GroupV2ChangeDetailType
+  （`ts/types/groups.std.ts` 联合 27 类）与引擎既有 history.rs 键形——
+  `title{newTitle?}`（空串同缺席）、`avatar{removed}`（空 = removed）、
+  `description{description|removed}`（空/缺席 = removed:true）、
+  `access-attributes/access-members/access-invite-link/
+  access-member-label{newPrivilege}`（GroupV2AccessLevel 字符串名
+  UNKNOWN/ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE）、
+  `member-add{aci}`、`member-remove{aci}`、
+  `member-privilege{aci,newPrivilege}`（UNKNOWN/DEFAULT/ADMINISTRATOR）、
+  `pending-add-one{serviceId}`、`pending-remove-one{serviceId}`、
+  `member-add-from-invite{aci|pni}`、
+  `admin-approval-add-one{aci}`、
+  `admin-approval-remove-one{aci}`、
+  `member-add-from-admin-approval{aci}`、`group-link-reset`、
+  `announcements-only{announcementsOnly}`。
+- **边界与偏差（宁缺勿错）**：① timer 夹带不进 `changes[]`，走既有
+  `expireTimerSeconds` 键形（0 = 关闭，`groupUpdated` 同语义）；纯
+  timer 批不投影 `groupChanged`（既有面承接）。② terminate 优先级
+  不变——批内含 terminate 仍整批投影 `groupTerminated`。③ 官方桌面
+  不渲染类跳过并登记：`modifyMemberProfileKey`、ban 两族
+  （add/delete）、`promotePendingPniAci`、`memberLabel` 内务四族
+  （detail 词表无对应类）。④ `pending-remove-one` 不带 `inviter`、
+  `member-add-from-invite` 不带 `inviter`：wire change 无该位，官方取
+  自旧群态 diff，引擎不做旧态对账（群态落库由 presage upsert 面承
+  担）。⑤ epoch ≤ 7 闸沿用（官方 isChangeEpochSupported 同语义）。
+- **消费面**：connector 现今不消费 `groupChanged`（纯加面待其接入）；
+  群态落库不因本批变化（presage registered 收到 groupV2 即
+  upsert_group 拉服务器态，既有行为）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

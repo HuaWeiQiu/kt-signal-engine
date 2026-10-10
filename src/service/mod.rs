@@ -3602,6 +3602,34 @@ async fn project_content(
                 },
             })];
         }
+        // D3 群态 change 全投影：批内含非 timer/terminate change →
+        // `groupChanged` 事件（官方 GroupV2ChangeDetailType 词表，compat
+        // §5）；timer 夹带走既有 expireTimerSeconds 键形；纯 timer/
+        // terminate 批由上面两既有面承接（None 不投影）。
+        if let Some(changes) = groups::project_changes_from_context(&master_key, change) {
+            let mut event = json!({
+                "groupId": changes.group_id,
+                "revision": changes.revision,
+                "changes": changes.changes,
+            });
+            if let Some(editor) = changes.editor {
+                event["editor"] = json!(editor);
+            }
+            if let Some(seconds) = changes.expire_timer_seconds {
+                event["expireTimerSeconds"] = json!(seconds);
+            }
+            return vec![json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": account,
+                    "envelope": {
+                        "timestamp": envelope_ts,
+                        "groupChanged": event,
+                    },
+                },
+            })];
+        }
     }
 
     let mut notifications = Vec::new();
@@ -7635,9 +7663,13 @@ mod tests {
         );
         let envelope = &notification["params"]["envelope"];
         assert!(envelope.get("groupTerminated").is_none());
+        // D3 起：非 terminate 的群 change 批 → groupChanged 事件（整信封
+        // 替换同 terminate/expiration 面；groupInfo 面只留无 change 群消息）。
+        assert_eq!(envelope["groupChanged"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupChanged"]["revision"], json!(10));
         assert_eq!(
-            envelope["dataMessage"]["groupInfo"]["groupId"],
-            json!(group_id)
+            envelope["groupChanged"]["changes"],
+            json!([{ "type": "title", "newTitle": "renamed" }])
         );
 
         // sent sync 内终止（其他设备发起）→ 同事件面。
@@ -7849,9 +7881,13 @@ mod tests {
         );
         let envelope = &notification["params"]["envelope"];
         assert!(envelope.get("groupUpdated").is_none());
+        // D3 起：非 timer 的群 change 批 → groupChanged 事件（整信封替换；
+        // groupInfo 面只留无 change 群消息）。
+        assert_eq!(envelope["groupChanged"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupChanged"]["revision"], json!(10));
         assert_eq!(
-            envelope["dataMessage"]["groupInfo"]["groupId"],
-            json!(group_id)
+            envelope["groupChanged"]["changes"],
+            json!([{ "type": "title", "newTitle": "renamed" }])
         );
 
         // sent sync 内 expiration（本机其他设备设置）→ 同事件面。
