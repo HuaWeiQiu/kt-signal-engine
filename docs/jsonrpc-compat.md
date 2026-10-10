@@ -127,6 +127,7 @@ UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 | `backups.cloudStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 restore） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`downloading`=在途（字节计数有效，total 缺席不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺，产物走 NDJSON 消费链——transfer_archive「无论成败收尾清快照」同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，transfer.downloadStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 restore 批）**：只读轮询面（backup.exportStatus/transfer.downloadStatus 同语义，无推送事件轮询到终态）；快照进程内存不跨重启；只读不落调度日志零 stderr |
 | `backups.uploadToCloud` | `{account}` | `{"status": "started"}`（全链后台化：装配段=专用 OS 线程（§10.3 同款，工件→main 容器流式写→临时产物 `<account_dir>/cloud-upload-main-tmp`）→上行段=LocalSet watcher：凭据拉取（restore §1 链同源，404 引导自愈）→zkgroup 兑换呈现→生产 chat 未鉴权 gRPC `get_upload_form`（cdn===3 强制）→TUS create-with-upload 单发 POST（`Tus-Resumable: 1.0.0` + `Upload-Length` + `Upload-Metadata: filename <b64(form.key)>` + form headers，body=密文产物 128 KiB 块流式读盘，请求级超时 900 s）→`refresh_backup`；终态经 `backups.uploadStatus` 观测；upload 面=官方桌面 `Backups.upload` 同链，产物 remote 型与一期 local 容器逐字节同构，派生钥=`derive_keys`+remote 臂（Some(forward-secrecy token)→NEW_DST），契约钉定 cloud-backup-contract §6.1） | account 缺失/非字符串 `-32603`；结构化码八族均 `-1` + message 码位（`CloudUploadError::rpc_code` 单一映射源，带 detail 时附 `data.detail`；uploadStatus failed 相位同表两端不漂）：同步段 `BACKUP_AUTH_FAILED`（未注册/fake 账号、AEP/registration/身份密钥缺席或 zkgroup 兑换被拒，retryable=false）、`BACKUP_UPLOAD_ALREADY_RUNNING`（同引擎已有在途 upload 重入，**新码位，白名单登记归 connector 透传批**，retryable=false）、`BACKUP_ARTIFACT_MISSING`/`BACKUP_ARTIFACT_INVALID`（工件缺席/首行非法，非法当场删工件，retryable=false）；后台段失败经 uploadStatus failed 相位透出：`BACKUP_NOT_PROVISIONED`（引导自愈后仍无档，retryable=false）/`BACKUP_TRANSPORT_FAILED`（凭据/form gRPC/refresh_backup，retryable=true）/`BACKUP_UPLOAD_FAILED`（**新码位，白名单登记归 connector 透传批**：cdn≠3/非 2xx/超帽/上行读盘，retryable=true——上传 POST 已离站=unknown-outcome 窗口，重试=整链重来）/`BACKUP_IO_FAILED`（临时产物写面，retryable=false）（cloud-backup-contract §6.2） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：官方 TUS 单发协议实锤（桌面 tusProtocol.node.ts create-with-upload：`POST {signedUploadLocation}` 2xx=完成，无断点续传——引擎同口径单发，失败=failed 终态不自动重试）；上传 POST 用 `HttpAuthOverride::Unidentified`（预签名 URL 不附账号 basic auth）；凭据/header 不落日志不落盘；临时产物任何终态必删（官方 finally unlink 同款），崩溃残留由下次上传覆盖写收敛；产物 1 GiB 帽 fail-closed（form 段 `UploadTooLarge` 同映射 `BACKUP_TRANSPORT_FAILED`，契约 §6.1 裁定）；media 档出范围（messages 档密文归档；mediaRootBackupKey 每次随机 32B，契约差异登记同 §10.5）；运行闸进程级单槽 CAS；send lane mutating；fake 账号无 store 同未注册答 `BACKUP_AUTH_FAILED`；不落调度日志零 stderr |
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
+| `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的两处声明如实自报——账号属性面 DeviceCapabilities（接收管线首步 presage set_account_attributes 推送的六位）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -2003,6 +2004,56 @@ kt-signal-calling relay-api-v2 §2/§5 帧族，引擎只产材料字节，relay
   kt-signal-calling 仓后续批；群通话状态同步（storage 面）不做（relay
   §6 诚实边界）；create-auth 的 POST 属凭据签发面（无用户可见状态变更），
   不按协议上行面落调度日志。
+
+### 引擎协议能力自证面（engine.protocolCapabilities，2026-10-10 批）
+
+Signal 服务器按客户端上报的 capability 做强制过滤（2026-03 曾无预告批量
+注销 capability 不达标的客户端，signal-cli#1993）。本批给引擎加自证面：
+运维/哨兵随时可查引擎当前向服务器声明的协议能力与依赖基线，上游下一轮
+强制收紧时快速核对达标面。方法行为见 §3 表行，本块登记事实源结构与
+防漂移闸。
+
+- **两处声明，两个真相源策略**（引擎以 linked device 身份入网，主注册链
+  confirmation.rs 不在引擎路径上，但同字面值一并钉定）：
+  - 账号属性面 `DeviceCapabilities` 六位（storage/transfer/
+    attachment_backfill/spqr/profiles_v2/username_change_sync_message）：
+    接收管线首步 presage `set_account_attributes` 推送（vendored
+    presage registered.rs 构造点，`src/service/mod.rs` finishLink 收口
+    注释同位佐证）。该构造是 vendor 内联字面值、无导出常量可调用，引擎
+    持**钉定镜像**（`service::capabilities::DEVICE_CAPABILITIES`，同型
+    vendor 结构体 const 构造——vendor 增删字段时引擎编译期即断）。
+  - 链接面 `LinkCapabilities` 三位：`link_device` 构造
+    `LinkRequest.account_attributes.capabilities` 取
+    `LinkCapabilities::default()`（vendored libsignal-service
+    provisioning/mod.rs 构造点 + push_service/linking.rs Default 实现）。
+    构造器 pub 可调用，引擎运行时 **live 复用**，零镜像。
+- **反双真相源闸（四层）**：① 编译期——镜像位值 const 块钉死（位值漂移
+  直接断编译），且镜像以 vendor 结构体显式全字段构造（vendor 增删字段
+  同样编译期断）；② 单测扫 vendor 源码——
+  `service::capabilities` 模块单测对 registered.rs/confirmation.rs 构造
+  点与 linking.rs Default 实现做空白归一字面断言（逐位值 + provisioning
+  构造点确用 `LinkCapabilities::default()`），vendor 升级改位/改点即红
+  灯，强制人工复核后同步镜像；③ 单测 live 对账——镜像与
+  `LinkCapabilities::default()`/`DeviceCapabilities::default()` 运行时
+  逐位比对（含两 Default 不得混用的 storage 位反证）；④ 基线锚钉定——
+  单测硬编码钉死 presage rev/libsignal tag+commit，依赖升级必须撞闸
+  重走能力位复核。
+- **依赖基线**：build.rs 从本仓 Cargo.toml（presage 声明 rev——[patch]
+  路径替换后 Cargo.lock 的 source 行不再回显 git rev，声明行才是上游钉
+  定锚）与 Cargo.lock（`libsignal-protocol` 的 git source 行——解析后
+  事实，tag + checkout commit 双值）提取，`cargo:rustc-env` 注入
+  `KT_ENGINE_*` 常量，`env!` 编译期内嵌；运行时零网络零文件读取。锚缺失
+  build.rs panic（fail-closed：自证面宁编译失败不报空）。
+- **应答形状即 wire 形状**：能力位 JSON 由 vendor 结构体按其 serde 属性
+  序列化产出（camelCase；`profiles_v2` 上游字面 snake，消费方不得
+  "纠正"）——自证面输出与引擎线上声明逐键同形，不另立投影词表。
+- **错误面**：无。只读常量应答，无参数闸（params 忽略）、无账号解析、
+  不触网；唯一可能失败面 = JSON-RPC 协议层（§2）。
+- **fake/real 同码路真实答**：常量派生面不进服务层（calls.endorsements
+  PublicKey 同款），fake 开关不影响应答；读面不落调度日志零 stderr。
+- **边界**：本方法只自证引擎声明面，不做服务器侧回读（whoami/profile
+  capabilities 回显位是另一事实，不在本面）；引擎位值随 vendor 升级
+  走闸同步，不提供运行时可写面（能力位是协议安全决策，ADR 0002 边界）。
 
 ## 6. fake 服务模式（仅测试）
 

@@ -43,6 +43,7 @@ use crate::state::EngineState;
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
+pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
 pub(crate) mod groups;
 pub(crate) mod identity;

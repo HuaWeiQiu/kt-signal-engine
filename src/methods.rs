@@ -14,9 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    parse_legacy_call_face, storage_sync, storage_write, LinkError, MessageRequestTarget,
-    SendMention, SendPreview, SendQuote, SendSticker, SendTextStyle, Service, UserStatusError,
-    MAX_SEND_TEXT_STYLES,
+    capabilities, parse_legacy_call_face, storage_sync, storage_write, LinkError,
+    MessageRequestTarget, SendMention, SendPreview, SendQuote, SendSticker, SendTextStyle, Service,
+    UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -2193,6 +2193,19 @@ async fn dispatch(
                 }
                 Err(error) => storage_error(id, &error),
             }
+        }
+        // ---- 引擎自证面（KT 扩展方法，compat §3 引擎自证块）----
+        // engine.protocolCapabilities：只读、零网络、账号无关（无 account
+        // 参数，未绑定账号照常应答）——引擎向服务器声明的协议能力位 +
+        // 依赖基线，上游强制过滤收紧时供运维/哨兵核对达标面（2026-03 上游
+        // 无预告批量注销 capability 不达标客户端的教训）。真相源登记见
+        // service::capabilities：链接面 live 复用 vendor 构造器，账号属性
+        // 面钉定镜像（vendor 内联字面值无导出常量），镜像/基线漂移由单测
+        // 扫 vendor 源码拦下。读面不落调度日志（listContacts 同纪律）；
+        // 无业务错误面，fake/real 同码路真实答（calls.endorsementsPublicKey
+        // 常量面同款）。
+        "engine.protocolCapabilities" => {
+            jsonrpc::success_response(id, capabilities::protocol_capabilities_payload())
         }
         _ => jsonrpc::error_response(
             id,

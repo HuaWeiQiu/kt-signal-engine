@@ -3352,3 +3352,80 @@ fn identities_trust_and_storage_records_fake_shapes_and_param_fail_closed() {
         );
     }
 }
+
+/// engine.protocolCapabilities（引擎自证面，KT 扩展方法）：只读、零网络、
+/// 账号无关——未绑定账号（全新数据目录，real 模式零账号）照常应答；
+/// fake/real 同码路真实答（常量派生面，calls.endorsementsPublicKey 同款）；
+/// 读面不落调度日志（engine-send-log.jsonl 不出现）。
+#[test]
+fn engine_protocol_capabilities_self_report_shape() {
+    let assert_shape = |result: &Value| {
+        let obj = result.as_object().expect("result object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>().as_slice(),
+            ["baseline", "deviceCapabilities", "linkCapabilities"]
+        );
+
+        let device = obj["deviceCapabilities"]
+            .as_object()
+            .expect("device object");
+        assert_eq!(
+            device.keys().collect::<Vec<_>>().as_slice(),
+            [
+                "attachmentBackfill",
+                "profiles_v2",
+                "spqr",
+                "storage",
+                "transfer",
+                "usernameChangeSyncMessage"
+            ]
+        );
+        assert_eq!(device["spqr"], json!(true));
+        assert_eq!(device["storage"], json!(true));
+        assert_eq!(device["transfer"], json!(false));
+        assert_eq!(device["attachmentBackfill"], json!(false));
+        assert_eq!(device["profiles_v2"], json!(false));
+        assert_eq!(device["usernameChangeSyncMessage"], json!(true));
+        // vendor serde 的 profiles_v2 字面拼写（线上声明即此形状）不得被
+        // "纠正"成 camelCase。
+        assert!(device.get("profilesV2").is_none());
+
+        let link = obj["linkCapabilities"].as_object().expect("link object");
+        assert_eq!(
+            link.keys().collect::<Vec<_>>().as_slice(),
+            ["attachmentBackfill", "spqr", "usernameChangeSyncMessage"]
+        );
+        assert_eq!(link["spqr"], json!(true));
+        assert_eq!(link["attachmentBackfill"], json!(false));
+        assert_eq!(link["usernameChangeSyncMessage"], json!(true));
+
+        let baseline = obj["baseline"].as_object().expect("baseline object");
+        assert_eq!(
+            baseline.keys().collect::<Vec<_>>().as_slice(),
+            ["libsignalCommit", "libsignalVersion", "presageRev"]
+        );
+        for key in ["presageRev", "libsignalCommit"] {
+            let value = baseline[key].as_str().expect("string");
+            assert_eq!(value.len(), 40, "{key} is a full git sha");
+            assert!(value.chars().all(|c| c.is_ascii_hexdigit()), "{key} hex");
+        }
+        let version = baseline["libsignalVersion"].as_str().expect("string");
+        assert!(!version.is_empty(), "libsignal version present");
+        assert!(version.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    };
+
+    // real 模式 + 全新数据目录：账号无关可应答（未绑定账号边界）。
+    let real_dir = temp_dir("capabilities-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_shape(&real_engine.request("engine.protocolCapabilities", json!({}))["result"]);
+    drop(real_engine);
+    assert!(
+        !real_dir.join("engine-send-log.jsonl").exists(),
+        "read-only face must not write the dispatch log"
+    );
+
+    // fake 模式：同码路真实答（形状逐键一致）。
+    let fake_dir = temp_dir("capabilities-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    assert_shape(&fake_engine.request("engine.protocolCapabilities", json!({}))["result"]);
+}
