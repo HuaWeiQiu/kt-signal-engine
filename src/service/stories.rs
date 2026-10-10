@@ -31,8 +31,8 @@ use presage::proto::{
 use serde_json::{json, Value};
 
 use super::{
-    open_registered, resolve_recipient, upload_attachments_for_send, SendError, SendTextStyle,
-    Service,
+    open_registered, resolve_recipient, send_error_of, upload_attachments_for_send, SendError,
+    SendTextStyle, Service,
 };
 
 /// 官方 MY_STORY_ID（`ts/types/Stories.std.ts:114-115`）：distributionListId
@@ -212,7 +212,7 @@ pub(crate) async fn send_story(
                 timestamp,
             )
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         results.push(json!({
             "recipientNumber": number,
             "success": { "timestamp": timestamp },

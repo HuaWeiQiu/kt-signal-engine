@@ -2517,7 +2517,9 @@ fn username_write_error(id: &Value, error: &crate::service::username::UsernameWr
 }
 
 /// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation
-/// terminated 位硬拒同语义）→ `-1` + `SEND_TARGET_TERMINATED`；其余（账号
+/// terminated 位硬拒同语义）→ `-1` + `SEND_TARGET_TERMINATED`；服务端凭据
+/// 拒绝（401 解绑，确定性失败不重试）→ `-32603` + getUserStatus 同款解绑
+/// 原文（同一常量，connector 分类器按 message 直接命中）；其余（账号
 /// 不可达/内部失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     use crate::service::SendError;
@@ -2525,6 +2527,33 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         SendError::TargetTerminated => {
             jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_TERMINATED"))
         }
+        SendError::Unbound => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+        }
         SendError::UnknownAccount | SendError::Internal => internal_error(id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sendError 解绑臂形状面：`-32603` + getUserStatus 同款解绑原文
+    /// （单一常量，不发明新字符串）。connector 分类器
+    /// （upstream_error_is_unauthorized）按 error.message 含
+    /// "AuthorizationFailedException" / "Authorization failed" 命中并驱动
+    /// 解绑事件链——常量形状即识别面，改动即断。
+    #[test]
+    fn send_error_unbound_face_matches_user_status_face() {
+        let response = send_error(&Value::from(7), crate::service::SendError::Unbound);
+        assert_eq!(response.get("id").and_then(Value::as_i64), Some(7));
+        let error = response.get("error").expect("error face");
+        assert_eq!(error.get("code").and_then(Value::as_i64), Some(-32603));
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some(USER_UNBOUND_MESSAGE)
+        );
+        assert!(USER_UNBOUND_MESSAGE.contains("AuthorizationFailedException"));
+        assert!(USER_UNBOUND_MESSAGE.contains("Authorization failed"));
     }
 }

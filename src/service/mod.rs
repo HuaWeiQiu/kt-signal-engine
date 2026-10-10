@@ -375,7 +375,30 @@ pub(crate) enum SendError {
     /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
     /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
     TargetTerminated,
+    /// 服务端凭据拒绝（HTTP 401/403 → ServiceError::Unauthorized，vendored
+    /// push_service/response.rs 归型）：账号在 Signal 侧已解绑。确定性失败，
+    /// 标失败不重试（unknown-send 纪律同向）；错误面 -32603 + 解绑原文
+    /// （getUserStatus 同款，compat §3）。
+    Unbound,
     Internal,
+}
+
+/// presage 发送/上行面错误归型：服务端 401/403（凭据吊销/解绑）同归
+/// `SendError::Unbound`——直接 ServiceError 面（whoami 等推送服务调用）
+/// 与 MessageSenderError 面（send_message 内 sender 上行同源再包一层）
+/// 两处归型点都覆盖；其余（网络/协议/存储）折叠 `SendError::Internal`。
+/// send 链各触网点单点共用（getUserStatus 的 whoami 面同归型先行）。
+pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
+    use presage::libsignal_service::prelude::ServiceError;
+    use presage::libsignal_service::sender::MessageSenderError;
+    match error {
+        presage::Error::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
+        presage::Error::MessageSenderError(sender_error) => match *sender_error {
+            MessageSenderError::ServiceError(ServiceError::Unauthorized) => SendError::Unbound,
+            _ => SendError::Internal,
+        },
+        _ => SendError::Internal,
+    }
 }
 
 /// sendMessageRequestResponse 的线程腿（connector §4.56 同款两腿恰一）：
@@ -824,7 +847,7 @@ impl Service {
             manager
                 .send_message(service_id, body, timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
             results.push(json!({
                 "recipientNumber": number,
                 "success": { "timestamp": timestamp },
@@ -861,7 +884,7 @@ impl Service {
             manager
                 .send_message(service_id, body, timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
         }
         Ok(())
     }
@@ -940,7 +963,7 @@ impl Service {
             manager
                 .send_message(service_id, body, timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
         }
         Ok(())
     }
@@ -1117,7 +1140,7 @@ impl Service {
             manager
                 .send_message(service_id, body(aci_bytes.clone(), timestamp), timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
         }
         Ok(())
     }
@@ -1152,7 +1175,7 @@ impl Service {
             manager
                 .send_message(service_id, body, timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
         }
         Ok(())
     }
@@ -1192,7 +1215,7 @@ impl Service {
             manager
                 .send_message(service_id, body, timestamp)
                 .await
-                .map_err(|_| SendError::Internal)?;
+                .map_err(send_error_of)?;
         }
         Ok(())
     }
@@ -1239,7 +1262,7 @@ impl Service {
         manager
             .send_message(own_aci, body, envelope_ts)
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         Ok(())
     }
 
@@ -1278,7 +1301,7 @@ impl Service {
         manager
             .send_message(own_aci, body, envelope_ts)
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         Ok(())
     }
 
@@ -1318,7 +1341,7 @@ impl Service {
         manager
             .send_message(service_id, body, timestamp)
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         Ok(timestamp)
     }
 
@@ -1347,7 +1370,7 @@ impl Service {
         manager
             .send_message_to_group(&master_key, build_call_message(&payload), timestamp)
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         Ok(timestamp)
     }
 
@@ -1557,7 +1580,7 @@ impl Service {
         manager
             .send_message_to_group(&master_key, body, timestamp)
             .await
-            .map_err(|_| SendError::Internal)
+            .map_err(send_error_of)
     }
 
     /// 群组发送公共头：账号/群可解校验 + 终止面硬拒（官方
@@ -1814,7 +1837,7 @@ impl Service {
         manager
             .send_message(service_id, body, timestamp)
             .await
-            .map_err(|_| SendError::Internal)?;
+            .map_err(send_error_of)?;
         Ok(timestamp)
     }
 
@@ -4268,7 +4291,7 @@ async fn dispatch_group(
     manager
         .send_message_to_group(&master_key, body, timestamp)
         .await
-        .map_err(|_| SendError::Internal)
+        .map_err(send_error_of)
 }
 
 /// contacts 的 uuid 字符串 → E.164 映射（群组成员/作者号批量解析共用）。
@@ -4328,7 +4351,7 @@ async fn upload_attachments_for_send(
                 .collect(),
         )
         .await
-        .map_err(|_| SendError::Internal)?;
+        .map_err(send_error_of)?;
     let mut pointers = uploads
         .into_iter()
         .map(|result| result.ok())
@@ -4485,7 +4508,7 @@ async fn upload_sticker_image(
     let mut uploads = manager
         .upload_attachments(vec![(spec, parsed.bytes)])
         .await
-        .map_err(|_| SendError::Internal)?;
+        .map_err(send_error_of)?;
     uploads
         .pop()
         .and_then(|result| result.ok())
@@ -4777,6 +4800,44 @@ mod tests {
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
+
+    /// 发送链凭据失效归型：presage 两层归型点（直接 ServiceError 面 /
+    /// MessageSenderError 内 sender 同源再包一层）的 401/403 同归
+    /// SendError::Unbound；其余错误（404 目标态、sender 其他失败、非服务
+    /// 错误）不误报解绑，维持 Internal 折叠。
+    #[test]
+    fn send_errors_classify_unauthorized_as_unbound() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError;
+
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::Unauthorized)),
+            SendError::Unbound
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::ServiceError(ServiceError::Unauthorized)
+            ))),
+            SendError::Unbound
+        ));
+
+        // 404 = 收件人面（官方 response.rs 注：recipient not registered），
+        // 与本账号凭据失效不同族，不得误报。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::NotFoundError)),
+            SendError::Internal
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::NoMessagesToSend
+            ))),
+            SendError::Internal
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::UnknownGroup),
+            SendError::Internal
+        ));
+    }
 
     /// project_content 现返通知向量：契约测试形状 = 恰一条投影，取首条
     /// （多通知形状由本批 profileKeyUpdate 面单测覆盖）。
