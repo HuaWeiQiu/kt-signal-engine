@@ -618,6 +618,16 @@ impl IdentityKeyStore for SqliteProtocolStore {
 
         tx.commit().await.into_protocol_error()?;
 
+        // KT: record the replacement so the receive loop can surface the
+        // identity-key change (see `Store::take_identity_changes`).
+        if is_replaced {
+            self.store
+                .identity_changes
+                .lock()
+                .expect("identity change log")
+                .push(address.to_owned());
+        }
+
         Ok(if is_replaced {
             IdentityChange::ReplacedExisting
         } else {

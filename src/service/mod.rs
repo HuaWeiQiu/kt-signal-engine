@@ -2659,6 +2659,63 @@ fn decryption_error_notification(
     })
 }
 
+/// 身份钥变更结构化事件（B4 身份事件面，compat §5）：形状 = receive 事件
+/// 族同构，envelope 级 `identityChanged` 标记（解密失败 decryptionError
+/// 同款加面纪律）。信任判定不动（OnNewIdentity::Trust），事件仅为投影；
+/// 触发该事件的本体消息照常随信封投影。
+fn identity_changed_notification(account: &str, sender: &ServiceId, timestamp: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "account": account,
+            "envelope": {
+                "sourceUuid": sender.service_id_string(),
+                "timestamp": timestamp,
+                "identityChanged": {},
+            },
+        },
+    })
+}
+
+/// Unbound 停环事件（B4，compat §5）：服务端 401 凭据拒绝（vendored 归型
+/// `ServiceError::Unauthorized`，401/403 同型）后接收循环停止，上抛一次
+/// 本通知（wire additive，connector 白名单不消费零影响）——官方链接设备
+/// 语义：凭据失效即停，等用户重链，不无限退避重连。
+fn account_unbound_notification(account: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "accountUnbound",
+        "params": { "account": account },
+    })
+}
+
+/// receive 流建流错误归型（B4 Unbound 停环）：`ServiceError::Unauthorized`
+/// → true（停环）；send_error_of 同款双层归型面（直接 ServiceError 与
+/// sender 再包层），其余（网络/协议/存储）维持退避重连。
+fn receive_stream_unbound(error: &presage::Error<<SqliteStore as Store>::Error>) -> bool {
+    use presage::libsignal_service::prelude::ServiceError;
+    use presage::libsignal_service::sender::MessageSenderError;
+    match error {
+        presage::Error::ServiceError(ServiceError::Unauthorized) => true,
+        presage::Error::MessageSenderError(inner) => matches!(
+            **inner,
+            MessageSenderError::ServiceError(ServiceError::Unauthorized)
+        ),
+        _ => false,
+    }
+}
+
+/// serve 流结局（B4 Unbound 停环）：Connected = 建流成功后结束（对端断/
+/// 关停/流排空）→ 退避 reset；Recoverable = 建流失败（store/manager/
+/// websocket 初始化）→ 退避步进；Unbound = 服务端凭据拒绝 → 停环等重链。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Connected,
+    Recoverable,
+    Unbound,
+}
+
 // ---------------------------------------------------------------------------
 // DERM 收发自愈（B 批，官方 Android MessageDecryptor / Desktop handleRetry
 // 行为对齐）：解密失败回发 DecryptionErrorMessage；收到重试请求按原始
@@ -2832,19 +2889,25 @@ async fn receive_pipeline(
             return;
         }
         let mut serve_rx = shutdown.clone();
-        let connected = tokio::select! {
+        let outcome = tokio::select! {
             _ = shutdown.changed() => return,
-            connected = serve_account_stream(
+            outcome = serve_account_stream(
                 service,
                 &number,
                 &dir,
                 &mut serve_rx,
                 &mut last_contacts_sync,
                 &mut derm_guard,
-            ) => connected,
+            ) => outcome,
         };
+        // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
+        // 不退避重连；结构化上抛一次（wire additive，compat §5）。
+        if outcome == StreamOutcome::Unbound {
+            let _ = service.outbound.send(account_unbound_notification(&number));
+            return;
+        }
         // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
-        backoff_step = if connected {
+        backoff_step = if outcome == StreamOutcome::Connected {
             0
         } else {
             backoff_step.saturating_add(1)
@@ -2940,8 +3003,11 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
     maintenance.failures += 1;
 }
 
-/// 建流失败返回 false（退避步进）；流建立后结束（对端断/关停）返回
-/// true（连接成功 → 退避 reset，官方 BackOff.reset 同语义）。
+/// 建流失败返回 Recoverable（退避步进）；流建立后结束（对端断/关停/流
+/// 排空）返回 Connected（连接成功 → 退避 reset，官方 BackOff.reset 同
+/// 语义）；建流遇服务端 401 凭据拒绝（vendored
+/// `ServiceError::Unauthorized`）返回 Unbound（停环等重链，B4）。
+#[allow(clippy::too_many_lines)]
 async fn serve_account_stream(
     service: &Service,
     number: &str,
@@ -2949,15 +3015,17 @@ async fn serve_account_stream(
     shutdown: &mut watch::Receiver<bool>,
     last_contacts_sync: &mut Option<std::time::Instant>,
     derm_guard: &mut DermRetryGuard,
-) -> bool {
+) -> StreamOutcome {
     let Ok(store) = open_store(dir).await else {
-        return false;
+        return StreamOutcome::Recoverable;
     };
     let Ok(mut manager) = Manager::load_registered(store).await else {
-        return false;
+        return StreamOutcome::Recoverable;
     };
-    let Ok(mut stream) = manager.receive_messages().await else {
-        return false;
+    let mut stream = match manager.receive_messages().await {
+        Ok(stream) => stream,
+        Err(error) if receive_stream_unbound(&error) => return StreamOutcome::Unbound,
+        Err(_) => return StreamOutcome::Recoverable,
     };
     // 存量联系人/会话补同步（欠账 §10-1，官方行为对齐：signal-cli/桌面
     // 链接后同样向主设备要一轮 contacts sync）：链路建立 2s 沉降后
@@ -2976,7 +3044,7 @@ async fn serve_account_stream(
     let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return true,
+            _ = shutdown.changed() => return StreamOutcome::Connected,
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
@@ -3030,7 +3098,38 @@ async fn serve_account_stream(
                 Some(Received::Duplicate(ack)) => {
                     ack.ack();
                 }
+                // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
+                // identity 被替换（会话按新钥重建，OnNewIdentity::Trust 纪律
+                // 不动——无提示 UI 前引入阻断会破坏现有会话）。结构化上抛
+                // connector；同信封本体解密成功，照常走投影面，单次 ack。
+                Some(Received::IdentityChange(sender, content, ack)) => {
+                    let _ = service.outbound.send(identity_changed_notification(
+                        number,
+                        &sender,
+                        content.metadata.client_timestamp.timestamp_millis().max(0) as u64,
+                    ));
+                    for notification in
+                        project_content(
+                            number,
+                            manager.store(),
+                            &content,
+                            &service.terminated_groups,
+                        )
+                        .await
+                    {
+                        let _ = service.outbound.send(notification);
+                    }
+                    ack.ack();
+                }
                 Some(Received::Content(content, ack)) => {
+                    // B4 身份事件面：verified 同步下行（多设备信任态收敛）
+                    // ——sidecar 权威突变 + receive 事件投影，先于普通投影
+                    // 面（该体在 project_content 恒空投影，零冲突）。
+                    if let Some(notification) =
+                        project_verified_sync(number, manager.store(), &content, dir).await
+                    {
+                        let _ = service.outbound.send(notification);
+                    }
                     // 官方契约：解密+落库+投影完成后才 ack（Android
                     // IncomingMessageObserver.kt 事务提交后逐条 ack；
                     // SignalWebSocket.kt「处理成功后由你 ack」）。两条路
@@ -3048,10 +3147,64 @@ async fn serve_account_stream(
                     }
                     ack.ack();
                 }
-                None => return true,
+                None => return StreamOutcome::Connected,
             }
         }
     }
+}
+
+/// verified 同步下行投影（B4 身份事件面，compat §5）：多设备信任态收敛——
+/// 主设备 verify/clear 后其他链接设备同步收口。sidecar 写为权威突变
+/// （identity::apply_synced_trust，比对闸已由发起设备完成，收侧直接落态）+
+/// receive 事件投影（`syncMessage.verified`，形状镜像自发面
+/// {destinationUuid, destinationNumber?, identityKey?, state}，state = trust
+/// 词表小写）。非 verified 体返回 None 零打扰；destination/state 缺席或
+/// 归型不出（UNKNOWN/TRANSLATED）整信封跳过不落不投（宁缺勿错）。
+async fn project_verified_sync(
+    account: &str,
+    store: &SqliteStore,
+    content: &presage::libsignal_service::content::Content,
+    account_dir: &Path,
+) -> Option<Value> {
+    let presage::libsignal_service::content::ContentBody::SynchronizeMessage(sync) = &content.body
+    else {
+        return None;
+    };
+    let Some(presage::proto::sync_message::Content::Verified(verified)) = sync.content.as_ref()
+    else {
+        return None;
+    };
+    let state = identity::TrustState::from_sync_state(verified.state)?;
+    let destination = verified.parse_destination_aci()?;
+    let sid = presage::libsignal_service::protocol::ServiceId::Aci(destination);
+    let sid_string = sid.service_id_string();
+    let timestamp = content.metadata.client_timestamp.timestamp_millis().max(0) as u64;
+    identity::apply_synced_trust(account_dir, &sid_string, state, timestamp);
+    let mut verified_json = json!({
+        "destinationUuid": sid_string,
+        "state": state.word(),
+    });
+    if let Some(peer) = describe_peer(store, &sid).await {
+        if let Some(number) = peer.number {
+            verified_json["destinationNumber"] = json!(number);
+        }
+    }
+    if let Some(key) = verified.identity_key.as_ref() {
+        verified_json["identityKey"] = json!(crate::service::hex_encode(key));
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "account": account,
+            "envelope": {
+                "sourceUuid": content.metadata.sender.service_id_string(),
+                "sourceDevice": u32::from(content.metadata.sender_device),
+                "timestamp": timestamp,
+                "syncMessage": { "verified": verified_json },
+            },
+        },
+    }))
 }
 
 /// P2-A 投影边界（compat §3 receive 段）：直聊 dataMessage 全消费面
@@ -9142,5 +9295,211 @@ mod tests {
         assert_eq!(decoded.group_id.as_deref(), Some(master_key.as_slice()));
         assert_eq!(decoded.action, Some(Action::Stopped as i32));
         assert_eq!(decoded.timestamp, Some(5));
+    }
+
+    /// B4 Unbound 停环：建流错误归型——Unauthorized 两层归型面（直接
+    /// ServiceError 与 sender 再包层）判 Unbound；404 NotFound / 其他
+    /// presage 错误不误报（维持退避重连，send_error_of 同纪律）。
+    #[test]
+    fn receive_stream_unbound_classifies_unauthorized_only() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError;
+
+        let unbound = |error| assert!(receive_stream_unbound(&error));
+        let bound = |error| assert!(!receive_stream_unbound(&error));
+
+        unbound(presage::Error::ServiceError(ServiceError::Unauthorized));
+        unbound(presage::Error::MessageSenderError(Box::new(
+            MessageSenderError::ServiceError(ServiceError::Unauthorized),
+        )));
+        bound(presage::Error::ServiceError(ServiceError::NotFoundError));
+        bound(presage::Error::MessageSenderError(Box::new(
+            MessageSenderError::ServiceError(ServiceError::NotFoundError),
+        )));
+        bound(presage::Error::UnknownGroup);
+    }
+
+    /// B4 事件面形状钉定：身份钥变更 = receive 族 + envelope.identityChanged
+    /// 标记（decryptionError 同款加面纪律）；Unbound = accountUnbound 独立
+    /// method + account 参数。
+    #[test]
+    fn identity_change_and_unbound_notification_shapes() {
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+
+        let identity = identity_changed_notification("acct", &sender, 1_700_000_000_000);
+        assert_eq!(identity["jsonrpc"], "2.0");
+        assert_eq!(identity["method"], "receive");
+        assert_eq!(identity["params"]["account"], "acct");
+        let envelope = &identity["params"]["envelope"];
+        assert_eq!(
+            envelope["sourceUuid"],
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(envelope["timestamp"], 1_700_000_000_000i64);
+        assert_eq!(envelope["identityChanged"], json!({}));
+
+        let unbound = account_unbound_notification("acct");
+        assert_eq!(unbound["method"], "accountUnbound");
+        assert_eq!(unbound["params"]["account"], "acct");
+    }
+
+    /// B4 身份事件面：verified 同步 state 归型——vendored proto 三值
+    /// （DEFAULT=0/VERIFIED=1/UNVERIFIED=2）全出；缺字段/越界值归 None
+    /// （收侧跳过不落，宁缺勿错）。
+    #[test]
+    fn trust_state_from_sync_covers_pinned_proto_values() {
+        use presage::proto::verified::State;
+
+        assert_eq!(
+            identity::TrustState::from_sync_state(Some(State::Default as i32)),
+            Some(identity::TrustState::Default)
+        );
+        assert_eq!(
+            identity::TrustState::from_sync_state(Some(State::Verified as i32)),
+            Some(identity::TrustState::Verified)
+        );
+        assert_eq!(
+            identity::TrustState::from_sync_state(Some(State::Unverified as i32)),
+            Some(identity::TrustState::Unverified)
+        );
+        assert_eq!(identity::TrustState::from_sync_state(None), None);
+        assert_eq!(identity::TrustState::from_sync_state(Some(99)), None);
+    }
+
+    /// B4 verified 同步下行全链：sidecar 权威突变（首建档 + 跨态迁移保留
+    /// addedAtMs）+ receive 事件投影（destinationUuid/destinationNumber?/
+    /// identityKey/state trust 词表）；普通投影面对该体恒空投影（零冲突）；
+    /// destination 缺席整信封跳过不落不投。
+    #[tokio::test]
+    async fn verified_sync_writes_sidecar_and_projects() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::sync_message::Content as SyncContent;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-verified-sync-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = open_store(&store_dir).await.unwrap();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let verified_body = |state: presage::proto::verified::State, with_dest: bool| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                    content: Some(SyncContent::Verified(presage::proto::Verified {
+                        destination_aci_binary: with_dest.then(|| {
+                            presage::libsignal_service::prelude::Uuid::parse_str(
+                                "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                            )
+                            .expect("uuid")
+                            .into_bytes()
+                            .to_vec()
+                        }),
+                        identity_key: Some(vec![7u8; 33]),
+                        state: Some(state as i32),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
+                metadata.clone(),
+            )
+        };
+        let sidecar_state = |dir: &std::path::Path| {
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(dir.join("identity-trust.json")).expect("sidecar"),
+            )
+            .expect("json")["identities"]["6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"]
+                .clone()
+        };
+
+        // verified：sidecar 首建档 + 投影全形状。
+        let first = project_verified_sync(
+            "acct",
+            &store,
+            &verified_body(presage::proto::verified::State::Verified, true),
+            &store_dir,
+        )
+        .await
+        .expect("verified projects");
+        assert_eq!(first["method"], "receive");
+        assert_eq!(first["params"]["account"], "acct");
+        let envelope = &first["params"]["envelope"];
+        assert_eq!(
+            envelope["sourceUuid"],
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(envelope["timestamp"], 1_700_000_000_000i64);
+        let face = &envelope["syncMessage"]["verified"];
+        assert_eq!(
+            face["destinationUuid"],
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"
+        );
+        assert_eq!(face["state"], "verified");
+        assert_eq!(face["identityKey"], hex_encode(&[7u8; 33]));
+        let entry = sidecar_state(&store_dir);
+        assert_eq!(entry["state"], "verified");
+        assert_eq!(entry["addedAtMs"], 1_700_000_000_000u64);
+
+        // unverified：跨态迁移保留 addedAtMs；普通投影面恒空（零冲突）。
+        let added_before = entry["addedAtMs"].as_u64();
+        let second = project_verified_sync(
+            "acct",
+            &store,
+            &verified_body(presage::proto::verified::State::Unverified, true),
+            &store_dir,
+        )
+        .await
+        .expect("unverified projects");
+        assert_eq!(
+            second["params"]["envelope"]["syncMessage"]["verified"]["state"],
+            "unverified"
+        );
+        let entry = sidecar_state(&store_dir);
+        assert_eq!(entry["state"], "unverified");
+        assert_eq!(entry["addedAtMs"].as_u64(), added_before);
+
+        assert!(project_content(
+            "acct",
+            &store,
+            &verified_body(presage::proto::verified::State::Verified, true),
+            &groups::TerminatedGroups::new(),
+        )
+        .await
+        .is_empty());
+
+        // destination 缺席：整信封跳过不落不投。
+        assert!(project_verified_sync(
+            "acct",
+            &store,
+            &verified_body(presage::proto::verified::State::Verified, false,),
+            &store_dir
+        )
+        .await
+        .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

@@ -1,4 +1,7 @@
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use presage::{
     libsignal_service::{
@@ -27,6 +30,9 @@ use crate::error::SqlxErrorExt;
 pub struct SqliteStore {
     pub(crate) db: SqlitePool,
     pub(crate) trust_new_identities: OnNewIdentity,
+    /// KT: addresses whose stored identity was replaced (see
+    /// `Store::take_identity_changes`).
+    pub(crate) identity_changes: Arc<Mutex<Vec<String>>>,
 }
 
 impl SqliteStore {
@@ -68,6 +74,7 @@ impl SqliteStore {
         Ok(Self {
             db,
             trust_new_identities,
+            identity_changes: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -96,6 +103,15 @@ impl Store for SqliteStore {
             store: self.clone(),
             identity: IdentityType::Pni,
         }
+    }
+
+    fn take_identity_changes(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .identity_changes
+                .lock()
+                .expect("identity change log"),
+        )
     }
 }
 

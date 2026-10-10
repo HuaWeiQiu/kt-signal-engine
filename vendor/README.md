@@ -54,6 +54,14 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   门禁测试 src/service/mod.rs tests::link_uri_advertises_numberless_capabilities。
 - `src/provisioning/mod.rs`（2026-10-10 nopni2 批）— `pub use pipe::link_uri`
   （引擎侧门禁测试入口）。
+- `src/messagepipe.rs`（2026-10-11 A 止血批③）— 信封 ack 不再在 yield 即
+  回 200：`EnvelopeAck` 句柄穿 presage unfold 交消费方（解密+落库+投影
+  完成后 ack，Android IncomingMessageObserver.kt 事务提交后逐条 ack /
+  SignalWebSocket.kt「处理成功后由你 ack」同契约）；queue-empty 标记仍
+  就地 ack。
+- `src/account_manager.rs`（2026-10-11 B3 prekey 维护批）— 抽 pub
+  `publish_fresh_pre_keys`（prekey 批生成+上传复用腿）与
+  `rotate_signed_pre_key_bundle`（signed prekey 按龄轮换上传腿）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -62,15 +70,50 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   StoryMessage、不落 store、不产 transcript，官方 profileKey 必需 + story
   不进本地 timeline 同口径）；②`send_message`/`send_message_to_group`
   两处 Metadata 字面量补 `story: None`（E2 字段新增的编译面，出站消息
-  story 位恒无）。
+  story 位恒无）；③（A③）接收 unfold 落库前 store 判重
+  （thread_for_sender_and_timestamp 命中 → `Received::Duplicate` 仅 ack）
+  + ack 时序改造（EnvelopeAck 交消费方）；④（A③/B1）解密失败不再静默
+  ——`Received::DecryptionError` 上抛 + DERM 分档（回发
+  DecryptionErrorMessage / 收重试请求按原始时间戳重发，找不到/超龄/超限
+  clear_sessions 重建，防环计数 5 + 14 天新鲜度）；⑤（A⑤）
+  `refresh_sender_certificate` + pub `unidentified_access_or_identified`
+  （证书预轮换与发送 identified 保险丝）；⑥（B2）发送前刷群态
+  （typing 免刷、取态失败 fail-open）+ `GroupSendOutcomes` 逐成员返回面
+  + announcements-only 发送闸；⑦（B3）`refresh_pre_keys`/
+  `rotate_signed_pre_keys`（2 天书签水位巡检 + 按龄轮换，kv 跨重启）；
+  ⑧（B4）身份变更日志 drain（`take_identity_changes` 逐信封）+
+  `Received::IdentityChange` 发射；接收流 refresh task **停发
+  AccountAttributes PUT**（上游硬编码 `discoverable_by_phone_number: true`
+  每次开流回写 = 隐私回写根因；pre-keys 注册腿保留；`set_account_attributes`
+  删除）——官方 Signal-Desktop 链接设备从不 PUT attributes。
 - `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
-  `story: None`（E2，同上纯编译面）。
+  `story: None`（E2，同上纯编译面）；（B4）`Store::take_identity_changes`
+  默认空实现（身份变更日志 drain 面，其他 store 无感）。
+- `presage/src/model/messages.rs` — ①（A③/B1）`Received::DecryptionError`
+  变体 + `DecryptionFailure{RetryReceipt, RetryRequest}`；②（A③）
+  `Received::Duplicate` 变体；③（B4）`Received::IdentityChange(ServiceId,
+  Box<Content>, EnvelopeAck)` 变体（本体随信封照常投影、单次 ack）。
+- `presage/src/manager/mod.rs` — ①（A⑤）`pub use
+  unidentified_access_or_identified`；②（B2）`pub use group_member_is_admin,
+  group_refresh_needed`（群发送语义纯函数）。
+- `presage/src/model/groups.rs` —（B2）`Group` serde 加
+  `announcements_only`（缺省 false，官方群态位）。
+- `presage/src/errors.rs` —（B2）`GroupAnnouncementsOnly` 错误臂。
 
 `vendor/presage/presage-store-sqlite/`：
 
 - `src/content.rs` — Metadata 解构模式补 `story: _`（E2：story 位不落库
   ——收侧 story 本就不存库，普通消息位恒 None）。
-- `src/data.rs` — Metadata 重放构造填 `story: None`（E2，同上）。
+- `src/data.rs` — Metadata 重放构造填 `story: None`（E2，同上）；
+  （B2）群发送语义数据面（announcements-only/成员角色读出）。
+- `src/content.rs`（2026-10-11 B1/B3 追加）— ①DERM 找回面（按发送方+
+  原始时间戳查已发消息、群成员名单读面）；②`kt_kv_get`/`kt_kv_set`
+  （引擎自有 kv 位，prekey 维护书签跨重启）。
+- `src/protocol.rs`（2026-10-11 B4）— `save_identity` ReplacedExisting 时
+  入身份变更日志（`Store::take_identity_changes` 数据源，接收流逐信封
+  drain）。
+- `src/lib.rs`（2026-10-11 B4）— `SqliteStore` 身份变更日志字段与
+  `take_identity_changes` 覆盖（Arc 共享，clone 语义不变）。
 
 ## 更新纪律
 

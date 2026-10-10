@@ -56,6 +56,17 @@ impl TrustState {
             Self::Default => presage::proto::verified::State::Default,
         }
     }
+
+    /// 收向 verified 同步的 state 归型（B4 身份事件面）：UNKNOWN/TRANSLATED
+    /// 等无 sidecar 语义的值归 None（收侧跳过不落）。
+    pub(crate) fn from_sync_state(raw: Option<i32>) -> Option<Self> {
+        match presage::proto::verified::State::try_from(raw?) {
+            Ok(presage::proto::verified::State::Verified) => Some(Self::Verified),
+            Ok(presage::proto::verified::State::Unverified) => Some(Self::Unverified),
+            Ok(presage::proto::verified::State::Default) => Some(Self::Default),
+            _ => None,
+        }
+    }
 }
 
 /// 读投影 trustLevel 词：sidecar `verified` → TRUSTED_VERIFIED、
@@ -375,6 +386,22 @@ pub(crate) async fn write_trust<K: IdentityKeyStore>(
         peer_key: peer_key.serialize().into_vec(),
         state,
     })
+}
+
+/// 收向 verified 同步落 sidecar（B4 身份事件面）：多设备信任态收敛——
+/// 主设备 verify/clear 后其他链接设备同步收口。比对闸已由发起设备完成，
+/// 收侧直接落态（write_trust 的 SetState 臂同型，免对端 identity 依赖）；
+/// addedAtMs 跨态迁移保留（首次建档 = now）。
+pub(crate) fn apply_synced_trust(
+    account_dir: &Path,
+    sid: &str,
+    state: TrustState,
+    now: u64,
+) -> bool {
+    let added_at = sidecar_entry(account_dir, sid)
+        .map(|(_, added)| added)
+        .unwrap_or(now);
+    save_trust_state(account_dir, sid, state, added_at, now)
 }
 
 #[cfg(test)]

@@ -119,10 +119,11 @@ mod tests {
 
     #[test]
     fn device_capabilities_bits_match_vendor_chain() {
-        for rel in [
-            "vendor/presage/presage/src/manager/registered.rs",
-            "vendor/presage/presage/src/manager/confirmation.rs",
-        ] {
+        // B4 身份事件面批：接收流 refresh task 停发 AccountAttributes PUT
+        // （vendored registered.rs 构造点已删除），vendor 唯一剩余构造点 =
+        // 主设备注册路径（confirmation.rs，引擎链接设备不走的协议必需腿），
+        // 镜像仍以它为能力位真相源。
+        for rel in ["vendor/presage/presage/src/manager/confirmation.rs"] {
             let block = construction_block(
                 &vendor_source(rel),
                 "capabilities: Some(DeviceCapabilities {",

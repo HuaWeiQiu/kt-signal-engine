@@ -13,7 +13,6 @@ use libsignal_service::{
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
-    encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
@@ -38,7 +37,7 @@ use libsignal_service::{
     utils::TryIntoE164,
     websocket::{
         self,
-        account::{AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse},
+        account::{DeviceInfo, WhoAmIResponse},
         SignalWebSocket,
     },
     zkgroup::{
@@ -615,21 +614,20 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         let store_inner = self.store.clone();
-        let registration_data_inner = self.registration_data().clone();
 
-        // We make a task to update the account attributes and refresh pre keys as needed that will
-        // only yield a value if one of the two operations fail (stop signal).
+        // We make a task to refresh pre keys as needed that will only yield a
+        // value if the operation fails (stop signal).
         //
         // This is necessary because in this context, we can't do the classic tokio::spawn with a
         // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
+        //
+        // KT: unlike upstream, this deliberately does NOT put account
+        // attributes. Linked devices must not PUT attributes: the server
+        // merges the payload with the primary's real settings and
+        // `discoverable_by_phone_number` hard-coded `true` here would
+        // silently flip the account's discoverability privacy setting.
+        // Official Signal-Desktop linked devices never PUT attributes.
         let refresh_registration_task = async move {
-            if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
-                    .await
-            {
-                error!(%error, "failed to set account attributes, this is problematic and should never happen!");
-            }
-
             if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
                 error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
             }
@@ -690,6 +688,12 @@ impl<S: Store> Manager<S, Registered> {
                                     }
                                 }
                             };
+                            // KT (identity change): the decryption above may
+                            // have replaced a stored identity (session
+                            // re-established on a changed key). Drain the
+                            // change log once per envelope; matched against
+                            // the sender below.
+                            let identity_changes = state.store.take_identity_changes();
                             match envelope {
                                 Ok(Some(content)) => {
                                     if let ContentBody::DecryptionErrorMessage(e) = &content.body {
@@ -1015,6 +1019,27 @@ impl<S: Store> Manager<S, Registered> {
                                     .await
                                     {
                                         error!(%error, "error saving message to store");
+                                    }
+
+                                    // KT (identity change): this envelope
+                                    // decrypted on a freshly replaced stored
+                                    // identity — surface the change and let
+                                    // the consumer project the message from
+                                    // the same item (single ack contract).
+                                    if identity_changes
+                                        .iter()
+                                        .any(|name| {
+                                            *name == content.metadata.sender.service_id_string()
+                                        })
+                                    {
+                                        return Some((
+                                            Received::IdentityChange(
+                                                content.metadata.sender.clone(),
+                                                Box::new(content),
+                                                ack,
+                                            ),
+                                            state,
+                                        ));
                                     }
 
                                     return Some((
@@ -2281,55 +2306,6 @@ async fn upsert_contact_from_profile<S: Store>(
             debug!("not storing profile for PNI contact");
         }
     }
-    Ok(())
-}
-
-async fn set_account_attributes<S: Store>(
-    account_manager: &mut AccountManager,
-    store: &S,
-    data: &RegistrationData,
-) -> Result<(), Error<S::Error>> {
-    trace!("setting account attributes");
-
-    let pni_registration_id = data.pni_registration_id.ok_or(Error::RelinkNecessary)?;
-
-    let name = if let Some(device_name) = data.device_name() {
-        let aci_key_pair = store.aci_protocol_store().get_identity_key_pair().await?;
-        let mut rng = rng();
-        Some(encrypt_device_name(
-            &mut rng,
-            device_name,
-            aci_key_pair.identity_key(),
-        )?)
-    } else {
-        None
-    };
-
-    account_manager
-        .set_account_attributes(AccountAttributes {
-            fetches_messages: true,
-            registration_id: data.registration_id,
-            pni_registration_id,
-            name,
-            registration_lock: None,
-            unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
-            unrestricted_unidentified_access: false,
-            capabilities: Some(DeviceCapabilities {
-                storage: true,
-                transfer: false,
-                attachment_backfill: false,
-                spqr: true,
-                profiles_v2: false,
-                username_change_sync_message: true,
-            }),
-            discoverable_by_phone_number: true,
-            recovery_password: None,
-            video: false,
-            voice: false,
-        })
-        .await?;
-
-    trace!("done setting account attributes");
     Ok(())
 }
 

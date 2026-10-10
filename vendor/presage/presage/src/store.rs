@@ -386,6 +386,14 @@ pub trait Store:
     fn aci_protocol_store(&self) -> Self::AciStore;
 
     fn pni_protocol_store(&self) -> Self::PniStore;
+
+    /// KT: take the addresses whose stored identity was replaced since the
+    /// previous call. The protocol layer records replacements while
+    /// processing sessions; the receive loop drains once per decrypted
+    /// envelope to surface identity-key changes.
+    fn take_identity_changes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A thread specifies where a message was sent, either to or from a contact or in a group.

@@ -40,4 +40,10 @@ pub enum Received {
     /// Incoming decrypted message with metadata and content, stored before
     /// yielding. The consumer acks after projecting the message.
     Content(Box<Content>, EnvelopeAck),
+
+    /// KT: the stored identity for the sender was replaced while decrypting
+    /// this envelope (session re-established on a changed key). The message
+    /// itself decrypted and is carried through unchanged: consumers project
+    /// it exactly like `Content`, ack once, and may surface the change.
+    IdentityChange(ServiceId, Box<Content>, EnvelopeAck),
 }

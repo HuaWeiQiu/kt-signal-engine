@@ -377,8 +377,15 @@ P5 扩面差异（2026-10-04，贴纸包安装状态 Storage Service 同步）�
   同语义）。同步发送失败不回滚、不报错（signal-cli trustIdentity 对
   sendVerifiedMessage 返回值不消费——store 写为权威突变，多设备收敛由
   下次 listIdentities 读面兜底）。
-- **receive 侧**：`syncMessage.verified` 下行投影本批不做（多设备信任态
-  下行收敛另行立项；读面 listIdentities 恒以引擎 sidecar 为准）。
+- **receive 侧**（2026-10-11 B 批身份事件面补齐）：`syncMessage.verified`
+  下行投影已做——主设备 verify/clear 后其他链接设备同步收口（官方多设备
+  信任态收敛）：sidecar 写为权威突变（`identity-trust.json`，比对闸已由
+  发起设备完成，收侧直接落态，addedAtMs 跨态迁移保留）+ receive 事件投影
+  `syncMessage.verified{destinationUuid, destinationNumber?, identityKey?,
+  state}`（state = trust 词表小写 `verified\|unverified\|default`，镜像
+  自发面；destinationAci/Binary 双形态解析，identityKey = 对端 key 33B
+  hex）；destination 或 state 缺席整信封跳过不落不投（宁缺勿错）。读面
+  listIdentities 恒以引擎 sidecar 为准不变。
 
 Storage 跨设备同步批差异（2026-10-08，chatFolders/notificationProfiles 记录面）：
 
@@ -2087,6 +2094,38 @@ announcements-only 客户端闸；群态完全取不到时维持 UnknownGroup �
 - **边界**：send 群形态以外的方法 results 面不变（仍 `{}` 无 results 键）；
   fake 模式群发送仍早退空 results；wire 仅 additive（results 填充 + 新
   错误码），既有键与错误码零改动。
+
+### 身份事件面 + Unbound 停环（2026-10-11 B 批，官方对齐 P8）
+
+B 批身份/凭据两事件面，全部 wire additive：既有方法与字段零改动，
+connector 白名单投影不消费则零影响。
+
+- **身份钥变更事件**：vendored presage 协议层在会话处理中替换既有
+  identity（`save_identity` ReplacedExisting）时记入 store 变更日志
+  （`Store::take_identity_changes`，trait 默认空实现，SqliteStore 覆盖）；
+  接收流逐信封 drain，命中当前发送方 → `Received::IdentityChange(sender,
+  content, ack)` 上抛引擎。本体消息解密成功照常投影，单次 ack（Content
+  同契约）。引擎事件面：`{method: "receive", params: {account, envelope:
+  {sourceUuid, timestamp, identityChanged: {}}}}`（解密失败 decryptionError
+  同款加面纪律）。信任判定本批不动（OnNewIdentity::Trust，无提示 UI 前
+  引入阻断会破坏现有会话）——事件仅为投影，强制闸待桌面批。
+- **verified 同步下行**：主设备 verify/clear 后其他链接设备收敛（官方
+  桌面 consumeVerifiedSync 同语义）——sidecar 权威突变 + receive 事件
+  `envelope.syncMessage.verified{destinationUuid, destinationNumber?,
+  identityKey?, state}`（详见 §5 安全码引擎面块 receive 侧条目）。
+- **Unbound 停环**：接收流建流遇 `ServiceError::Unauthorized`（401/403
+  同归型，send 链凭据失效归一批同型）→ 接收循环停止（官方链接设备语义：
+  凭据失效即停等重链，不无限退避重连），上抛一次
+  `{method: "accountUnbound", params: {account}}`。恢复路径 = 重链
+  （finishLink/deleteLocalAccountData 生命周期），无进程内自愈——服务端
+  凭据不可原址复活。send 链 `SendError::Unbound` 归型不变。
+- **AccountAttributes PUT 停发（vendored）**：接收流 refresh task 不再
+  PUT account attributes（上游 presage 每次开流硬编码
+  `discoverable_by_phone_number: true` 回写——A⑦隐私回写根因，服务器端
+  primitive 缺省 true 下缺字段≠不改，Option None 无效，A 批⑦证伪改道的
+  彻底修法）；pre-keys 注册腿保留。主设备注册路径（presage
+  confirmation.rs 的 register_account PUT）不动——协议必需且引擎账号全为
+  链接设备。官方 Signal-Desktop 链接设备从不 PUT attributes，同语义。
 
 ### 发送链凭据失效归一（SendError::Unbound，2026-10-10 批）
 
