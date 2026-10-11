@@ -3270,6 +3270,17 @@ fn decryption_error_notification(
 /// 族同构，envelope 级 `identityChanged` 标记（解密失败 decryptionError
 /// 同款加面纪律）。信任判定不动（OnNewIdentity::Trust），事件仅为投影；
 /// 触发该事件的本体消息照常随信封投影。
+/// 排空通知（时序审计 G3，compat §3）：服务器历史队列排空（官方
+/// ApiEmptyQueue→EmptyEvent 同位），`receive.emptied` 语义 per-account
+/// additive 上抛；引擎只报态，消费方（连接器/desktop）自定后续。
+fn queue_emptied_notification(account: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive.emptied",
+        "params": { "account": account },
+    })
+}
+
 fn identity_changed_notification(account: &str, sender: &ServiceId, timestamp: u64) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -3755,8 +3766,12 @@ async fn serve_account_stream(
             item = stream.next() => {
                 match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
-                // messagepipe 层已就地 ack）。
-                Some(Received::QueueEmpty) => {}
+                // messagepipe 层已就地 ack）。G3：排空态 additive 上抛
+                // （官方 ApiEmptyQueue→EmptyEvent 同位；引擎只报态，连接
+                // 器/desktop 消费自定）。
+                Some(Received::QueueEmpty) => {
+                    service.notify(queue_emptied_notification(number));
+                }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
                 // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
                 // ContactSync 载体，fork 登记 vendor/README.md），投影 receive
@@ -12778,6 +12793,17 @@ mod tests {
             json!("11111111-2222-4333-8444-555555555555")
         );
         assert_eq!(envelope["decryptionError"], json!({}));
+    }
+
+    /// G3 排空通知形状面：`receive.emptied` 独立方法（非 envelope 载体——
+    /// 排空是流态事件，无信封可挂），per-account 单键 params。
+    #[test]
+    fn queue_emptied_notification_shape_is_additive_stream_face() {
+        let notification = queue_emptied_notification("acct");
+        assert_eq!(notification["jsonrpc"], json!("2.0"));
+        assert_eq!(notification["method"], json!("receive.emptied"));
+        assert_eq!(notification["params"]["account"], json!("acct"));
+        assert!(notification["params"].get("envelope").is_none());
     }
 
     /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内

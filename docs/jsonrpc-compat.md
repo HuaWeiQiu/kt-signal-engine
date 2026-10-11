@@ -3380,6 +3380,35 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   声明面，与此请求消费面无关，勿混淆）。后续若 connector 提出媒体回填
   消费需求再立项。
 
+### P15b 批（2026-10-11，时序自愈审计 + 状态收敛审计落地窗，wire additive）
+
+- **项1 ack durability 收口（时序审计 G1，engine 内闭环，wire 零变化）**：
+  receive 管线四个投影臂（Content/Contacts/IdentityChange/DecryptionError）
+  的 ack 从「投影入队即 ack」后移到「投影已写进 stdout 并 flush（连接器
+  至少收到字节）」——出站帧协议 Notice + Flush 背压栅栏（engine 内部，非
+  wire）。此前 presage 已落库、连接器未收到的窗口内引擎死亡（watchdog/
+  链式重启/OOM）时服务器队列已耗、连接器永不收到，且重启重放被 presage
+  重放闸吞成 Duplicate——该批消息永久丢失。栅栏不可解（stdout 死）→ 不
+  ack + 接收管线停环（StdioDead，不退避——重连会把重投信封喂进 Duplicate
+  就地 ack 吞掉），信封留服务器队列待连接器重启引擎后全量重放补投影。
+  连接器侧语义：receive 通知到达即「引擎已尽力投递」，ack 时序对 wire 面
+  零感知；背压上收（连接器读得慢 ack 就慢，服务器侧流控自然生效）。
+- **项3 dedup 门 thread scoping（时序审计组二#4，vendored presage，fork
+  登记 vendor/README.md）**：接收重放闸 `(sender, client_timestamp)` 从
+  跨 thread 全局判重改为同 thread 才抑制（`is_thread_scoped_redelivery`
+  + `Thread::try_from(&content)` 入向线程推导比对；入向线程推不出保守沿
+  用旧全局抑制；批内 batch_seen 键同步加 thread 维度）——同 sender 同毫
+  秒发两条到两个群，第二条不再被吞。store trait 与 store-sqlite SQL 零
+  改动（查询本就返回 Thread，比对上收调用方）。
+- **项7 QueueEmpty 排空上抛（时序审计 G3，wire additive）**：接收流历史
+  队列排空标记此前为 no-op，现上抛 per-account 通知
+  `{method: "receive.emptied", params: {account}}`（官方 ApiEmptyQueue→
+  EmptyEvent 同位：MessageReceiver 收空队列即 dispatch empty 事件）。独立
+  方法名非 envelope 载体——排空是流态事件，无信封可挂（accountUnbound
+  同款加面纪律）。引擎只报态；连接器/desktop 消费自定（如启动期「积压
+  回放完成」推进度旗标）。每轮排空都投（服务器每次报空即一次），消费方
+  幂等自便。
+
 
 ## 6. fake 服务模式（仅测试）
 
