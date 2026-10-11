@@ -5203,6 +5203,60 @@ fn engine_protocol_capabilities_self_report_shape() {
     assert_shape(&fake_engine.request("engine.protocolCapabilities", json!({}))["result"]);
 }
 
+/// engine.perfMetrics（S2a 性能基线打点层，KT 扩展方法）：进程内指标快照
+/// 只读投影——零参数、账号无关、零网络；`{uptimeMs, timings, counters,
+/// unknownKeyDropped}` 四键恒在；`rpc_dispatch` 计时随请求数单调（respond
+/// 分派咽喉每笔请求后落点，快照构建先于本笔落点）；读面不落调度日志。
+#[test]
+fn engine_perf_metrics_snapshot_shape() {
+    let assert_shape = |result: &Value| {
+        let obj = result.as_object().expect("result object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>().as_slice(),
+            ["counters", "timings", "unknownKeyDropped", "uptimeMs"]
+        );
+        assert!(obj["uptimeMs"].is_u64(), "uptimeMs u64");
+        assert!(obj["timings"].is_object(), "timings object");
+        assert!(obj["counters"].is_object(), "counters object");
+        assert_eq!(obj["unknownKeyDropped"], json!(0));
+    };
+
+    // real 模式 + 全新数据目录：账号无关可应答（未绑定账号边界）；
+    // rpc_dispatch 计时随请求单调——首笔快照时自身尚未落点（快照构建
+    // 先于分派落点），此后每笔请求恰 +1。
+    let real_dir = temp_dir("perf-metrics-real");
+    let mut engine = Engine::spawn(&real_dir);
+    let first = engine.request("engine.perfMetrics", json!({}))["result"].clone();
+    assert_shape(&first);
+    assert!(
+        first["timings"].get("rpc_dispatch").is_none(),
+        "首笔快照时自身尚未落点"
+    );
+    engine.request("engine.protocolCapabilities", json!({}));
+    let second = engine.request("engine.perfMetrics", json!({}))["result"].clone();
+    assert_shape(&second);
+    let dispatch = &second["timings"]["rpc_dispatch"];
+    assert_eq!(dispatch["count"], 2, "两笔先于本笔的请求各落一点");
+    assert!(
+        dispatch["totalUs"].as_u64().unwrap_or(0) > 0,
+        "totalUs 为正"
+    );
+    assert!(
+        dispatch["maxUs"].as_u64().unwrap_or(0) >= dispatch["lastUs"].as_u64().unwrap_or(0),
+        "maxUs ≥ lastUs 序列自洽"
+    );
+    drop(engine);
+    assert!(
+        !real_dir.join("engine-send-log.jsonl").exists(),
+        "read-only face must not write the dispatch log"
+    );
+
+    // fake 模式：同码路真实答（形状逐键一致）。
+    let fake_dir = temp_dir("perf-metrics-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    assert_shape(&fake_engine.request("engine.perfMetrics", json!({}))["result"]);
+}
+
 /// engine.deviceCapabilities（D5 设备面能力注册，KT 扩展方法）：fake 模式
 /// 恒已注册（getUserStatus 同款，不触网）回读上传面；real 模式未知账号
 /// -32603 折叠（open_registered 未命中，解绑判定只属 401）。不落调度日志。

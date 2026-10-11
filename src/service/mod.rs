@@ -54,6 +54,9 @@ pub(crate) mod group_cache;
 pub(crate) mod group_link;
 pub(crate) mod groups;
 pub(crate) mod identity;
+/// S2a 性能基线打点层（只测不改）：进程内有界指标注册表 + `engine.perfMetrics`
+/// 只读投影。零 stderr、零行为语义、词表封闭（模块头注载纪律）。
+pub(crate) mod perf_metrics;
 pub(crate) mod prekey;
 pub(crate) mod profile;
 pub(crate) mod report;
@@ -1070,7 +1073,20 @@ impl Service {
     /// 退出/通道关闭）——调用方据此放弃 ack，让服务器队列保留信封待重启
     /// 重放，连接器侧永不缺投影。
     pub(crate) async fn flush_barrier(&self) -> bool {
-        crate::outbound_flush_barrier(&self.outbound).await
+        let started = std::time::Instant::now();
+        let resolved = crate::outbound_flush_barrier(&self.outbound).await;
+        // S2a 打点：栅栏时长 + 成败计数（O3 flush_barrier 批量化候选的
+        // 基线测量面；只测不改，语义零变化）。
+        perf_metrics::record_us(
+            perf_metrics::keys::FLUSH_BARRIER,
+            started.elapsed().as_micros() as u64,
+        );
+        if resolved {
+            perf_metrics::add(perf_metrics::keys::FLUSH_BARRIER_OK, 1);
+        } else {
+            perf_metrics::add(perf_metrics::keys::FLUSH_BARRIER_DEAD, 1);
+        }
+        resolved
     }
 
     /// 启动时为每个真实账号拉起接收管线（`--receive-mode on-start` 语义）。
@@ -4487,6 +4503,7 @@ async fn receive_pipeline(
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
         // 不退避重连；结构化上抛一次（wire additive，compat §5）。
         if outcome == StreamOutcome::Unbound {
+            perf_metrics::add(perf_metrics::keys::STREAM_UNBOUND, 1);
             service.notify(account_unbound_notification(&number));
             return;
         }
@@ -4494,15 +4511,23 @@ async fn receive_pipeline(
         // 投影永不可达。停管线不退避——重连只会把重投信封喂进 Duplicate
         // 就地 ack 吞掉；信封留服务器队列，连接器重启引擎后全量重放补投影。
         if outcome == StreamOutcome::StdioDead {
+            perf_metrics::add(perf_metrics::keys::STREAM_STDIO_DEAD, 1);
             return;
         }
         // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
         backoff_step = if outcome == StreamOutcome::Connected {
+            perf_metrics::add(perf_metrics::keys::STREAM_CONNECTED, 1);
             0
         } else {
+            perf_metrics::add(perf_metrics::keys::STREAM_RECOVERABLE, 1);
             backoff_step.saturating_add(1)
         };
         let delay = reconnect_jittered_delay(reconnect_backoff_delay(backoff_step));
+        // S2a 打点：退避实际等待落地值（P12 2c' 退避链观测面）。
+        perf_metrics::record_us(
+            perf_metrics::keys::RECONNECT_BACKOFF,
+            delay.as_micros() as u64,
+        );
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(delay) => {}
@@ -4671,7 +4696,13 @@ async fn serve_account_stream(
                     // 链接完成 sync 上行三请求（P15c 项4）：官方
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
+                    let sync_started = std::time::Instant::now();
                     send_initial_sync_requests(&mut manager).await;
+                    // S2a 打点：存量补同步三请求耗时（一次性面基线）。
+                    perf_metrics::record_us(
+                        perf_metrics::keys::INITIAL_SYNC_REQUESTS,
+                        sync_started.elapsed().as_micros() as u64,
+                    );
                     *last_contacts_sync = Some(std::time::Instant::now());
                 }
             }, if sync_pending.is_some() => {
@@ -4699,6 +4730,8 @@ async fn serve_account_stream(
             }, if quick_at.is_some() => {
                 let now = prekey::now_ms();
                 if prekey::quick_check_due(quick_last_ms, now) {
+                    // S2a 打点：快速巡检触发源计数（时间拍）。
+                    perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_TIME_TRIGGER, 1);
                     prekey::quick_check(&mut manager).await;
                 }
                 quick_last_ms = Some(now);
@@ -4721,12 +4754,15 @@ async fn serve_account_stream(
                 }
             }
             item = stream.next() => {
+                // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
+                let envelope_started = std::time::Instant::now();
                 match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
                 // messagepipe 层已就地 ack）。G3：排空态 additive 上抛
                 // （官方 ApiEmptyQueue→EmptyEvent 同位；引擎只报态，连接
                 // 器/desktop 消费自定）。
                 Some(Received::QueueEmpty) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_QUEUE_EMPTY, 1);
                     service.notify(queue_emptied_notification(number));
                 }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
@@ -4735,6 +4771,7 @@ async fn serve_account_stream(
                 // 事件供 connector upsert 自有库（官方 contactSync 消费同位）。
                 // G1：ack 前等 flush 栅栏（投影可达连接器才耗服务器队列）。
                 Some(Received::Contacts(sync, ack)) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
                     for notification in project_contacts_sync(number, &sync) {
                         service.notify(notification);
@@ -4742,6 +4779,10 @@ async fn serve_account_stream(
                     if !service.flush_barrier().await {
                         return StreamOutcome::StdioDead;
                     }
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                     ack.ack();
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
@@ -4752,6 +4793,7 @@ async fn serve_account_stream(
                 // （超限早退 / archive-on-match / 找回重发 / 兜底）处理。
                 // 全链路失败静默，绝不影响 ack。
                 Some(Received::DecryptionError(sender, timestamp, failure, ack)) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DECRYPTION_ERROR, 1);
                     service.notify(decryption_error_notification(number, &sender, timestamp));
                     if !service.flush_barrier().await {
                         return StreamOutcome::StdioDead;
@@ -4760,11 +4802,20 @@ async fn serve_account_stream(
                         derm_handle(&mut manager, sender, failure, derm_guard).await;
                     }
                     quick_seen += 1;
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                     ack.ack();
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
                 Some(Received::Duplicate(ack)) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DUPLICATE, 1);
                     quick_seen += 1;
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                     ack.ack();
                 }
                 // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
@@ -4777,6 +4828,7 @@ async fn serve_account_stream(
                 // fail-open（闸缺位不阻断主收发，compat §5 如实登记）。
                 // 确认钩子 = trust 写面（verified / state:"default" 清标）。
                 Some(Received::IdentityChange(sender, content, ack)) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_IDENTITY_CHANGE, 1);
                     let sid_string = sender.service_id_string();
                     let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
                     // P15b 项8：偏移观测（IdentityChange 臂同 Content 臂）。
@@ -4806,9 +4858,15 @@ async fn serve_account_stream(
                         return StreamOutcome::StdioDead;
                     }
                     quick_seen += 1;
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
+                    // S2a 打点：Content 臂信封计数。
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTENT, 1);
                     // P15b 项8 时钟偏移闸：服务器时间戳 vs 本地钟（边缘触发
                     // 告警上抛，不拒信封不停车，§5 偏差登记）。
                     skew_gate.observe(
@@ -4864,6 +4922,10 @@ async fn serve_account_stream(
                         }
                     }
                     quick_seen += 1;
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                     ack.ack();
                 }
                     None => return StreamOutcome::Connected,
@@ -4872,6 +4934,8 @@ async fn serve_account_stream(
                 // 一次，计数与时间臂计时器同复位（含解密失败/重复投递——
                 // 服务器侧取信封同样消耗一次性 prekey）。
                 if prekey::quick_check_volume_due(std::mem::replace(&mut quick_seen, 0)) {
+                    // S2a 打点：快速巡检触发源计数（量拍）。
+                    perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_VOLUME_TRIGGER, 1);
                     prekey::quick_check(&mut manager).await;
                     quick_last_ms = Some(prekey::now_ms());
                     quick_at = Some(
@@ -4956,7 +5020,24 @@ async fn project_verified_sync(
 /// §4.19/§4.20），作者号字段在 contacts 命中时给 E.164，未命中给 ACI 字符串。
 /// 返回通知向量（可空：群终止/群更新事件可能替换/追加普通投影；调用方
 /// 逐条外发）。
+/// S2a 打点薄壳：投影阶段时长（RECEIVE_PROJECT；函数体在
+/// [`project_content_inner`] 原样未动——只测不改，控制流零变化）。
 async fn project_content(
+    account: &str,
+    store: &SqliteStore,
+    content: &presage::libsignal_service::content::Content,
+    terminated_groups: &groups::TerminatedGroups,
+) -> Vec<Value> {
+    let started = std::time::Instant::now();
+    let projected = project_content_inner(account, store, content, terminated_groups).await;
+    perf_metrics::record_us(
+        perf_metrics::keys::RECEIVE_PROJECT,
+        started.elapsed().as_micros() as u64,
+    );
+    projected
+}
+
+async fn project_content_inner(
     account: &str,
     store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
@@ -8052,7 +8133,14 @@ async fn dispatch_group(
 ) -> Result<GroupSendOutcomes, SendError> {
     // C 批提速：sender-key + 单请求 MRM 主路径；目标过少/MRM 链路不可用
     // 时内部 failover 回 vendored 逐收件人路径（官方合法 fallback）。
-    group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp).await
+    let started = std::time::Instant::now();
+    let sent = group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp).await;
+    // S2a 打点：群发送整体耗时（MRM/failover 汇总咽喉；P12 #11 观测面）。
+    perf_metrics::record_us(
+        perf_metrics::keys::SEND_GROUP_TOTAL,
+        started.elapsed().as_micros() as u64,
+    );
+    sent
 }
 
 /// contacts 的 uuid 字符串 → E.164 映射（群组成员/作者号批量解析共用）。
@@ -8581,8 +8669,14 @@ async fn open_registered(service: &Arc<Service>, account: &str) -> Option<Shared
 async fn lock_registered_for_send(
     shared: &SharedSendManager,
 ) -> AsyncMutexGuard<'_, Manager<SqliteStore, Registered>> {
+    let started = std::time::Instant::now();
     let mut manager = shared.lock().await;
     prekey::send_gate(&mut manager).await;
+    // S2a 打点：常驻发送链锁等待（含 send_gate 按龄轮换；P12 #1 观测面）。
+    perf_metrics::record_us(
+        perf_metrics::keys::SEND_LOCK_WAIT,
+        started.elapsed().as_micros() as u64,
+    );
     manager
 }
 

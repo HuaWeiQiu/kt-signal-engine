@@ -320,6 +320,8 @@ pub(crate) async fn dispatch_group_message(
     // —— 单请求发送 + 409/410 修复循环（每轮重枚举会话设备面并重加密：
     // 修复轮删除/重建会话后，载荷的 per-device 目标集必须跟着变）——
     let mut rounds = 0usize;
+    // S2a 打点：MRM 主路径计数（修复环前即 MRM 链路已锁定）。
+    super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_MRM, 1);
     let unregistered: Vec<ServiceId> = loop {
         let Some(endorsement) = endorsement_bytes.clone() else {
             return failover(manager, &master_key, body, timestamp).await;
@@ -407,6 +409,8 @@ pub(crate) async fn dispatch_group_message(
             Ok(response) => break response.unregistered_ids,
             Err(MrmSendFailure::Mismatched(accounts)) => {
                 rounds += 1;
+                // S2a 打点：409/410 修复轮计数（每轮一次）。
+                super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_REPAIR_ROUND, 1);
                 if rounds > MRM_REPAIR_ROUNDS {
                     return failover(manager, &master_key, body, timestamp).await;
                 }
@@ -493,6 +497,8 @@ async fn failover(
     body: DataMessage,
     timestamp: u64,
 ) -> Result<GroupSendOutcomes, SendError> {
+    // S2a 打点：vendored 逐收件人 failover 路径计数（官方合法 fallback）。
+    super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_FAILOVER, 1);
     manager
         .send_message_to_group(master_key, ContentBody::DataMessage(body), timestamp)
         .await

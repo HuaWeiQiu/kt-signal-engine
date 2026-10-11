@@ -188,6 +188,7 @@ pub(crate) fn rotation_due(
 /// 2 天 maintenance 节律，判龄挂 30min 快拍保证实际龄不漂过 2 天）。
 /// 全链路 best-effort：失败静默，只影响本轮，下一拍时间/量触发再补。
 pub(crate) async fn quick_check(manager: &mut Manager<SqliteStore, Registered>) {
+    let started = std::time::Instant::now();
     let _ = manager.refresh_pre_keys().await;
     let now = now_ms();
     let signed = oldest_signed_pre_key_created_at(manager.store()).await;
@@ -195,6 +196,11 @@ pub(crate) async fn quick_check(manager: &mut Manager<SqliteStore, Registered>) 
     if rotation_due(signed, last_resort, now) {
         let _ = manager.rotate_signed_pre_keys().await;
     }
+    // S2a 打点：快巡检耗时（P12 #8 节律基线；尾部单点，控制流零变化）。
+    super::perf_metrics::record_us(
+        super::perf_metrics::keys::PREKEY_QUICK_CHECK,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// 保留窗判删（纯函数）：按 created-at 升序取最旧 `keep_newest` 窗外的
@@ -271,6 +277,7 @@ async fn fetch_message_queue_time_seconds(
 /// 的键（含当前在役 signed/last-resort）恒存活。全链路 best-effort：
 /// 读/删失败静默，下轮节律再扫。
 pub(crate) async fn cleanup_tick(manager: &mut Manager<SqliteStore, Registered>) {
+    let started = std::time::Instant::now();
     let message_queue_time =
         match super::push_service_from_registration(manager.registration_data()) {
             Some(push) => fetch_message_queue_time_seconds(&push).await,
@@ -330,6 +337,11 @@ pub(crate) async fn cleanup_tick(manager: &mut Manager<SqliteStore, Registered>)
         );
         let _ = protocol_store.kt_remove_kyber_pre_keys(&last_resort).await;
     }
+    // S2a 打点：保留窗扫删耗时（尾部单点）。
+    super::perf_metrics::record_us(
+        super::perf_metrics::keys::PREKEY_CLEANUP,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// 定时巡检执行面（receive 管线节律臂挂点）：书签到期 → 水位补发（双身份
@@ -350,6 +362,7 @@ pub(crate) async fn maintenance_tick(manager: &mut Manager<SqliteStore, Register
     if !maintenance_due(last_run, now) {
         return;
     }
+    let started = std::time::Instant::now();
     let _ = manager.refresh_pre_keys().await;
     let signed = oldest_signed_pre_key_created_at(manager.store()).await;
     let last_resort = oldest_newest_last_resort_created_at(manager.store()).await;
@@ -361,6 +374,11 @@ pub(crate) async fn maintenance_tick(manager: &mut Manager<SqliteStore, Register
         .store()
         .kt_kv_set(KV_LAST_RUN_MS, &now.to_string())
         .await;
+    // S2a 打点：维护拍耗时（仅到期执行路径采样；P12 #8 节律基线）。
+    super::perf_metrics::record_us(
+        super::perf_metrics::keys::PREKEY_MAINTENANCE,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 #[cfg(test)]

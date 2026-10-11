@@ -163,6 +163,7 @@ send message: Signal server unavailable.
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
 | `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
+| `engine.perfMetrics` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{uptimeMs, timings, counters, unknownKeyDropped}`（timings 条目 `{count, totalUs, maxUs, lastUs}` 微秒制、键序 BTreeMap 确定性；词表封闭见 §5 S2a 块——未命中的计时/计数键不出现，诚实缺席不发明 0） | 无（只读快照应答，无业务错误面；fake/real 同码路真实答——指标是进程真相，不分模式） | **2026-10-12 real（KT 扩展，S2a 性能基线打点层，【engine-compat】，§5 S2a 块）**：进程内有界指标注册表的只读投影（只测不改立项纪律，`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md` §附四②）；快照进程内存不跨重启；词表外键计 `unknownKeyDropped` 丢弃（有界面）；消费面 = connector 白名单透传（**connector 切片遗留**）+ S2b 直连实测 harness；不落调度日志零 stderr |
 | `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
 | `getConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup}`（kind 词表与会话引用形状同 setConversationBlocked 面） | `{mutedUntilTimestamp, archived, markedUnread}`（三键恒在；目标记录缺席/无 storage 状态/manifest 404 = 全缺省 `0/false/false`，诚实幂等不报错） | 未注册账号 `-32603`；kind 缺失/词表外、会话不可解析/形状错 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2，状态收敛审计 R1，wire additive，§5 P15b 块）**：真相源 = Storage Service record 字段（非 sync message）——ContactRecord.archived/markedUnread/mutedUntilTimestamp（SignalStorage.proto 11/12/13）与 GV2/GV1 同名位（4/5/6）；MuteExpiration.toProto 语义 = 绝对毫秒、0 = 未静音；fake：恒缺省态（契约测试钉定） |
 | `setConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup, mutedUntilTimestamp?, archived?, markedUnread?}`（部分写意图——缺席位不动；mutedUntilTimestamp = 非负整数毫秒、两位布尔；null/形状错整拒；三 flag 全缺 = 无写意图 `-32603`） | `{mutedUntilTimestamp, archived, markedUnread}`（写后目标三 flag 投影，getConversationState 同形状；官方 upload 成功语义 = 本地写后面为准） | 参数形状错（见左）/kind 词表外/会话不可解析/未注册账号 `-32603`；storage 链路：PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`、服务不可达 `STORAGE_UNAVAILABLE`、读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2）**：复用 blocked/sticker 写面既有编排（read 改写 decode→mutate→encode 保真、新 16B item id、WriteOperation version+1、409 采纳重放）；同值幂等无写；目标记录缺席非缺省意图 = 最小记录首建（标识 + 三 flag，fresh_blocked_record 同构）、全缺省不空造记录；noteToSelf kind 不收（官方走 AccountRecord.noteToSelf* 位且无静音位，消费方提出再立项，偏差登记）；fake：缺省态叠意图回显（契约测试钉定） |
@@ -4250,6 +4251,48 @@ round-trip 保真单测早已钉定，仅缺写面接线）。
   `account_configuration_face_projects_record_and_write_echo` 钉形
   （fake 无 storage 态不回显）；契约测试补 linkPreviews 单写成功形状 +
   非布尔拒绝 + getConfiguration 形状/参数面。
+
+### S2a 性能基线打点层（2026-10-12，只测不改；进程内指标 + `engine.perfMetrics` 只读投影，wire additive【engine-compat】）
+
+立项纪律（`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md`
+§附四②）：基线先行、优化另批——本层只落测量/打点面，零行为语义改动；
+任何优化项（含 O2 解密基线身份库、O3 flush_barrier 批量化）须凭本层基线
+数据另批向 owner 申请。
+
+- **载体**：`src/service/perf_metrics.rs` 进程内有界指标注册表——计时序列
+  `{count, totalUs, maxUs, lastUs}`（微秒）+ 计数器；词表封闭
+  （`perf_metrics::keys`），未知键计 `unknownKeyDropped` 丢弃，内存有界
+  不随运行增长；快照键序 BTreeMap 确定性；进程内存不跨重启。
+- **测量点词表（封闭集，本批 31 键）**：
+  - 计时：`receive_envelope`（收流信封到达→ack，五臂；QueueEmpty 非信封
+    不计，StdioDead 停管线路径不采样）、`receive_project`
+    （project_content 薄壳咽喉）、`flush_barrier`（G1 背压栅栏
+    Service 咽喉——**O3 行为候选的基线测量面**）、`send_lock_wait`
+    （常驻发送管理器锁等待，含 send_gate——P12 #1 观测面）、
+    `send_text_total`（直聊族发送整体）、`send_group_total`
+    （群发送 MRM/failover 汇总咽喉——P12 #11 观测面）、`rpc_dispatch`
+    （JSON-RPC 请求分派整体，respond 单点包裹）、`prekey_quick_check` /
+    `prekey_maintenance_tick` / `prekey_cleanup_tick`（P12 #8 节律）、
+    `reconnect_backoff`（退避实际等待——P12 2c' 观测面）、
+    `initial_sync_requests`（链接后补同步三请求）。
+  - 计数：`receive_kind_*` 五信封族 + `queue_empty`、`flush_barrier_ok` /
+    `flush_barrier_dead`、`send_text_ok` / `send_text_err`、
+    `send_group_mrm` / `send_group_failover` / `send_group_repair_round`
+    （409/410 修复轮）、`prekey_quick_check_time_trigger` /
+    `prekey_quick_check_volume_trigger`、`stream_outcome_*` 四出口。
+- **纪律对位**：零 stderr（compat §1 watchdog 判死活）；测量点全走单一
+  咽喉（Service::flush_barrier / lock_registered_for_send /
+  dispatch_group / failover / project_content 薄壳），调用序/返回值/控制流
+  零变化；零新增依赖（std + serde_json 既有）。
+- **fake/real**：同码路真实答——指标是进程真相，不分模式；fake 模式收发
+  管线不拉起，序列天然近空。
+- **消费面与遗留**：connector 白名单透传 `engine.perfMetrics` 属
+  **connector 切片遗留**（连同 `receive_persistence_loop` 逐信封 ingest
+  事务打点=最大瓶颈候选的 connector 侧测量）；S2b 实测批以直连 harness
+  或经 connector 透传取快照。vendored presage 批窗内部（75ms/30 窗的
+  窗填充/解密/批量落库三相细分）在 vendor 面，未随本批打点（vendor 纪律
+  成本，engine 侧 `receive_envelope` 已含其端到端时延）——如需相细分另批
+  按 vendor/README.md 纪律登记。
 
 
 ## 6. fake 服务模式（仅测试）

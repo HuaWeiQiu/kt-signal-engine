@@ -14,10 +14,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    capabilities, parse_legacy_call_face, parse_send_contact, storage_sync, storage_write,
-    DeleteForMeAuthor, DeleteForMeConversation, DeleteForMeEntry, DeviceCapabilitiesError,
-    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange,
-    SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    capabilities, parse_legacy_call_face, parse_send_contact, perf_metrics, storage_sync,
+    storage_write, DeleteForMeAuthor, DeleteForMeConversation, DeleteForMeEntry,
+    DeviceCapabilitiesError, LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote,
+    SendQuoteBodyRange, SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError,
+    MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -61,7 +62,17 @@ pub(crate) async fn respond(
         Inbound::Overlong => jsonrpc::parse_error_response(Value::Null),
         Inbound::Line(line) => match jsonrpc::parse_line(line.as_bytes()) {
             ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id),
-            ParseOutcome::Request(request) => dispatch(&request, state, service).await,
+            ParseOutcome::Request(request) => {
+                // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
+                // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
+                let dispatch_started = std::time::Instant::now();
+                let response = dispatch(&request, state, service).await;
+                crate::service::perf_metrics::record_us(
+                    crate::service::perf_metrics::keys::RPC_DISPATCH,
+                    dispatch_started.elapsed().as_micros() as u64,
+                );
+                response
+            }
         },
     }
 }
@@ -72,6 +83,7 @@ async fn dispatch(
     service: Arc<Service>,
 ) -> Value {
     let Request { id, method, params } = request;
+    // S2a 打点在 respond 单点包裹（本函数臂内多 `return`，不在此计时）。
     match method.as_str() {
         "startLink" => match service.start_link().await {
             Ok(uri) => jsonrpc::success_response(id, json!({ "deviceLinkUri": uri })),
@@ -497,6 +509,8 @@ async fn dispatch(
                 (Some(account), message, None, Ok(recipients))
                     if sticker.is_some() || message.is_some() || view_once =>
                 {
+                    // S2a 打点：直聊族发送整体耗时（成败两臂各自落计数）。
+                    let send_started = std::time::Instant::now();
                     match service
                         .send_text(
                             account,
@@ -514,6 +528,11 @@ async fn dispatch(
                         .await
                     {
                         Ok((timestamp, results, failures)) => {
+                            perf_metrics::add(perf_metrics::keys::SEND_TEXT_OK, 1);
+                            perf_metrics::record_us(
+                                perf_metrics::keys::SEND_TEXT_TOTAL,
+                                send_started.elapsed().as_micros() as u64,
+                            );
                             let mut payload = json!({ "timestamp": timestamp, "results": results });
                             // 时序审计组二#9 additive：per-recipient 失败条目
                             //（空表键不在，旧宿主零变化）。
@@ -522,7 +541,14 @@ async fn dispatch(
                             }
                             jsonrpc::success_response(id, payload)
                         }
-                        Err(error) => send_error(id, error),
+                        Err(error) => {
+                            perf_metrics::add(perf_metrics::keys::SEND_TEXT_ERR, 1);
+                            perf_metrics::record_us(
+                                perf_metrics::keys::SEND_TEXT_TOTAL,
+                                send_started.elapsed().as_micros() as u64,
+                            );
+                            send_error(id, error)
+                        }
                     }
                 }
                 // 空 account/message 或 recipient 形状非法：fail-closed。
@@ -3757,6 +3783,14 @@ async fn dispatch(
         "engine.protocolCapabilities" => {
             jsonrpc::success_response(id, capabilities::protocol_capabilities_payload())
         }
+        // engine.perfMetrics（S2a 性能基线打点层，2026-10-12）：进程内指标
+        // 快照只读投影（{uptimeMs, timings, counters, unknownKeyDropped}；
+        // 词表封闭 additive，见 service::perf_metrics 模块头注与 compat §5
+        // S2a 块）。零参数（params 忽略），无账号语义，无业务错误面；
+        // fake/real 同码路——指标是进程真相，不分模式。不落调度日志
+        // （engine.protocolCapabilities 同纪律）。消费面：connector 白名单
+        // 透传属 connector 切片遗留；S2b 实测前由直连 harness/契约测试消费。
+        "engine.perfMetrics" => jsonrpc::success_response(id, perf_metrics::snapshot_json()),
         // engine.deviceCapabilities（D5 设备面能力注册）：PUT
         // /v1/devices/capabilities（官方 registerCapabilities 同端点）并回
         // 读上传面。触网方法（fake 恒已注册，getUserStatus 同款）；仅 401
