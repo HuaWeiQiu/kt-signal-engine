@@ -3648,17 +3648,23 @@ fn pinned_payload(entries: &[storage_sync::PinnedEntry]) -> Value {
     })
 }
 
-/// 拉黑返回体（getBlockedConversations）：顺序 = 存储序；条目形状与置顶
-/// 面同构（conversationId + kind）。
-fn blocked_payload(entries: &[storage_sync::EngineConversationId]) -> Value {
+/// 拉黑返回体（getBlockedConversations/setConversationBlocked）：顺序 =
+/// 存储序；条目形状与置顶面同构（conversationId + kind）+
+/// blockedAtTimestampMs 透出（窗D B7——contact/GV2 记录位，未知 0/无位
+/// GV1 键缺席，getCallLinks deletedAtTimestampMs 同口径）。
+fn blocked_payload(entries: &[storage_sync::BlockedConversation]) -> Value {
     json!({
         "blocked": entries
             .iter()
             .map(|entry| {
-                json!({
-                    "conversationId": entry.id_string(),
-                    "kind": entry.kind(),
-                })
+                let mut item = json!({
+                    "conversationId": entry.id.id_string(),
+                    "kind": entry.id.kind(),
+                });
+                if let Some(blocked_at) = entry.blocked_at_timestamp {
+                    item["blockedAtTimestampMs"] = json!(blocked_at);
+                }
+                item
             })
             .collect::<Vec<_>>(),
     })

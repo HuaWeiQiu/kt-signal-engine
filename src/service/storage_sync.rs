@@ -975,30 +975,51 @@ fn contact_engine_id(contact: &storage_proto::ContactRecord) -> Option<EngineCon
         .map(|sid| EngineConversationId::Contact(sid.service_id_string()))
 }
 
-/// 单条明文 StorageRecord → 引擎会话标识（blocked 面投影）：仅
-/// Contact/GroupV1/GroupV2 三类参与，`blocked==false`、非三类记录或标识
-/// 映射不出 → None（调用方跳过，零 stderr——daemon 静默纪律，compat §1）。
-pub(crate) fn blocked_conversation_of(plaintext: &[u8]) -> Option<EngineConversationId> {
+/// blocked 读面条目（窗D B7 blockedAt 透出）：会话标识 + 拉黑时刻投影。
+/// blockedAtTimestamp 官方口径「blocked=true 时 0 = 拉黑时刻未知」→ None；
+/// GroupV1 记录 proto 历史无该位恒 None（§5 记档）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedConversation {
+    pub(crate) id: EngineConversationId,
+    pub(crate) blocked_at_timestamp: Option<u64>,
+}
+
+/// 单条明文 StorageRecord → blocked 读面条目（窗D B7）：仅 Contact/GroupV1/
+/// GroupV2 三类参与，`blocked==false`、非三类记录或标识映射不出 → None
+///（调用方跳过，零 stderr——daemon 静默纪律，compat §1）。
+pub(crate) fn blocked_conversation_of(plaintext: &[u8]) -> Option<BlockedConversation> {
     let record = storage_proto::StorageRecord::decode(plaintext)
         .ok()?
         .record?;
     match record {
         storage_proto::storage_record::Record::Contact(contact) if contact.blocked => {
-            contact_engine_id(&contact)
+            Some(BlockedConversation {
+                id: contact_engine_id(&contact)?,
+                blocked_at_timestamp: (contact.blocked_at_timestamp > 0)
+                    .then_some(contact.blocked_at_timestamp),
+            })
         }
         storage_proto::storage_record::Record::GroupV1(group)
             if group.blocked && !group.id.is_empty() =>
         {
-            Some(EngineConversationId::LegacyGroup(
-                String::from_utf8_lossy(&group.id).into_owned(),
-            ))
+            Some(BlockedConversation {
+                id: EngineConversationId::LegacyGroup(
+                    String::from_utf8_lossy(&group.id).into_owned(),
+                ),
+                // GV1 记录无 blockedAtTimestamp 位（proto 历史无该字段）。
+                blocked_at_timestamp: None,
+            })
         }
         storage_proto::storage_record::Record::GroupV2(group)
             if group.blocked && !group.master_key.is_empty() =>
         {
-            Some(EngineConversationId::Group(
-                base64::engine::general_purpose::STANDARD.encode(&group.master_key),
-            ))
+            Some(BlockedConversation {
+                id: EngineConversationId::Group(
+                    base64::engine::general_purpose::STANDARD.encode(&group.master_key),
+                ),
+                blocked_at_timestamp: (group.blocked_at_timestamp > 0)
+                    .then_some(group.blocked_at_timestamp),
+            })
         }
         _ => None,
     }
@@ -1011,7 +1032,7 @@ async fn read_blocked_ids(
     push: &PushService,
     storage_key: &StorageServiceKey,
     manifest: &ManifestRecord,
-) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+) -> Result<Vec<BlockedConversation>, StorageSyncError> {
     let keys: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
@@ -1043,20 +1064,20 @@ async fn read_blocked_ids(
         let Ok(plaintext) = decrypt_raw_item(storage_key, item, record_ikm) else {
             continue;
         };
-        if let Some(id) = blocked_conversation_of(&plaintext) {
-            out.push(id);
+        if let Some(entry) = blocked_conversation_of(&plaintext) {
+            out.push(entry);
         }
     }
     Ok(out)
 }
 
 /// 读面编排：master key → manifest → 全部 blocked 会话（存储序）。master
-/// key 缺失或 manifest 404（账号从未有过 storage 状态）→ 空列表。v1 投影
-/// 不含 blockedAtTimestamp（官方 Contact/GroupV2 记录有该字段，投影面 v1
-/// 裁剪——compat §5 登记）。
+/// key 缺失或 manifest 404（账号从未有过 storage 状态）→ 空列表。条目携
+/// blockedAtTimestampMs 透出（窗D B7，contact/GV2 记录位，0=未知官方口径
+/// → 键缺席；GV1 无位）。
 pub(crate) async fn read_blocked_conversations(
     context: &StorageContext,
-) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+) -> Result<Vec<BlockedConversation>, StorageSyncError> {
     let Some(master_key) = context
         .store
         .fetch_master_key()
@@ -1404,7 +1425,7 @@ async fn read_conversation_items(
 }
 
 /// blocked 名单投影（明文批次 → 读面同构投影）。
-fn project_blocked(items: &[ConversationItem]) -> Vec<EngineConversationId> {
+fn project_blocked(items: &[ConversationItem]) -> Vec<BlockedConversation> {
     items
         .iter()
         .filter_map(|item| blocked_conversation_of(&item.plaintext))
@@ -1412,20 +1433,26 @@ fn project_blocked(items: &[ConversationItem]) -> Vec<EngineConversationId> {
 }
 
 /// 写后 blocked 名单投影（官方 upload 成功语义 = 本地写后面为准）：被换写
-/// 的目标条目按写后状态计入，其余条目沿用本轮读取态（存储序）。
+/// 的目标条目按写后状态计入，其余条目沿用本轮读取态（存储序）。补尾条目
+///（目标置拉黑且不在读取态名单）携引擎时刻——flip_blocked/fresh_blocked_
+/// record 同真值，写后回显即本地写后面。
 fn project_blocked_after(
     items: &[ConversationItem],
     replaced_key: Option<&[u8]>,
     canonical: &EngineConversationId,
     target_blocked: bool,
-) -> Vec<EngineConversationId> {
-    let mut out: Vec<EngineConversationId> = items
+    now_ms: u64,
+) -> Vec<BlockedConversation> {
+    let mut out: Vec<BlockedConversation> = items
         .iter()
         .filter(|item| replaced_key.is_none_or(|key| item.key != key))
         .filter_map(|item| blocked_conversation_of(&item.plaintext))
         .collect();
-    if target_blocked && !out.contains(canonical) {
-        out.push(canonical.clone());
+    if target_blocked && !out.iter().any(|entry| &entry.id == canonical) {
+        out.push(BlockedConversation {
+            id: canonical.clone(),
+            blocked_at_timestamp: Some(now_ms),
+        });
     }
     out
 }
@@ -1441,7 +1468,7 @@ pub(crate) async fn write_blocked(
     target: &EngineConversationId,
     blocked: bool,
     now_ms: u64,
-) -> Result<Vec<EngineConversationId>, StorageSyncError> {
+) -> Result<Vec<BlockedConversation>, StorageSyncError> {
     let canonical = blocked_target_canonical(context, target).await?;
     let master_key = match context
         .store
@@ -1548,6 +1575,7 @@ pub(crate) async fn write_blocked(
                     replaced_key.as_deref(),
                     &canonical,
                     blocked,
+                    now_ms,
                 ));
             }
             PutOutcome {
@@ -2506,7 +2534,7 @@ mod tests {
         }
 
         // contact blocked：aciBinary 16 字节优先 → 小写连字 UUID（置顶面
-        // contact 投影同口径）。
+        // contact 投影同口径）；blockedAtTimestamp>0 透出。
         let contact = ContactRecord {
             blocked: true,
             aci_binary: [
@@ -2514,6 +2542,7 @@ mod tests {
                 0x88, 0xae,
             ]
             .to_vec(),
+            blocked_at_timestamp: 1_700_000_000_000,
             ..Default::default()
         };
         let expected_aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
@@ -2521,7 +2550,10 @@ mod tests {
             blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
                 contact.clone()
             ))),
-            Some(EngineConversationId::Contact(expected_aci.to_owned()))
+            Some(BlockedConversation {
+                id: EngineConversationId::Contact(expected_aci.to_owned()),
+                blocked_at_timestamp: Some(1_700_000_000_000),
+            })
         );
 
         // 字符串形态回退（无 binary）：ACI 字符串直通。
@@ -2532,7 +2564,23 @@ mod tests {
             blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
                 by_string
             ))),
-            Some(EngineConversationId::Contact(expected_aci.to_owned()))
+            Some(BlockedConversation {
+                id: EngineConversationId::Contact(expected_aci.to_owned()),
+                blocked_at_timestamp: Some(1_700_000_000_000),
+            })
+        );
+
+        // 拉黑时刻未知（0 = 官方口径）→ None（wire 键缺席投影）。
+        let mut unknown_at = contact.clone();
+        unknown_at.blocked_at_timestamp = 0;
+        assert_eq!(
+            blocked_conversation_of(&wire(storage_proto::storage_record::Record::Contact(
+                unknown_at
+            ))),
+            Some(BlockedConversation {
+                id: EngineConversationId::Contact(expected_aci.to_owned()),
+                blocked_at_timestamp: None,
+            })
         );
 
         // e164 形态非引擎 contact 口径 → 跳过。
@@ -2560,15 +2608,19 @@ mod tests {
         let mut group = GroupV2Record {
             blocked: true,
             master_key: vec![9u8; 32],
+            blocked_at_timestamp: 1_700_000_000_000,
             ..Default::default()
         };
         assert_eq!(
             blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV2(
                 group.clone()
             ))),
-            Some(EngineConversationId::Group(
-                base64::engine::general_purpose::STANDARD.encode([9u8; 32])
-            ))
+            Some(BlockedConversation {
+                id: EngineConversationId::Group(
+                    base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+                ),
+                blocked_at_timestamp: Some(1_700_000_000_000),
+            })
         );
         // 空 master key → 跳过。
         let mut keyless = group.clone();
@@ -2586,7 +2638,8 @@ mod tests {
             None
         );
 
-        // legacyGroup（v1）blocked：id bytes → 引擎字符串口径。
+        // legacyGroup（v1）blocked：id bytes → 引擎字符串口径；GV1 记录无
+        // blockedAtTimestamp 位（proto 历史无该字段）恒 None。
         let mut legacy = GroupV1Record {
             blocked: true,
             id: b"old-group-id".to_vec(),
@@ -2596,7 +2649,10 @@ mod tests {
             blocked_conversation_of(&wire(storage_proto::storage_record::Record::GroupV1(
                 legacy.clone()
             ))),
-            Some(EngineConversationId::LegacyGroup("old-group-id".to_owned()))
+            Some(BlockedConversation {
+                id: EngineConversationId::LegacyGroup("old-group-id".to_owned()),
+                blocked_at_timestamp: None,
+            })
         );
         // 未拉黑 → None。
         legacy.blocked = false;
@@ -2849,8 +2905,8 @@ mod tests {
     }
 
     /// 写后 blocked 名单投影（project_blocked_after）：被换写条目按写后
-    /// 状态计入（replaced_key 剔除旧态）、目标置拉黑缺席则补尾（存储序）、
-    /// 解除（false）不追加。
+    /// 状态计入（replaced_key 剔除旧态）、目标置拉黑缺席则补尾（存储序，
+    /// 补尾条目携引擎时刻）、解除（false）不追加。
     #[test]
     fn project_blocked_after_swaps_target_and_appends() {
         let aci_a = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
@@ -2871,31 +2927,40 @@ mod tests {
         let items = vec![contact_item(aci_a), contact_item(aci_b)];
         let target =
             EngineConversationId::Contact("99999999-8888-4777-8666-555555555555".to_owned());
+        let entry = |id: EngineConversationId, blocked_at: Option<u64>| BlockedConversation {
+            id,
+            blocked_at_timestamp: blocked_at,
+        };
+        let now = 1_700_000_000_000;
 
-        // 目标不在名单：置拉黑写后补尾（存储序 = 先既有后目标）。
+        // 目标不在名单：置拉黑写后补尾（存储序 = 先既有后目标，补尾条目
+        // 携引擎时刻——既有条目 blockedAtTimestamp 缺位投影 None）。
         assert_eq!(
-            project_blocked_after(&items, Some(b"9"), &target, true),
+            project_blocked_after(&items, Some(b"9"), &target, true, now),
             vec![
-                EngineConversationId::Contact(aci_a.to_owned()),
-                EngineConversationId::Contact(aci_b.to_owned()),
-                target.clone(),
+                entry(EngineConversationId::Contact(aci_a.to_owned()), None),
+                entry(EngineConversationId::Contact(aci_b.to_owned()), None),
+                entry(target.clone(), Some(now)),
             ]
         );
 
         // 解除（false）：不追加，名单只剩既有条目。
         assert_eq!(
-            project_blocked_after(&items, None, &target, false),
+            project_blocked_after(&items, None, &target, false, now),
             vec![
-                EngineConversationId::Contact(aci_a.to_owned()),
-                EngineConversationId::Contact(aci_b.to_owned()),
+                entry(EngineConversationId::Contact(aci_a.to_owned()), None),
+                entry(EngineConversationId::Contact(aci_b.to_owned()), None),
             ]
         );
 
         // replaced_key 命中既有条目：旧态剔除（目标换写态由上方补尾位）。
         let replaced = items[0].key.clone();
         assert_eq!(
-            project_blocked_after(&items, Some(&replaced), &target, true),
-            vec![EngineConversationId::Contact(aci_b.to_owned()), target,]
+            project_blocked_after(&items, Some(&replaced), &target, true, now),
+            vec![
+                entry(EngineConversationId::Contact(aci_b.to_owned()), None),
+                entry(target, Some(now)),
+            ]
         );
     }
 

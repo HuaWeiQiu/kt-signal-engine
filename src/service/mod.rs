@@ -3081,13 +3081,14 @@ impl Service {
         storage_sync::read_pinned(&context).await
     }
 
-    /// getBlockedConversations（P5 扩面）：读 Storage Service 全部
-    /// Contact/GroupV1/GroupV2 记录的 blocked 位 → 引擎会话标识投影（存储
-    /// 序；形状与置顶条目同构，只读面不落 store）。
+    /// getBlockedConversations（P5 扩面 + 窗D B7 blockedAt 透出）：读
+    /// Storage Service 全部 Contact/GroupV1/GroupV2 记录的 blocked 位 →
+    /// 引擎会话标识 + blockedAtTimestamp 投影（存储序；形状与置顶条目同
+    /// 构，只读面不落 store）。
     pub(crate) async fn blocked_conversations(
         self: &Arc<Self>,
         account: &str,
-    ) -> Result<Vec<storage_sync::EngineConversationId>, storage_sync::StorageSyncError> {
+    ) -> Result<Vec<storage_sync::BlockedConversation>, storage_sync::StorageSyncError> {
         if !self.real {
             return Ok(Vec::new());
         }
@@ -3147,7 +3148,7 @@ impl Service {
         account: &str,
         conversation: storage_sync::EngineConversationId,
         blocked: bool,
-    ) -> Result<Vec<storage_sync::EngineConversationId>, storage_sync::StorageSyncError> {
+    ) -> Result<Vec<storage_sync::BlockedConversation>, storage_sync::StorageSyncError> {
         if !self.real {
             return Ok(Vec::new());
         }
