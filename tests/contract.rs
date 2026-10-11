@@ -1390,6 +1390,135 @@ fn leave_group_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// 群邀请链接族纯函数面（generateInviteLinkPassword/buildInviteLink/
+/// parseInviteLink，KT 扩展批 P13/任务1，官方 generateGroupInviteLinkPass
+/// word/buildGroupLink/parseGroupLink 行为对齐）：三方法皆 fake/real 同码路
+/// 纯本地/显式材料臂；密码 16B（官方 GROUP_INVITE_LINK_PASSWORD_LENGTH 同
+/// 长）；链接形 = `https://signal.group/#<websafe>`；解析 roundtrip 还原
+/// masterKey+password；参数面 fail-closed（-32603：password 空·坏 base64·
+/// 非字符串、groupId 非 32B、inviteLink 缺席·三种坏形状）；材料面非协议
+/// 上行——不落调度日志；buildInviteLink 缺 password 臂 fake 无群态面 →
+/// GROUP_INVITE_LINK_UNAVAILABLE。
+#[test]
+fn invite_link_materials_pure_faces_and_param_fail_closed() {
+    use base64::Engine as _;
+    let dir = temp_dir("invite-link-materials-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // 密码生成：16B 标准 base64（fake/real 同码路）。
+    let generated = engine.request("generateInviteLinkPassword", json!({}))["result"].clone();
+    let password = generated["password"].as_str().expect("password string");
+    let password_bytes = base64::engine::general_purpose::STANDARD
+        .decode(password)
+        .expect("password decodes");
+    assert_eq!(password_bytes.len(), 16, "官方 16B 密码同长");
+    let other = engine.request("generateInviteLinkPassword", json!({}))["result"]["password"]
+        .as_str()
+        .expect("second password")
+        .to_owned();
+    assert_ne!(password, other, "CSPRNG 面两次不重合");
+
+    // 链接构造（显式 password 臂）：官方 URL 形 + roundtrip。
+    let master_key = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY="; // 32B
+    let built = engine.request(
+        "buildInviteLink",
+        json!({ "account": "+15550000000", "groupId": master_key, "password": password }),
+    )["result"]["inviteLink"]
+        .as_str()
+        .expect("inviteLink string")
+        .to_owned();
+    assert!(
+        built.starts_with("https://signal.group/#"),
+        "官方 URL 形: {built}"
+    );
+    let code = built.rsplit('#').next().expect("code segment");
+    assert!(
+        !code.contains('+') && !code.contains('/') && !code.contains('='),
+        "websafe 化"
+    );
+
+    // 解析 roundtrip（三种官方 URL 形 + 裸 code）。
+    for value in [
+        built.clone(),
+        format!("sgnl://signal.group/#{code}"),
+        format!("sgnl://joingroup#{code}"),
+        code.to_owned(),
+    ] {
+        let parsed =
+            engine.request("parseInviteLink", json!({ "inviteLink": value }))["result"].clone();
+        assert_eq!(parsed["groupId"], json!(master_key));
+        assert_eq!(parsed["password"], json!(password));
+    }
+
+    // buildInviteLink 缺 password 臂：fake 无群态面 →
+    // GROUP_INVITE_LINK_UNAVAILABLE。
+    let response = engine.request(
+        "buildInviteLink",
+        json!({ "account": "+15550000000", "groupId": master_key }),
+    );
+    assert_eq!(response["error"]["code"], -1);
+    assert_eq!(
+        response["error"]["message"],
+        "GROUP_INVITE_LINK_UNAVAILABLE"
+    );
+
+    // 参数面 fail-closed（-32603）。
+    let bad_b64 = base64::engine::general_purpose::STANDARD.encode(b"short");
+    let rejects = [
+        json!({ "groupId": master_key }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "password": password }),
+        json!({ "account": "+15550000000", "groupId": bad_b64, "password": password }),
+        json!({ "account": "+15550000000", "groupId": master_key, "password": "" }),
+        json!({ "account": "+15550000000", "groupId": master_key, "password": "###" }),
+        json!({ "account": "+15550000000", "groupId": master_key, "password": 42 }),
+        json!({}),
+        json!({ "inviteLink": "" }),
+        json!({ "inviteLink": "https://signal.group/#" }),
+        json!({ "inviteLink": "https://signal.group/#@@@" }),
+        json!({ "inviteLink": 42 }),
+    ];
+    for params in &rejects {
+        let method = if params.get("inviteLink").is_some()
+            || params.as_object().is_none_or(|m| m.is_empty())
+        {
+            "parseInviteLink"
+        } else {
+            "buildInviteLink"
+        };
+        let response = engine.request(method, params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "{method} rejects {params}"
+        );
+    }
+
+    // 材料面非协议上行：零调度日志行。
+    let log_path = dir.join("engine-send-log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "invite link materials are not protocol uplink: no dispatch log"
+    );
+
+    // real 模式显式 password 臂同码路（纯构造，零网络）。
+    let real_dir = temp_dir("invite-link-materials-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let real_built = real_engine.request(
+        "buildInviteLink",
+        json!({ "account": "+15559990000", "groupId": master_key, "password": password }),
+    )["result"]["inviteLink"]
+        .as_str()
+        .expect("real-mode pure arm builds")
+        .to_owned();
+    assert_eq!(real_built, built);
+    // real 模式缺 password 臂：未注册账号 storage 上下文打不开 → -32603。
+    let (code_err, message) = real_engine.error_of(
+        "buildInviteLink",
+        json!({ "account": "+15559990000", "groupId": master_key }),
+    );
+    assert_eq!((code_err, message.as_str()), (-32603, "Internal error"));
+}
+
 /// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
 /// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
 /// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同

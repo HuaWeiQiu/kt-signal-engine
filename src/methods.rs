@@ -2194,7 +2194,10 @@ async fn dispatch(
                     json!({ "groupId": group_id, "revision": revision }),
                 ),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
-                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                | Err(crate::service::groups::TerminateError::UnknownGroup)
+                | Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    internal_error(id)
+                }
                 Err(crate::service::groups::TerminateError::AvatarUpload) => {
                     jsonrpc::error_response(
                         id,
@@ -2243,7 +2246,10 @@ async fn dispatch(
             match service.terminate_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "terminated" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
-                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                | Err(crate::service::groups::TerminateError::UnknownGroup)
+                | Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    internal_error(id)
+                }
                 // 群终止链路不触头像上行（变体穷尽性；同按写面失败码位折叠）。
                 Err(crate::service::groups::TerminateError::AvatarUpload) => {
                     jsonrpc::error_response(id, &RpcError::new(-1, "GROUP_UPDATE_FAILED"))
@@ -2396,7 +2402,10 @@ async fn dispatch(
             {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
-                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                | Err(crate::service::groups::TerminateError::UnknownGroup)
+                | Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    internal_error(id)
+                }
                 Err(crate::service::groups::TerminateError::AvatarUpload) => {
                     jsonrpc::error_response(
                         id,
@@ -2450,7 +2459,10 @@ async fn dispatch(
             match service.leave_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "left" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
-                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                | Err(crate::service::groups::TerminateError::UnknownGroup)
+                | Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    internal_error(id)
+                }
                 Err(crate::service::groups::TerminateError::AvatarUpload) => internal_error(id),
                 Err(crate::service::groups::TerminateError::Failed { status }) => {
                     let mut data = serde_json::Map::new();
@@ -2469,6 +2481,90 @@ async fn dispatch(
                 Err(crate::service::groups::TerminateError::Unavailable) => {
                     jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
                 }
+            }
+        }
+        // 群邀请链接族（P13 链接批，KT 扩展方法，官方 generateGroupInvite
+        // LinkPassword/buildGroupLink/parseGroupLink 行为对齐）：三方法皆
+        // 密码/链接材料面——非协议上行，不落调度日志；密码/链接字节零日志
+        //（凭据面同纪律）。generateInviteLinkPassword 无参数（纯 CSPRNG，
+        // 16B，fake/real 同码路）；buildInviteLink {account, groupId,
+        // password?}：password 显式臂纯构造（fake/real 同码路）、缺省臂读
+        // 服务器群态 invite_link_password（fake 无群态面 → GROUP_INVITE_
+        // LINK_UNAVAILABLE）；parseInviteLink {inviteLink} 纯解析（三种官方
+        // URL 形 + 裸 inviteCode 容错，坏形状 -32603 fail-closed）。
+        "generateInviteLinkPassword" => {
+            let password = service.generate_invite_link_password();
+            jsonrpc::success_response(id, json!({ "password": standard_b64(&password) }))
+        }
+        "buildInviteLink" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let password = match params.get("password") {
+                None => None,
+                Some(Value::String(text)) => {
+                    use base64::Engine as _;
+                    match base64::engine::general_purpose::STANDARD.decode(text) {
+                        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                        _ => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            let (Some(account), Some(master_key)) = (account, master_key) else {
+                return internal_error(id);
+            };
+            match service
+                .build_invite_link(account, &master_key, password)
+                .await
+            {
+                Ok(invite_link) => {
+                    jsonrpc::success_response(id, json!({ "inviteLink": invite_link }))
+                }
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "GROUP_INVITE_LINK_UNAVAILABLE"))
+                }
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_INVITE_LINK_UNAVAILABLE",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+                Err(crate::service::groups::TerminateError::AvatarUpload) => internal_error(id),
+            }
+        }
+        "parseInviteLink" => {
+            let Some(link) = params.get("inviteLink").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match crate::service::group_link::parse_invite_link(link) {
+                Ok(parsed) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "groupId": standard_b64(&parsed.master_key),
+                        "password": standard_b64(&parsed.password),
+                    }),
+                ),
+                Err(
+                    crate::service::group_link::LinkParseError::Empty
+                    | crate::service::group_link::LinkParseError::Malformed
+                    | crate::service::group_link::LinkParseError::UnsupportedVersion,
+                ) => internal_error(id),
             }
         }
         // calls.linkPresentation（call-link 凭据材料面，KT 扩展，P4c 切一；
@@ -2890,6 +2986,11 @@ fn internal_error(id: &Value) -> Value {
 /// calls.* 材料字节 → 标准 base64（凭据/presentation 字节面统一编码点；
 /// 字节内容零日志零落盘纪律不变，此处只编码出 RPC 响应）。
 fn calls_b64(bytes: &[u8]) -> String {
+    standard_b64(bytes)
+}
+
+/// 字节面 → 标准 base64（群邀请链接族 password/groupId 同编码点）。
+fn standard_b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }

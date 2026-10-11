@@ -50,6 +50,7 @@ pub(crate) mod delivery_receipt;
 /// R1 群发本地缓存面：GSE 按群落 kv（官方 2h-2d 窗 + 成员面失效）+ 发送
 /// 面 terminated 探针缓存。稳态群发 0 次额外 HTTPS。
 pub(crate) mod group_cache;
+pub(crate) mod group_link;
 pub(crate) mod groups;
 pub(crate) mod identity;
 pub(crate) mod prekey;
@@ -2027,6 +2028,40 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         groups::create_group(&context, title, expiration_secs, avatar, members).await
+    }
+
+    /// generateInviteLinkPassword（群邀请链接族，KT 扩展批 P13/任务1）：16B
+    /// CSPRNG（官方 GROUP_INVITE_LINK_PASSWORD_LENGTH 同长）。纯本地面，
+    /// fake/real 同码路，零网络。
+    pub(crate) fn generate_invite_link_password(&self) -> [u8; group_link::LINK_PASSWORD_BYTES] {
+        group_link::generate_invite_link_password()
+    }
+
+    /// buildInviteLink（同批）：password 显式臂 = 纯构造（fake/real 同码路，
+    /// 官方 buildGroupLink 同形状）；password 缺省臂 = 服务器群态读面取
+    /// invite_link_password（官方 conversation.groupInviteLinkPassword 同
+    /// 位；fake 无群态面 → InviteLinkUnset）。
+    pub(crate) async fn build_invite_link(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: &[u8],
+        password: Option<Vec<u8>>,
+    ) -> Result<String, groups::TerminateError> {
+        if let Some(password) = password {
+            return Ok(group_link::build_invite_link(master_key, &password));
+        }
+        if !self.real {
+            return Err(groups::TerminateError::InviteLinkUnset);
+        }
+        let context = storage_context(self, account).await?;
+        let group = groups::fetch_group_state(&context, master_key).await?;
+        if group.invite_link_password.is_empty() {
+            return Err(groups::TerminateError::InviteLinkUnset);
+        }
+        Ok(group_link::build_invite_link(
+            master_key,
+            &group.invite_link_password,
+        ))
     }
 
     /// calls.linkPresentation（KT 扩展，P4c 切一）：当天 CallLinkAuthCredential

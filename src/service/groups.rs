@@ -81,7 +81,9 @@ pub(crate) const SUPPORTED_CHANGE_EPOCH: u32 = 7;
 ///（avatar 上行链任一步失败——form 拉取/属性校验/blob 加密/CDN POST，
 /// data `{retryable:true, textSaved:false}`：合成单 change 语义下伴生面
 /// 未提交，§5 群头像上行面批）；Unavailable 折叠 `-1` +
-/// `STORAGE_UNAVAILABLE`（网络面，STORAGE 族同款 retryable 语义）。
+/// `STORAGE_UNAVAILABLE`（网络面，STORAGE 族同款 retryable 语义）；
+/// InviteLinkUnset 折叠 `-1` + `GROUP_INVITE_LINK_UNAVAILABLE`（群链接
+/// 密码未设/群态不可得，P13 链接族批）。
 #[derive(Debug)]
 pub(crate) enum TerminateError {
     UnknownAccount,
@@ -89,6 +91,7 @@ pub(crate) enum TerminateError {
     Failed { status: Option<u16> },
     AvatarUpload,
     Unavailable,
+    InviteLinkUnset,
 }
 
 impl From<StorageSyncError> for TerminateError {
