@@ -2840,6 +2840,24 @@ jobs/helpers/sendGroupCallUpdate.preload.ts:23-100。
   偏差两处：①name/description 解密失败省略键（官方桌面 GUI 兜底
   unknownGroup 不搬，engine 省略键宁缺勿错）；②avatar URL 不投影（官方
   桌面 CDN 代理面取图，engine 读面无消费方，**gap 登记**后续批）。
+- **receive 投影三面细化（P13/任务5，2026-10-11，官方 extractDiffs 对齐
+  groups.preload.ts:4705-4749/:4841，isAccessControlEnabled =
+  ANY\|\|ADMINISTRATOR，groups/util.std.ts:9）**：`groupChanged` changes[]
+  链接面由「access-invite-link/group-link-reset 无条件各一条」改为批内
+  组合裁定——access+password 同批（官方 buildNewGroupLinkChange「启用即
+  双面同批」同构）→ enabled（access ≠ UNSATISFIABLE）投
+  `group-link-add{privilege}`、disabled 投 `group-link-remove`，不另发
+  reset；仅 password → `group-link-reset`；仅 access → enabled 投
+  `access-invite-link{newPrivilege}`（官方「已启用改权限」形——wire 无
+  旧态不区分初次启用/改权限，**偏差登记**）、disabled 投
+  `group-link-remove`。官方按 old/new 态差分裁定（linkPreviouslyEnabled/
+  linkCurrentlyEnabled），wire change 不携旧态，批内组合是近似——
+  groupChanged 事件消费面足够。**member-add-from-link 面**：add_members
+  `join_from_invite_link=true` → `member-add-from-link{aci}`（官方
+  extractDiffs joinedFromLink，groups.preload.ts:4841，序在 pending 邀请
+  /管理员批准之后）——vendored decrypt_group_change 丢该位，投影函数在
+  解密消费前从原始 proto actions 二次解码补集（decrypt_service_id 回
+  ACI，二次解码/解密失败空集兜底宁缺勿错，§3 面无新键）。
 - **fake 两桩**：preview → `GROUP_INVITE_LINK_PREVIEW_FAILED` 无 status
   （fake 无链接读面，材料不可得即错误面）；join → `{status:"joined"}`
   direct 臂形状（fake 无 join info 读面不裁定审批臂——**登记偏差**，

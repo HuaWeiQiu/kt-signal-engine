@@ -1413,12 +1413,37 @@ pub(crate) fn project_changes_from_context(
     group_change: Option<&[u8]>,
 ) -> Option<GroupChangesProjection> {
     use base64::Engine as _;
-    use presage::libsignal_service::groups_v2::GroupChange;
+    use presage::libsignal_service::groups_v2::{AccessRequired, GroupChange};
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+    use presage::libsignal_service::zkgroup;
 
     let group_change = group_change?;
     let key: [u8; 32] = master_key.try_into().ok()?;
     let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
     let encrypted = presage::proto::GroupChange::decode(group_change).ok()?;
+    // P13/任务5：vendored decrypt_group_change 丢 add_members
+    // join_from_invite_link 位（官方 extractDiffs member-add-from-link 同源，
+    // groups.preload.ts:4841）——解密消费 encrypted 前从原始 proto actions
+    // 补集 ACI；二次解码/解密失败面不阻塞主投影（空集兜底，宁缺勿错）。
+    let link_join_acis: Vec<Aci> =
+        presage::proto::group_change::Actions::decode(encrypted.actions.as_slice())
+            .map(|actions| {
+                actions
+                    .add_members
+                    .iter()
+                    .filter(|action| action.join_from_invite_link)
+                    .filter_map(|action| {
+                        let member = action.added.as_ref()?;
+                        match secret_params
+                            .decrypt_service_id(zkgroup::deserialize(&member.user_id).ok()?)
+                        {
+                            Ok(ServiceId::Aci(aci)) => Some(aci),
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     let changes = GroupOperations::new(secret_params)
         .decrypt_group_change(encrypted)
         .ok()?;
@@ -1427,6 +1452,18 @@ pub(crate) fn project_changes_from_context(
     if changes.change_epoch > SUPPORTED_CHANGE_EPOCH {
         return None;
     }
+    // P13/任务5 群链接三面批内裁定（官方 extractDiffs 按 old/new 态差分裁
+    // 定 group-link-add/remove/access-invite-link/group-link-reset 四形，
+    // groups.preload.ts:4705-4749）：wire change 不携旧态——以批内 access
+    // + password 组合近似（buildNewGroupLinkChange「启用即双面同批」同构）。
+    let link_access = changes.changes.iter().find_map(|change| match change {
+        GroupChange::InviteLinkAccess(access) => Some(*access),
+        _ => None,
+    });
+    let link_password_present = changes
+        .changes
+        .iter()
+        .any(|change| matches!(change, GroupChange::InviteLinkPassword(_)));
     let mut details = Vec::new();
     let mut expire_timer_seconds = None;
     for change in &changes.changes {
@@ -1481,18 +1518,47 @@ pub(crate) fn project_changes_from_context(
                 "type": "access-members",
                 "newPrivilege": access_level_name(access),
             })),
-            GroupChange::InviteLinkAccess(access) => details.push(serde_json::json!({
-                "type": "access-invite-link",
-                "newPrivilege": access_level_name(access),
-            })),
+            GroupChange::InviteLinkAccess(access) => {
+                // 批内裁定：access 不可满足 = 关闭面 → group-link-remove；
+                // 双面在场（官方 buildNewGroupLinkChange 双面同批）= 启用 →
+                // group-link-add{privilege}，password 不另发 reset（官方
+                // reset 仅捕纯密码换面）；仅 access enabled =
+                // access-invite-link{newPrivilege}（官方「已启用改权限」形
+                // ——wire 无旧态不区分初次启用/改权限，§5 偏差登记）。
+                if *access == AccessRequired::Unsatisfiable {
+                    details.push(serde_json::json!({ "type": "group-link-remove" }));
+                } else if link_password_present {
+                    details.push(serde_json::json!({
+                        "type": "group-link-add",
+                        "privilege": access_level_name(access),
+                    }));
+                } else {
+                    details.push(serde_json::json!({
+                        "type": "access-invite-link",
+                        "newPrivilege": access_level_name(access),
+                    }));
+                }
+            }
             GroupChange::MemberLabelAccess(access) => details.push(serde_json::json!({
                 "type": "access-member-label",
                 "newPrivilege": access_level_name(access),
             })),
-            GroupChange::NewMember(member) => details.push(serde_json::json!({
-                "type": "member-add",
-                "aci": member.aci.service_id_string(),
-            })),
+            GroupChange::NewMember(member) => {
+                // 官方 extractDiffs joinedFromLink 位（groups.preload.ts:4841
+                // 同序：pending 邀请 > 链接入群 > 管理员批准 > 直加）——命中
+                // 原始 proto 补集 = member-add-from-link，否则 member-add。
+                if link_join_acis.contains(&member.aci) {
+                    details.push(serde_json::json!({
+                        "type": "member-add-from-link",
+                        "aci": member.aci.service_id_string(),
+                    }));
+                } else {
+                    details.push(serde_json::json!({
+                        "type": "member-add",
+                        "aci": member.aci.service_id_string(),
+                    }));
+                }
+            }
             GroupChange::DeleteMember(aci) => details.push(serde_json::json!({
                 "type": "member-remove",
                 "aci": aci.service_id_string(),
@@ -1542,7 +1608,12 @@ pub(crate) fn project_changes_from_context(
                 "aci": aci.service_id_string(),
             })),
             GroupChange::InviteLinkPassword(_) => {
-                details.push(serde_json::json!({ "type": "group-link-reset" }));
+                // 仅密码面（无 access 同批）= 既有 reset 语义；与 access 同
+                // 批时启用/关闭裁定由 access 臂承载，此处静默（不另发
+                // reset——官方 reset 面仅捕纯密码换）。
+                if link_access.is_none() {
+                    details.push(serde_json::json!({ "type": "group-link-reset" }));
+                }
             }
             GroupChange::AnnouncementOnly(value) => details.push(serde_json::json!({
                 "type": "announcements-only",
@@ -2400,8 +2471,9 @@ mod tests {
         );
 
         // 词表宽度批：remove/privilege/pending/admin-approval 四族 + avatar
-        // /description/access 两面 + link-reset/announcements-only + ban 跳
-        // 过（官方不渲染类）。
+        // /description/access 两面 + 链接双面（access UNSATISFIABLE +
+        // password 同批 = 关闭组合写 → group-link-remove 单条，不另发
+        // reset）/announcements-only + ban 跳过（官方不渲染类）。
         let wide = presage::proto::group_change::Actions {
             group_id: secret_params.get_group_identifier().to_vec(),
             source_user_id: editor_uid.clone(),
@@ -2487,7 +2559,11 @@ mod tests {
         let projection =
             project_changes_from_context(&master_key, Some(encrypted(wide).as_slice()))
                 .expect("wide batch projects");
-        assert_eq!(projection.changes.len(), 14, "ban 跳过、其余逐类投影");
+        assert_eq!(
+            projection.changes.len(),
+            13,
+            "ban 跳过、链接双面合一、其余逐类投影"
+        );
         assert_eq!(
             projection.changes[0],
             serde_json::json!({
@@ -2537,10 +2613,7 @@ mod tests {
         );
         assert_eq!(
             projection.changes[7],
-            serde_json::json!({
-                "type": "access-invite-link",
-                "newPrivilege": "UNSATISFIABLE",
-            })
+            serde_json::json!({ "type": "group-link-remove" })
         );
         assert_eq!(
             projection.changes[8],
@@ -2565,24 +2638,171 @@ mod tests {
         );
         assert_eq!(
             projection.changes[11],
-            serde_json::json!({ "type": "group-link-reset" })
-        );
-        assert_eq!(
-            projection.changes[12],
             serde_json::json!({
                 "type": "announcements-only",
                 "announcementsOnly": true,
             })
         );
         assert_eq!(
-            projection.changes[13],
+            projection.changes[12],
             serde_json::json!({
                 "type": "access-member-label",
                 "newPrivilege": "UNKNOWN",
             })
         );
+        assert!(
+            !projection
+                .changes
+                .iter()
+                .any(|c| c["type"] == "group-link-reset"),
+            "链接双面同批不另发 reset"
+        );
         assert_eq!(projection.revision, 10);
         assert_eq!(projection.expire_timer_seconds, None, "无 timer 批该键缺席");
+
+        // P13/任务5 链接三面批内裁定逐形：
+        // 仅 access enabled → access-invite-link{newPrivilege}。
+        let access_only = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 14,
+            modify_add_from_invite_link_access: Some(
+                actions::ModifyAddFromInviteLinkAccessControlAction {
+                    add_from_invite_link_access: ProtoAccess::Any as i32,
+                },
+            ),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(access_only).as_slice()))
+                .expect("access-only batch projects");
+        assert_eq!(
+            projection.changes,
+            vec![serde_json::json!({
+                "type": "access-invite-link",
+                "newPrivilege": "ANY",
+            })]
+        );
+
+        // 仅 access disabled → group-link-remove。
+        let access_disabled = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 15,
+            modify_add_from_invite_link_access: Some(
+                actions::ModifyAddFromInviteLinkAccessControlAction {
+                    add_from_invite_link_access: ProtoAccess::Unsatisfiable as i32,
+                },
+            ),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(access_disabled).as_slice()))
+                .expect("access-disabled batch projects");
+        assert_eq!(
+            projection.changes,
+            vec![serde_json::json!({ "type": "group-link-remove" })]
+        );
+
+        // 仅 password → group-link-reset（纯密码换面）。
+        let password_only = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 16,
+            modify_invite_link_password: Some(actions::ModifyInviteLinkPasswordAction {
+                invite_link_password: vec![9, 9, 9],
+            }),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(password_only).as_slice()))
+                .expect("password-only batch projects");
+        assert_eq!(
+            projection.changes,
+            vec![serde_json::json!({ "type": "group-link-reset" })]
+        );
+
+        // 双面 enabled（官方 buildNewGroupLinkChange「启用即双面同批」）→
+        // group-link-add{privilege}，不另发 reset。
+        let link_enable = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 17,
+            modify_add_from_invite_link_access: Some(
+                actions::ModifyAddFromInviteLinkAccessControlAction {
+                    add_from_invite_link_access: ProtoAccess::Administrator as i32,
+                },
+            ),
+            modify_invite_link_password: Some(actions::ModifyInviteLinkPasswordAction {
+                invite_link_password: vec![8, 8, 8],
+            }),
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(link_enable).as_slice()))
+                .expect("link-enable batch projects");
+        assert_eq!(
+            projection.changes,
+            vec![serde_json::json!({
+                "type": "group-link-add",
+                "privilege": "ADMINISTRATOR",
+            })]
+        );
+
+        // member-add-from-link 面：add_members join_from_invite_link=true
+        //（官方 buildAddMemberActionWithCredential joinFromInviteLink 位，
+        // extractDiffs joinedFromLink 同序投影）。
+        let link_joiner = Aci::parse_from_service_id_string("55555555-6666-4777-8888-999999999999")
+            .expect("link joiner aci");
+        let link_joiner_uid =
+            zkgroup::serialize(&secret_params.encrypt_service_id(link_joiner.into()));
+        // profile key 密文按成员 ACI 绑定加密（decrypt_profile_key 同闸）。
+        let link_joiner_pk_ct =
+            zkgroup::serialize(&secret_params.encrypt_profile_key(profile_key, link_joiner));
+        let link_join = presage::proto::group_change::Actions {
+            group_id: secret_params.get_group_identifier().to_vec(),
+            source_user_id: editor_uid.clone(),
+            version: 18,
+            add_members: vec![
+                actions::AddMemberAction {
+                    added: Some(presage::proto::Member {
+                        user_id: member_uid.clone(),
+                        role: ProtoRole::Default as i32,
+                        profile_key: profile_key_ct.clone(),
+                        ..Default::default()
+                    }),
+                    join_from_invite_link: false,
+                },
+                actions::AddMemberAction {
+                    added: Some(presage::proto::Member {
+                        user_id: link_joiner_uid,
+                        role: ProtoRole::Default as i32,
+                        profile_key: link_joiner_pk_ct,
+                        ..Default::default()
+                    }),
+                    join_from_invite_link: true,
+                },
+            ],
+            ..presage::proto::group_change::Actions::default()
+        };
+        let projection =
+            project_changes_from_context(&master_key, Some(encrypted(link_join).as_slice()))
+                .expect("link-join batch projects");
+        assert_eq!(projection.changes.len(), 2, "双成员逐位投影");
+        assert_eq!(
+            projection.changes[0],
+            serde_json::json!({
+                "type": "member-add",
+                "aci": "44444444-5555-4666-9777-888888888888",
+            })
+        );
+        assert_eq!(
+            projection.changes[1],
+            serde_json::json!({
+                "type": "member-add-from-link",
+                "aci": "55555555-6666-4777-8888-999999999999",
+            })
+        );
 
         // avatar 移除面（空串 = removed）与 description 移除面（空/缺席 =
         // removed:true，decrypt 侧空串归 None）。
