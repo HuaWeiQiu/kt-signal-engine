@@ -106,12 +106,7 @@ impl Store for SqliteStore {
     }
 
     fn take_identity_changes(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .identity_changes
-                .lock()
-                .expect("identity change log"),
-        )
+        std::mem::take(&mut *self.identity_changes.lock().expect("identity change log"))
     }
 }
 

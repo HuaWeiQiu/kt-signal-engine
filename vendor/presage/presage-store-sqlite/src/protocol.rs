@@ -872,13 +872,15 @@ mod test {
         };
 
         let device = DeviceId::new(1)?;
-        let address = ProtocolAddress::new("10000000-0000-0000-0000-000000000001".to_owned(), device);
+        let address =
+            ProtocolAddress::new("10000000-0000-0000-0000-000000000001".to_owned(), device);
         let old_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
         let new_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
         assert_ne!(old_key, new_key);
 
         // First-time contact: no stored identity → trusted both directions.
-        let stranger = ProtocolAddress::new("10000000-0000-0000-0000-000000000002".to_owned(), device);
+        let stranger =
+            ProtocolAddress::new("10000000-0000-0000-0000-000000000002".to_owned(), device);
         assert!(
             protocol_store
                 .is_trusted_identity(&stranger, &new_key, Direction::Sending)

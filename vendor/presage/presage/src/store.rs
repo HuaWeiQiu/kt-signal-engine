@@ -134,6 +134,21 @@ pub trait ContentsStore: Send + Sync {
         message: Content,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
+    /// KT (receive batching): save a batch of (thread, message) pairs,
+    /// ideally within a single transaction. The default implementation
+    /// falls back to per-message saves.
+    fn save_messages(
+        &self,
+        messages: Vec<(Thread, Content)>,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> {
+        async move {
+            for (thread, message) in messages {
+                self.save_message(&thread, message).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Delete a single message, identified by its received timestamp from a thread.
     /// Useful when you want to delete a message locally only.
     fn delete_message(

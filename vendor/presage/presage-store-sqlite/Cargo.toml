@@ -6,7 +6,11 @@ license = "AGPL-3.0-only"
 
 [features]
 default = ["libsqlite3-sys/bundled-sqlcipher"]
-cdsi = ["presage/cdsi", "libsqlite3-sys/bundled-sqlcipher-custom-crypto"]
+# KT (vendored): the upstream `cdsi` feature is removed — it required
+# `libsqlite3-sys/bundled-sqlcipher-custom-crypto`, which no crates.io
+# libsqlite3-sys provides, so merely declaring it made every standalone
+# (non-engine-workspace) build of this crate unresolvable. The engine never
+# enables cdsi (see vendor/README.md).
 
 [dependencies]
 presage = { path = "../presage", default-features = false }
@@ -32,3 +36,16 @@ libsqlite3-sys = { version = "0.36.0", features = [] }
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["rt", "macros"] }
 rand = "0.9"
+
+# KT (vendored): standalone workspace root so this crate's own tests can run
+# without being captured by the consumer workspace sitting above vendor/.
+[workspace]
+
+# KT (vendored): same fork wiring as the consuming engine's [patch], so the
+# standalone test build links the vendored presage/libsignal-service (KT
+# forks) instead of the pinned git sources.
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "../../libsignal-service" }
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "../presage" }

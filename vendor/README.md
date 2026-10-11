@@ -104,14 +104,33 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   groupCredentialFetcher 7 天窗对位；原每操作新建
   `InMemoryCredentialsCache` 必 miss 必发凭据请求）。接收流 init 臂改走
   `build_groups_manager()`（流内持有独立实例语义不变）；群头像/群发送/
-  fetch_group_with_endorsements 三调用点改守卫解引用，行为面零变化。
+  fetch_group_with_endorsements 三调用点改守卫解引用，行为面零变化；
+  ⑫（P12/R2）接收批化解密+单事务批量落库——unfold 收信加官方 75ms/30
+  批窗（`collect_window`，MessageReceiver.preload.ts:359-366），窗内逐信封
+  分类为 slot 队列（DERM/Contacts/Duplicate/IdentityChange 直挂 Ready，
+  Content 挂 to_save 下标）+ 窗毕 `save_messages_batch` 一次事务落库后按
+  原序 yield（消费方所见事件流与 ack 契约不变）；批内判重 `batch_seen`
+  补 store 判重盲区（落库在窗毕，窗内重复信封查不到）；mid-window
+  QueueEmpty 仅转发事件、keys 同步请求留首拍专臂
+  （`request_keys_from_primary_if_needed`）；`save_message` 拆
+  `prepare_message_for_save`（profile-key/expire/远程删/delete-for-me 逐
+  消息面原样）+ 单条壳保持原签名；`collect_window` 五例单测（tokio
+  start_paused）。顺带收口：4 处机械 clippy（explicit_auto_deref×2/
+  needless_borrow×2，历史批遗留）；移除无人引用的
+  quickcheck/quickcheck_async dev-deps（syn1 full 特性断链，vendor 测试
+  因此从未跑过）；dev tokio 加 test-util；本 manifest 加独立
+  `[workspace]`+libsignal-service `[patch]`（脱离消费方 workspace 独立
+  测试，接的是本 vendor 叉）。
 - `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
   `story: None`（E2，同上纯编译面）；（B4）`Store::take_identity_changes`
-  默认空实现（身份变更日志 drain 面，其他 store 无感）。
+  默认空实现（身份变更日志 drain 面，其他 store 无感）；（P12/R2）
+  `Store::save_messages(Vec<(Thread, Content)>)` 默认实现（循环
+  save_message 兜底，事务型 store 应覆盖为单事务）。
 - `presage/src/model/messages.rs` — ①（A③/B1）`Received::DecryptionError`
   变体 + `DecryptionFailure{RetryReceipt, RetryRequest}`；②（A③）
   `Received::Duplicate` 变体；③（B4）`Received::IdentityChange(ServiceId,
-  Box<Content>, EnvelopeAck)` 变体（本体随信封照常投影、单次 ack）。
+  Box<Content>, EnvelopeAck)` 变体（本体随信封照常投影、单次 ack）；
+  （P12/R2）`cargo fmt` 收口重排（变体行超宽换行，语义零变化）。
 - `presage/src/manager/mod.rs` — ①（A⑤）`pub use
   unidentified_access_or_identified`；②（B2）`pub use group_member_is_admin,
   group_refresh_needed`（群发送语义纯函数）。
@@ -133,12 +152,19 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   fail-open 注释纪律）。
 - `src/content.rs`（2026-10-11 B1/B3 追加）— ①DERM 找回面（按发送方+
   原始时间戳查已发消息、群成员名单读面）；②`kt_kv_get`/`kt_kv_set`
-  （引擎自有 kv 位，prekey 维护书签跨重启）。
+  （引擎自有 kv 位，prekey 维护书签跨重启）；③（P12/R2）
+  `save_message_on_tx` 抽出（单条插入挪到调用方管理的事务内）+
+  `save_messages` 覆盖（一窗一事务循环 on_tx + 一次 commit，
+  MessageReceiver.preload.ts:1003-1123 同位）+ 批量落库整窗读回测试；
+  ④`.sqlx/` 离线缓存 3 条重生成（宏搬家后源位变化、SQL 文本缩进变化
+  → sha256 键失配，describe 沿用原条目）。
 - `src/protocol.rs`（2026-10-11 B4）— `save_identity` ReplacedExisting 时
   入身份变更日志（`Store::take_identity_changes` 数据源，接收流逐信封
   drain）。
 - `src/lib.rs`（2026-10-11 B4）— `SqliteStore` 身份变更日志字段与
-  `take_identity_changes` 覆盖（Arc 共享，clone 语义不变）。
+  `take_identity_changes` 覆盖（Arc 共享，clone 语义不变）；
+  （P12/R2）`cargo fmt` 收口重排（take_identity_changes 表达式收行，
+  语义零变化）。
 - `src/protocol.rs`（2026-10-11 P9 身份安全闸批追加）— ①
   `is_trusted_identity` 存储钥不匹配时按方向裁定：Receiving 放行（收向
   换钥/事件链不变）、Sending 拒绝（官方 isTrustedForSending 不匹配 →
@@ -150,7 +176,14 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   （官方 saveIdentity 换钥 archiveSiblingSessions 同位，
   SignalProtocolStore.preload.ts:2140-2192/:2188-2192），同钥重存保留
   会话；群 outbound sender key 复位不做（引擎无群成员面，取舍登记
-  compat §5）；④换钥 archive/同钥保留单测。
+  compat §5）；④换钥 archive/同钥保留单测；（P12/R2）`cargo fmt`
+  收口重排（测试内超宽地址行，语义零变化）。
+- `Cargo.toml`（2026-10-11 P12/R2）— 废 `cdsi` feature 移除：其
+  `libsqlite3-sys/bundled-sqlcipher-custom-crypto` 要求在 crates.io
+  libsqlite3-sys（0.36 无此 feature）上不可解析，仅声明即令本 crate 脱离
+  消费方 workspace 的独立构建全部失败；引擎从不启用 cdsi（
+  `default-features=false` 且无透传）。同批加独立 `[workspace]`+
+  presage/libsignal-service `[patch]`（独立测试接本 vendor 叉）。
 
 ## 更新纪律
 

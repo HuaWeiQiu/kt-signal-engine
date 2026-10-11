@@ -30,7 +30,12 @@ pub enum Received {
     // Carries the deferred ack (decrypt failures are acked too, like upstream
     // clients), the sender-assigned client timestamp when known, and the DERM
     // retry material when one can be derived (KT).
-    DecryptionError(ServiceId, Option<u64>, Option<DecryptionFailure>, EnvelopeAck),
+    DecryptionError(
+        ServiceId,
+        Option<u64>,
+        Option<DecryptionFailure>,
+        EnvelopeAck,
+    ),
 
     /// Redelivered envelope: a `(sender, client_timestamp)` row already exists
     /// in the store. The message was stored (and is expected to have been

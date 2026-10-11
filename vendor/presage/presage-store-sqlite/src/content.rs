@@ -109,82 +109,24 @@ impl ContentsStore for SqliteStore {
     async fn save_message(
         &self,
         thread: &Thread,
-        Content { metadata, body }: Content,
+        content: Content,
     ) -> Result<(), Self::ContentsStoreError> {
         let mut tx = self.db.begin().await?;
+        save_message_on_tx(&mut tx, thread, content).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
-        let thread_id = match thread {
-            Thread::Contact(service_id) => {
-                let uuid = service_id.raw_uuid();
-                query_scalar!(
-                    "INSERT INTO threads(recipient_id, group_master_key) VALUES (?1, NULL)
-                    ON CONFLICT DO UPDATE SET recipient_id = ?1 RETURNING id",
-                    uuid,
-                )
-                .fetch_one(&mut *tx)
-                .await?
-            }
-            Thread::Group(master_key_bytes) => {
-                let master_key_bytes = master_key_bytes.as_slice();
-                query_scalar!(
-                    "INSERT INTO threads(recipient_id, group_master_key) VALUES (NULL, ?1)
-                    ON CONFLICT DO UPDATE SET group_master_key = ?1 RETURNING id",
-                    master_key_bytes
-                )
-                .fetch_one(&mut *tx)
-                .await?
-            }
-        };
-
-        let Metadata {
-            sender,
-            destination,
-            sender_device,
-            client_timestamp: timestamp,
-            needs_receipt,
-            unidentified_sender,
-            server_guid: _,
-            was_plaintext,
-            server_timestamp: _,
-            pni_verified,
-            story: _, // KT fork (stories): not persisted (stories are not saved).
-        } = metadata;
-
-        let sender_device: u8 = sender_device.into();
-        let sender_service_id = sender.service_id_string();
-        let destination_service_id = destination.service_id_string();
-
-        let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
-        let timestamp = timestamp.timestamp_millis();
-
-        query!(
-            "INSERT OR REPLACE INTO thread_messages (
-                ts,
-                thread_id,
-                sender_service_id,
-                sender_device_id,
-                destination_service_id,
-                needs_receipt,
-                unidentified_sender,
-                content_body,
-                was_plaintext,
-                pni_verified
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            timestamp,
-            thread_id,
-            sender_service_id,
-            sender_device,
-            destination_service_id,
-            needs_receipt,
-            unidentified_sender,
-            proto_bytes,
-            was_plaintext,
-            pni_verified.as_ref().map(|p| p.service_id_string())
-        )
-        .execute(&mut *tx)
-        .await?;
-
+    /// KT (receive batching): a whole receive window commits as a single
+    /// transaction (official Desktop MessageReceiver.preload.ts:1003-1123).
+    async fn save_messages(
+        &self,
+        messages: Vec<(Thread, Content)>,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let mut tx = self.db.begin().await?;
+        for (thread, content) in messages {
+            save_message_on_tx(&mut tx, &thread, content).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -712,6 +654,89 @@ impl ContentsStore for SqliteStore {
     }
 }
 
+/// KT (receive batching): single-message insert within a caller-managed
+/// transaction, shared by [`save_message`] and the batched
+/// [`ContentsStore::save_messages`] override.
+async fn save_message_on_tx(
+    conn: &mut sqlx::SqliteConnection,
+    thread: &Thread,
+    Content { metadata, body }: Content,
+) -> Result<(), SqliteStoreError> {
+    let thread_id = match thread {
+        Thread::Contact(service_id) => {
+            let uuid = service_id.raw_uuid();
+            query_scalar!(
+                "INSERT INTO threads(recipient_id, group_master_key) VALUES (?1, NULL)
+                ON CONFLICT DO UPDATE SET recipient_id = ?1 RETURNING id",
+                uuid,
+            )
+            .fetch_one(&mut *conn)
+            .await?
+        }
+        Thread::Group(master_key_bytes) => {
+            let master_key_bytes = master_key_bytes.as_slice();
+            query_scalar!(
+                "INSERT INTO threads(recipient_id, group_master_key) VALUES (NULL, ?1)
+                ON CONFLICT DO UPDATE SET group_master_key = ?1 RETURNING id",
+                master_key_bytes
+            )
+            .fetch_one(&mut *conn)
+            .await?
+        }
+    };
+
+    let Metadata {
+        sender,
+        destination,
+        sender_device,
+        client_timestamp: timestamp,
+        needs_receipt,
+        unidentified_sender,
+        server_guid: _,
+        was_plaintext,
+        server_timestamp: _,
+        pni_verified,
+        story: _, // KT fork (stories): not persisted (stories are not saved).
+    } = metadata;
+
+    let sender_device: u8 = sender_device.into();
+    let sender_service_id = sender.service_id_string();
+    let destination_service_id = destination.service_id_string();
+
+    let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
+    let timestamp = timestamp.timestamp_millis();
+
+    query!(
+        "INSERT OR REPLACE INTO thread_messages (
+            ts,
+            thread_id,
+            sender_service_id,
+            sender_device_id,
+            destination_service_id,
+            needs_receipt,
+            unidentified_sender,
+            content_body,
+            was_plaintext,
+            pni_verified
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        timestamp,
+        thread_id,
+        sender_service_id,
+        sender_device,
+        destination_service_id,
+        needs_receipt,
+        unidentified_sender,
+        proto_bytes,
+        was_plaintext,
+        pni_verified.as_ref().map(|p| p.service_id_string())
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
+}
+
 trait ThreadExt {
     fn group_master_key(&self) -> Option<&[u8]>;
     fn recipient_id(&self) -> Option<Uuid>;
@@ -795,9 +820,20 @@ impl SqliteStore {
         .fetch_optional(&self.db)
         .await
         .into_protocol_error()?;
-        let Some((group_master_key, recipient_id, ts, server_ts, sender_service_id,
-                  sender_device_id, destination_service_id, needs_receipt, unidentified_sender,
-                  content_body, was_plaintext, pni_verified)) = row
+        let Some((
+            group_master_key,
+            recipient_id,
+            ts,
+            server_ts,
+            sender_service_id,
+            sender_device_id,
+            destination_service_id,
+            needs_receipt,
+            unidentified_sender,
+            content_body,
+            was_plaintext,
+            pni_verified,
+        )) = row
         else {
             return Ok(None);
         };
@@ -837,12 +873,11 @@ impl SqliteStore {
     /// bookmarks (the `kv` table predates the fork; account_entropy_pool is
     /// the in-tree consumer). Values are plain text blobs.
     pub async fn kt_kv_get(&self, key: &str) -> Result<Option<String>, SqliteStoreError> {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as("SELECT value FROM kv WHERE key = ?1")
-                .bind(key)
-                .fetch_optional(&self.db)
-                .await
-                .into_protocol_error()?;
+        let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT value FROM kv WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.db)
+            .await
+            .into_protocol_error()?;
         Ok(row.map(|(value,)| String::from_utf8_lossy(&value).to_string()))
     }
 
@@ -863,6 +898,9 @@ impl SqliteStore {
 mod test {
     use super::*;
     use crate::OnNewIdentity;
+    use presage::libsignal_service::content::ContentBody;
+    use presage::libsignal_service::protocol::DeviceId;
+    use presage::proto::NullMessage;
 
     #[tokio::test]
     async fn upsert_profile_key_reports_the_write() -> Result<(), Box<dyn std::error::Error>> {
@@ -872,6 +910,52 @@ mod test {
 
         assert!(store.upsert_profile_key(&uuid, key).await?);
         assert!(store.upsert_profile_key(&uuid, key).await?);
+
+        Ok(())
+    }
+
+    // KT (receive batching): the batched path must land every message of a
+    // window — three saves in one call read back as three rows in one thread.
+    #[tokio::test]
+    async fn save_messages_persists_a_whole_window() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let sender = ServiceId::Aci(Uuid::from_u128(1).into());
+        let thread = Thread::Contact(sender);
+
+        let content = |ts: u64| {
+            Content::from_body(
+                ContentBody::NullMessage(NullMessage::default()),
+                Metadata {
+                    sender,
+                    destination: sender,
+                    sender_device: DeviceId::new(1).unwrap(),
+                    pni_verified: None,
+                    client_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
+                    server_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    server_guid: None,
+                    story: None,
+                },
+            )
+        };
+
+        store
+            .save_messages(vec![
+                (thread.clone(), content(1_700_000_000_000)),
+                (thread.clone(), content(1_700_000_000_001)),
+                (thread.clone(), content(1_700_000_000_002)),
+            ])
+            .await?;
+
+        for ts in [1_700_000_000_000u64, 1_700_000_000_001, 1_700_000_000_002] {
+            assert!(
+                store.message(&thread, ts).await?.is_some(),
+                "message {ts} missing"
+            );
+        }
+        assert_eq!(store.messages(&thread, ..).await?.count(), 3);
 
         Ok(())
     }
