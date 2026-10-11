@@ -5729,6 +5729,19 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
         .flags
         .is_some_and(|flags| flags & Flags::VoiceMessage as u32 != 0);
     value["isVoiceNote"] = json!(voice_note);
+    // P14 组 3 收投影缺（附件 flags）：BORDERLESS=2/GIF=8 两 flag 位恒投
+    // 布尔（镜像 isVoiceNote 先例——无 flag 位 = false，三布尔同形消费面
+    // 无需判键）。官方 isGIF（Attachment.std.ts:321）另有 contentType
+    // video/* 附加闸，引擎 flag-only 如实投位：媒体类自判归消费方（宁多
+    // 投不误判；GIF 边界官方语义登记 §5）。
+    let is_borderless = pointer
+        .flags
+        .is_some_and(|flags| flags & Flags::Borderless as u32 != 0);
+    let is_gif = pointer
+        .flags
+        .is_some_and(|flags| flags & Flags::Gif as u32 != 0);
+    value["isBorderless"] = json!(is_borderless);
+    value["isGif"] = json!(is_gif);
     let mut locator = serde_json::Map::new();
     if let Some(key) = pointer.key.as_deref().filter(|key| !key.is_empty()) {
         locator.insert(
@@ -7483,6 +7496,43 @@ mod tests {
         assert!(out.get("blurHash").is_none());
         assert!(out.get("incrementalMac").is_none());
         assert!(out.get("chunkSize").is_none());
+    }
+
+    /// P14 收投影缺批（组 3）：附件 flags BORDERLESS=2/GIF=8 恒投布尔
+    /// （镜像 isVoiceNote 先例）；与 VOICE_MESSAGE 位共存按位掩码各自命中；
+    /// 无 flags = 三布尔全 false。
+    #[test]
+    fn attachment_pointer_projection_carries_borderless_and_gif_flags() {
+        use presage::proto::attachment_pointer::Flags;
+
+        let out = project_attachment_pointer(&AttachmentPointer {
+            flags: Some(Flags::Borderless as u32),
+            ..Default::default()
+        });
+        assert_eq!(out["isBorderless"], json!(true));
+        assert_eq!(out["isGif"], json!(false));
+        assert_eq!(out["isVoiceNote"], json!(false));
+
+        let out = project_attachment_pointer(&AttachmentPointer {
+            flags: Some(Flags::Gif as u32),
+            ..Default::default()
+        });
+        assert_eq!(out["isBorderless"], json!(false));
+        assert_eq!(out["isGif"], json!(true));
+
+        // 多 flag 共存按位掩码各自命中（未知 flag 位宽容面 §5 同口径）。
+        let out = project_attachment_pointer(&AttachmentPointer {
+            flags: Some(Flags::VoiceMessage as u32 | Flags::Gif as u32),
+            ..Default::default()
+        });
+        assert_eq!(out["isVoiceNote"], json!(true));
+        assert_eq!(out["isBorderless"], json!(false));
+        assert_eq!(out["isGif"], json!(true));
+
+        let out = project_attachment_pointer(&AttachmentPointer::default());
+        assert_eq!(out["isBorderless"], json!(false));
+        assert_eq!(out["isGif"], json!(false));
+        assert_eq!(out["isVoiceNote"], json!(false));
     }
 
     /// P14 收投影缺批（组 2）：payment=20（notification 臂 note 有/无两面

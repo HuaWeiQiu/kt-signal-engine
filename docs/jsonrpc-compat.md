@@ -163,13 +163,16 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?, type(NORMAL\|GIFTBADGE——proto 词原值恒产，缺席/枚举外 coerce NORMAL，官方 isKnownProtoEnumMember 同构；六问批 Q5), bodyRanges?: [{number?, style?, start, length}] ≤64（mention 二进制优先 + author_numbers E.164 映射、Style 臂归同条目 style 键、NONE 丢、未知枚举整条丢；六问批 Q5）}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
-  size?, width?, height?, caption?, isVoiceNote, locator?}`（≤32；元数据
+  size?, width?, height?, caption?, isVoiceNote, isBorderless, isGif,
+  locator?}`（≤32；元数据
   面 + 2026-10-07 起 `locator` 指针面随行——key/cdnKey/cdnNumber/
   uploadTimestamp/digest，proto 只投影不发明，全缺键不在，§5 receive
   信封附件 locator 投影块；P14 收投影缺批增 `blurHash?`（非空才投）与
   `incrementalMac?`+`chunkSize?`（同进同退齐备才投，导出面
   project_pointer_common 同形——官方 filePointers.preload.ts:84-87
-  同构；导出+live 两面派生自本批，§5））、`previews[] {url, title?,
+  同构；导出+live 两面派生自本批，§5）及 `isBorderless`/`isGif` 两
+  flag 位恒投布尔（组 3，镜像 isVoiceNote 先例——官方 isGIF 另有
+  contentType video/* 附加闸，引擎 flag-only，§5））、`previews[] {url, title?,
   description?, date?, image?}`（≤4；image 同走附件指针投影；`date` 为
   P14 Preview.date 两端批——发布时刻毫秒，>0 才投，官方
   cleanLinkPreviewDate 同语义）、
@@ -3023,6 +3026,20 @@ proto 全字段穷举审计（七项）落地：全部为「收了未投影」�
   ——测试内模拟 Signal 服务器签发全链（ServerSecretParams/ServerPublic
   Params deterministic randomness → request context → issue → receive →
   presentation）钉全四键形状 + 空 presentation 整键不在 + 坏字节降级两键。
+
+### P14 proto 进阶投影收尾·组 3 附件 flags BORDERLESS/GIF（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+- **BORDERLESS=2 / GIF=8**：`project_attachment_pointer` live 面（接收信封
+  + quote thumbnail + sticker data + preview image 同一投影函数全生效）
+  增 `isBorderless`/`isGif` **恒投**布尔——镜像 isVoiceNote 先例（无
+  flag 位 = false，三布尔同形消费面无需判键；多 flag 共存按位掩码各自
+  命中，未知 flag 位宽容不弃行）。
+- **官方 isGIF 附加闸不镜像**：官方 Attachment.std.ts:321 `isGIF` =
+  flag 命中 **∧** `isVideoAttachment`（contentType video/*）双闸；引擎
+  flag-only 如实投位，媒体类自判归消费方（宁多投不误判；gif 闸是官方
+  UI 渲染语义非 wire 语义，消费方持 contentType 可同算）。
+- **导出面零改动**：backup 导出 `attachment_record` 恒产原值 `flag`
+  数位（历史形状），不引入布尔形——wire additive-only 不动既有键。
 
 
 ## 6. fake 服务模式（仅测试）
