@@ -815,8 +815,11 @@ impl<S: Store> Manager<S, Registered> {
                                 Ready(Received),
                             }
                             let mut slots: Vec<BatchSlot> = Vec::with_capacity(window.len());
-                            let mut batch_seen: std::collections::HashSet<(String, u64)> =
-                                Default::default();
+                            let mut batch_seen: std::collections::HashSet<(
+                                String,
+                                u64,
+                                Option<Thread>,
+                            )> = Default::default();
 
                             for (envelope, ack) in window {
                                 // KT (DERM): retry-receipt material captured before the
@@ -943,13 +946,10 @@ impl<S: Store> Manager<S, Registered> {
                                                 Ok(contacts) => {
                                                     info!("saving contacts");
                                                     let mut saved = Vec::new();
-                                                    for contact in contacts.filter_map(Result::ok)
-                                                    {
+                                                    for contact in contacts.filter_map(Result::ok) {
                                                         let contact: Contact = contact.into();
-                                                        if let Err(error) = state
-                                                            .store
-                                                            .save_contact(&contact)
-                                                            .await
+                                                        if let Err(error) =
+                                                            state.store.save_contact(&contact).await
                                                         {
                                                             warn!(%error, "failed to save contacts");
                                                             break;
@@ -959,9 +959,7 @@ impl<S: Store> Manager<S, Registered> {
                                                     slots.push(BatchSlot::Ready(
                                                         Received::Contacts(
                                                             ContactSync {
-                                                                content: Box::new(
-                                                                    content.clone(),
-                                                                ),
+                                                                content: Box::new(content.clone()),
                                                                 complete,
                                                                 contacts: saved,
                                                             },
@@ -1128,34 +1126,50 @@ impl<S: Store> Manager<S, Registered> {
                                         }
 
                                         // Redelivery gate (KT): a (sender, client_timestamp) row
-                                        // already in the store means this envelope was stored and
+                                        // in the same thread means this envelope was stored and
                                         // projected once; re-store/re-project would duplicate
                                         // downstream notifications. Ack the handle instead.
+                                        // KT: the gate is thread-scoped — the same sender may
+                                        // legitimately emit two messages with one client
+                                        // timestamp into two different groups; only a row in
+                                        // the very thread this content belongs to is a
+                                        // redelivery. An underivable thread keeps the
+                                        // conservative global suppression.
+                                        let incoming_thread = Thread::try_from(&content).ok();
                                         let timestamp = u64::try_from(
                                             content.metadata.client_timestamp.timestamp_millis(),
                                         )
                                         .ok();
                                         let redelivered = {
                                             match timestamp {
-                                                Some(timestamp) => state
-                                                    .store
-                                                    .thread_for_sender_and_timestamp(
-                                                        &content.metadata.sender,
-                                                        timestamp,
+                                                Some(timestamp) => {
+                                                    let stored = state
+                                                        .store
+                                                        .thread_for_sender_and_timestamp(
+                                                            &content.metadata.sender,
+                                                            timestamp,
+                                                        )
+                                                        .await
+                                                        .ok()
+                                                        .flatten();
+                                                    is_thread_scoped_redelivery(
+                                                        stored,
+                                                        incoming_thread.clone(),
                                                     )
-                                                    .await
-                                                    .ok()
-                                                    .flatten()
-                                                    .is_some(),
+                                                }
                                                 None => false,
                                             }
                                         };
                                         // KT (receive batching): the store lookup above
                                         // runs before this batch is saved, so a duplicate
                                         // inside the same window would slip past it — the
-                                        // in-batch set closes that gap.
+                                        // in-batch set closes that gap (keyed per thread).
                                         let batch_key = timestamp.map(|timestamp| {
-                                            (content.metadata.sender.service_id_string(), timestamp)
+                                            (
+                                                content.metadata.sender.service_id_string(),
+                                                timestamp,
+                                                incoming_thread.clone(),
+                                            )
                                         });
                                         if redelivered
                                             || batch_key
@@ -2691,6 +2705,18 @@ pub fn unidentified_access_or_identified(
         })
 }
 
+/// KT: thread-scoped redelivery verdict for the (sender, client_timestamp)
+/// gate — a stored row only suppresses re-projection when it lives in the
+/// same thread as the incoming content (one timestamp, two groups is legal).
+/// An underivable incoming thread keeps the conservative global suppression.
+fn is_thread_scoped_redelivery(stored: Option<Thread>, incoming: Option<Thread>) -> bool {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => stored == incoming,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod receive_batch_tests {
     use super::*;
@@ -2820,5 +2846,24 @@ mod receive_batch_tests {
 
         assert_eq!(items, vec![1]);
         assert_eq!(end, BatchWindowEnd::StreamError);
+    }
+
+    #[test]
+    fn redelivery_gate_is_thread_scoped() {
+        let group_a = Thread::Group([1u8; 32]);
+        let group_b = Thread::Group([2u8; 32]);
+        let contact = Thread::Contact(ServiceId::Aci(Aci::from(Uuid::nil())));
+        // same thread → redelivery (suppress)
+        assert!(is_thread_scoped_redelivery(
+            Some(group_a.clone()),
+            Some(group_a.clone())
+        ));
+        // one timestamp, two groups → both project
+        assert!(!is_thread_scoped_redelivery(Some(group_a), Some(group_b)));
+        // nothing stored → project
+        assert!(!is_thread_scoped_redelivery(None, Some(contact.clone())));
+        assert!(!is_thread_scoped_redelivery(None, None));
+        // underivable incoming thread → conservative global suppression
+        assert!(is_thread_scoped_redelivery(Some(contact), None));
     }
 }

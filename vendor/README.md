@@ -187,6 +187,13 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   落库成功记录入 ContactSync 上抛（save 循环保持上游 break-on-error 语义，
   break 后剩余条目不投影；blob 下载仍走 `retrieve_contacts` 既有附件
   下载面，零新平行机制）。
+- `presage/src/manager/registered.rs`（2026-10-11 时序审计组二#4 批）—
+  接收重放闸 thread scoping：`(sender, client_timestamp)` 判重从跨
+  thread 全局改为同 thread 才抑制（`is_thread_scoped_redelivery` 纯函数
+  + `Thread::try_from(&content)` 入向线程推导比对——同 sender 同毫秒发
+  两条到两个群，第二条不再被吞；线程推不出（try_from 失败）保守沿用旧
+  全局抑制；batch_seen 去重键同步加 thread 维度）。单测
+  `receive_batch_tests::redelivery_gate_is_thread_scoped`。
 
 `vendor/presage/presage-store-sqlite/`：
 
