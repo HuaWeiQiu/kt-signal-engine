@@ -2790,6 +2790,46 @@ impl Service {
         groups::create_group(&context, title, expiration_secs, avatar, members).await
     }
 
+    /// migrateGroup（GV1 群迁移 GV2，KT 扩展方法，官方
+    /// initiateMigrationToGroupV2 行为对齐）：GV1 群 id 字节 HKDF 派生新
+    /// master key + createGroup 共用主体（成员分流/avatar 上行/初始
+    /// proto/`PUT v1/groups`）+ 已迁移兜底（读面探测诚实返回既有群态）。
+    /// fake 模式形状桩（随机 master key 标准 base64 + revision 0，不触网；
+    /// avatar data URI 臂同 createGroup fake 纪律 = AvatarUpload 错误面）。
+    pub(crate) async fn migrate_group(
+        self: &Arc<Self>,
+        account: &str,
+        legacy_group_id: &[u8],
+        title: Option<&str>,
+        expiration_secs: Option<u32>,
+        avatar: Option<groups::AvatarWrite>,
+        members: &[String],
+    ) -> Result<(String, u32), groups::TerminateError> {
+        if !self.real {
+            return match avatar {
+                Some(groups::AvatarWrite::Replace(_)) => Err(groups::TerminateError::AvatarUpload),
+                _ => {
+                    use base64::Engine as _;
+                    let master_key = groups::random_32_bytes_pub();
+                    Ok((
+                        base64::engine::general_purpose::STANDARD.encode(master_key),
+                        0,
+                    ))
+                }
+            };
+        }
+        let context = storage_context(self, account).await?;
+        groups::migrate_group(
+            &context,
+            legacy_group_id,
+            title,
+            expiration_secs,
+            avatar,
+            members,
+        )
+        .await
+    }
+
     /// generateInviteLinkPassword（群邀请链接族，KT 扩展批 P13/任务1）：16B
     /// CSPRNG（官方 GROUP_INVITE_LINK_PASSWORD_LENGTH 同长）。纯本地面，
     /// fake/real 同码路，零网络。

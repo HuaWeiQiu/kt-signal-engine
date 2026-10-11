@@ -2893,6 +2893,131 @@ async fn dispatch(
                 }
             }
         }
+        // 群迁移（migrateGroup，KT 扩展方法，官方 initiateMigrationToGroupV2
+        // 行为对齐）：协议上行面，落调度日志（createGroup 同纪律；avatar
+        // 键落盘前形状摘要化——「调度零头像字节」同纪律）。groupId 必填
+        // = 遗留 GV1 群 id 标准 base64（形状闸 = 合法 base64 非空，不硬钉
+        // 16B——HKDF 派生原语对任意字节定义良好，官方 libsignal GV1 id 为
+        // 16B 但引擎不越权加闸）；title 可选非空（缺席 = 空串迁入——官方
+        // 从本地 GV1 群态继承 title，headless 引擎无本地群态，compat §5
+        // 记档）；members 必填非空字符串数组（官方迁移必携 V1 成员名单
+        // 同位）；expiration/avatar 三态与 createGroup 同形状。参数面
+        // fail-closed -32603；服务器拒绝 → -1 GROUP_MIGRATION_FAILED +
+        // data.status 诚实透传；已迁移兜底（put 失败后读面探测，群已在
+        // 服务器 = 诚实返回既有 {groupId, revision}，官方
+        // hasV1GroupBeenMigrated 同语义简化版）；avatar 上行链失败 →
+        // GROUP_AVATAR_UPLOAD_FAILED；网络面 → STORAGE_UNAVAILABLE；
+        // self 凭据取材失败 → GROUP_MIGRATION_FAILED data.status 缺省。
+        // fake 模式形状桩 {groupId(随机 master key 标准 base64),
+        // revision: 0}（avatar data URI 臂失败同 createGroup 两臂纪律）。
+        "migrateGroup" => {
+            let mut logged_params = params.clone();
+            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
+                let digest = format!("[avatar data uri: {} bytes]", uri.len());
+                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
+            }
+            state.lock().await.append_dispatch(method, &logged_params);
+            let account = params.get("account").and_then(Value::as_str);
+            let legacy_id = match params.get("groupId") {
+                Some(Value::String(text)) if !text.is_empty() => {
+                    use base64::Engine as _;
+                    match base64::engine::general_purpose::STANDARD.decode(text) {
+                        Ok(bytes) if !bytes.is_empty() => bytes,
+                        _ => return internal_error(id),
+                    }
+                }
+                Some(_) | None => return internal_error(id),
+            };
+            let title = match params.get("title") {
+                Some(Value::String(title)) if !title.is_empty() => Some(title.to_owned()),
+                Some(Value::Null) | None => None,
+                Some(_) => return internal_error(id),
+            };
+            let expiration = params
+                .get("expiration")
+                .and_then(Value::as_u64)
+                .and_then(|seconds| u32::try_from(seconds).ok());
+            if params.get("expiration").is_some() && expiration.is_none() {
+                return internal_error(id);
+            }
+            let avatar = match params.get("avatar") {
+                None => None,
+                Some(Value::Null) => Some(crate::service::groups::AvatarWrite::Remove),
+                Some(Value::String(uri)) => {
+                    match crate::service::profile::parse_avatar_data_uri(uri) {
+                        Some((_, bytes)) => {
+                            Some(crate::service::groups::AvatarWrite::Replace(bytes))
+                        }
+                        None => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            let members = match params.get("members") {
+                Some(Value::Array(entries)) if !entries.is_empty() => {
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(text) => parsed.push(text.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) | None => return internal_error(id),
+            };
+            let Some(account) = account else {
+                return internal_error(id);
+            };
+            match service
+                .migrate_group(
+                    account,
+                    &legacy_id,
+                    title.as_deref(),
+                    expiration,
+                    avatar,
+                    &members,
+                )
+                .await
+            {
+                Ok((group_id, revision)) => jsonrpc::success_response(
+                    id,
+                    json!({ "groupId": group_id, "revision": revision }),
+                ),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup)
+                | Err(crate::service::groups::TerminateError::InviteLinkUnset) => {
+                    internal_error(id)
+                }
+                Err(crate::service::groups::TerminateError::AvatarUpload) => {
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_AVATAR_UPLOAD_FAILED",
+                            json!({ "retryable": true, "textSaved": false }),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_MIGRATION_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+            }
+        }
         // 群终止（terminateGroup，KT 扩展方法）：协议上行面，落调度日志
         //（send 系/reportSpam 同纪律）。groupId 必须 32B 标准 base64 群
         // master key、缺 account/坏 groupId → 参数面 -32603 fail-closed；

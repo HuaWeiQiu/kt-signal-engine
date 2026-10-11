@@ -1731,6 +1731,24 @@ pub(crate) fn random_32_bytes_pub() -> [u8; 32] {
     random_32_bytes()
 }
 
+/// GV1 → GV2 迁移 master key 派生（官方 Signal-Desktop
+/// ts/Crypto.node.ts:72 deriveMasterKeyFromGroupV1 行为对齐：HKDF-SHA256，
+/// salt = 32 零字节，info = "GV2 Migration"，OKM 取首 32B 为新群 master
+/// key）。输入吃任意长度 GV1 群 id 字节——官方 libsignal GV1 id 为 16B，
+/// 引擎不硬钉长度（派生原语对任意输入定义良好；形状闸在 wire 层做合法
+/// base64 非空）。无官方测试向量，单测钉输出稳定性作回归锚。
+pub(crate) fn derive_master_key_from_group_v1(legacy_group_id: &[u8]) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), legacy_group_id);
+    let mut okm = [0u8; 32];
+    // 32B OKM 恒在 HKDF 合法输出长度内，unwrap 不可达（库面
+    // InvalidLength 仅在 len > 255 * HashLen 时出现）。
+    hk.expand(b"GV2 Migration", &mut okm)
+        .expect("32B OKM 合法长度");
+    okm
+}
+
 /// 群写面成员入参解析：service-id 串（ACI/PNI）直通；否则按联系人号码
 /// 数字位后缀匹配 → 联系人 ACI（send 收件人解析同口径；找不到 = None，
 /// 调用方按 API 语义整拒——官方桌面缺本地联系人是静默跳过的 GUI 语义，
@@ -1871,29 +1889,14 @@ async fn refresh_local_group_state(context: &StorageContext, master_key: &[u8]) 
     }
 }
 
-/// createGroup 编排（官方 createGroupV2 行为对齐，KT 扩展方法）：随机
-/// master key（32B CSPRNG）→ zkgroup 派生链（secret params → public
-/// params → groupId = get_group_identifier，官方 deriveGroupFields 同构；
-/// wire 面 groupId = master key 标准 base64 引擎口径）→ self + 成员
-/// 凭据取材（有 profile key + 凭据 = 全成员，无 = pending 降级，官方
-/// createGroupV2 成员分流同构）→ avatar 上行链（Replace 臂，官方
-/// uploadAvatar 建群前同序）→ 初始 Group proto（version 0 + 官方
-/// accessControl 默认 + 加密 title/timer，官方 buildGroupProto 同形状）→
-/// `PUT v1/groups` → 本地群态落库。成员入参（service-id 串/号码）此处
-/// 解析，不可解析 = UnknownGroup（handler 面 -32603 整拒——官方桌面缺
-/// 本地联系人静默跳过是 GUI 语义，API 面不静默）。self 凭据取材失败 =
-/// 建群失败 Failed{None}（服务器必拒无 presentation 的创建，不硬造）。
-pub(crate) async fn create_group(
+/// 群写面成员批量解析（createGroup/migrateGroup 共用）：逐条
+/// `resolve_group_member`，去重保序；任一条不可解析 = UnknownGroup 整拒
+/// （官方桌面缺本地联系人静默跳过是 GUI 语义，API 面不静默，compat §5
+/// 已登记）。
+async fn resolve_group_members(
     context: &StorageContext,
-    title: &str,
-    expiration_secs: Option<u32>,
-    avatar: Option<AvatarWrite>,
     members: &[String],
-) -> Result<(String, u32), TerminateError> {
-    use base64::Engine as _;
-    use presage::libsignal_service::groups_v2::{AccessRequired, GroupMemberCandidate};
-    use presage::store::ContentsStore as _;
-
+) -> Result<Vec<presage::libsignal_service::protocol::ServiceId>, TerminateError> {
     let mut resolved = Vec::with_capacity(members.len());
     for entry in members {
         let service_id = resolve_group_member(&context.store, entry)
@@ -1903,8 +1906,35 @@ pub(crate) async fn create_group(
             resolved.push(service_id);
         }
     }
+    Ok(resolved)
+}
 
-    let master_key = random_32_bytes();
+/// 群创建编排（createGroup + migrateGroup 共用主体）：zkgroup 派生链
+///（secret params → public params → groupId = get_group_identifier，官方
+/// deriveGroupFields 同构；wire 面 groupId = master key 标准 base64 引擎
+/// 口径）→ self + 成员凭据取材（有 profile key + 凭据 = 全成员，无 =
+/// pending 降级，官方 createGroupV2 成员分流同构）→ avatar 上行链
+///（Replace 臂，官方 uploadAvatar 建群前同序）→ 初始 Group proto
+///（version 0 + 官方 accessControl 默认 + 加密 title/timer，官方
+/// buildGroupProto 同形状）→ `PUT v1/groups` → 本地群态落库。
+/// `probe_already_migrated` 仅迁移臂启用：put 失败后 `fetch_group_state`
+/// 探测（官方 initiateMigrationToGroupV2 错误路径 hasV1GroupBeenMigrated
+/// 同语义简化版——派生 key 确定性，重复迁移 = 服务器已存群，诚实返回
+/// 既有群态；createGroup 臂随机 key 无冲突面，不探测，错误原样上抛）。
+#[allow(clippy::too_many_arguments)]
+async fn create_group_with_master_key(
+    context: &StorageContext,
+    master_key: [u8; 32],
+    resolved: Vec<presage::libsignal_service::protocol::ServiceId>,
+    title: &str,
+    expiration_secs: Option<u32>,
+    avatar: Option<AvatarWrite>,
+    probe_already_migrated: bool,
+) -> Result<(String, u32), TerminateError> {
+    use base64::Engine as _;
+    use presage::libsignal_service::groups_v2::{AccessRequired, GroupMemberCandidate};
+    use presage::store::ContentsStore as _;
+
     let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
     let operations = presage::libsignal_service::groups_v2::GroupOperations::new(secret_params);
 
@@ -1985,12 +2015,82 @@ pub(crate) async fn create_group(
         .map_err(|_| TerminateError::Failed { status: None })?;
 
     let authorization = group_authorization(context, &master_key).await?;
-    let revision = put_group(&context.push, authorization, &group).await?;
+    let revision = match put_group(&context.push, authorization, &group).await {
+        Ok(revision) => revision,
+        Err(err) if probe_already_migrated => {
+            // 已迁移兜底（官方 hasV1GroupBeenMigrated 同语义简化版）：
+            // 读面探测成功 = 群已在服务器，诚实返回既有 revision。
+            match fetch_group_state(context, &master_key).await {
+                Ok(existing) => existing.version,
+                Err(_) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
     refresh_local_group_state(context, &master_key).await;
     Ok((
         base64::engine::general_purpose::STANDARD.encode(master_key),
         revision,
     ))
+}
+
+/// createGroup 编排（官方 createGroupV2 行为对齐，KT 扩展方法）：随机
+/// master key（32B CSPRNG）+ `create_group_with_master_key` 共用主体。
+/// 成员入参（service-id 串/号码）此处解析，不可解析 = UnknownGroup
+///（handler 面 -32603 整拒）。self 凭据取材失败 = 建群失败 Failed{None}
+///（服务器必拒无 presentation 的创建，不硬造）。
+pub(crate) async fn create_group(
+    context: &StorageContext,
+    title: &str,
+    expiration_secs: Option<u32>,
+    avatar: Option<AvatarWrite>,
+    members: &[String],
+) -> Result<(String, u32), TerminateError> {
+    let resolved = resolve_group_members(context, members).await?;
+    let master_key = random_32_bytes();
+    create_group_with_master_key(
+        context,
+        master_key,
+        resolved,
+        title,
+        expiration_secs,
+        avatar,
+        false,
+    )
+    .await
+}
+
+/// migrateGroup 编排（GV1 群迁移 GV2，官方 initiateMigrationToGroupV2
+/// 行为对齐，KT 扩展方法）：GV1 群 id 字节 → deriveMasterKeyFromGroupV1
+///（HKDF 派生新群 master key，官方 ts/Crypto.node.ts:72 同式）→ 成员
+/// 解析分流（复用 createGroup 链）→ 初始 Group proto（revision 0 + 官方
+/// accessControl 默认）→ `PUT v1/groups` → 已迁移兜底（读面探测，群已
+/// 在服务器 = 诚实返回既有群态）→ 本地群态落库。title/expiration/avatar
+/// 由调用方供给（引擎无 GV1 本地群态可继承——官方从本地 DB 读 V1 群
+/// title/expireTimer/avatar 后迁入，headless 引擎面为调用方显式入参，
+/// compat §5 记档）。成员角色偏差：官方迁移全员 ADMINISTRATOR，引擎复用
+/// createGroup 加密链（encrypt_group_with_credentials）→ 非本人有凭据
+/// 成员角色 DEFAULT、本人 ADMINISTRATOR（compat §5 记档）。
+pub(crate) async fn migrate_group(
+    context: &StorageContext,
+    legacy_group_id: &[u8],
+    title: Option<&str>,
+    expiration_secs: Option<u32>,
+    avatar: Option<AvatarWrite>,
+    members: &[String],
+) -> Result<(String, u32), TerminateError> {
+    let resolved = resolve_group_members(context, members).await?;
+    let master_key = derive_master_key_from_group_v1(legacy_group_id);
+    create_group_with_master_key(
+        context,
+        master_key,
+        resolved,
+        title.unwrap_or(""),
+        expiration_secs,
+        avatar,
+        true,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3877,6 +3977,35 @@ mod tests {
             params_a.get_group_identifier(),
             params_b.get_group_identifier()
         );
+    }
+
+    /// GV1 → GV2 迁移 master key 派生稳定性（官方 deriveMasterKeyFromGroupV1
+    /// 行为对齐，无官方测试向量——本测钉确定性 + 区分度 + 长度无关性作
+    /// 回归锚）：同输入同输出；不同输入不同输出；输出 32B；输入长度变化
+    ///（16B 官方 GV1 形状 / 其他长度）照常派生不 panic。
+    #[test]
+    fn derive_master_key_from_group_v1_is_deterministic_and_length_agnostic() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let a_again = [0x11u8; 16];
+
+        let derived_a = derive_master_key_from_group_v1(&a);
+        let derived_a_again = derive_master_key_from_group_v1(&a_again);
+        let derived_b = derive_master_key_from_group_v1(&b);
+        assert_eq!(derived_a, derived_a_again, "derive deterministic");
+        assert_ne!(derived_a, derived_b, "distinct inputs diverge");
+        assert_eq!(derived_a.len(), 32, "OKM 32B");
+
+        // 官方 GV1 id 固定 16B，但派生原语对任意输入定义良好（wire 层
+        // 只闸合法 base64 非空，不硬钉长度——回归锚在此固化该口径）。
+        let odd = derive_master_key_from_group_v1(&[0x33u8; 7]);
+        assert_eq!(odd.len(), 32);
+        assert_ne!(odd, derived_a);
+
+        // 空输入与零输入区分（派生吃任意字节，wire 非空闸之外的兜底）。
+        let empty = derive_master_key_from_group_v1(&[]);
+        let zero = derive_master_key_from_group_v1(&[0u8; 16]);
+        assert_ne!(empty, zero);
     }
 
     /// 群写面成员入参解析（service-id 串直通 / 未知号码 None）：ACI/PNI

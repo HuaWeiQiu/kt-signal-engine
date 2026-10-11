@@ -1207,6 +1207,135 @@ fn create_group_fake_shape_param_fail_closed_and_log_redaction() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// 群迁移（migrateGroup，KT 扩展方法，官方 initiateMigrationToGroupV2
+/// 行为对齐）：fake 模式形状桩 `{groupId(随机 32B master key 标准 base64),
+/// revision: 0}`（落调度日志，avatar 键摘要化，遗留 GV1 groupId 逐字
+/// 保留）；avatar data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED；参数面
+/// fail-closed（-32603：缺 account / groupId 缺席·空串·非 base64·非字符
+/// 串 / title 空串·非字符串 / expiration 非法形状 / members 缺席·非数组·
+/// 空数组·条目非字符串 / avatar 非 image 族·坏 base64）；real 模式未注册
+/// 账号折叠 -32603。
+#[test]
+fn migrate_group_fake_shapes_and_param_fail_closed() {
+    use base64::Engine as _;
+    let dir = temp_dir("migrate-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 遗留 GV1 群 id（官方 libsignal 形状 = 16B 标准 base64，24 字符）。
+    let legacy_id = base64::engine::general_purpose::STANDARD.encode([0xABu8; 16]);
+    let members = json!(["+15551112222"]);
+    let avatar = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake")
+    );
+
+    // fake 合法面：groupId + members 必填，title / expiration / avatar
+    // 缺省 → 形状桩 {groupId, revision: 0}；新 groupId ≠ 遗留 id 且为
+    // 32B 标准 base64。
+    let migrated = engine.request(
+        "migrateGroup",
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": members }),
+    )["result"]
+        .clone();
+    let new_group_id = migrated["groupId"].as_str().expect("groupId string");
+    assert_ne!(new_group_id, legacy_id, "新 GV2 id ≠ 遗留 GV1 id");
+    assert_eq!(new_group_id.len(), 44, "32B master key 标准 base64");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(new_group_id)
+        .expect("groupId decodes");
+    assert_eq!(decoded.len(), 32);
+    assert_eq!(migrated["revision"], json!(0));
+
+    // title / expiration 臂同形成功（title 可选非空，缺席 = 空串迁入）。
+    assert_eq!(
+        engine.request(
+            "migrateGroup",
+            json!({ "account": "+15550000000", "groupId": legacy_id, "title": "旧群",
+                    "expiration": 86_400, "members": members })
+        )["result"]["revision"],
+        json!(0)
+    );
+
+    // fake 失败臂：avatar data URI（需上行链）→ GROUP_AVATAR_UPLOAD_FAILED
+    // data {retryable:true, textSaved:false}。
+    let response = engine.request(
+        "migrateGroup",
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": members,
+                "avatar": avatar }),
+    );
+    assert_eq!(response["error"]["code"], -1);
+    assert_eq!(response["error"]["message"], "GROUP_AVATAR_UPLOAD_FAILED");
+
+    // 参数面 fail-closed 逐形状（-32603）。
+    let rejects = [
+        json!({ "groupId": legacy_id, "members": members }),
+        json!({ "account": "+15550000000", "members": members }),
+        json!({ "account": "+15550000000", "groupId": "", "members": members }),
+        json!({ "account": "+15550000000", "groupId": "###", "members": members }),
+        json!({ "account": "+15550000000", "groupId": 7, "members": members }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "title": "", "members": members }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "title": 7, "members": members }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "expiration": "3600", "members": members }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "expiration": -1, "members": members }),
+        json!({ "account": "+15550000000", "groupId": legacy_id }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": "not-array" }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": [] }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": [7] }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": members, "avatar": "data:text/plain;base64,aGk=" }),
+        json!({ "account": "+15550000000", "groupId": legacy_id, "members": members, "avatar": "data:image/png;base64,###" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("migrateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "migrateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：groupId/members/title 键逐字保留（协议上行面纪律），
+    // avatar 键形状摘要化（data URI 载荷零字节落盘）；被拒调用同样落日志。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .filter(|entry: &Value| entry["method"] == "migrateGroup")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        18,
+        "成功两条 + 失败一条 + 拒绝十五条均落日志"
+    );
+    assert_eq!(entries[0]["params"]["groupId"], json!(legacy_id));
+    assert_eq!(entries[0]["params"]["members"], members);
+    assert!(
+        entries[0]["params"]["title"].is_null(),
+        "title 缺省原样保留"
+    );
+    let redacted = &entries[2]["params"]["avatar"];
+    assert!(
+        redacted.is_string()
+            && redacted
+                .as_str()
+                .expect("avatar digest")
+                .starts_with("[avatar data uri: "),
+        "avatar key digested in dispatch log: {redacted}"
+    );
+    assert!(
+        !log.contains("iVBO"),
+        "avatar base64 payload leaked into log"
+    );
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（createGroup
+    // 同款，细节不外泄）。
+    let real_dir = temp_dir("migrate-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "migrateGroup",
+        json!({ "account": "+15559990000", "groupId": legacy_id, "members": members }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// 群终止（terminateGroup，KT 扩展方法）：fake 模式成功投影
 /// `{status: "terminated"}`（落调度日志，协议上行面纪律）；参数面
 /// fail-closed（-32603：缺 account / 缺 groupId / groupId 非 base64 /
