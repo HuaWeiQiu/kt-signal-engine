@@ -2653,8 +2653,19 @@ B 批「强制闸待桌面批」遗留闭合 + 身份防护三面，wire additiv
   2140-2192/:2188-2192——旧钥下建的会话不得在换钥后存活，下一收发自新
   钥重建，DERM 重发/MRM 重试自愈面承接对端旧会话残留）。以先读旧钥
   比对为判定：上游 rows_affected 语义把「行存在」当「钥变」，同钥重存
-  （如正常建会话路径）不得清会话。群 outbound sender key 复位未做
-  （引擎无群成员面，取舍登记）；inbound sender key 不清（群收向自愈）。
+  （如正常建会话路径）不得清会话。
+- **群 outbound sender key 评估（2026-10-11 S4 复核批，结论 = 无需代码，
+  维持不做）**：身份替换 archive 会话后，群 sender key 分发台账
+ （group_mrm.rs SenderKeyInfo covered 表）按「有活会话的设备面」比对
+  ——`session_device_ids` 只含有会话设备（load_session 过滤），换钥 archive
+  即 covered 失配 → 下次群发送自动重建 SKDM 并经新会话重发，覆盖面自愈
+  无需人工登记失效。outbound sender key 本体（sender_keys 表 own address
+  行）不随对端身份换钥轮换：sender key 安全性不依赖对端身份钥（SKDM 按
+  会话加密投递，新会话只需重新投递同一密钥材料），官方
+  archiveSiblingSessions 同样不触 sender key——复位反而是过度操作（对端
+  收到新 distributionId 会多一轮 SKDM 处理，无安全收益）。早期「引擎无
+  群成员面」的取舍理由随群写面四域批失效，本条为现行机制论证；inbound
+  sender key 不清（群收向自愈）不变。
 
 ## 6. fake 服务模式（仅测试）
 
