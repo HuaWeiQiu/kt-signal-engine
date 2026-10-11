@@ -1,6 +1,8 @@
 use chrono::Utc;
 use libsignal_core::DeviceId;
-use libsignal_protocol::{Pni, ProtocolAddress, ServiceId, SenderKeyDistributionMessage};
+use libsignal_protocol::{
+    Pni, ProtocolAddress, SenderKeyDistributionMessage, ServiceId,
+};
 use prost::Message;
 use std::fmt;
 use uuid::Uuid;
@@ -193,7 +195,9 @@ impl ContentBody {
         match self {
             Self::SenderKeyDistributionMessage(msg) => crate::proto::Content {
                 content: None,
-                sender_key_distribution_message: Some(msg.serialized().to_vec()),
+                sender_key_distribution_message: Some(
+                    msg.serialized().to_vec(),
+                ),
                 pni_signature_message: None,
             },
             body => {

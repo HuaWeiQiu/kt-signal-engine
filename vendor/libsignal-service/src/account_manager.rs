@@ -209,8 +209,12 @@ impl AccountManager {
             tracing::info!("Available keys sufficient; forcing refresh.");
         }
 
-        self.publish_fresh_pre_keys(protocol_store, service_id_kind, use_last_resort_key)
-            .await
+        self.publish_fresh_pre_keys(
+            protocol_store,
+            service_id_kind,
+            use_last_resort_key,
+        )
+        .await
     }
 
     /// KT (pre-key maintenance): time-based signed pre-key rotation.

@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn envelope_ack_writes_the_response_exactly_once() {
-        let (responder, receiver) = oneshot::channel();
+        let (responder, mut receiver) = oneshot::channel();
         let ack = EnvelopeAck {
             response: WebSocketResponseMessage::default(),
             responder,

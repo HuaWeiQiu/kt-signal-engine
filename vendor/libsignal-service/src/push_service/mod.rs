@@ -14,7 +14,13 @@ use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
 use tracing::{debug_span, Instrument};
 
-pub const KEEPALIVE_TIMEOUT_SECONDS: Duration = Duration::from_secs(55);
+// KT (P12/R3): 55s→30s. A keepalive counts as failed only at the *next*
+// tick, so dead-link detection was 55-110s; at 30s it is ≤60s while staying
+// above typical NAT idle amortization for a healthy ack-driven link
+// (official Desktop: WebsocketResources.preload.ts:512
+// KEEPALIVE_TIMEOUT_MS = 30s).
+pub const KEEPALIVE_TIMEOUT_SECONDS: Duration = Duration::from_secs(30);
+
 pub static DEFAULT_DEVICE_ID: LazyLock<libsignal_core::DeviceId> =
     LazyLock::new(|| libsignal_core::DeviceId::try_from(1).unwrap());
 
@@ -295,5 +301,20 @@ mod tests {
     fn serde_json_form_empty_vec() {
         // If we're trying to send and empty payload, serde_json must be able to make a Vec out of it
         assert!(serde_json::to_vec(b"").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod keepalive_timeout_tests {
+    use super::KEEPALIVE_TIMEOUT_SECONDS;
+
+    // KT (P12/R3): the aggressive-dead-link-detection tightening must not
+    // silently regress upward (nor drop below the NAT-amortization floor).
+    #[test]
+    fn keepalive_timeout_is_thirty_seconds() {
+        assert_eq!(
+            KEEPALIVE_TIMEOUT_SECONDS,
+            std::time::Duration::from_secs(30)
+        );
     }
 }

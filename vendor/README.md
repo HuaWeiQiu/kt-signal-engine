@@ -62,6 +62,18 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `src/account_manager.rs`（2026-10-11 B3 prekey 维护批）— 抽 pub
   `publish_fresh_pre_keys`（prekey 批生成+上传复用腿）与
   `rotate_signed_pre_key_bundle`（signed prekey 按龄轮换上传腿）。
+- `src/push_service/mod.rs`（2026-10-11 P12/R3 批）— `KEEPALIVE_TIMEOUT_SECONDS`
+  55s→30s：keepalive 上一拍未回即断，死链检测 55-110s → ≤60s（官方
+  Desktop WebsocketResources.preload.ts:512 KEEPALIVE_TIMEOUT_MS=30s 同
+  位）；30s 断言单测。
+- `src/messagepipe.rs`（2026-10-11 P12/R3 批追加）— ack 单测补 `mut`
+  （编译错，vendor 测试首次可跑时暴露）。
+- `src/sender.rs`（2026-10-11 P12/R3 批追加）— `try_send_message` 加
+  `#[allow(clippy::too_many_arguments)]`（Stories 批 `story` 参数超限；
+  参数结构体重构另行立项）。
+- `src/account_manager.rs`、`src/content.rs`、`src/sender.rs`、
+  `src/push_service/mod.rs`（同批 `cargo fmt` 收口）— 稳定通道 rustfmt
+  子集重排，语义零变化。
 
 `vendor/presage/`（rev 33dd149）：
 

@@ -537,6 +537,9 @@ where
         skip(self, unidentified_access, content_body, recipient),
         fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
     )]
+    // KT (Stories E1): the `story` parameter pushed this one over
+    // clippy::too_many_arguments; a params-struct refactor is deferred.
+    #[allow(clippy::too_many_arguments)]
     async fn try_send_message(
         &mut self,
         recipient: ServiceId,
@@ -571,8 +574,7 @@ where
             }) = self
                 .create_encrypted_messages(
                     &recipient,
-                    story
-                        .or(unidentified_access.map(|x| &x.certificate)),
+                    story.or(unidentified_access.map(|x| &x.certificate)),
                     &content_bytes,
                 )
                 .await?
