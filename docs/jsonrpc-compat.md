@@ -3393,6 +3393,34 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   就地 ack 吞掉），信封留服务器队列待连接器重启引擎后全量重放补投影。
   连接器侧语义：receive 通知到达即「引擎已尽力投递」，ack 时序对 wire 面
   零感知；背压上收（连接器读得慢 ack 就慢，服务器侧流控自然生效）。
+- **项2 会话状态三 flag 同步（状态收敛审计 R1，getConversationState/
+  setConversationState，wire additive）**：静音/归档/标记未读三 flag 的
+  多设备同步写读面——官方通道 = Storage Service record 字段（非 sync
+  message）：ContactRecord.archived/markedUnread/mutedUntilTimestamp（
+  SignalStorage.proto 11/12/13）与 GroupV2Record/GroupV1Record 同名位
+  （GV2 4/5/6、GV1 4/5/6；storageRecordOps applyContactRecord/
+  applyGroupV2Record 消费 + toContactRecord/toGroupV2Record 上行同位，
+  MuteExpiration.toProto 语义 = 绝对毫秒、0 = 未静音）。复用 blocked/
+  sticker 写面既有编排（read 改写 decode→mutate→encode 保真、新 16B
+  item id、WriteOperation version+1、409 采纳重放 3 次、manifest 404
+  播种分支）；部分写意图（缺席位不动，AccountConfigurationUpdate 同
+  款）；同值幂等无写；目标记录缺席时非缺省意图 = 最小记录首建（标识 +
+  三 flag，fresh_blocked_record 同构）、全缺省 = 不空造记录。
+  - `getConversationState {account, conversationId, kind}` →
+    `{mutedUntilTimestamp, archived, markedUnread}`（三键恒在；目标记录
+    缺席/无 storage 状态/manifest 404 = 全缺省 0/false/false，诚实幂等）。
+  - `setConversationState {account, conversationId, kind,
+    mutedUntilTimestamp?, archived?, markedUnread?}` → 写后目标三 flag
+    （getConversationState 同形状；官方 upload 成功语义 = 本地写后面为
+    准）。mutedUntilTimestamp 非负整数、archived/markedUnread 布尔；
+    null/形状错/负数 `-32603`（官方 falsy no-op 静默语义引擎不收，
+    updateGroup title 同纪律）；三 flag 全缺 = 无写意图 `-32603`。
+  - kind 词表 contact/group/legacyGroup（blocked 面同款；Note to Self 的
+    archived/markedUnread 在官方走 AccountRecord.noteToSelf* 位且无静音
+    位——本批不收 noteToSelf kind，消费方提出需求再立项，偏差登记）。
+  - fake：get 恒缺省态；set 缺省态叠意图回显。错误面 = storage 四码
+    （STORAGE_UNAVAILABLE/READ_FAILED/WRITE_FAILED/会话不可解析
+    -32603，blocked 面同款）。
 - **项3 dedup 门 thread scoping（时序审计组二#4，vendored presage，fork
   登记 vendor/README.md）**：接收重放闸 `(sender, client_timestamp)` 从
   跨 thread 全局判重改为同 thread 才抑制（`is_thread_scoped_redelivery`

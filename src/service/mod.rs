@@ -2554,6 +2554,42 @@ impl Service {
         storage_sync::write_blocked(&context, &conversation, blocked, now_ms()).await
     }
 
+    /// getConversationState（P15b 项2）：读 Storage Service 目标会话记录
+    /// 三 flag（mutedUntilTimestamp/archived/markedUnread）→ 读投影；目标
+    /// 记录缺席 / 无 storage 状态 = 全缺省（诚实幂等）。fake 模式缺省桩。
+    pub(crate) async fn conversation_state(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: storage_sync::EngineConversationId,
+    ) -> Result<storage_sync::ConversationState, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_sync::ConversationState::default());
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::read_conversation_state(&context, &conversation).await
+    }
+
+    /// setConversationState（P15b 项2）：三 flag 部分写意图（缺席位不动）
+    /// → Storage Service 目标会话记录读改写 + 409 冲突重放；返回写后三
+    /// flag（官方 upload 成功语义 = 本地写后面为准）。fake 模式缺省态叠
+    /// 意图回显。
+    pub(crate) async fn set_conversation_state(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: storage_sync::EngineConversationId,
+        intent: storage_sync::ConversationStateWrite,
+    ) -> Result<storage_sync::ConversationState, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_sync::ConversationState {
+                muted_until_timestamp: intent.muted_until_timestamp.unwrap_or(0),
+                archived: intent.archived.unwrap_or(false),
+                marked_unread: intent.marked_unread.unwrap_or(false),
+            });
+        }
+        let context = storage_context(self, account).await?;
+        storage_sync::write_conversation_state(&context, &conversation, intent).await
+    }
+
     /// getStickerPackSyncs（P5 扩面）：读全部贴纸包安装状态（存储序 =
     /// manifest STICKER identifiers 首现序；坏条目跳过不炸面）。
     pub(crate) async fn sticker_pack_syncs(

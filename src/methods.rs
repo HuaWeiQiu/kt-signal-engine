@@ -1958,6 +1958,80 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 会话状态三 flag 读写面（getConversationState/setConversationState，
+        // P15b 项2 KT 扩展方法）：Storage Service 真相源（Contact/GV1/GV2
+        // 记录 archived/markedUnread/mutedUntilTimestamp 位），参数纪律与
+        // setConversationBlocked 同款（kind 缺失/未知 fail-closed -32603）。
+        // set 臂三 flag 全缺（或全 null）= 无写意图整拒；写后返回目标三
+        // flag 读投影（getConversationState 同形状）。
+        "getConversationState" => {
+            state.lock().await.append_dispatch(method, params);
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(conversation) = conversation_of(
+                params.get("conversationId").and_then(Value::as_str),
+                params.get("kind").and_then(Value::as_str),
+            ) else {
+                return internal_error(id);
+            };
+            match service.conversation_state(account, conversation).await {
+                Ok(state) => jsonrpc::success_response(id, conversation_state_payload(&state)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        "setConversationState" => {
+            state.lock().await.append_dispatch(method, params);
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(conversation) = conversation_of(
+                params.get("conversationId").and_then(Value::as_str),
+                params.get("kind").and_then(Value::as_str),
+            ) else {
+                return internal_error(id);
+            };
+            // 三 flag 各自 Option（null/错误形状 = 该位非法整拒——官方
+            // falsy no-op 的静默语义引擎不收，updateGroup title 同纪律）。
+            let muted_until = match params.get("mutedUntilTimestamp") {
+                None => Some(None),
+                Some(Value::Number(value)) => value.as_u64().map(Some),
+                Some(_) => None,
+            };
+            let archived = match params.get("archived") {
+                None => Some(None),
+                Some(Value::Bool(value)) => Some(Some(*value)),
+                Some(_) => None,
+            };
+            let marked_unread = match params.get("markedUnread") {
+                None => Some(None),
+                Some(Value::Bool(value)) => Some(Some(*value)),
+                Some(_) => None,
+            };
+            let (Some(muted_until), Some(archived), Some(marked_unread)) =
+                (muted_until, archived, marked_unread)
+            else {
+                return internal_error(id);
+            };
+            let intent = storage_sync::ConversationStateWrite {
+                muted_until_timestamp: muted_until,
+                archived,
+                marked_unread,
+            };
+            if intent == storage_sync::ConversationStateWrite::default() {
+                // 三 flag 全缺 = 无写意图（updateGroup 全缺整拒同纪律）。
+                return internal_error(id);
+            }
+            match service
+                .set_conversation_state(account, conversation, intent)
+                .await
+            {
+                Ok(written) => jsonrpc::success_response(id, conversation_state_payload(&written)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 举报垃圾消息（reportSpam，KT 扩展方法）：协议上行面，落调度日志
         //（send 系/setExpirationTimer 同纪律）。serverGuids 每项必须可解析
         // UUID（fail-closed -32603，防路径注入）且单批 ≤1000（官方
@@ -3109,6 +3183,17 @@ fn blocked_payload(entries: &[storage_sync::EngineConversationId]) -> Value {
                 })
             })
             .collect::<Vec<_>>(),
+    })
+}
+
+/// 会话状态三 flag 读投影（getConversationState 应答 + setConversationState
+/// 写后回显同形状；三键恒在——0/false = 位缺省，与 Storage record 位读出
+/// 面一致）。
+fn conversation_state_payload(state: &storage_sync::ConversationState) -> Value {
+    json!({
+        "mutedUntilTimestamp": state.muted_until_timestamp,
+        "archived": state.archived,
+        "markedUnread": state.marked_unread,
     })
 }
 

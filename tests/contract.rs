@@ -621,6 +621,79 @@ fn conversation_blocked_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// 会话状态三 flag 读写面（getConversationState/setConversationState，
+/// P15b 项2）：fake 模式 get 恒缺省态 / set 缺省态叠意图回显；参数面
+/// fail-closed -32603（kind 缺失/未知、三 flag 形状错、三 flag 全缺 =
+/// 无写意图）。
+#[test]
+fn conversation_state_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("conversation-state-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 读：三 kind 同构缺省态（三键恒在）。
+    for kind in ["contact", "group", "legacyGroup"] {
+        assert_eq!(
+            engine.request(
+                "getConversationState",
+                json!({ "account": "+15550000000", "conversationId": "x", "kind": kind }),
+            )["result"],
+            json!({ "mutedUntilTimestamp": 0, "archived": false, "markedUnread": false })
+        );
+    }
+
+    // fake 写：缺省态叠意图回显（部分意图位缺席 = 不动该位）。
+    assert_eq!(
+        engine.request(
+            "setConversationState",
+            json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact",
+                    "mutedUntilTimestamp": 123, "archived": true }),
+        )["result"],
+        json!({ "mutedUntilTimestamp": 123, "archived": true, "markedUnread": false })
+    );
+
+    // 缺 account / 未知 kind / 缺 conversationId → -32603。
+    let (code, _) = engine.error_of("getConversationState", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "getConversationState",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "bogus" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "getConversationState",
+        json!({ "account": "+15550000000", "kind": "contact" }),
+    );
+    assert_eq!(code, -32603);
+
+    // 写面形状错：mutedUntilTimestamp 非数字/null/负数、archived 非布尔
+    // → -32603。
+    let (code, _) = engine.error_of(
+        "setConversationState",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact",
+                "mutedUntilTimestamp": "soon" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationState",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact",
+                "mutedUntilTimestamp": -5 }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "setConversationState",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact",
+                "archived": "yes" }),
+    );
+    assert_eq!(code, -32603);
+
+    // 三 flag 全缺 = 无写意图 → -32603（updateGroup 全缺整拒同纪律）。
+    let (code, _) = engine.error_of(
+        "setConversationState",
+        json!({ "account": "+15550000000", "conversationId": "x", "kind": "contact" }),
+    );
+    assert_eq!(code, -32603);
+}
+
 /// 举报垃圾消息（reportSpam，KT 扩展方法）：fake 模式全量成功投影
 ///（reported = 批大小 + failures 空表）；参数面 fail-closed -32603：缺
 /// targetAci / targetAci 非 UUID / serverGuids 缺失·非数组·空批·元素非
