@@ -44,6 +44,13 @@ pub struct Metadata {
     /// KT fork (stories): Envelope.story=16 passthrough — receive-side
     /// story classification bit (Signal-Desktop MessageReceiver.preload.ts:1517).
     pub story: Option<bool>,
+
+    /// KT fork (P15a): Envelope ephemeral(12)/urgent(14)/report_spam_token(17)
+    /// passthrough — captured at decrypt, consumed by the engine projection
+    /// (Signal-Desktop envelope face MessageReceiver.preload.ts:1177-1180).
+    pub ephemeral: Option<bool>,
+    pub urgent: Option<bool>,
+    pub report_spam_token: Option<Vec<u8>>,
 }
 
 impl fmt::Display for Metadata {

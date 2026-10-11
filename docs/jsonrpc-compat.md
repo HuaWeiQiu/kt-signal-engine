@@ -159,9 +159,15 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   `timestamp`；contacts 命中时附 `sourceNumber`（E.164）与 `sourceName`。
   `serverGuid`（2026-10-06，reportSpam 面配套）：服务器为该条消息分配的
   UUID（举报 API 的路径参数），信封元数据公共位，有值才投（proto 只投影
-  不发明）；envelope 级 reportSpamToken 经 presage Content 转换丢弃
-  （Metadata 不携带），不在投影（§5 reportSpam 块；P14 组 7 核对批：
-  捕获需 vendored Metadata 扩位，归 P15）。
+  不发明）。`urgent` / `ephemeral` / `reportingToken`（P15a 项2，官方
+  信封事件面同位 MessageReceiver.preload.ts:1177-1180）：vendored
+  Metadata 扩位捕获 Envelope.urgent(14)/ephemeral(12)/reportSpamToken(17)
+  上抛——两标志 raw 位投影（wire 在场即投真值：urgent 缺席 = proto 缺省
+  true、ephemeral 缺席 = false，缺席键不在）；reportingToken = token 非空
+  时标准 base64（官方 Bytes.isNotEmpty 闸同构；键名沿官方事件面，proto
+  字段 reportSpamToken——组5 adminKey 先例同款），connector 举报面
+  （reportSpam 方法 token 参数）的引擎侧真数据源；ephemeral 官方桌面零
+  消费（P14 组 7 核对结论），如实投位由消费方自判。
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?, type(NORMAL\|GIFTBADGE——proto 词原值恒产，缺席/枚举外 coerce NORMAL，官方 isKnownProtoEnumMember 同构；六问批 Q5), bodyRanges?: [{number?, style?, start, length}] ≤64（mention 二进制优先 + author_numbers E.164 映射、Style 臂归同条目 style 键、NONE 丢、未知枚举整条丢；六问批 Q5）}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
@@ -1126,12 +1132,12 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   防路径注入 fail-closed；`serverGuids` 空批 = 无意图调用 `-32603`（
   setAccountConfiguration 零可写字段先例）。
 - **receive 投影配套**：信封公共位加 `serverGuid`（Metadata.server_guid
-  有值才投；proto 只投影不发明）。**已知边界（token 不透投影）**：
-  envelope 级 `reportSpamToken` 经 presage Content 转换丢弃（Metadata
-  仅携带 server_guid），引擎收投影无 token 可透——调用方举报时可自选
-  透传 token 参数，token 从 receive 面拿不到。**处置订正（P14 组 7 核对
-  批）**：捕获需 vendored Metadata 扩位（story bit 同型 fork 先例，非
-  「上游 Metadata 升版」），vendor/ 不动硬边界，归 P15。
+  有值才投；proto 只投影不发明）。**已知边界（token 不透投影）——
+  P15a 项2 收口勘误**：envelope 级 `reportSpamToken` 经 vendored
+  Metadata 扩位捕获投影（信封级 `reportingToken` 键，非空 base64，
+  §3 信封公共位行），上边界「token 从 receive 面拿不到」就此废止；
+  处置如 P14 组 7 核对批订正（vendored Metadata 扩位，story bit 同型
+  fork，非「上游 Metadata 升版」）。
 - **fake 纪律**：`getAvatar` → `AVATAR_UNAVAILABLE`、
   `setConversationBlocked` → `{blocked: []}`、`reportSpam` → 全量成功
   `{reported: N, failures: []}`。调度日志：`reportSpam` 落（协议上行面，
@@ -3278,6 +3284,22 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
     （`TODO: Conversations, local-only deletes, attachments` 上游原样），
     conversationDeletes 收包后引擎 store 行不删、connector 自有库行删除
     为准（如实登记）。
+- **项2 ephemeral/urgent/reportSpamToken 捕获投影（vendored Metadata
+  扩位，story bit 同型 fork）**：P14 组 7 两项「vendored 边界跳过归
+  P15」就此收口——`Metadata` 增 `ephemeral/urgent/report_spam_token`
+  三位（libsignal-service `content.rs` + `cipher.rs` decrypt 构造点；
+  presage/store-sqlite 五处字面量补 `None`/`_` 编译面，fork 清单
+  vendor/README.md 登记），引擎 `project_content` 信封级投影
+  `urgent`/`ephemeral`/`reportingToken`（face 见 §3 信封公共位行）。
+  行为锚：官方信封事件面 MessageReceiver.preload.ts:1177-1180——urgent
+  原样透传、reportingToken `Bytes.isNotEmpty` 闸、base64 落会话属性
+  （conversations.preload.ts updateReportingToken）；官方桌面对
+  ephemeral 零消费（服务器离线队列语义位），引擎如实投位由消费方自判。
+  键名 `reportingToken` 沿官方事件面（proto 字段 reportSpamToken，组 5
+  adminKey 先例同款）。两标志 raw 位投影、缺席键不在（urgent wire 缺席
+  = proto 缺省 true、ephemeral 缺席 = false，旧宿主零变化）；不落库
+  （store-sqlite destructure `_`，story 位同款——信封位只活接收现场）。
+  reportSpam 块「token 不透投影」边界同步废止（§5 reportSpam 块勘误）。
 
 
 ## 6. fake 服务模式（仅测试）

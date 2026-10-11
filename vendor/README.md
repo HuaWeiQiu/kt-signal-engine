@@ -79,6 +79,15 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   `ServiceError::Unauthorized`（此前 `.into_websocket()` 把非 101 升级
   失败整体折叠 `WsError`，升级状态码丢弃，凭据死亡被黑盒化）；
   `upgrade_classify_tests` 单测。
+- `src/content.rs`（2026-10-11 P15a 项2 批）— `Metadata` 增
+  `pub ephemeral: Option<bool>` / `pub urgent: Option<bool>` /
+  `pub report_spam_token: Option<Vec<u8>>`：Envelope 12/14/17 三位接收
+  透传（官方桌面信封事件面 MessageReceiver.preload.ts:1177-1180 urgent
+  原样透传 + reportingToken 消费面；engine 接收投影上抛，connector 侧
+  举报前缀/优先级消费）。
+- `src/cipher.rs`（同批）— `decrypt` 唯一 Metadata 构造点填
+  `ephemeral/urgent: envelope.*`、`report_spam_token:
+  envelope.report_spam_token.clone()`（P15a 项2）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -157,6 +166,11 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   新 `BannedMember` 模型（uuid/service_id_type/timestamp，PendingMember
   同形状）——引擎 listGroups 投影面。
 - `presage/src/errors.rs` —（B2）`GroupAnnouncementsOnly` 错误臂。
+- `presage/src/manager/registered.rs`（2026-10-11 P15a 项2 批追加）— 两处
+  出站 Metadata 字面量补 `ephemeral/urgent/report_spam_token: None`
+  （Metadata 新字段编译面，出站消息信封位恒无）。
+- `presage/src/store.rs`（同批追加）— verified sync 存储路径 Metadata
+  字面量补三 `None`（同上编译面）。
 
 `vendor/presage/presage-store-sqlite/`：
 
@@ -201,6 +215,11 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   消费方 workspace 的独立构建全部失败；引擎从不启用 cdsi（
   `default-features=false` 且无透传）。同批加独立 `[workspace]`+
   presage/libsignal-service `[patch]`（独立测试接本 vendor 叉）。
+- `src/content.rs`（2026-10-11 P15a 项2 批追加）— save 路径 Metadata 解构
+  补 `ephemeral: _`/`urgent: _`/`report_spam_token: _`（信封位不落库，
+  story 位同款纪律）；批窗重放构造补三 `None`。
+- `src/data.rs`（同批追加）— 重放 Metadata 构造补三 `None`（同上不落库
+  纪律）。
 
 ## 更新纪律
 

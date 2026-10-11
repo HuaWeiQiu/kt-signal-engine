@@ -3938,10 +3938,31 @@ async fn project_content(
     });
     // 举报面（reportSpam 批）：server_guid = 信封公共位（服务器为该条消息
     // 分配的 UUID，举报 API 的路径参数；proto 只投影不发明，缺席键不在）。
-    // envelope 级 reportSpamToken 经 presage Content 转换丢弃（Metadata 不
-    // 携带），token 不在本投影——compat §5 reportSpam 块登记。
     if let Some(server_guid) = content.metadata.server_guid.as_ref() {
         envelope["serverGuid"] = json!(server_guid.to_string());
+    }
+    // P15a 项2（compat §5）：Envelope.ephemeral(12)/urgent(14)/
+    // report_spam_token(17) 经 vendored Metadata 扩位捕获（story bit 同型
+    // fork），官方事件面同位（MessageReceiver.preload.ts:1177-1180 urgent
+    // 原样透传、reportingToken Bytes.isNotEmpty 闸、键名沿官方事件面——
+    // proto 字段 reportSpamToken，组5 adminKey 先例同款）。两标志 raw 位
+    // 投影（在场即投真值）：urgent wire 缺席 = proto 缺省 true、ephemeral
+    // 缺席 = false，缺席键不在（旧宿主零变化，§3 记档）。官方桌面对
+    // ephemeral 零消费（P14 组7 核对结论），按任务口径如实投位。
+    if let Some(urgent) = content.metadata.urgent {
+        envelope["urgent"] = json!(urgent);
+    }
+    if let Some(ephemeral) = content.metadata.ephemeral {
+        envelope["ephemeral"] = json!(ephemeral);
+    }
+    if let Some(token) = content
+        .metadata
+        .report_spam_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
+        use base64::Engine as _;
+        envelope["reportingToken"] = json!(base64::engine::general_purpose::STANDARD.encode(token));
     }
     if let Some(peer) = describe_peer(store, &content.metadata.sender).await {
         if let Some(number) = peer.number {
@@ -8209,6 +8230,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
 
         // 群 typing：groupId 标准 base64 投出。
@@ -8290,6 +8314,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
 
         let base_sent = || sync_message::Sent {
@@ -8426,6 +8453,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let make = |sync_content| {
             Content::from_body(
@@ -8660,6 +8690,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let make = |keys| {
             Content::from_body(
@@ -9868,9 +9901,7 @@ mod tests {
 
     /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid
     /// 在场 → 信封带 serverGuid（UUID 串形态）；缺席 → 键不在（proto 只投影
-    /// 不发明）；token 不透投影（presage Content 转换丢弃 envelope 级
-    /// reportSpamToken，compat §5 reportSpam 块登记的已知边界）。基础信封位
-    /// （sourceUuid/sourceDevice/timestamp）同批防回归。
+    /// 不发明）。基础信封位（sourceUuid/sourceDevice/timestamp）同批防回归。
     #[tokio::test]
     async fn receive_envelope_projects_server_guid_when_present() {
         use presage::libsignal_service::content::{Content, ContentBody, Metadata};
@@ -9902,6 +9933,9 @@ mod tests {
             was_plaintext: false,
             server_guid,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let server_guid = presage::libsignal_service::prelude::Uuid::parse_str(
             "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
@@ -9947,6 +9981,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// P15a 项2 信封三标志投影（vendored Metadata 扩位捕获面）：urgent/
+    /// ephemeral 在场即投真值（raw 位）、reportSpamToken 非空 base64（键名
+    /// 沿官方事件面 reportingToken）、全缺席键不在（urgent wire 缺席 = proto
+    /// 缺省 true、ephemeral 缺席 = false，§3 记档）。
+    #[tokio::test]
+    async fn receive_envelope_projects_urgent_ephemeral_reporting_token() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        use base64::Engine as _;
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-envelope-flags-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = |ephemeral: Option<bool>,
+                        urgent: Option<bool>,
+                        report_spam_token: Option<Vec<u8>>| Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral,
+            urgent,
+            report_spam_token,
+        };
+        // 三位在场：urgent/ephemeral raw 真值 + token 标准 base64。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata(Some(true), Some(false), Some(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["ephemeral"], json!(true));
+        assert_eq!(envelope["urgent"], json!(false));
+        assert_eq!(
+            envelope["reportingToken"],
+            json!(base64::engine::general_purpose::STANDARD.encode([0xDE, 0xAD, 0xBE, 0xEF]))
+        );
+
+        // 空字节 token：官方 Bytes.isNotEmpty 闸同口径省键。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata(Some(false), Some(true), Some(Vec::new())),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["ephemeral"], json!(false));
+        assert_eq!(envelope["urgent"], json!(true));
+        assert!(envelope.get("reportingToken").is_none());
+
+        // 全缺席：三键都不在（旧宿主零变化）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata(None, None, None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope.get("ephemeral").is_none());
+        assert!(envelope.get("urgent").is_none());
+        assert!(envelope.get("reportingToken").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// Stories 接收批（E2）：StoryMessage text 面投影——textAttachment
     /// {text, textStyle, preview.image 指针投影}、allowsReplies、profileKey
     /// base64（有值才投）、group 缺席键不在；isStory 位随信封 story 位；
@@ -9985,6 +10107,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let story = |text_style| presage::proto::StoryMessage {
             profile_key: Some(vec![9u8; 32]),
@@ -10108,6 +10233,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: Some(true),
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let story = |url: Option<&str>, title: Option<&str>| presage::proto::StoryMessage {
             profile_key: None,
@@ -10208,6 +10336,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let story_context = data_message::StoryContext {
             author_aci: None,
@@ -10331,6 +10462,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
 
         // ①1:1 story 回复：string 兜底形态，isStory 键不在。
@@ -10450,6 +10584,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
 
         let master_key = [0x33u8; 32];
@@ -10631,6 +10768,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
 
         let master_key = [0x55u8; 32];
@@ -11385,6 +11525,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         }
     }
 
@@ -12463,6 +12606,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         // NullMessage 走 save_message 落库面（receipt/call 同族，typing 不落库
         // ——瞬态面不去重，与 unfold 注释一致）。
@@ -12705,6 +12851,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let verified_body = |state: presage::proto::verified::State, with_dest: bool| {
             Content::from_body(
@@ -13105,6 +13254,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let sent_body = |sent: sync_message::Sent| {
             Content::from_body(
@@ -13220,6 +13372,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let author_bytes =
             ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
@@ -13339,6 +13494,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         };
         let aci = |text: &str| {
             ServiceId::parse_from_service_id_string(text)

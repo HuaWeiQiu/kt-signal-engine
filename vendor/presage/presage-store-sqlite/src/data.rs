@@ -255,6 +255,9 @@ impl TryInto<Content> for SqlMessage {
                 })
                 .transpose()?,
             story: None, // KT fork (stories): not persisted.
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None, // KT fork (P15a): envelope bits, not persisted.
         };
         Content::from_proto(body, metadata).map_err(|_| SqliteStoreError::InvalidFormat)
     }

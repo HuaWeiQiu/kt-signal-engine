@@ -671,6 +671,9 @@ async fn save_outgoing_group_message(
             was_plaintext: false,
             pni_verified: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         },
         body: ContentBody::DataMessage(body.clone()),
     };

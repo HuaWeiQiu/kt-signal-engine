@@ -697,6 +697,9 @@ async fn save_message_on_tx(
         server_timestamp: _,
         pni_verified,
         story: _, // KT fork (stories): not persisted (stories are not saved).
+        ephemeral: _,
+        urgent: _,
+        report_spam_token: _, // KT fork (P15a): envelope bits, not persisted.
     } = metadata;
 
     let sender_device: u8 = sender_device.into();
@@ -937,6 +940,9 @@ mod test {
                     was_plaintext: false,
                     server_guid: None,
                     story: None,
+                    ephemeral: None,
+                    urgent: None,
+                    report_spam_token: None,
                 },
             )
         };

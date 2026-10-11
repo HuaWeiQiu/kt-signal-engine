@@ -568,6 +568,10 @@ where
             pni_verified,
             // KT fork (stories): story classification bit from the envelope.
             story: envelope.story,
+            // KT fork (P15a): envelope flags + report-spam token passthrough.
+            ephemeral: envelope.ephemeral,
+            urgent: envelope.urgent,
+            report_spam_token: envelope.report_spam_token.clone(),
         };
         Ok(Plaintext { metadata, message })
     }

@@ -1406,6 +1406,9 @@ impl<S: Store> Manager<S, Registered> {
                 was_plaintext: false,
                 pni_verified: None,
                 story: None,
+                ephemeral: None,
+                urgent: None,
+                report_spam_token: None,
             },
             body: content_body,
         };
@@ -1618,6 +1621,9 @@ impl<S: Store> Manager<S, Registered> {
                 was_plaintext: false,
                 pni_verified: None,
                 story: None,
+                ephemeral: None,
+                urgent: None,
+                report_spam_token: None,
             },
             body: content_body,
         };

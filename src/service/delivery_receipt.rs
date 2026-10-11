@@ -186,6 +186,9 @@ mod tests {
             was_plaintext: false,
             server_guid: None,
             story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
         }
     }
 
