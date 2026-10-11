@@ -2463,6 +2463,17 @@ B 批「强制闸待桌面批」遗留闭合 + 身份防护三面，wire additiv
   即等价「解除全部拉黑」（:3988-4044/:4207-4230）；Keys 臂属账号熵材料
   （AEP）按需过度同步，一并停答。防再触发：vendored 改动处注释引用
   官方 file:line。
+- **profileSharing 闸（S3）**：直聊内容发送面（send/撤回/回应/pin/unpin）
+  逐收件人查 Storage Service 联系人记录 `ContactRecord.whitelisted` 位
+  （官方 storage proto field 10；引擎无本地会话库，位从云读，与 blocked
+  读面同源）：位 false → 不注入本机 profile_key（官方
+  sendNormalMessage.preload.ts:183-185 profileSharing 位闸同位——
+  profile_key 外泄 = 对端可反查本机 profile，未同意即不外泄）；缺记录/
+  位 true → 照常注入。读面 master key 缺失/manifest 404/网络/解密失败 →
+  fail-open 照常注入（官方读本地库无失败面，偏差登记）。vendored 侧
+  `send_message` 拆 `send_message_with_profile_sharing`（前者行为不变，
+  后者注入位受参）；群发送/story 面不在本闸（vendored 群发送无本机
+  profile_key 注入点）；typing/回执面无 profile_key 字段，无关。
 
 ## 6. fake 服务模式（仅测试）
 

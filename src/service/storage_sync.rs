@@ -60,6 +60,7 @@ use presage::store::{ContentsStore, StateStore};
 use prost::Message as _;
 use rand::RngCore;
 use serde_json::json;
+use std::collections::HashMap;
 
 use crate::proto::storage::{self as storage_proto, AccountRecord, StorageRecord};
 // 记录载荷面（AccountRecord/PinnedConversation/StorageRecord）一律走官方
@@ -1061,6 +1062,93 @@ pub(crate) async fn read_blocked_conversations(
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
     read_blocked_ids(&context.push, &storage_key, &manifest).await
+}
+
+// ---------------------------------------------------------------------------
+// profileSharing 只读面（P9 S3）
+// ---------------------------------------------------------------------------
+
+/// 单条明文 StorageRecord → (aci 小写, whitelisted)：仅 Contact 类参与
+/// （标识口径复用 `contact_engine_id`；位 = 官方 storage proto
+/// ContactRecord.whitelisted，field 10）。
+fn contact_whitelist_of(plaintext: &[u8]) -> Option<(String, bool)> {
+    let record = storage_proto::StorageRecord::decode(plaintext)
+        .ok()?
+        .record?;
+    match record {
+        storage_proto::storage_record::Record::Contact(contact) => {
+            match contact_engine_id(&contact) {
+                Some(EngineConversationId::Contact(id)) => {
+                    Some((id.to_lowercase(), contact.whitelisted))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 全量联系人 whitelist 位 map（aci 小写 → 位），直聊发送面 profileSharing
+/// 闸的输入：官方 sendNormalMessage 以会话 `profileSharing` 位闸本机
+/// profile_key 注入（sendNormalMessage.preload.ts:183-185）；本引擎无本地
+/// 会话库，位读 Storage Service contact 记录。任一环节失败（master key
+/// 缺失 / manifest 404 / 网络 / 解密）→ 空 map——fail-open = 照常注入
+/// （官方读本地库无失败面，偏差登记 compat §5；零 stderr——daemon 静默
+/// 纪律，compat §1）。
+pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<String, bool> {
+    let Ok(master_key) = context.store.fetch_master_key().await else {
+        return HashMap::new();
+    };
+    let Some(master_key) = master_key else {
+        return HashMap::new();
+    };
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let Ok(storage) = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await
+    else {
+        return HashMap::new();
+    };
+    let manifest = match storage.manifest().await {
+        Ok(manifest) => manifest,
+        Err(_) => return HashMap::new(),
+    };
+    let keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            matches!(
+                identifier.r#type(),
+                manifest_record::identifier::Type::Contact
+            )
+        })
+        .map(|identifier| identifier.raw.clone())
+        .collect();
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let record_ikm = if manifest.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest.record_ikm.as_slice())
+    };
+    let Ok(auth) = storage_auth(&context.push).await else {
+        return HashMap::new();
+    };
+    let Ok(items) = read_raw_items(&context.push, auth, keys).await else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for item in &items {
+        if let Ok(plaintext) = decrypt_raw_item(&storage_key, item, record_ikm) {
+            if let Some((id, whitelisted)) = contact_whitelist_of(&plaintext) {
+                out.insert(id, whitelisted);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

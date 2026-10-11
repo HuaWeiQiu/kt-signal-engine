@@ -91,7 +91,11 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   syncRequests.preload.ts:11-33 只发三请求，MessageReceiver.preload.ts
   :3070-3074 收向 request 仅记日志即从缓存移除；原 Blocked 臂回全空表
   按官方 _handleBlocked 差集语义消费即「解除全部拉黑」（:3988-4044/
-  :4207-4230），Keys 臂属 AEP 账号材料按需外泄，一并停答）。
+  :4207-4230），Keys 臂属 AEP 账号材料按需外泄，一并停答）；
+  ⑩（P9）`send_message_with_profile_sharing` 拆面（`send_message` 委托
+  恒传 true，行为不变）——`DataMessage.profile_key` 本机注入改调用方闸
+  （官方 sendNormalMessage.preload.ts:183-185 profileSharing 位闸同位；
+  `required_protocol_version` 保持无条件 = 线协议字段非同意面）。
 - `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
   `story: None`（E2，同上纯编译面）；（B4）`Store::take_identity_changes`
   默认空实现（身份变更日志 drain 面，其他 store 无感）。

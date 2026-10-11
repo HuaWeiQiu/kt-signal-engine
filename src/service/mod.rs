@@ -474,6 +474,27 @@ fn identity_send_gate(account_dir: &Path, service_id: &ServiceId) -> Result<(), 
     }
 }
 
+/// P9 profileSharing 闸读面（S3）：Storage Service 联系人记录 whitelist 位
+/// map。任一读失败 → 空 map = 照常注入（fail-open，官方读本地库无失败面，
+/// 偏差登记 compat §5）。
+async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> HashMap<String, bool> {
+    match storage_context(service, account).await {
+        Ok(context) => storage_sync::contact_whitelist_map(&context).await,
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// whitelist 位 → 是否注入本机 profile_key：仅记录显式 `whitelisted == false`
+/// 才不注入（缺记录/位 true → 注入，fail-open 同语义）。
+fn include_profile_key_for(whitelist: &HashMap<String, bool>, service_id: &ServiceId) -> bool {
+    !matches!(
+        whitelist
+            .get(&service_id.service_id_string().to_lowercase())
+            .copied(),
+        Some(false)
+    )
+}
+
 /// sendMessageRequestResponse 的线程腿（connector §4.56 同款两腿恰一）：
 /// Thread = 直聊对端（recipient，号码/UUID 双形态，service 层解析为 ACI）；
 /// Group = 群 master key（groupId，32B 标准 base64，decode_group_id 闸后
@@ -903,6 +924,8 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
         // 同样多收件人共享指针。
         let (pointers, preview_image) = upload_attachments_for_send(
@@ -923,6 +946,9 @@ impl Service {
             // P9 身份拒发闸：对端换钥未确认 → 拒发（直聊内容发送面统一
             // 判定；整批失败与既有逐收件人失败同语义，compat §3）。
             identity_send_gate(&account_dir, &service_id)?;
+            // P9 profileSharing 闸（S3）：会话未同意 profileSharing → 不注入
+            // 本机 profile_key（官方 sendNormalMessage.preload.ts:183-185）。
+            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
             let body = match sticker {
                 Some(sticker) => {
                     build_sticker_data_message(
@@ -951,7 +977,7 @@ impl Service {
                 }
             };
             manager
-                .send_message(service_id, body, timestamp)
+                .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
                 .await
                 .map_err(send_error_of)?;
             results.push(json!({
@@ -976,12 +1002,16 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
             // P9 身份拒发闸（撤回同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
+            // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
+            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
             let body = DataMessage {
                 timestamp: Some(timestamp),
                 delete: Some(presage::proto::data_message::Delete {
@@ -990,7 +1020,7 @@ impl Service {
                 ..DataMessage::default()
             };
             manager
-                .send_message(service_id, body, timestamp)
+                .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
                 .await
                 .map_err(send_error_of)?;
         }
@@ -1047,6 +1077,8 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         // 协议字段是 targetAuthorAci（UUID）：本机号走注册数据（回应自己发的
         // 消息），其余经 contacts 映射解析（ADR 0004）；都未命中按内部失败，
         // 不透传号码。
@@ -1059,6 +1091,8 @@ impl Service {
                 .ok_or(SendError::Internal)?;
             // P9 身份拒发闸（回应面同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
+            // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
+            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
             let body = DataMessage {
                 timestamp: Some(timestamp),
                 reaction: Some(presage::proto::data_message::Reaction {
@@ -1071,7 +1105,7 @@ impl Service {
                 ..DataMessage::default()
             };
             manager
-                .send_message(service_id, body, timestamp)
+                .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
                 .await
                 .map_err(send_error_of)?;
         }
@@ -1246,6 +1280,8 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         // 直聊回应用自己发的消息时 targetAuthor 是本机号（不在 contacts），
         // resolve_author_aci 已含注册数据回退。
         let target_aci = resolve_author_aci(manager.store(), target_author)
@@ -1258,8 +1294,15 @@ impl Service {
                 .ok_or(SendError::Internal)?;
             // P9 身份拒发闸（pin/unpin 同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
+            // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
+            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
             manager
-                .send_message(service_id, body(aci_bytes.clone(), timestamp), timestamp)
+                .send_message_with_profile_sharing(
+                    service_id,
+                    body(aci_bytes.clone(), timestamp),
+                    timestamp,
+                    include_profile_key,
+                )
                 .await
                 .map_err(send_error_of)?;
         }

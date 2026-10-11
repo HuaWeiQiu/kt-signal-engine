@@ -1164,6 +1164,25 @@ impl<S: Store> Manager<S, Registered> {
         message: impl Into<ContentBody>,
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
+        self.send_message_with_profile_sharing(recipient, message, timestamp, true)
+            .await
+    }
+
+    /// KT fork (profileSharing gate, P9): same as [`Self::send_message`],
+    /// but the caller decides whether **our** profile key is injected into
+    /// the outgoing `DataMessage`. Official Desktop gates this on the
+    /// conversation's `profileSharing` consent bit — a direct message
+    /// without it must not leak our profile key to the recipient
+    /// (ts/textsecure/sendNormalMessage.preload.ts:183-185; the consent
+    /// record is `ContactRecord.whitelisted`, storage proto field 10).
+    /// [`Self::send_message`] keeps the legacy always-share behavior.
+    pub async fn send_message_with_profile_sharing(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_profile_key: bool,
+    ) -> Result<(), Error<S::Error>> {
         let mut sender = self.new_message_sender().await?;
         let recipient = recipient.into();
 
@@ -1193,11 +1212,16 @@ impl<S: Store> Manager<S, Registered> {
             sender_certificate,
         );
 
-        // we need to put our profile key in DataMessage
+        // we need to put our profile key in DataMessage — gated by the
+        // caller's profileSharing decision (KT P9; official
+        // sendNormalMessage.preload.ts:183-185). required_protocol_version
+        // stays unconditional: it is a wire-protocol field, not consent.
         if let ContentBody::DataMessage(message) = &mut content_body {
-            message
-                .profile_key
-                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+            if include_profile_key {
+                message
+                    .profile_key
+                    .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+            }
             message.required_protocol_version = Some(0);
         }
 
