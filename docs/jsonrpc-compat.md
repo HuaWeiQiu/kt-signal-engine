@@ -3362,6 +3362,23 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   拉黑集后按 timestamp 记 blockedAt）由消费方 connector 自行落库，引擎
   只投影原值；②P9 既有「收向 Request{Blocked} 不应答」面与本接收投影面
   互不相干（收投影 = 主设备推送拉黑态给链接设备）。
+- **项5 AttachmentBackfillRequest 求证结论：官方桌面侧零接收消费，本引擎
+  不实现（如实记档跳过）**。求证（upstream 全量仓 abe80d3）：官方桌面
+  `#handleSyncMessage` 分派臂全集（MessageReceiver.preload.ts:2994-3152）
+  **无 attachmentBackfillRequest 接收臂**——桌面收到该请求零消费（该臂
+  在官方桌面收侧落默认丢弃）；桌面仅在**发送侧**构造该请求（
+  `getAttachmentBackfillSyncMessage` SendMessage.preload.ts:1984-2016，
+  由 jobs/helpers/attachmentBackfill.preload.ts `AttachmentBackfill.
+  request` 触发——本地媒体下载缺失 + 能力闸 `attachmentBackfill` + 有
+  其他设备时向手机要回填），响应臂 `attachmentBackfillResponse` 桌面有
+  消费（AttachmentDownloadManager.handleBackfillResponse）。即该请求的
+  **接收消费方是手机端（Signal-Android）**，引擎角色 = 桌面（linked
+  device），无对应接收消费职责。引擎现状行为与官方桌面收侧一致：
+  `Content::AttachmentBackfillRequest` 落兜底臂整信封丢（零投影）。发送
+  侧亦不实现（引擎元数据投影无媒体落盘缺失场景；`engine.
+  protocolCapabilities` 的 attachmentBackfill 位 = linked-device 能力
+  声明面，与此请求消费面无关，勿混淆）。后续若 connector 提出媒体回填
+  消费需求再立项。
 
 
 ## 6. fake 服务模式（仅测试）
