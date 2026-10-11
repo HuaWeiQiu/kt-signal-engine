@@ -4386,6 +4386,126 @@ async fn project_content(
                     }
                     envelope["syncMessage"] = json!({ "keys": Value::Object(face) });
                 }
+                // P15a 项4：Blocked 同步收投影（官方 _handleBlocked 同位
+                // MessageReceiver.preload.ts:3988——此前落兜底臂整信封丢）。
+                // modern/legacy 家族选择按官方 areModernFieldsUsed/
+                // areLegacyFieldsUsed 判定同构：任一 modern 三型非空 → modern
+                // 家族；否则（legacy 在场或全空）→ legacy 家族（官方
+                // `areModernFieldsUsed || !areLegacyFieldsUsed` 同构——全空
+                // 归 modern 空对象，信号面即事件）。投影所选家族的 proto
+                // 字段：modern = blockedE164s[{e164?, timestamp?}]/
+                // blockedAcis[{aci, timestamp?}]/blockedGroups[{groupId,
+                // timestamp?}]（aci 二进制→UUID 串、groupId 原字节标准
+                // base64——引擎 groupId 口径；timestamp 缺席键不在）；
+                // legacy = numbers/acis/groupIds/acisBinary 四位（acisBinary
+                // 逐项 UUID 串、groupIds 逐项 base64）。上游 abe80d3 新增
+                // modern 三型（vendored proto 同步登记 §5 proto 批）。
+                Some(presage::proto::sync_message::Content::Blocked(blocked)) => {
+                    use base64::Engine as _;
+                    let modern_used = !blocked.blocked_e164s.is_empty()
+                        || !blocked.blocked_acis.is_empty()
+                        || !blocked.blocked_groups.is_empty();
+                    let mut face = serde_json::Map::new();
+                    if modern_used {
+                        let e164s: Vec<Value> = blocked
+                            .blocked_e164s
+                            .iter()
+                            .filter_map(|item| {
+                                let e164 = item.e164.as_deref().filter(|e| !e.is_empty())?;
+                                let mut entry = serde_json::Map::new();
+                                entry.insert("e164".into(), json!(e164));
+                                if let Some(ts) = item.timestamp {
+                                    entry.insert("timestamp".into(), json!(ts));
+                                }
+                                Some(Value::Object(entry))
+                            })
+                            .collect();
+                        if !e164s.is_empty() {
+                            face.insert("blockedE164s".into(), Value::Array(e164s));
+                        }
+                        let acis: Vec<Value> = blocked
+                            .blocked_acis
+                            .iter()
+                            .filter_map(|item| {
+                                let aci = ServiceId::parse_from_service_id_binary(
+                                    item.aci_binary.as_deref()?,
+                                )
+                                .map(|sid| sid.service_id_string())?;
+                                let mut entry = serde_json::Map::new();
+                                entry.insert("aci".into(), json!(aci));
+                                if let Some(ts) = item.timestamp {
+                                    entry.insert("timestamp".into(), json!(ts));
+                                }
+                                Some(Value::Object(entry))
+                            })
+                            .collect();
+                        if !acis.is_empty() {
+                            face.insert("blockedAcis".into(), Value::Array(acis));
+                        }
+                        let groups: Vec<Value> = blocked
+                            .blocked_groups
+                            .iter()
+                            .filter_map(|item| {
+                                let group_id =
+                                    item.group_id.as_deref().filter(|g| !g.is_empty())?;
+                                let mut entry = serde_json::Map::new();
+                                entry.insert(
+                                    "groupId".into(),
+                                    json!(
+                                        base64::engine::general_purpose::STANDARD.encode(group_id)
+                                    ),
+                                );
+                                if let Some(ts) = item.timestamp {
+                                    entry.insert("timestamp".into(), json!(ts));
+                                }
+                                Some(Value::Object(entry))
+                            })
+                            .collect();
+                        if !groups.is_empty() {
+                            face.insert("blockedGroups".into(), Value::Array(groups));
+                        }
+                    } else {
+                        let numbers: Vec<Value> = blocked
+                            .numbers
+                            .iter()
+                            .filter(|n| !n.is_empty())
+                            .map(|n| json!(n))
+                            .collect();
+                        if !numbers.is_empty() {
+                            face.insert("numbers".into(), Value::Array(numbers));
+                        }
+                        let acis: Vec<Value> = blocked
+                            .acis
+                            .iter()
+                            .filter(|a| !a.is_empty())
+                            .map(|a| json!(a))
+                            .collect();
+                        if !acis.is_empty() {
+                            face.insert("acis".into(), Value::Array(acis));
+                        }
+                        let group_ids: Vec<Value> = blocked
+                            .group_ids
+                            .iter()
+                            .filter(|g| !g.is_empty())
+                            .map(|g| json!(base64::engine::general_purpose::STANDARD.encode(g)))
+                            .collect();
+                        if !group_ids.is_empty() {
+                            face.insert("groupIds".into(), Value::Array(group_ids));
+                        }
+                        let aci_binaries: Vec<Value> = blocked
+                            .acis_binary
+                            .iter()
+                            .filter_map(|bytes| {
+                                ServiceId::parse_from_service_id_binary(bytes)
+                                    .map(|sid| json!(sid.service_id_string()))
+                            })
+                            .collect();
+                        if !aci_binaries.is_empty() {
+                            face.insert("acisBinary".into(), Value::Array(aci_binaries));
+                        }
+                    }
+                    envelope["syncMessage"] = json!({ "blocked": Value::Object(face) });
+                }
                 // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
                 // #handleViewed「read 专信封」调度序同位——content 面分支
                 // 不动，兜底臂承接直接 repeated 字段 read=5/viewed=16）。
@@ -10246,6 +10366,147 @@ mod tests {
             ["envelope"]["syncMessage"]["contacts"];
         assert_eq!(face["complete"], json!(false));
         assert_eq!(face["records"], json!([]));
+    }
+
+    /// P15a 项4 Blocked 同步收投影：modern/legacy 家族选择（官方
+    /// areModernFieldsUsed 判定同构——modern 任一非空走 modern、否则
+    /// legacy；全空归 modern 空对象）、modern 三型 shape（aci 二进制→UUID
+    /// 串/groupId base64/timestamp 缺席键不在）、legacy 四位 shape、混合
+    /// 在场 modern 胜。
+    #[tokio::test]
+    async fn sync_projects_blocked_modern_and_legacy_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::sync_message::blocked::{BlockedAci, BlockedE164, BlockedGroup};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-blocked-sync-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let aci_bytes = |text: &str| {
+            ServiceId::parse_from_service_id_string(text)
+                .unwrap()
+                .raw_uuid()
+                .as_bytes()
+                .to_vec()
+        };
+        let blocked_body = |blocked: sync_message::Blocked| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_message::Content::Blocked(blocked)),
+                    ..SyncMessage::default()
+                }),
+                metadata.clone(),
+            )
+        };
+
+        // modern 家族：三型齐投（e164 缺席条目丢），legacy 同场在场——
+        // modern 非空胜（官方判定同构）。
+        let content = blocked_body(sync_message::Blocked {
+            blocked_e164s: vec![
+                BlockedE164 {
+                    e164: Some("+15557654321".to_owned()),
+                    timestamp: Some(1_699_998_000_000),
+                },
+                // e164 缺席条目丢。
+                BlockedE164 {
+                    e164: None,
+                    timestamp: Some(1_699_998_000_100),
+                },
+            ],
+            blocked_acis: vec![BlockedAci {
+                aci_binary: Some(aci_bytes("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")),
+                timestamp: None,
+            }],
+            blocked_groups: vec![BlockedGroup {
+                group_id: Some(vec![9u8; 32]),
+                timestamp: Some(1_699_998_000_200),
+            }],
+            numbers: vec!["+15550000000".to_owned()],
+            ..sync_message::Blocked::default()
+        });
+        let face = &pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "blocked projects",
+        )["params"]["envelope"]["syncMessage"]["blocked"];
+        assert!(face.get("numbers").is_none(), "modern 在场时 legacy 不投");
+        assert_eq!(
+            face["blockedE164s"],
+            json!([{ "e164": "+15557654321", "timestamp": 1_699_998_000_000_u64 }])
+        );
+        assert_eq!(
+            face["blockedAcis"],
+            json!([{ "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae" }])
+        );
+        assert_eq!(
+            face["blockedGroups"],
+            json!([{
+                "groupId": base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+                "timestamp": 1_699_998_000_200_u64,
+            }])
+        );
+
+        // legacy 家族：modern 全空才走。
+        let content = blocked_body(sync_message::Blocked {
+            numbers: vec!["+15550000000".to_owned()],
+            acis: vec!["6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned()],
+            group_ids: vec![vec![7u8; 32]],
+            acis_binary: vec![aci_bytes("0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283")],
+            ..sync_message::Blocked::default()
+        });
+        let face = &pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "blocked legacy projects",
+        )["params"]["envelope"]["syncMessage"]["blocked"];
+        assert_eq!(face["numbers"], json!(["+15550000000"]));
+        assert_eq!(
+            face["acis"],
+            json!(["6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
+        );
+        assert_eq!(
+            face["groupIds"],
+            json!([base64::engine::general_purpose::STANDARD.encode([7u8; 32])])
+        );
+        assert_eq!(
+            face["acisBinary"],
+            json!(["0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283"])
+        );
+
+        // 全空：官方 `areModernFieldsUsed || !areLegacyFieldsUsed` 归 modern
+        // 空对象（信号面即事件）。
+        let content = blocked_body(sync_message::Blocked::default());
+        let face = &pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "blocked empty projects",
+        )["params"]["envelope"]["syncMessage"]["blocked"];
+        assert_eq!(face, &json!({}));
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Stories 接收批（E2）：StoryMessage text 面投影——textAttachment

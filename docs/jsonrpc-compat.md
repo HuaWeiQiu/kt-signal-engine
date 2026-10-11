@@ -345,6 +345,21 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   批）；complete = blob complete 旗标（官方 isFullSync 同位，connector
   据此决定全量重置语义）；空 records 照投事件（complete 旗标即信号，
   官方 contactSync:complete 空 blob 照发同构）；信封公共位三键同面。
+- `syncMessage.blocked {blockedE164s?: [{e164, timestamp?}],
+  blockedAcis?: [{aci, timestamp?}], blockedGroups?: [{groupId,
+  timestamp?}]}` / `syncMessage.blocked {numbers?, acis?, groupIds?,
+  acisBinary?}`（P15a 项4，官方 `_handleBlocked` 同位
+  MessageReceiver.preload.ts:3988——此前落兜底臂整信封丢）：modern/
+  legacy 家族选择 = 官方 areModernFieldsUsed/areLegacyFieldsUsed 判定
+  同构（`areModernFieldsUsed || !areLegacyFieldsUsed`——modern 任一非空
+  走 modern、否则 legacy；全空归 modern 空对象，信号面即事件）；
+  modern 三型 = 上游 abe80d3 新增（vendored proto 同步，field 5/6/7
+  additive，§5 proto 批登记）：blockedE164s 条目 e164 缺席丢、blockedAcis
+  aciBinary 二进制→UUID 串（不可解析丢）、blockedGroups groupId 原字节
+  标准 base64（引擎 groupId 口径）、timestamp 缺席键不在；legacy 四位 =
+  numbers/acis 原样（空串条目滤）、groupIds 逐项 base64、acisBinary 逐项
+  UUID 串（不可解析滤）；所选家族键全空 → 空对象照投；modern 在场时
+  legacy 四位不投（官方单家族消费同构）。
 - `syncMessage.configuration {readReceipts?, unidentifiedDeliveryIndicators?,
   typingIndicators?, linkPreviews?}` / `syncMessage.fetchLatest {type?}` /
   `syncMessage.callLinkUpdate {type?, rootKey?, adminKey?}` /
@@ -3330,6 +3345,23 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   inboxPosition 0 与缺席不可分（presage Contact u32 模型），0 不投；
   ④无 aci 纯号码条目上游 `from_proto` MissingUuid 已滤（官方允许 e164-only
   条目——模型面偏差，§5 如实登记）；⑤blob 本体不投（二进制）。
+- **项4 Blocked modern 三型（vendored proto 升级，§5 proto 变更登记）**：
+  上游 abe80d3 的 `SyncMessage.Blocked` 新增 modern 三型
+  BlockedE164(5)/BlockedAci(6)/BlockedGroup(7)（带 timestamp 位），引擎
+  vendored proto 钉定 rev（libsignal-service 9e6c08b）无此三位——本批
+  逐字对照 Signal-Desktop `protos/SignalService.proto:581-605` 同步进
+  `vendor/libsignal-service/protobuf/SignalService.proto`（含 deprecated
+  注释原样；**wire additive-only**：新增 field 5/6/7 与嵌套消息，旧四位
+  号不动，prost 重生成后旧编码字节面零变化，fork 清单 vendor/README.md
+  登记）。既有「§5 E 批已如实登记」先例同姿态：proto 钉定面与官方现行
+  面的差值由 vendored proto 摘要如实补齐，引擎不发明字段。收投影实现
+  Blocked 同步消费：官方 `_handleBlocked` modern/legacy 家族判定同构
+  （`areModernFieldsUsed || !areLegacyFieldsUsed`），face 见 §3
+  syncMessage.blocked 行；此前 Content::Blocked 落兜底臂整信封丢（引擎
+  完全无 blocked 同步消费）。偏差登记：①blockedAt 时间戳语义（官方 diff
+  拉黑集后按 timestamp 记 blockedAt）由消费方 connector 自行落库，引擎
+  只投影原值；②P9 既有「收向 Request{Blocked} 不应答」面与本接收投影面
+  互不相干（收投影 = 主设备推送拉黑态给链接设备）。
 
 
 ## 6. fake 服务模式（仅测试）

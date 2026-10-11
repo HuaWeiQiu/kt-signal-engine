@@ -88,6 +88,12 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `src/cipher.rs`（同批）— `decrypt` 唯一 Metadata 构造点填
   `ephemeral/urgent: envelope.*`、`report_spam_token:
   envelope.report_spam_token.clone()`（P15a 项2）。
+- `protobuf/SignalService.proto`（2026-10-11 P15a 项4 批）— `Blocked`
+  消息同步上游 abe80d3 的 modern 三型：新增 `BlockedE164`(5)/
+  `BlockedAci`(6)/`BlockedGroup`(7) 三消息与 repeated 字段（逐字对照
+  Signal-Desktop `protos/SignalService.proto:581-605`，含 deprecated
+  注释；wire additive-only，field 5/6/7 不与旧四位冲突）；引擎 Blocked
+  同步收投影消费面（官方 `_handleBlocked` modern/legacy 家族判定）。
 
 `vendor/presage/`（rev 33dd149）：
 
