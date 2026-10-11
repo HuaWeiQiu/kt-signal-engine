@@ -788,89 +788,33 @@ impl<S: Store> Manager<S, Registered> {
                                     {
                                         use libsignal_service::content::sync_message::request::Type as RequestType;
 
+                                        // KT (sync request stop-answer, P9): linked
+                                        // devices only REQUEST syncs, they never
+                                        // answer them — official Desktop neither
+                                        // sends answers on request
+                                        // (ts/textsecure/syncRequests.preload.ts:11-33
+                                        // sends the three requests) nor processes
+                                        // incoming requests beyond logging
+                                        // (ts/textsecure/MessageReceiver.preload.ts:3070-3074
+                                        // removes the envelope from cache). The
+                                        // former Blocked arm replied with an EMPTY
+                                        // block table, which a consumer applies as
+                                        // a set-difference → unblock-everything
+                                        // (official _handleBlocked diff semantics,
+                                        // MessageReceiver.preload.ts:3988-4044 and
+                                        // :4207-4230); the Keys arm over-shared
+                                        // account entropy material on demand. All
+                                        // arms now log and skip — no reply of any
+                                        // table.
                                         match request.r#type() {
                                             RequestType::Contacts => {
-                                                let contacts = state
-                                                    .store
-                                                    .contacts()
-                                                    .await
-                                                    .map(|i| {
-                                                        i.collect::<Result<Vec<_>, _>>()
-                                                            .unwrap_or_default()
-                                                    })
-                                                    .unwrap_or_default();
-
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                let aci = state.service_ids.aci();
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender
-                                                    .send_contact_details(
-                                                        &ServiceId::Aci(aci),
-                                                        None,
-                                                        contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
-                                                            number: c.phone_number.map(|p| p.to_string()),
-                                                            aci: Some(c.uuid.to_string()),
-                                                            aci_binary: Some(c.uuid.into_bytes().into()),
-                                                            name: Some(c.name),
-                                                            avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
-                                                                content_type: Some(a.content_type),
-                                                                length: a.reader.len().try_into().ok(),
-                                                            }),
-                                                            expire_timer: Some(c.expire_timer),
-                                                            expire_timer_version: Some(c.expire_timer_version),
-                                                            inbox_position: None,
-                                                        }),
-                                                        false,
-                                                        true,
-                                                    )
-                                                    .await;
-
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending contact details to other devices");
-                                                    }
-                                                });
+                                                warn!("ignoring contacts sync request: linked devices only request syncs, never answer them (official syncRequests.preload.ts:11-33 / MessageReceiver.preload.ts:3070-3074)");
                                             }
                                             RequestType::Keys => {
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                let account_entropy_pool = state
-                                                    .account_entropy_pool
-                                                    .as_ref()
-                                                    .map(|aep| aep.to_string());
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender.send_sync_message(SyncMessage {
-                                                        content: Some(SyncContent::Keys(libsignal_service::content::sync_message::Keys {
-                                                            account_entropy_pool,
-                                                            media_root_backup_key: None,
-                                                        })),
-                                                        ..SyncMessage::with_padding(&mut rand::rng())
-                                                    }).await;
-
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending keys to other devices");
-                                                    }
-                                                });
+                                                warn!("ignoring keys sync request: answering would over-share account entropy material; official clients never answer sync requests on a linked device (syncRequests.preload.ts:11-33)");
                                             }
                                             RequestType::Blocked => {
-                                                warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender.send_sync_message(SyncMessage {
-                                                    content: Some(SyncContent::Blocked(libsignal_service::content::sync_message::Blocked {
-                                                        numbers: vec![],
-                                                        acis: vec![],
-                                                        acis_binary: vec![],
-                                                        group_ids: vec![],
-                                                    })),
-                                                    ..SyncMessage::with_padding(&mut rand::rng())
-                                                }).await;
-
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending blocked contacts to other devices");
-                                                    }
-                                                });
+                                                warn!("ignoring blocked sync request: an empty-blocks reply would be consumed as unblock-everything (official _handleBlocked diff semantics, MessageReceiver.preload.ts:3988-4044); official linked devices never answer (syncRequests.preload.ts:11-33)");
                                             }
                                             t => {
                                                 info!(type = ?t, "Got sync request of currently unhandled type")

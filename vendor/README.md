@@ -85,7 +85,13 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   `Received::IdentityChange` 发射；接收流 refresh task **停发
   AccountAttributes PUT**（上游硬编码 `discoverable_by_phone_number: true`
   每次开流回写 = 隐私回写根因；pre-keys 注册腿保留；`set_account_attributes`
-  删除）——官方 Signal-Desktop 链接设备从不 PUT attributes。
+  删除）——官方 Signal-Desktop 链接设备从不 PUT attributes；
+  ⑨（P9）收向同步请求三臂停答——`Request` Contacts/Keys/Blocked 全部
+  warn + 跳过，不回任何表（官方链接设备只发请求不应答：
+  syncRequests.preload.ts:11-33 只发三请求，MessageReceiver.preload.ts
+  :3070-3074 收向 request 仅记日志即从缓存移除；原 Blocked 臂回全空表
+  按官方 _handleBlocked 差集语义消费即「解除全部拉黑」（:3988-4044/
+  :4207-4230），Keys 臂属 AEP 账号材料按需外泄，一并停答）。
 - `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
   `story: None`（E2，同上纯编译面）；（B4）`Store::take_identity_changes`
   默认空实现（身份变更日志 drain 面，其他 store 无感）。

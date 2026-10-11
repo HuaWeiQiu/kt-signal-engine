@@ -2454,6 +2454,15 @@ B 批「强制闸待桌面批」遗留闭合 + 身份防护三面，wire additiv
   防环闸不变）。
 - **sidecar 形状**：`identity-trust.json` 条目 additive 键
   `pending`（bool；存量条目缺键 = 未挂起，读面容错不变）。
+- **同步请求停答（S2）**：vendored presage 收向 `Request{…}` 三臂
+  （Contacts/Keys/Blocked）全部停答（warn + 跳过，不回任何表）。官方
+  语义：链接设备只发请求不应答——ts/textsecure/syncRequests.preload.ts:
+  11-33 链接侧只发三请求；ts/textsecure/MessageReceiver.preload.ts:
+  3070-3074 收向 request 仅记日志后从缓存移除，官方桌面不充当应答方。
+  此前 Blocked 臂回全空表，若被对端消费按官方 _handleBlocked 差集语义
+  即等价「解除全部拉黑」（:3988-4044/:4207-4230）；Keys 臂属账号熵材料
+  （AEP）按需过度同步，一并停答。防再触发：vendored 改动处注释引用
+  官方 file:line。
 
 ## 6. fake 服务模式（仅测试）
 
