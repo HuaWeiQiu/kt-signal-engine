@@ -5285,6 +5285,55 @@ fn project_data_message(
             });
         }
     }
+    // P14 组 2 收投影缺：payment=20（官方 processDataMessage processPayment
+    // 行为对齐——payment 缺席/item 缺席整键不在；notification 臂 =
+    // {kind:"NOTIFICATION", note}（note 官方 `note ?? null` null 填位镜像；
+    // receipt 字节官方事件面同样不投）；activation 臂官方折叠 kind 词——
+    // type REQUEST→"ACTIVATION_REQUEST"、ACTIVATED→"ACTIVATION"（SCREAMING
+    // 词表同 quote/contact 惯例），type 缺省/词表外 = 官方 fall-through
+    // 整键不在。引擎 metadata-only 无 MobileCoin 节点/余额面，Amount 位
+    // 官方通知事件同样不投）。
+    if let Some(payment) = data_message.payment.as_ref() {
+        let event = match payment.item.as_ref() {
+            Some(presage::proto::data_message::payment::Item::Notification(notification)) => {
+                let mut event = json!({ "kind": "NOTIFICATION" });
+                event["note"] = match notification.note.as_deref() {
+                    Some(note) => json!(note),
+                    None => Value::Null,
+                };
+                Some(event)
+            }
+            Some(presage::proto::data_message::payment::Item::Activation(activation)) => {
+                let kind = activation.r#type.and_then(|kind| {
+                    presage::proto::data_message::payment::activation::Type::try_from(kind).ok()
+                });
+                match kind {
+                    Some(presage::proto::data_message::payment::activation::Type::Request) => {
+                        Some(json!({ "kind": "ACTIVATION_REQUEST" }))
+                    }
+                    Some(presage::proto::data_message::payment::activation::Type::Activated) => {
+                        Some(json!({ "kind": "ACTIVATION" }))
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        if let Some(event) = event {
+            out["payment"] = event;
+        }
+    }
+    // P14 组 2 收投影缺：giftBadge=22（官方 processGiftBadge 行为对齐——
+    // presentation 缺席/空 = 官方 undefined 整键不在；在场 zkgroup 解析取
+    // expiration（秒→毫秒，官方 `getReceiptExpirationTime() * SECOND` 同
+    // 算）/level，连同 base64 原件与 receive 时点初态 state 词；解析失败
+    // 官方是构造 throw 炸整条消息处理，引擎宁收勿丢红线不镜像——降级只投
+    // 材料两键可补算，宽容面记 compat §5）。
+    if let Some(gift_badge) = data_message.gift_badge.as_ref() {
+        if let Some(value) = project_gift_badge(gift_badge) {
+            out["giftBadge"] = value;
+        }
+    }
     out
 }
 
@@ -5325,6 +5374,36 @@ fn story_reply_author(context: &presage::proto::data_message::StoryContext) -> O
         }
     }
     context.author_aci.clone().filter(|aci| !aci.is_empty())
+}
+
+/// P14 组 2 giftBadge=22 投影（官方 processGiftBadge 同形四键
+/// {expiration(毫秒), level, receiptCredentialPresentation(标准 base64),
+/// state}；官方 `id: undefined` JSON 面无键不投）。state 词 =
+/// "UNOPENED"（桌面 GiftBadgeStates.Unopened 的 SCREAMING 投影形，词表
+/// 大小写惯例同 quote/contact）——receive 时点恒初态，开启/兑换状态机归
+/// 消费方。
+fn project_gift_badge(gift_badge: &presage::proto::data_message::GiftBadge) -> Option<Value> {
+    use base64::Engine as _;
+    let presentation = gift_badge.receipt_credential_presentation.as_deref()?;
+    if presentation.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    if let Ok(receipt) =
+        zkgroup::deserialize::<zkgroup::api::receipts::ReceiptCredentialPresentation>(presentation)
+    {
+        out.insert(
+            "expiration".into(),
+            json!(receipt.get_receipt_expiration_time().epoch_seconds() * 1000),
+        );
+        out.insert("level".into(), json!(receipt.get_receipt_level()));
+    }
+    out.insert(
+        "receiptCredentialPresentation".into(),
+        json!(base64::engine::general_purpose::STANDARD.encode(presentation)),
+    );
+    out.insert("state".into(), json!("UNOPENED"));
+    Some(Value::Object(out))
 }
 
 /// Q2 contact 卡片投影（官方 processContact 展开位 + backup 导出面
@@ -7309,9 +7388,10 @@ mod tests {
     }
 
     /// P14 收投影缺批（组 1）：dataMessage 面四键——expireTimerVersion=23
-    /// （Some 原样，Some(0) 也是线上陈述）、requiredProtocolVersion=12
-    /// （弱面：>0 才投、不 enforce——宽容面记 compat §5）、preview.date
-    /// （>0 才投，官方 cleanLinkPreviewDate 同语义）。
+    /// （>0 才投——0 = INITIAL 初值零信息量，presage 对无计时器线程注
+    /// Some(0)）、requiredProtocolVersion=12（弱面：>0 才投、不 enforce——
+    /// 宽容面记 compat §5）、preview.date（>0 才投，官方 cleanLinkPreviewDate
+    /// 同语义）。
     #[test]
     fn data_message_projection_carries_p14_receive_faces() {
         let numbers = HashMap::new();
@@ -7403,6 +7483,159 @@ mod tests {
         assert!(out.get("blurHash").is_none());
         assert!(out.get("incrementalMac").is_none());
         assert!(out.get("chunkSize").is_none());
+    }
+
+    /// P14 收投影缺批（组 2）：payment=20（notification 臂 note 有/无两面
+    /// + activation 双 kind 词 + type 缺省整键不在）与 giftBadge=22（测试
+    ///   内模拟服务器签发 zkgroup roundtrip → 全四键；空 presentation 整键
+    ///   不在；坏字节降级材料两键——官方 throw 面不镜像）。
+    #[test]
+    fn data_message_projection_carries_payment_and_gift_badge_faces() {
+        use base64::Engine as _;
+        use presage::proto::data_message::payment::{self, Item};
+
+        let numbers = HashMap::new();
+
+        // notification 臂：note 有值如实、无值 null 填位（官方 `note ?? null`）。
+        let out = project_data_message(
+            &DataMessage {
+                payment: Some(presage::proto::data_message::Payment {
+                    item: Some(Item::Notification(payment::Notification {
+                        note: Some("thx".to_owned()),
+                        transaction: None,
+                    })),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["payment"]["kind"], json!("NOTIFICATION"));
+        assert_eq!(out["payment"]["note"], json!("thx"));
+
+        let out = project_data_message(
+            &DataMessage {
+                payment: Some(presage::proto::data_message::Payment {
+                    item: Some(Item::Notification(payment::Notification {
+                        note: None,
+                        transaction: None,
+                    })),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["payment"]["note"], serde_json::Value::Null);
+
+        // activation 臂：REQUEST/ACTIVATED 折叠双 kind 词；type 缺省 =
+        // 官方 fall-through 整键不在。
+        for (kind, expected) in [
+            (
+                Some(payment::activation::Type::Request),
+                "ACTIVATION_REQUEST",
+            ),
+            (Some(payment::activation::Type::Activated), "ACTIVATION"),
+        ] {
+            let out = project_data_message(
+                &DataMessage {
+                    payment: Some(presage::proto::data_message::Payment {
+                        item: Some(Item::Activation(payment::Activation {
+                            r#type: kind.map(|kind| kind as i32),
+                        })),
+                    }),
+                    ..Default::default()
+                },
+                &numbers,
+            );
+            assert_eq!(out["payment"]["kind"], json!(expected));
+        }
+        let out = project_data_message(
+            &DataMessage {
+                payment: Some(presage::proto::data_message::Payment {
+                    item: Some(Item::Activation(payment::Activation { r#type: None })),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("payment").is_none());
+
+        // gift badge：测试内模拟 Signal 服务器签发（deterministic
+        // randomness），投影全四键（expiration 秒→毫秒同官方换算）。
+        use zkgroup::api::server_params::ServerSecretParams;
+        let server_secret = ServerSecretParams::generate([0xC0; 32]);
+        let server_public = server_secret.get_public_params();
+        let context =
+            server_public.create_receipt_credential_request_context([0xC1; 32], [0x42_u8; 16]);
+        let response = server_secret.issue_receipt_credential(
+            [0xC2; 32],
+            &context.get_request(),
+            zkgroup::Timestamp::from_epoch_seconds(86_400 * 20_500),
+            2,
+        );
+        let credential = server_public
+            .receive_receipt_credential(&context, &response)
+            .expect("credential");
+        let presentation =
+            server_public.create_receipt_credential_presentation([0xC3; 32], &credential);
+        let presentation_bytes = zkgroup::serialize(&presentation);
+        let out = project_data_message(
+            &DataMessage {
+                gift_badge: Some(presage::proto::data_message::GiftBadge {
+                    receipt_credential_presentation: Some(presentation_bytes.clone()),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(
+            out["giftBadge"]["expiration"],
+            json!(86_400_u64 * 20_500 * 1000)
+        );
+        assert_eq!(out["giftBadge"]["level"], json!(2));
+        assert_eq!(
+            out["giftBadge"]["receiptCredentialPresentation"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&presentation_bytes)
+                    .as_str()
+            )
+        );
+        assert_eq!(out["giftBadge"]["state"], json!("UNOPENED"));
+
+        // presentation 空 = 官方 undefined 整键不在；坏字节 = 降级材料两键
+        // （官方构造 throw 炸整条消息，引擎宁收勿丢不镜像）。
+        let out = project_data_message(
+            &DataMessage {
+                gift_badge: Some(presage::proto::data_message::GiftBadge {
+                    receipt_credential_presentation: Some(Vec::new()),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("giftBadge").is_none());
+
+        let garbage = vec![0x00_u8; 32];
+        let out = project_data_message(
+            &DataMessage {
+                gift_badge: Some(presage::proto::data_message::GiftBadge {
+                    receipt_credential_presentation: Some(garbage.clone()),
+                }),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(
+            out["giftBadge"]["receiptCredentialPresentation"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&garbage)
+                    .as_str()
+            )
+        );
+        assert_eq!(out["giftBadge"]["state"], json!("UNOPENED"));
+        assert!(out["giftBadge"].get("expiration").is_none());
+        assert!(out["giftBadge"].get("level").is_none());
     }
 
     /// P14 收投影缺批（组 1）：TypingMessage.groupId=3 收投影——群 typing

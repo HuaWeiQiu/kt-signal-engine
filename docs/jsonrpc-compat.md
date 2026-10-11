@@ -217,6 +217,16 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 - `sticker {packId(hex), packKey(base64), stickerId, emoji?, data?}`
   （官方 DataMessage.Sticker 序列化同构；data 走附件指针投影，元数据
   only，2026-10-04）。
+- `payment {kind(NOTIFICATION\|ACTIVATION_REQUEST\|ACTIVATION),
+  note?(notification 臂恒产，无值 null 填位——官方 note ?? null 镜像)}` /
+  `giftBadge {expiration?(毫秒——zkgroup 解析得，秒→毫秒同官方
+  getReceiptExpirationTime()*SECOND), level?, receiptCredentialPresentation
+  (标准 base64), state(UNOPENED——receive 时点恒初态，开启/兑换状态机归
+  消费方)}`（P14 组 2 收投影缺批，官方 processPayment:171/processGiftBadge:476
+  行为对齐：payment 缺席/item 缺席/activation type 缺省词表外整键不在；
+  kind 词 SCREAMING 同 quote/contact 惯例；giftBadge presentation 缺席/空
+  整键不在，解析失败降级只投 receiptCredentialPresentation+state 两键——
+  官方构造 throw 炸整条消息处理，引擎宁收勿丢不镜像，§5）。
 - `syncMessage.sentMessage`：本机其他设备发出的直聊（timestamp/message/
   destinationNumber|destinationUuid + 同 dataMessage 控制面）；sent 臂
   message/editMessage/storyMessage 三肢序取第一个在场位（六问批 Q6③——
@@ -2984,6 +2994,35 @@ proto 全字段穷举审计（七项）落地：全部为「收了未投影」�
   .preload.ts:612-622，dev 断言）。引擎 flag 位只读不 enforce（多 flag
   共存按位掩码各自命中，expiration_receive_projection_faces 单测钉），
   未知 flag 位不弃行。
+
+### P14 proto 进阶投影收尾·组 2 payment+giftBadge 收投影（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+- **payment=20**（官方 processDataMessage.preload.ts:171 processPayment 行
+  为对齐）：`{kind, note?}` 事件投影——notification 臂 = `NOTIFICATION`
+  + note（官方 `note ?? null` null 填位镜像；receipt 字节官方事件面同样
+  不投）；activation 臂官方折叠 kind 词：type REQUEST→
+  `ACTIVATION_REQUEST`、ACTIVATED→`ACTIVATION`（SCREAMING 词表同
+  quote/contact 惯例；官方 PaymentEventKind 是 TS 侧数字枚举 1/2/3，词形
+  取投影惯例非直抄）；type 缺省/词表外 = 官方 fall-through 整键不在。
+  payment 缺席/item 缺席整键不在。引擎 metadata-only 无 MobileCoin 节点/
+  余额面，Amount 位官方通知事件同样不投（金额面归消费方）。
+- **giftBadge=22**（官方 processGiftBadge:476 行为对齐）：
+  receiptCredentialPresentation 缺席/空 = 官方 undefined 整键不在；在场
+  则 zkgroup `ReceiptCredentialPresentation`（v0.99.0 同 tag 既有直依赖，
+  云备份凭据同源——**零新增依赖**）解析取 expiration（秒→毫秒，官方
+  `getReceiptExpirationTime() * SECOND` 同算）/level，连同标准 base64
+  原件与 state。state 词 = `UNOPENED`（桌面 GiftBadgeStates.Unopened 的
+  SCREAMING 投影形，词表惯例同 quote/contact；官方 'Unopened' 原词大小写
+  漂移登记在案）——receive 时点恒初态，开启/兑换状态机归消费方；官方
+  `id: undefined` JSON 面无键不投。
+- **宽容面（不镜像官方 throw）**：官方解析失败 = ReceiptCredential
+  Presentation 构造 throw（炸整条消息处理，消息丢弃）。引擎「宁收勿丢」
+  红线不镜像——降级只投 `{receiptCredentialPresentation, state}` 两键
+  （材料保留可补算），不弃消息不炸信封。
+- **单测**：`data_message_projection_carries_payment_and_gift_badge_faces`
+  ——测试内模拟 Signal 服务器签发全链（ServerSecretParams/ServerPublic
+  Params deterministic randomness → request context → issue → receive →
+  presentation）钉全四键形状 + 空 presentation 整键不在 + 坏字节降级两键。
 
 
 ## 6. fake 服务模式（仅测试）
