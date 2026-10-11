@@ -222,6 +222,23 @@ async fn dispatch(
                 },
                 _ => return internal_error(id),
             };
+            // previewDate（P14 Preview.date 两端批）：链接预览发布时刻毫秒
+            // u64；非整数 fail-closed，0 无时刻语义归缺席（官方
+            // cleanLinkPreviewDate falsy 同口径）。
+            let preview_date = match params.get("previewDate") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(value)) => match value.as_u64() {
+                    Some(date) if date > 0 => Some(date),
+                    Some(_) => None,
+                    None => return internal_error(id),
+                },
+                Some(_) => return internal_error(id),
+            };
+            // previewDate 须挂 preview 键对（quoteType 同先例：宿主对象缺席
+            // 则无处挂载，fail-closed）。
+            if !params.get("previewUrl").is_some() && preview_date.is_some() {
+                return internal_error(id);
+            }
             let preview = params
                 .get("previewUrl")
                 .and_then(Value::as_str)
@@ -239,6 +256,7 @@ async fn dispatch(
                         .get("previewImage")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    date: preview_date,
                 });
             // 附件条目：connector 上游唯一形状（data URI 字符串数组）；
             // 非字符串条目 fail-closed。
@@ -1092,6 +1110,26 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // previewDate（P14 Preview.date 两端批）：语义与 send 的
+            // previewDate 同面（毫秒 u64，非整数 fail-closed，0 归缺席）；
+            // 须挂三 preview 扩展键之一（url/title/image——preview 对象
+            // 三件任一在场即成，build_story_preview 组装闸同口径）。
+            let preview_date = match params.get("previewDate") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(value)) => match value.as_u64() {
+                    Some(date) if date > 0 => Some(date),
+                    Some(_) => None,
+                    None => return internal_error(id),
+                },
+                Some(_) => return internal_error(id),
+            };
+            if preview_date.is_some()
+                && preview_url.is_none()
+                && preview_title.is_none()
+                && preview_image.is_none()
+            {
+                return internal_error(id);
+            }
             match (account, message) {
                 (Some(account), Some(message)) => {
                     match service
@@ -1106,6 +1144,7 @@ async fn dispatch(
                             preview_image,
                             preview_url,
                             preview_title,
+                            preview_date,
                         )
                         .await
                     {

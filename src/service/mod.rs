@@ -110,6 +110,9 @@ pub(crate) struct SendPreview {
     pub(crate) description: Option<String>,
     /// previewImage 数据 URI（data URI 同附件形状）；随同批 CDN 上行。
     pub(crate) image: Option<String>,
+    /// P14 Preview.date 两端批：链接预览文章发布时刻（毫秒，>0）；缺席 =
+    /// proto 字段省略（官方 desktop preview.date 同位）。
+    pub(crate) date: Option<u64>,
 }
 
 /// mentions 条目：number 经 resolve_author_aci 转 ACI；start/length 为
@@ -1065,6 +1068,7 @@ impl Service {
         preview_image: Option<&str>,
         preview_url: Option<String>,
         preview_title: Option<String>,
+        preview_date: Option<u64>,
     ) -> Result<(u64, Vec<Value>), SendError> {
         stories::send_story(
             self,
@@ -1078,6 +1082,7 @@ impl Service {
             preview_image,
             preview_url,
             preview_title,
+            preview_date,
         )
         .await
     }
@@ -3919,10 +3924,19 @@ async fn project_content(
                 }
                 _ => "STARTED",
             };
-            envelope["typingMessage"] = json!({
+            let mut typing_json = json!({
                 "action": action,
                 "timestamp": typing.timestamp.unwrap_or(envelope_ts),
             });
+            // P14 收投影缺：TypingMessage.groupId=3（群 typing 面位——官方
+            // desktop TypingMessage 与 1:1 同信封分发，connector 群会话
+            // typing 归路靠它；1:1 缺席键不在，旧宿主零变化）。
+            if let Some(group_id) = typing.group_id.as_deref().filter(|id| !id.is_empty()) {
+                use base64::Engine as _;
+                typing_json["groupId"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(group_id));
+            }
+            envelope["typingMessage"] = typing_json;
         }
         ContentBody::ReceiptMessage(receipt) => {
             let kind = receipt.r#type.unwrap_or_default();
@@ -3974,6 +3988,35 @@ async fn project_content(
                             );
                         }
                         (None, None) => {}
+                    }
+                    // P14 收投影缺：Sent 三位可选面（isRecipientUpdate=6/
+                    // unidentifiedStatus=5/storyMessageRecipients=9，官方桌面
+                    // SentEvent 同名直投：MessageReceiver.preload.ts:2097-2101
+                    // 解构同位）。proto 只投影不发明，缺席/空批键不在。
+                    if sent.is_recipient_update == Some(true) {
+                        sent_json.insert("isRecipientUpdate".into(), json!(true));
+                    }
+                    if !sent.unidentified_status.is_empty() {
+                        sent_json.insert(
+                            "unidentifiedStatus".into(),
+                            Value::Array(
+                                sent.unidentified_status
+                                    .iter()
+                                    .map(sent_unidentified_status_json)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    if !sent.story_message_recipients.is_empty() {
+                        sent_json.insert(
+                            "storyMessageRecipients".into(),
+                            Value::Array(
+                                sent.story_message_recipients
+                                    .iter()
+                                    .map(sent_story_message_recipient_json)
+                                    .collect(),
+                            ),
+                        );
                     }
                     if let Some(data_message) = sent.message.as_ref() {
                         let numbers = resolve_author_numbers(store, data_message).await;
@@ -4765,6 +4808,82 @@ fn sent_expiration_start(sent: &presage::proto::sync_message::Sent) -> Option<u6
     sent.expiration_start_timestamp.filter(|start| *start > 0)
 }
 
+/// Sent.unidentifiedStatus 条目投影（P14 收投影缺）：destinationUuid =
+/// binary 16/17B 优先、字符串兜底（Sent.destination 同口径），两者皆缺/
+/// 不可解析键省略；unidentified 布尔 Some 才投（线上缺省 false 如实缺席）；
+/// destinationPniIdentityKey = 目的地 PNI 身份公钥字节（公开材料，标准
+/// base64，非空才投——官方 PNI 目的地专用位）。
+fn sent_unidentified_status_json(
+    status: &presage::proto::sync_message::sent::UnidentifiedDeliveryStatus,
+) -> Value {
+    use base64::Engine as _;
+    let mut out = serde_json::Map::new();
+    let service_id = status
+        .destination_service_id_binary
+        .as_deref()
+        .and_then(ServiceId::parse_from_service_id_binary)
+        .or_else(|| {
+            status
+                .destination_service_id
+                .as_deref()
+                .and_then(ServiceId::parse_from_service_id_string)
+        });
+    if let Some(service_id) = service_id {
+        out.insert(
+            "destinationUuid".into(),
+            json!(service_id.service_id_string()),
+        );
+    }
+    if let Some(unidentified) = status.unidentified {
+        out.insert("unidentified".into(), json!(unidentified));
+    }
+    if let Some(key) = status
+        .destination_pni_identity_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        out.insert(
+            "destinationPniIdentityKey".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(key)),
+        );
+    }
+    Value::Object(out)
+}
+
+/// Sent.storyMessageRecipients 条目投影（P14 收投影缺，官方桌面
+/// handleSentMessage storyMessageRecipients 同位）：destinationUuid =
+/// binary 优先字符串兜底（键省略同上）；distributionListIds 原样数组
+/// （空批照投空数组——名单收窄语义）；isAllowedToReply Some 才投。
+fn sent_story_message_recipient_json(
+    recipient: &presage::proto::sync_message::sent::StoryMessageRecipient,
+) -> Value {
+    let mut out = serde_json::Map::new();
+    let service_id = recipient
+        .destination_service_id_binary
+        .as_deref()
+        .and_then(ServiceId::parse_from_service_id_binary)
+        .or_else(|| {
+            recipient
+                .destination_service_id
+                .as_deref()
+                .and_then(ServiceId::parse_from_service_id_string)
+        });
+    if let Some(service_id) = service_id {
+        out.insert(
+            "destinationUuid".into(),
+            json!(service_id.service_id_string()),
+        );
+    }
+    out.insert(
+        "distributionListIds".into(),
+        json!(recipient.distribution_list_ids),
+    );
+    if let Some(allowed) = recipient.is_allowed_to_reply {
+        out.insert("isAllowedToReply".into(), json!(allowed));
+    }
+    Value::Object(out)
+}
+
 /// dataMessage 面（正文/引用/reaction/remoteDelete/pinMessage/unpinMessage/
 /// adminDelete/附件元数据/预览/mentions/viewOnce）。边界纪律：附件 ≤32、
 /// 预览 ≤4、mentions ≤64（connector §4.13/§4.20 上限同源）；条目内字段协议
@@ -4790,6 +4909,27 @@ fn project_data_message(
     // 同义投影。
     if is_expiration_update_row(data_message) {
         out["isExpirationUpdate"] = json!(true);
+    }
+    // P14 收投影缺：expireTimerVersion=23（计时器版本单调位，官方桌面
+    // updateExpirationTimer 乱序丢弃判据；E 批起我们发送线面由 presage
+    // 注入，收投影此前缺位）。>0 才投（0 = INITIAL 初值零信息量——presage
+    // restore_thread_timer 对无计时器线程注 Some(0)，全量透出会给每条
+    // 无计时器消息加零信息键；1 起才是官方版本化语义）。
+    if let Some(version) = data_message
+        .expire_timer_version
+        .filter(|version| *version > 0)
+    {
+        out["expireTimerVersion"] = json!(version);
+    }
+    // P14 收投影缺（弱面）：requiredProtocolVersion=12。官方强校验是
+    // required > 本端支持即整消息拒收（宁收勿丢红线，不收紧）；引擎只
+    // 投影给消费方自判，缺席/>0 才投（0 = INITIAL 无要求语义，零信息量
+    // 不投）。宽容面记 compat §5。
+    if let Some(version) = data_message
+        .required_protocol_version
+        .filter(|version| *version > 0)
+    {
+        out["requiredProtocolVersion"] = json!(version);
     }
     if let Some(group_id) = group_id_of(data_message) {
         // signal-cli 同款形状（dataMessage.groupV2 / sent 内群组同形状）：
@@ -4973,6 +5113,12 @@ fn project_data_message(
             }
             if let Some(description) = preview.description.as_deref() {
                 value["description"] = json!(description);
+            }
+            // P14 收投影缺：Preview.date=5（链接预览文章发布时刻，毫秒；
+            // 官方 cleanLinkPreviewDate 同语义 >0 才有效——0/缺席无时刻
+            // 信息不投）。两端批：发送面 previewDate 对位。
+            if let Some(date) = preview.date.filter(|date| *date > 0) {
+                value["date"] = json!(date);
             }
             if let Some(image) = preview.image.as_ref() {
                 value["image"] = project_attachment_pointer(image);
@@ -5364,8 +5510,9 @@ fn delete_for_me_conversation_id(
 /// 影）；DEFAULT=0 线上在场照投词——与发送面缺省省略的不对称是线上形状的
 /// 如实两面。preview.url/preview.title 引擎扩展键往返面（2026-10-09 批，
 /// 发送面 previewUrl/previewTitle 对端回声）：Some 且非空才投，同一
-/// preview 对象内与 image 并列（description/date 官方 story 预览面未消
-/// 费，仍不投）。无 attachment 位 = 官方发送面不可能产出的 malformed 行，
+/// preview 对象内与 image 并列（description 官方 story 预览面未消
+/// 费，仍不投；date 已于 P14 Preview.date 两端批补投）。无 attachment 位
+/// = 官方发送面不可能产出的 malformed 行，
 /// 返回 None（调用方整信封丢弃）。
 fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> {
     use base64::Engine as _;
@@ -5389,6 +5536,13 @@ fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> 
                 }
                 if let Some(title) = preview.title.as_deref().filter(|title| !title.is_empty()) {
                     face.insert("title".into(), json!(title));
+                }
+                // P14 Preview.date 两端批：官方 story 预览同样走 processPreview
+                // 消费 date（MessageReceiver.preload.ts:2183 → processDataMessage
+                // .preload.ts:297-310），与 dataMessage preview.date 同语义
+                //（>0 才投）。
+                if let Some(date) = preview.date.filter(|date| *date > 0) {
+                    face.insert("date".into(), json!(date));
                 }
                 if let Some(image) = preview.image.as_ref() {
                     face.insert("image".into(), project_attachment_pointer(image));
@@ -5476,6 +5630,21 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
     }
     if let Some(caption) = pointer.caption.as_deref() {
         value["caption"] = json!(caption);
+    }
+    // P14 live 投影缺（导出面 project_pointer_common 已有，live 接收信封
+    // 补齐同形）：blurHash 非空才投（空串零信息量）；incrementalMac+
+    // chunkSize 同进同退（官方 filePointers.preload.ts:84-87 两者齐备才
+    // 保留同构——流式完整性校验材料，mac 标准 base64，chunkSize >0）。
+    if let Some(blur_hash) = pointer.blur_hash.as_deref().filter(|hash| !hash.is_empty()) {
+        value["blurHash"] = json!(blur_hash);
+    }
+    if let (Some(mac), Some(chunk_size)) = (pointer.incremental_mac.as_deref(), pointer.chunk_size)
+    {
+        if !mac.is_empty() && chunk_size > 0 {
+            use base64::Engine as _;
+            value["incrementalMac"] = json!(base64::engine::general_purpose::STANDARD.encode(mac));
+            value["chunkSize"] = json!(chunk_size);
+        }
     }
     let voice_note = pointer
         .flags
@@ -6048,7 +6217,9 @@ async fn build_text_data_message(
             title: preview.title.clone(),
             description: preview.description.clone(),
             image: preview_image,
-            ..presage::proto::Preview::default()
+            // P14 Preview.date 两端批：链接预览发布时刻（毫秒）如实透传，
+            // 官方 desktop preview.date 同位（SendMessage.preload.ts:687）。
+            date: preview.date,
         }];
     }
     if !mentions.is_empty() {
@@ -7135,6 +7306,315 @@ mod tests {
             .as_object()
             .expect("sticker data locator");
         assert_eq!(sticker_locator["cdnNumber"], json!(2));
+    }
+
+    /// P14 收投影缺批（组 1）：dataMessage 面四键——expireTimerVersion=23
+    /// （Some 原样，Some(0) 也是线上陈述）、requiredProtocolVersion=12
+    /// （弱面：>0 才投、不 enforce——宽容面记 compat §5）、preview.date
+    /// （>0 才投，官方 cleanLinkPreviewDate 同语义）。
+    #[test]
+    fn data_message_projection_carries_p14_receive_faces() {
+        let numbers = HashMap::new();
+
+        // 有：version/requiredVersion/date 全投。
+        let out = project_data_message(
+            &DataMessage {
+                expire_timer_version: Some(3),
+                required_protocol_version: Some(2),
+                timestamp: Some(1_700_000_000_000),
+                preview: vec![Preview {
+                    url: Some("https://example.com/a".to_owned()),
+                    date: Some(1_600_000_000_000),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert_eq!(out["expireTimerVersion"], json!(3));
+        assert_eq!(out["requiredProtocolVersion"], json!(2));
+        assert_eq!(out["previews"][0]["date"], json!(1_600_000_000_000_u64));
+
+        // 缺省键不在；required=0/date=0 零信息量不投（0 = INITIAL 无要求
+        // 语义 / 官方 falsy 同口径）。
+        let out = project_data_message(
+            &DataMessage {
+                expire_timer_version: Some(0),
+                required_protocol_version: Some(0),
+                preview: vec![Preview {
+                    url: Some("https://example.com/a".to_owned()),
+                    date: Some(0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("expireTimerVersion").is_none());
+        assert!(out.get("requiredProtocolVersion").is_none());
+        assert!(out["previews"][0].get("date").is_none());
+
+        // 普通行零 P14 键。
+        let out = project_data_message(
+            &DataMessage {
+                body: Some("plain".to_owned()),
+                ..Default::default()
+            },
+            &numbers,
+        );
+        assert!(out.get("expireTimerVersion").is_none());
+        assert!(out.get("requiredProtocolVersion").is_none());
+    }
+
+    /// P14 收投影缺批（组 1）：附件指针 live 投影 blurHash /
+    /// incrementalMac+chunkSize（导出面 project_pointer_common 同形：
+    /// blurHash 非空才投；mac+chunkSize 同进同退、齐备才保留——官方
+    /// filePointers.preload.ts:84-87 同构）。
+    #[test]
+    fn attachment_pointer_projection_carries_blur_hash_and_incremental_mac() {
+        use base64::Engine as _;
+
+        let out = project_attachment_pointer(&AttachmentPointer {
+            blur_hash: Some("L6H2:R-;4nWB?b-;~qof4nWBj[%M".to_owned()),
+            incremental_mac: Some(vec![0x77_u8; 32]),
+            chunk_size: Some(1024),
+            ..Default::default()
+        });
+        assert_eq!(
+            out["blurHash"].as_str(),
+            Some("L6H2:R-;4nWB?b-;~qof4nWBj[%M")
+        );
+        assert_eq!(
+            out["incrementalMac"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0x77_u8; 32])
+                    .as_str()
+            )
+        );
+        assert_eq!(out["chunkSize"], json!(1024));
+
+        // 同进同退：只带 mac 无 chunkSize → 两键都不投；空串 blurHash 不投。
+        let out = project_attachment_pointer(&AttachmentPointer {
+            blur_hash: Some(String::new()),
+            incremental_mac: Some(vec![0x77_u8; 32]),
+            ..Default::default()
+        });
+        assert!(out.get("blurHash").is_none());
+        assert!(out.get("incrementalMac").is_none());
+        assert!(out.get("chunkSize").is_none());
+    }
+
+    /// P14 收投影缺批（组 1）：TypingMessage.groupId=3 收投影——群 typing
+    /// 面位（标准 base64，非空才投）；1:1 缺席键不在（旧宿主零变化）。
+    #[tokio::test]
+    async fn typing_projection_carries_group_id() {
+        use base64::Engine as _;
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-typing-group-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+
+        // 群 typing：groupId 标准 base64 投出。
+        let content = Content::from_body(
+            ContentBody::TypingMessage(presage::proto::TypingMessage {
+                action: Some(presage::proto::typing_message::Action::Started as i32),
+                timestamp: Some(1_700_000_000_000),
+                group_id: Some(vec![0xAB_u8; 32]),
+            }),
+            metadata.clone(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "typing projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["typingMessage"]["groupId"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0xAB_u8; 32])
+                    .as_str()
+            )
+        );
+
+        // 1:1 typing：groupId 键不在。
+        let content = Content::from_body(
+            ContentBody::TypingMessage(presage::proto::TypingMessage {
+                action: Some(presage::proto::typing_message::Action::Started as i32),
+                timestamp: Some(1_700_000_000_000),
+                group_id: None,
+            }),
+            metadata,
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "typing projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope["typingMessage"].get("groupId").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// P14 收投影缺批（组 1）：Sent 三位可选面——isRecipientUpdate=true 才
+    /// 投、unidentifiedStatus[]（destinationUuid binary 优先/字符串兜底、
+    /// unidentified、destinationPniIdentityKey base64 非空才投）、
+    /// storyMessageRecipients[]（destinationUuid、distributionListIds 原样、
+    /// isAllowedToReply Some 才投）。空批/缺省键不在（旧宿主零变化）。
+    #[tokio::test]
+    async fn sent_sync_projection_carries_p14_three_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-sent-faces-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+
+        let base_sent = || sync_message::Sent {
+            timestamp: Some(1_699_999_999_000),
+            message: Some(DataMessage {
+                body: Some("echo".to_owned()),
+                timestamp: Some(1_699_999_999_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // 有：三位全投（PNI 17B binary 优先解析；uuid string 形态兜底在
+        // 二进制缺席臂单测钉）。
+        let pni_bytes =
+            ServiceId::parse_from_service_id_string("PNI:00000000-0000-0000-0000-000000000001")
+                .expect("pni")
+                .raw_uuid()
+                .as_bytes()
+                .to_vec();
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::Sent(sync_message::Sent {
+                    is_recipient_update: Some(true),
+                    unidentified_status: vec![sync_message::sent::UnidentifiedDeliveryStatus {
+                        destination_service_id_binary: Some(
+                            [[0x01_u8].as_slice(), pni_bytes.as_slice()].concat(),
+                        ),
+                        unidentified: Some(true),
+                        destination_pni_identity_key: Some(vec![0x88_u8; 32]),
+                        ..Default::default()
+                    }],
+                    story_message_recipients: vec![sync_message::sent::StoryMessageRecipient {
+                        destination_service_id: Some(
+                            "11111111-2222-4333-8444-555555555555".to_owned(),
+                        ),
+                        distribution_list_ids: vec![
+                            "00000000-0000-0000-0000-000000000000".to_owned()
+                        ],
+                        is_allowed_to_reply: Some(false),
+                        ..Default::default()
+                    }],
+                    ..base_sent()
+                })),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let sent = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent projects",
+        )["params"]["envelope"]["syncMessage"]["sentMessage"]
+            .clone();
+        assert_eq!(sent["isRecipientUpdate"], json!(true));
+        assert_eq!(
+            sent["unidentifiedStatus"][0]["destinationUuid"].as_str(),
+            Some("PNI:00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(sent["unidentifiedStatus"][0]["unidentified"], json!(true));
+        assert!(sent["unidentifiedStatus"][0]["destinationPniIdentityKey"]
+            .as_str()
+            .is_some());
+        // 16B ACI binary（无前缀）同面解析；字符串形态兜底臂在
+        // storyMessageRecipients 条目钉（destination_service_id 字符串）。
+        assert_eq!(
+            sent["storyMessageRecipients"][0]["destinationUuid"].as_str(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(
+            sent["storyMessageRecipients"][0]["distributionListIds"],
+            json!(["00000000-0000-0000-0000-000000000000"])
+        );
+        assert_eq!(
+            sent["storyMessageRecipients"][0]["isAllowedToReply"],
+            json!(false)
+        );
+
+        // 缺：isRecipientUpdate=false/缺席、两数组空批 → 三键全不在。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::Sent(base_sent())),
+                ..Default::default()
+            }),
+            metadata,
+        );
+        let sent = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent projects",
+        )["params"]["envelope"]["syncMessage"]["sentMessage"]
+            .clone();
+        assert!(sent.get("isRecipientUpdate").is_none());
+        assert!(sent.get("unidentifiedStatus").is_none());
+        assert!(sent.get("storyMessageRecipients").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// pinMessage=27/unpinMessage=28/adminDelete=29 投影（官方
