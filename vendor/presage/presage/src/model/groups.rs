@@ -39,6 +39,11 @@ pub struct Group {
     /// deserializable.
     #[serde(default)]
     pub announcements_only: bool,
+    /// KT (listGroups projection): banned members carried through for the
+    /// engine's group read surface; `default` keeps previously stored rows
+    /// deserializable.
+    #[serde(default)]
+    pub banned_members: Vec<BannedMember>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,6 +66,15 @@ pub struct PendingMember {
     pub role: Role,
     #[serde(alias = "added_by_uuid", with = "serde_aci")]
     pub added_by_aci: Aci,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BannedMember {
+    // for backwards compatibility
+    pub uuid: Uuid,
+    #[serde(default)]
+    pub service_id_type: ServiceIdType,
     pub timestamp: u64,
 }
 
@@ -95,6 +109,15 @@ impl From<libsignal_service::groups_v2::Group> for Group {
             invite_link_password: val.invite_link_password,
             description: val.description_text,
             announcements_only: val.announcements_only,
+            banned_members: val
+                .members_banned
+                .into_iter()
+                .map(|banned| BannedMember {
+                    uuid: banned.user_id.raw_uuid(),
+                    service_id_type: banned.user_id.kind().into(),
+                    timestamp: banned.timestamp,
+                })
+                .collect(),
         }
     }
 }

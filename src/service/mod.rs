@@ -1581,11 +1581,14 @@ impl Service {
         Ok(out)
     }
 
-    /// listGroups：store 内已同步群组（本机所在群才会在库）。`isMember` 恒
-    /// true（入库即成员；被移出群的本地残留清理 P3）；群组 id = master key
-    /// 标准 base64（signal-cli 同源，connector send 回传同 id）。`terminated`
-    /// 位 = 进程内终止登记（groups 模块；presage Group 模型无该字段，读面
-    /// 以登记表为准，compat §5 终止批登记）。
+    /// listGroups：store 内已同步群组。群组 id = master key 标准 base64
+    ///（signal-cli 同源，connector send 回传同 id）。投影族细节见
+    /// groups::project_group_list_entry（群写面 P5 批：description/
+    /// announcementsOnly/expireTimerSeconds/revision/members[].role/pending
+    /// Members/requestingMembers/bannedMembers/accessControl 四族；isMember
+    /// 改计算值——own ACI ∈ members，早期「入库即成员恒 true」口径废止）。
+    /// `terminated` 位 = 进程内终止登记（groups 模块；presage Group 模型无
+    /// 该字段，读面以登记表为准，compat §5 终止批登记）。
     pub(crate) async fn list_groups(
         self: &Arc<Self>,
         account: &str,
@@ -1598,6 +1601,9 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let manager = lock_registered_for_send(&shared).await;
         let numbers = contacts_number_map(manager.store()).await;
+        let own_aci = presage::libsignal_service::protocol::Aci::from(
+            manager.registration_data().service_ids.aci,
+        );
         let groups = manager
             .store()
             .groups()
@@ -1605,27 +1611,18 @@ impl Service {
             .map_err(|_| SendError::Internal)?;
         let mut out = Vec::new();
         for (master_key, group) in groups.filter_map(Result::ok) {
-            use base64::Engine as _;
-            let id = base64::engine::general_purpose::STANDARD.encode(master_key);
-            let members: Vec<Value> = group
-                .members
-                .iter()
-                .map(|member| {
-                    let sid = ServiceId::from(member.aci);
-                    let number = numbers
-                        .get(&sid.service_id_string().to_owned())
-                        .cloned()
-                        .unwrap_or_else(|| sid.service_id_string().to_owned());
-                    json!({ "number": number })
-                })
-                .collect();
-            out.push(json!({
-                "id": id,
-                "name": group.title,
-                "isMember": true,
-                "members": members,
-                "terminated": self.terminated_groups.contains(&id),
-            }));
+            let terminated = {
+                use base64::Engine as _;
+                let id = base64::engine::general_purpose::STANDARD.encode(master_key);
+                self.terminated_groups.contains(&id)
+            };
+            out.push(crate::service::groups::project_group_list_entry(
+                &master_key,
+                &group,
+                &numbers,
+                own_aci,
+                terminated,
+            ));
         }
         Ok(out)
     }
@@ -9883,6 +9880,7 @@ mod tests {
             invite_link_password: Vec::new(),
             description: None,
             announcements_only: true,
+            banned_members: Vec::new(),
         };
 
         // 本机为 ADMINISTRATOR → 闸放行；Default 角色/缺席 → 闸拦下。

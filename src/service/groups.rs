@@ -810,6 +810,114 @@ pub(crate) async fn leave_group(
     Ok(())
 }
 
+/// listGroups 单群投影纯函数（官方桌面 getGroupBody 投影族行为对齐，群写
+/// 面 P5 批）：id/name/revision/description?/announcementsOnly/
+/// expireTimerSeconds(0 = 关)/members[].role/pendingMembers/
+/// requestingMembers/bannedMembers/accessControl 四族/isMember（计算值：
+/// own ACI ∈ members——早期「入库即成员恒 true」登记口径废止，被移出群的
+/// 本地残留投影即 false，compat §3 诚实化修正登记）/terminated（进程内登
+/// 记位）。号码标签 = contacts 反查（找不到回退 service-id 串，群成员既有
+/// 投影纪律）。
+pub(crate) fn project_group_list_entry(
+    master_key: &[u8],
+    group: &presage::model::groups::Group,
+    numbers: &std::collections::HashMap<String, String>,
+    own_aci: presage::libsignal_service::protocol::Aci,
+    terminated: bool,
+) -> serde_json::Value {
+    use base64::Engine as _;
+    use presage::libsignal_service::protocol::ServiceId;
+    let id = base64::engine::general_purpose::STANDARD.encode(master_key);
+    let label_of = |sid: &ServiceId| -> String {
+        numbers
+            .get(&sid.service_id_string().to_owned())
+            .cloned()
+            .unwrap_or_else(|| sid.service_id_string())
+    };
+    let service_id_of = |uuid: uuid::Uuid, kind: &presage::model::ServiceIdType| -> ServiceId {
+        use presage::model::ServiceIdType;
+        match kind {
+            // Uuid → Aci/Pni 由变体推断（libsignal-core From<Uuid> 两臂）。
+            ServiceIdType::AccountIdentity => ServiceId::Aci(uuid.into()),
+            ServiceIdType::PhoneNumberIdentity => ServiceId::Pni(uuid.into()),
+        }
+    };
+    let members: Vec<serde_json::Value> = group
+        .members
+        .iter()
+        .map(|member| {
+            let sid = ServiceId::from(member.aci);
+            serde_json::json!({
+                "number": label_of(&sid),
+                "role": role_name(&member.role),
+            })
+        })
+        .collect();
+    let pending_members: Vec<serde_json::Value> = group
+        .pending_members
+        .iter()
+        .map(|pending| {
+            let sid = service_id_of(pending.uuid, &pending.service_id_type);
+            serde_json::json!({
+                "number": label_of(&sid),
+                "addedBy": label_of(&ServiceId::from(pending.added_by_aci)),
+                "timestamp": pending.timestamp,
+            })
+        })
+        .collect();
+    let requesting_members: Vec<serde_json::Value> = group
+        .requesting_members
+        .iter()
+        .map(|requesting| {
+            let sid = ServiceId::from(requesting.aci);
+            serde_json::json!({
+                "number": label_of(&sid),
+                "timestamp": requesting.timestamp,
+            })
+        })
+        .collect();
+    let banned_members: Vec<serde_json::Value> = group
+        .banned_members
+        .iter()
+        .map(|banned| {
+            let sid = service_id_of(banned.uuid, &banned.service_id_type);
+            serde_json::json!({
+                "number": label_of(&sid),
+                "timestamp": banned.timestamp,
+            })
+        })
+        .collect();
+    let mut entry = serde_json::json!({
+        "id": id,
+        "name": group.title,
+        "revision": group.revision,
+        "announcementsOnly": group.announcements_only,
+        "expireTimerSeconds": group
+            .disappearing_messages_timer
+            .as_ref()
+            .map(|timer| timer.duration)
+            .unwrap_or(0),
+        "isMember": group.members.iter().any(|member| member.aci == own_aci),
+        "members": members,
+        "pendingMembers": pending_members,
+        "requestingMembers": requesting_members,
+        "bannedMembers": banned_members,
+        "terminated": terminated,
+    });
+    if let Some(description) = group.description.as_deref() {
+        entry["description"] = serde_json::json!(description);
+    }
+    if let Some(access_control) = group.access_control.as_ref() {
+        entry["accessControl"] = serde_json::json!({
+            "attributes": access_level_name(&access_control.attributes),
+            "members": access_level_name(&access_control.members),
+            "addFromInviteLink": access_level_name(&access_control.add_from_invite_link),
+            "memberLabel": access_level_name(&access_control.member_label),
+        });
+    }
+    entry
+}
+
 /// receive 投影面：群更新消息内携带 terminated change → `group_terminated`
 /// 事件投影（groupId = master key 标准 base64、terminator = 编辑者 ACI 串）。
 pub(crate) struct TerminateProjection {
@@ -1078,7 +1186,7 @@ pub(crate) fn project_changes_from_context(
 /// AccessRequired → GroupV2AccessLevel 词表名（官方 detail.newPrivilege
 /// 字符串名形态；backup proto 枚举与解密侧 AccessRequired 五值一一对应，
 /// UNKNOWN 兜底，history.rs group_v2_access_level_name 同词表）。
-fn access_level_name(
+pub(crate) fn access_level_name(
     access: &presage::libsignal_service::groups_v2::AccessRequired,
 ) -> &'static str {
     use presage::libsignal_service::groups_v2::AccessRequired;
@@ -1093,7 +1201,7 @@ fn access_level_name(
 
 /// Role → 官方 detail.newPrivilege 字符串名（history.rs member-privilege
 /// 同词表：UNKNOWN/DEFAULT/ADMINISTRATOR）。
-fn role_name(role: &presage::libsignal_service::groups_v2::Role) -> &'static str {
+pub(crate) fn role_name(role: &presage::libsignal_service::groups_v2::Role) -> &'static str {
     use presage::libsignal_service::groups_v2::Role;
     match role {
         Role::Unknown => "UNKNOWN",
@@ -2634,6 +2742,116 @@ mod tests {
             own_pni,
         );
         assert!(pending.delete_members.is_empty());
+    }
+
+    /// listGroups 投影（群写面 P5 批）：id/revision/announcementsOnly/
+    /// expireTimerSeconds/description/accessControl 四族词表/members[].role/
+    /// pending/requesting/banned 三成员面与时间戳；isMember = own ACI ∈
+    /// members 计算值（诚实化——own 不在投影即 false）；无 contacts 时号码
+    /// 标签回退 service-id 串。
+    #[test]
+    fn project_group_list_entry_shape() {
+        use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+        use presage::libsignal_service::prelude::{ProfileKey, Timer};
+        use presage::libsignal_service::protocol::Aci;
+        use presage::model::ServiceIdType;
+        use serde_json::json;
+        use std::collections::HashMap;
+        let master_key = [0x51u8; 32];
+        let own_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let other_aci = Aci::from(uuid::Uuid::from_u128(
+            0xaaaa_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let member = |aci: Aci, role: Role| presage::model::groups::Member {
+            aci,
+            role,
+            profile_key: ProfileKey::create([0u8; 32]),
+            joined_at_revision: 3,
+            label: None,
+            label_emoji: None,
+        };
+        let group = presage::model::groups::Group {
+            title: "投影群".to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: Some(Timer { duration: 86_400 }),
+            access_control: Some(presage::model::groups::AccessControl {
+                attributes: AccessRequired::Administrator,
+                members: AccessRequired::Member,
+                add_from_invite_link: AccessRequired::Unsatisfiable,
+                member_label: AccessRequired::Unknown,
+            }),
+            revision: 9,
+            members: vec![
+                member(own_aci, Role::Administrator),
+                member(other_aci, Role::Default),
+            ],
+            pending_members: vec![presage::model::groups::PendingMember {
+                uuid: uuid::Uuid::from_u128(0xbbbb_2222_3333_4444_5555_6666_7777_8888),
+                service_id_type: ServiceIdType::PhoneNumberIdentity,
+                role: Role::Default,
+                added_by_aci: own_aci,
+                timestamp: 1234,
+            }],
+            requesting_members: vec![presage::model::groups::RequestingMember {
+                aci: other_aci,
+                profile_key: ProfileKey::create([0u8; 32]),
+                timestamp: 5678,
+            }],
+            invite_link_password: vec![],
+            description: Some("群描述".to_owned()),
+            announcements_only: true,
+            banned_members: vec![presage::model::groups::BannedMember {
+                uuid: uuid::Uuid::from_u128(0xcccc_2222_3333_4444_5555_6666_7777_8888),
+                service_id_type: ServiceIdType::AccountIdentity,
+                timestamp: 99,
+            }],
+        };
+        let entry = project_group_list_entry(&master_key, &group, &HashMap::new(), own_aci, false);
+        assert_eq!(
+            entry["id"],
+            json!("UVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVE="),
+            "32B master key 标准 base64（[0x51;32] 实值）"
+        );
+        assert_eq!(entry["name"], json!("投影群"));
+        assert_eq!(entry["revision"], json!(9));
+        assert_eq!(entry["announcementsOnly"], json!(true));
+        assert_eq!(entry["expireTimerSeconds"], json!(86_400));
+        assert_eq!(entry["description"], json!("群描述"));
+        assert_eq!(entry["terminated"], json!(false));
+        assert_eq!(entry["isMember"], json!(true), "own 在 members");
+        assert_eq!(
+            entry["accessControl"],
+            json!({
+                "attributes": "ADMINISTRATOR",
+                "members": "MEMBER",
+                "addFromInviteLink": "UNSATISFIABLE",
+                "memberLabel": "UNKNOWN"
+            })
+        );
+        let members = entry["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["role"], json!("ADMINISTRATOR"));
+        assert_eq!(
+            members[0]["number"],
+            json!("11112222-3333-4444-5555-666677778888"),
+            "无 contacts → service-id 串回退"
+        );
+        assert_eq!(members[1]["role"], json!("DEFAULT"));
+        assert_eq!(entry["pendingMembers"][0]["timestamp"], json!(1234));
+        assert_eq!(entry["requestingMembers"][0]["timestamp"], json!(5678));
+        assert_eq!(entry["bannedMembers"][0]["timestamp"], json!(99));
+
+        // isMember 计算值：own 不在 members → false（诚实化修正，不恒 true）。
+        let other_only = presage::model::groups::Group {
+            members: vec![member(other_aci, Role::Default)],
+            ..group
+        };
+        let entry =
+            project_group_list_entry(&master_key, &other_only, &HashMap::new(), own_aci, true);
+        assert_eq!(entry["isMember"], json!(false));
+        assert_eq!(entry["terminated"], json!(true));
     }
 
     /// 群头像 CDN 载荷加密面（upload_group_avatar 内联链的纯函数钉定）：

@@ -187,6 +187,9 @@ impl SqlGroup<'_> {
             // the send-path group refresh overwrites it from the server
             // (fetch failure degrades to this value: fail-open by design).
             announcements_only: false,
+            // KT (listGroups projection): same row-schema limitation —
+            // rebuilt rows have no banned list until the next server refresh.
+            banned_members: Vec::new(),
         };
         Ok((master_key, group))
     }

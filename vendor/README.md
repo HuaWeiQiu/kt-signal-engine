@@ -107,7 +107,10 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   unidentified_access_or_identified`；②（B2）`pub use group_member_is_admin,
   group_refresh_needed`（群发送语义纯函数）。
 - `presage/src/model/groups.rs` —（B2）`Group` serde 加
-  `announcements_only`（缺省 false，官方群态位）。
+  `announcements_only`（缺省 false，官方群态位）；（2026-10-11 P5 批）
+  `Group` 再加 `banned_members`（缺省空，解密侧 `members_banned` 映射）+
+  新 `BannedMember` 模型（uuid/service_id_type/timestamp，PendingMember
+  同形状）——引擎 listGroups 投影面。
 - `presage/src/errors.rs` —（B2）`GroupAnnouncementsOnly` 错误臂。
 
 `vendor/presage/presage-store-sqlite/`：
@@ -115,7 +118,10 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `src/content.rs` — Metadata 解构模式补 `story: _`（E2：story 位不落库
   ——收侧 story 本就不存库，普通消息位恒 None）。
 - `src/data.rs` — Metadata 重放构造填 `story: None`（E2，同上）；
-  （B2）群发送语义数据面（announcements-only/成员角色读出）。
+  （B2）群发送语义数据面（announcements-only/成员角色读出）；
+  （2026-10-11 P5 批）`into_group` 重建面补 `banned_members: Vec::new()`
+（行 schema 无封禁列，下次服务器群态刷新收敛，announcements_only 同款
+  fail-open 注释纪律）。
 - `src/content.rs`（2026-10-11 B1/B3 追加）— ①DERM 找回面（按发送方+
   原始时间戳查已发消息、群成员名单读面）；②`kt_kv_get`/`kt_kv_set`
   （引擎自有 kv 位，prekey 维护书签跨重启）。
