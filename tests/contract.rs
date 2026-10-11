@@ -3895,3 +3895,247 @@ fn engine_device_capabilities_register_and_report() {
     );
     assert_eq!(code, -32603, "unknown account folds to internal error");
 }
+
+/// editMessage 契约面（2026-10-11 六问批，官方编辑发送面对位）：fake 合法面
+/// （直聊/群组两腿）回 `{timestamp, results}` + 调度日志逐键保留；参数面
+/// fail-closed 逐形状（-32603：message 空/缺席/非字符串、targetTimestamp
+/// 缺席/非数字、account 缺席、两腿同置/都缺、recipient 条目非字符串）。
+/// 24h 窗口/次数闸是官方 UI 层闸，wire 面不设（compat §5 登记）。
+#[test]
+fn edit_message_param_faces_and_dispatch_log() {
+    let dir = temp_dir("edit-message");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 直聊合法面：{timestamp, results} 与 send 同构。
+    let ok = engine.request(
+        "editMessage",
+        json!({ "account": number, "recipient": ["+15555550101"], "targetTimestamp": 42, "message": "edited body" }),
+    );
+    assert!(ok["result"]["timestamp"].is_u64(), "direct edit ok");
+    assert!(ok["result"]["results"].is_array(), "results face");
+
+    // 群组合法面（32B master key 标准 base64）。
+    let group_ok = engine.request(
+        "editMessage",
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "targetTimestamp": 42, "message": "group edited" }),
+    );
+    assert!(group_ok["result"]["timestamp"].is_u64(), "group edit ok");
+
+    let rejects = [
+        // message 空/缺席/非字符串（官方 canEditMessage body 非空闸）。
+        json!({ "account": number, "recipient": ["+15555550101"], "targetTimestamp": 42, "message": "" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "targetTimestamp": 42 }),
+        json!({ "account": number, "recipient": ["+15555550101"], "targetTimestamp": 42, "message": 7 }),
+        // targetTimestamp 缺席/非数字。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "targetTimestamp": "42", "message": "x" }),
+        // account 缺席。
+        json!({ "recipient": ["+15555550101"], "targetTimestamp": 42, "message": "x" }),
+        // 两腿同置/都缺。
+        json!({ "account": number, "recipient": ["+15555550101"], "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "targetTimestamp": 42, "message": "x" }),
+        json!({ "account": number, "targetTimestamp": 42, "message": "x" }),
+        // recipient 条目非字符串。
+        json!({ "account": number, "recipient": [42], "targetTimestamp": 42, "message": "x" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("editMessage", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "editMessage rejects {params}"
+        );
+    }
+
+    // 调度日志：合法派发逐键保留（含非法派发，send 系纪律同款）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "editMessage" && entry["params"]["message"] == json!("edited body")
+        })
+        .expect("editMessage logged");
+    assert_eq!(entry["params"]["targetTimestamp"], json!(42));
+    assert_eq!(entry["params"]["recipient"], json!(["+15555550101"]));
+    assert_eq!(entry["params"]["account"], json!(number));
+}
+
+/// sendGroupCallUpdate 契约面（同批，官方群通话开始/结束信令面）：fake 成功
+/// `{}`（remoteDelete 同风格）+ 调度日志逐键保留；参数面 fail-closed 逐形状
+/// （-32603：groupId 缺席/形状错、eraId 缺席/空串/非字符串、account 缺席）。
+#[test]
+fn send_group_call_update_param_faces_and_dispatch_log() {
+    let dir = temp_dir("group-call-update");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 合法面：成功 `{}`。
+    let ok = engine.request(
+        "sendGroupCallUpdate",
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "eraId": "era-1" }),
+    );
+    assert_eq!(ok["result"], json!({}), "fake success (remoteDelete style)");
+
+    let rejects = [
+        json!({ "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "eraId": "era-1" }),
+        json!({ "account": number, "eraId": "era-1" }),
+        json!({ "account": number, "groupId": "not-base64!!", "eraId": "era-1" }),
+        json!({ "account": number, "groupId": "QUJD", "eraId": "era-1" }),
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }),
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "eraId": "" }),
+        json!({ "account": number, "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "eraId": 7 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("sendGroupCallUpdate", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendGroupCallUpdate rejects {params}"
+        );
+    }
+
+    // 调度日志：eraId 逐键保留。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendGroupCallUpdate")
+        .expect("sendGroupCallUpdate logged");
+    assert_eq!(entry["params"]["eraId"], json!("era-1"));
+    assert_eq!(entry["params"]["account"], json!(number));
+}
+
+/// send quoteType/quoteBodyRanges 契约面（Q5 扩面，官方 Quote.type 恒写 +
+/// bodyRanges toBodyRange 同构）：fake 合法面成功 + 调度日志逐键保留；参数面
+/// fail-closed 逐形状（-32603：quoteType 词表外（含 poll——引擎无 poll 发送
+/// 面）/非字符串、quoteBodyRanges 条目缺 start/length、start/length 超 u32、
+/// mention/style 同置或都缺、style 词表外、>64 条、非数组、quote 键对缺席
+/// 时挂 type/bodyRanges）。
+#[test]
+fn send_quote_type_and_body_ranges_param_faces_and_dispatch_log() {
+    let dir = temp_dir("quote-type");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 合法面：giftBadge 词 + mention/style 混合条目。
+    let ok = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "reply",
+            "quoteTimestamp": 42,
+            "quoteAuthor": "+15555550101",
+            "quoteType": "giftBadge",
+            "quoteBodyRanges": [
+                { "number": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "start": 0, "length": 3 },
+                { "style": "BOLD", "start": 4, "length": 2 }
+            ]
+        }),
+    );
+    assert!(ok["result"]["timestamp"].is_u64(), "quote type send ok");
+
+    // 缺省词（normal）+ 空数组合法（无 bodyRanges 语义）。
+    let plain = engine.request(
+        "send",
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "message": "plain quote",
+            "quoteTimestamp": 42,
+            "quoteAuthor": "+15555550101",
+            "quoteType": "normal",
+            "quoteBodyRanges": []
+        }),
+    );
+    assert!(plain["result"]["timestamp"].is_u64(), "normal word ok");
+
+    let rejects = [
+        // quoteType 词表外（poll 引擎无发送面）/非字符串。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteType": "poll" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteType": 7 }),
+        // quoteBodyRanges 条目缺 start/length。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "number": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "length": 3 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "style": "BOLD", "start": 0 }] }),
+        // start/length 超 u32。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "style": "BOLD", "start": 4294967296u64, "length": 1 }] }),
+        // mention/style 同置。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "number": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "style": "BOLD", "start": 0, "length": 1 }] }),
+        // mention/style 都缺。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "start": 0, "length": 1 }] }),
+        // style 词表外（含 NONE——composer 永不发出的 no-op 标记）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "style": "MAGIC", "start": 0, "length": 1 }] }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": [{ "style": "NONE", "start": 0, "length": 1 }] }),
+        // 非数组。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": "x" }),
+        // >64 条（cap 镜像整拒不截断）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteTimestamp": 42, "quoteAuthor": "+15555550101", "quoteBodyRanges": (0..65).map(|i| json!({ "style": "BOLD", "start": i, "length": 1 })).collect::<Vec<_>>() }),
+        // quote 键对缺席时挂 type/bodyRanges（无处挂载 fail-closed）。
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteType": "giftBadge" }),
+        json!({ "account": number, "recipient": ["+15555550101"], "message": "x", "quoteBodyRanges": [{ "style": "BOLD", "start": 0, "length": 1 }] }),
+    ];
+    for params in &rejects {
+        let response = engine.request("send", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "quote faces reject {params}"
+        );
+    }
+
+    // 调度日志：quoteType/quoteBodyRanges 数组逐字保留（IPC 形状锚）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["params"].get("quoteType") == Some(&json!("giftBadge")))
+        .expect("quote type send logged");
+    assert_eq!(
+        entry["params"]["quoteBodyRanges"],
+        json!([
+            { "number": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "start": 0, "length": 3 },
+            { "style": "BOLD", "start": 4, "length": 2 }
+        ]),
+        "quoteBodyRanges array verbatim"
+    );
+}

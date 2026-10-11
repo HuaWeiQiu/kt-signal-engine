@@ -15,8 +15,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
     capabilities, parse_legacy_call_face, storage_sync, storage_write, DeviceCapabilitiesError,
-    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendSticker,
-    SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange,
+    SendSticker, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -139,13 +139,84 @@ async fn dispatch(
             let group = params.get("groupId").and_then(Value::as_str);
             // 引用/预览/mentions 扩面：键名与 connector 上游同名直投。
             // quote 半参（只有 timestamp 或只有 author）fail-closed；mentions
-            // 条目缺字段/超 u32 fail-closed。
+            // 条目缺字段/超 u32 fail-closed。quoteType/quoteBodyRanges（Q5
+            // 扩面）：quoteType 词表 normal|giftBadge（缺省 normal——官方
+            // isGiftBadge ? GIFT_BADGE : NORMAL 同语义）；quoteBodyRanges
+            // 条目 {number?, style?, start, length} mention/style 恰一（官方
+            // toBodyRange 无关联值条目不产），style 五值白名单、start/length
+            // 超 u32、>64 条 fail-closed（mentions/textStyle 闸纪律）；两键
+            // 须挂 quote 键对（quote 键对缺席时报错——官方 quote 对象缺席则
+            // type/bodyRanges 无处挂载）。
+            let quote_type = match params.get("quoteType") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(word)) if word == "normal" || word == "giftBadge" => {
+                    Some(word.clone())
+                }
+                Some(_) => return internal_error(id),
+            };
+            let quote_body_ranges = match params.get("quoteBodyRanges") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.len() > MAX_SEND_TEXT_STYLES {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let mention = entry.get("number").and_then(Value::as_str);
+                        let style = entry.get("style").and_then(Value::as_str);
+                        let start = entry
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let length = entry
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let style = match style {
+                            Some(
+                                style @ ("BOLD" | "ITALIC" | "SPOILER" | "STRIKETHROUGH"
+                                | "MONOSPACE"),
+                            ) => Some(style.to_owned()),
+                            Some(_) => return internal_error(id),
+                            None => None,
+                        };
+                        match (mention.map(str::to_owned), style, start, length) {
+                            (Some(number), None, Some(start), Some(length)) => {
+                                parsed.push(SendQuoteBodyRange {
+                                    mention: Some(number),
+                                    style: None,
+                                    start,
+                                    length,
+                                })
+                            }
+                            (None, Some(style), Some(start), Some(length)) => {
+                                parsed.push(SendQuoteBodyRange {
+                                    mention: None,
+                                    style: Some(style),
+                                    start,
+                                    length,
+                                })
+                            }
+                            _ => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
             let quote = match (params.get("quoteTimestamp"), params.get("quoteAuthor")) {
-                (None, None) => None,
+                (None, None) => {
+                    if quote_type.is_some() || !quote_body_ranges.is_empty() {
+                        return internal_error(id);
+                    }
+                    None
+                }
                 (Some(ts), Some(author)) => match (ts.as_u64(), author.as_str()) {
                     (Some(ts), Some(author)) => Some(SendQuote {
                         timestamp: ts,
                         author: author.to_owned(),
+                        gift_badge: quote_type.as_deref() == Some("giftBadge"),
+                        body_ranges: quote_body_ranges,
                     }),
                     _ => return internal_error(id),
                 },
@@ -382,6 +453,100 @@ async fn dispatch(
                     }
                 }
                 // 空 account/message 或 recipient 形状非法：fail-closed。
+                _ => internal_error(id),
+            }
+        }
+        // editMessage（2026-10-11 六问批，官方编辑发送面）：message 必填非空
+        // （官方 canEditMessage body 非空闸），targetTimestamp 必填 u64；寻址
+        // 两腿恰一（sendMessageRequestResponse 同构）：直聊腿（recipient，
+        // recipients_of 归一非空）与群腿（groupId 32B 群 master key 标准
+        // base64）同置/都缺/任一腿形状非法全拒。24h 窗口/次数闸是官方 UI 层
+        // 闸，wire 面不设（§5 登记）。
+        "editMessage" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|body| !body.is_empty());
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("groupId").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                _ => recipients_of(params)
+                    .ok()
+                    .filter(|list| !list.is_empty())
+                    .map(Some),
+            };
+            let group = match params.get("groupId") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(|_| text.as_str()))
+                }
+                Some(_) => None,
+            };
+            match (account, message, target, recipient, group) {
+                (Some(account), Some(message), Some(target), None, Some(Some(group))) => {
+                    match service
+                        .send_edit_message_group(account, group, target, message)
+                        .await
+                    {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                (Some(account), Some(message), Some(target), Some(Some(recipients)), None) => {
+                    match service
+                        .send_edit_message(account, &recipients, target, message)
+                        .await
+                    {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        // sendGroupCallUpdate（同批，官方群通话开始/结束信令面）：groupId 必填
+        // （群通话信令无直聊形态——1:1 通话信令走 sendCallMessage）且参数层
+        // 闸 32B 群 master key 标准 base64（decode_group_id，fake 面同样
+        // fail-closed——sendCallMessage 群腿同源口径），eraId 必填非空（官方
+        // eraId 字符串即 era 标识）。
+        "sendGroupCallUpdate" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let group = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .filter(|group| crate::service::decode_group_id(group).is_some());
+            let era_id = params
+                .get("eraId")
+                .and_then(Value::as_str)
+                .filter(|era| !era.is_empty());
+            match (account, group, era_id) {
+                (Some(account), Some(group), Some(era_id)) => {
+                    match service.send_group_call_update(account, group, era_id).await {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
                 _ => internal_error(id),
             }
         }

@@ -78,9 +78,26 @@ pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("C
 const RECEIPT_CHUNK_SIZE: usize = 100;
 
 /// send 扩面 payload（compat §3 send 行，键名与 connector 上游同名直投）。
+/// quoteType/quoteBodyRanges 两键（2026-10-11 六问批，官方 Quote.type 恒写
+/// `isGiftBadge ? GIFT_BADGE : NORMAL`（SendMessage.preload.ts:506-509）、
+/// bodyRanges 经 toBodyRange 同构）：词表缺省 normal（proto NORMAL=0 缺省
+/// 同位），bodyRanges 条目见 SendQuoteBodyRange。
 pub(crate) struct SendQuote {
     pub(crate) timestamp: u64,
     pub(crate) author: String,
+    pub(crate) gift_badge: bool,
+    pub(crate) body_ranges: Vec<SendQuoteBodyRange>,
+}
+
+/// quoteBodyRanges 条目（官方 toBodyRange 同构）：mention（number→ACI 解析）
+/// 与 style（五值词表）恰一（官方 BodyRange 无关联值条目不产）；start/length
+/// 为 UTF-16 code units（官方 BodyRange 同语义），透传不校验正文对齐
+/// （mentions/textStyle 同款调用方纪律）。
+pub(crate) struct SendQuoteBodyRange {
+    pub(crate) mention: Option<String>,
+    pub(crate) style: Option<String>,
+    pub(crate) start: u32,
+    pub(crate) length: u32,
 }
 
 pub(crate) struct SendPreview {
@@ -1484,11 +1501,15 @@ impl Service {
     /// 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7/0.14.8
     /// CallManager.sendBusyViaSignal/sendHangupViaSignal 同构裸帧族）。收件人
     /// 号码/UUID 双形态解析（send 系同口径）；群臂见 send_call_message_group。
-    /// 发送面偏差（compat §5 通话消息块登记）：官方 call 消息 online=true 不
-    /// 排队，presage send_message 硬编码 online_only=false（上游 TODO issue
-    /// #252）——引擎发出的 call 信封离线可排队，属可接受偏差；CallMessage 无
-    /// sent transcript（上游 create_multi_device_sent_transcript_content 对
-    /// CallMessage 返回 None），本机其他设备不同步自发 call 记录。
+    /// 发送通路注记（compat §5 通话消息块，2026-10-11 勘误）：早前版本记
+    /// 「官方 call 消息 online=true」为偏差——官方源码复核（abe80d3）不成立：
+    /// 官方仅 typing 显式 `online: true`（conversations.preload.ts:1530/:1551），
+    /// call 发送链（sendCallingMessage → sendMessageProtoAndWait）不设 online，
+    /// 线面 online_only=false 与引擎/presage 现状一致（presage send_message
+    /// 硬编码 online_only=false，上游 TODO issue #252——事实保留，当前无行为
+    /// 差；上游若开放 online 选项再跟进）。CallMessage 无 sent transcript
+    /// （上游 create_multi_device_sent_transcript_content 对 CallMessage 返回
+    /// None），本机其他设备不同步自发 call 记录。
     pub(crate) async fn send_call_message(
         self: &Arc<Self>,
         account: &str,
@@ -1545,6 +1566,126 @@ impl Service {
             .map_err(send_error_of)
             .map(|_| ())?;
         Ok(timestamp)
+    }
+
+    /// editMessage 直聊腿（2026-10-11 六问批，官方编辑发送面对位）：官方编辑
+    /// = Content.editMessage{targetSentTimestamp, dataMessage}（SendMessage
+    /// .preload.ts:1075-1092 getContentMessage 同构，内层 dataMessage 只携
+    /// 新 body + timestamp）。24h 窗口/10 次上限是官方 UI 层闸
+    /// （canEditMessage.dom.ts），引擎 wire 面不设（API 调用方自担，§5 登记）；
+    /// 内层不带 attachments/preview/sticker 等扩展位（官方编辑内层同界）。
+    /// 身份拒发闸 + profileSharing 白名单与 send_text 同纪律；返回
+    /// （信封 timestamp, 逐收件人 results），形状同 send。
+    pub(crate) async fn send_edit_message(
+        self: &Arc<Self>,
+        account: &str,
+        recipients: &[String],
+        target_timestamp: u64,
+        message: &str,
+    ) -> Result<(u64, Vec<Value>), SendError> {
+        if !self.real {
+            return Ok((now_ms(), Vec::new()));
+        }
+        let (shared, account_dir) = open_registered_with_dir(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
+        let mut results = Vec::new();
+        for number in recipients {
+            let service_id = resolve_recipient(&manager, number)
+                .await
+                .ok_or(SendError::Internal)?;
+            // P9 身份拒发闸（编辑同为内容面）。
+            identity_send_gate(&account_dir, &service_id)?;
+            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
+            let body = build_edit_message_body(target_timestamp, timestamp, message, None);
+            manager
+                .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
+                .await
+                .map_err(send_error_of)?;
+            results.push(json!({
+                "recipientNumber": number,
+                "success": { "timestamp": timestamp },
+            }));
+        }
+        Ok((timestamp, results))
+    }
+
+    /// editMessage 群腿（同批）：MRM 主路径只支持 DataMessage（group_mrm
+    /// 硬编码 Content::DataMessage），走 vendored `send_message_to_group`
+    /// 原语（自带刷群态/announcements 闸/per-recipient outcomes/多设备
+    /// 转录——vendored create_multi_device_sent_transcript_content 已把
+    /// EditMessage 转成 Sent.editMessage）。vendored 不为 EditMessage 注入
+    /// 群上下文，内层 DataMessage 的 group_v2 由本面手注（接收方进群线程
+    /// 唯一依据，group_mrm DataMessage 同判例）；revision 经
+    /// fetch_group_with_endorsements best-effort，失败 None（proto 缺席合法，
+    /// 接收端按 0 归线程）。
+    pub(crate) async fn send_edit_message_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_timestamp: u64,
+        message: &str,
+    ) -> Result<(u64, Vec<Value>), SendError> {
+        if !self.real {
+            return Ok((now_ms(), Vec::new()));
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+        let revision = match manager.fetch_group_with_endorsements(&master_key).await {
+            Ok(Some((group, _))) => Some(group.revision),
+            _ => None,
+        };
+        let body = build_edit_message_body(
+            target_timestamp,
+            timestamp,
+            message,
+            Some((master_key.clone(), revision)),
+        );
+        let outcomes = manager
+            .send_message_to_group(&master_key, body, timestamp)
+            .await
+            .map_err(send_error_of)?;
+        let numbers = contacts_number_map(manager.store()).await;
+        Ok((
+            timestamp,
+            group_send_result_entries(outcomes, timestamp, &numbers),
+        ))
+    }
+
+    /// sendGroupCallUpdate（2026-10-11 六问批，官方群通话开始/结束信令面对
+    /// 位）：DataMessage.groupCallUpdate{eraId}（field 19）走 dispatch_group
+    /// （MRM 主路径 DataMessage 同族，group_v2 上下文 + announcements 闸 +
+    /// terminated 硬拒全部沿用群发送系口径）。官方发送端
+    /// `sendToGroup {groupCallUpdate:{eraId}, groupV2, timestamp}`
+    /// （jobs/helpers/sendGroupCallUpdate.preload.ts:23-100）同构；官方对
+    /// groupCallUpdate 不设 announcements 闸（KT 群发送闸族统一收口，§5
+    /// 登记偏差）。fake 成功 `{}`（remoteDelete 同风格）。
+    pub(crate) async fn send_group_call_update(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        era_id: &str,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            group_call_update: Some(presage::proto::data_message::GroupCallUpdate {
+                era_id: Some(era_id.to_owned()),
+            }),
+            ..DataMessage::default()
+        };
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
     }
 
     /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
@@ -3640,30 +3781,77 @@ async fn project_content(
             // 是直接 repeated 字段，兜底臂承接，D2）。
             match sync.content.as_ref() {
                 Some(presage::proto::sync_message::Content::Sent(sent)) => {
-                    let Some(data_message) = sent.message.as_ref() else {
-                        return Vec::new();
-                    };
-                    let numbers = resolve_author_numbers(store, data_message).await;
-                    let mut sent_json = project_data_message(data_message, &numbers);
-                    sent_json["timestamp"] = json!(sent.timestamp.unwrap_or(envelope_ts));
+                    // 公共位（timestamp/expirationStart/destination）三臂共用；
+                    // 面臂按 message → editMessage → storyMessage 序取第一个
+                    // 在场位（官方 sent sync 单面发送，多面并存在线面上不出现）；
+                    // 全缺 = 空转录整信封丢弃（宁缺勿错）。
+                    let mut sent_json = serde_json::Map::new();
+                    sent_json.insert(
+                        "timestamp".into(),
+                        json!(sent.timestamp.unwrap_or(envelope_ts)),
+                    );
                     // 消失消息 E 批：Sent.expirationStartTimestamp=4（官方多
                     // 设备的精确起算同步位，官方 1:1 已读起算语义的线面对应）。
                     // 0 无起算语义不投（同 history 面 0 过滤口径）；收侧
                     // DataMessage 在钉定 rev 无同名字段（proto 缺口，§5）。
                     if let Some(start) = sent_expiration_start(sent) {
-                        sent_json["expirationStartTimestamp"] = json!(start);
+                        sent_json.insert("expirationStartTimestamp".into(), json!(start));
                     }
                     match (
                         sent.destination_e164.as_deref(),
                         sent.parse_destination_service_id(),
                     ) {
-                        (Some(e164), _) => sent_json["destinationNumber"] = json!(e164),
+                        (Some(e164), _) => {
+                            sent_json.insert("destinationNumber".into(), json!(e164));
+                        }
                         (None, Some(service_id)) => {
-                            sent_json["destinationUuid"] = json!(service_id.service_id_string());
+                            sent_json.insert(
+                                "destinationUuid".into(),
+                                json!(service_id.service_id_string()),
+                            );
                         }
                         (None, None) => {}
                     }
-                    envelope["syncMessage"] = json!({ "sentMessage": sent_json });
+                    if let Some(data_message) = sent.message.as_ref() {
+                        let numbers = resolve_author_numbers(store, data_message).await;
+                        match project_data_message(data_message, &numbers) {
+                            Value::Object(map) => sent_json.extend(map),
+                            _ => unreachable!("dataMessage projection is an object"),
+                        }
+                        envelope["syncMessage"] =
+                            json!({ "sentMessage": Value::Object(sent_json) });
+                    } else if let Some(edit) = sent.edit_message.as_ref() {
+                        // Q1：自发 echo 的 editMessage 投影（Sent.editMessage=10，
+                        // 多设备编辑同步——此前被整臂丢弃）。形状镜像 proto
+                        // Sent：sentMessage.editMessage{targetSentTimestamp,
+                        // dataMessage}，公共位照旧。
+                        let Some(data_message) = edit.data_message.as_ref() else {
+                            return Vec::new();
+                        };
+                        let numbers = resolve_author_numbers(store, data_message).await;
+                        sent_json.insert(
+                            "editMessage".into(),
+                            json!({
+                                "targetSentTimestamp": edit.target_sent_timestamp.unwrap_or(0),
+                                "dataMessage": project_data_message(data_message, &numbers),
+                            }),
+                        );
+                        envelope["syncMessage"] =
+                            json!({ "sentMessage": Value::Object(sent_json) });
+                    } else if let Some(story) = sent.story_message.as_ref() {
+                        // Q6③：sent.storyMessage 投影（Sent.storyMessage=8，
+                        // story 发送的多设备转录面——此前被整臂丢弃）。复用
+                        // story 投影单点；无 attachment 位 = malformed 整信封
+                        // 丢弃纪律照旧。
+                        let Some(projection) = project_story_message(story) else {
+                            return Vec::new();
+                        };
+                        sent_json.insert("storyMessage".into(), projection);
+                        envelope["syncMessage"] =
+                            json!({ "sentMessage": Value::Object(sent_json) });
+                    } else {
+                        return Vec::new();
+                    }
                 }
                 // E3：viewOnceOpen 投影（官方 content oneof viewOnceOpen=11）
                 // ——本机主设备/其他设备已打开某阅后即焚消息，上层据此把对应
@@ -3693,6 +3881,21 @@ async fn project_content(
                         return Vec::new();
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
+                }
+                // Q6②：deleteForMe 收包投影（SyncContent.deleteForMe=22，本机
+                // 「为我删除」多设备同步）：vendored 接收面已对 presage store
+                // 做 delete_message 消费（registered.rs save_message 臂）且
+                // Received::Content 无条件上抛，引擎投影给 connector 供其删
+                // 自有库行。v1 只投 messageDeletes 臂（vendored 消费面同界）；
+                // conversationDeletes/localOnlyConversationDeletes/
+                // attachmentDeletes 三型不投（§5 gap 登记）。作者不可解析条目
+                // 丢弃（vendored store 面 warn-and-continue 同口径）；无有效
+                // 条目整信封丢弃。
+                Some(presage::proto::sync_message::Content::DeleteForMe(delete)) => {
+                    let Some(projection) = project_delete_for_me(delete) else {
+                        return Vec::new();
+                    };
+                    envelope["syncMessage"] = json!({ "deleteForMe": projection });
                 }
                 // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
                 // #handleViewed「read 专信封」调度序同位——content 面分支
@@ -4296,6 +4499,31 @@ async fn resolve_author_numbers(
                 candidates.push(uuid.to_string());
             }
         }
+        // Q5：quote.bodyRanges mention 作者与 quote author 同解析口径
+        // （E.164 优先，收投影 bodyRanges 映射共用）。
+        for range in &quote.body_ranges {
+            match range.associated_value.as_ref() {
+                Some(presage::proto::body_range::AssociatedValue::MentionAci(aci)) => {
+                    candidates.push(aci.clone());
+                }
+                Some(presage::proto::body_range::AssociatedValue::MentionAciBinary(bytes)) => {
+                    if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+                        candidates.push(uuid.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Q3：pollVote targetAuthor 与 pin/unpin/adminDelete 同解析口径。
+    if let Some(bytes) = data_message
+        .poll_vote
+        .as_ref()
+        .and_then(|vote| vote.target_author_aci_binary.as_deref())
+    {
+        if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+            candidates.push(uuid.to_string());
+        }
     }
     if let Some(reaction) = data_message.reaction.as_ref() {
         candidates.extend(reaction.target_author_aci.clone());
@@ -4459,6 +4687,57 @@ fn project_data_message(
         if !attachments.is_empty() {
             quote_json["attachments"] = Value::Array(attachments);
         }
+        // Q5：quote.type 收投影（Quote.type=7；官方 processQuote 恒产 type——
+        // isKnownProtoEnumMember coerce，未知/缺席值归 NORMAL，
+        // processDataMessage.preload.ts:227-229）。
+        let quote_type =
+            presage::proto::data_message::quote::Type::try_from(quote.r#type.unwrap_or_default())
+                .map(|value| value.as_str_name())
+                .unwrap_or("NORMAL");
+        quote_json["type"] = json!(quote_type);
+        // Q5：quote.bodyRanges 收投影（Quote.bodyRanges=6；官方 processQuote
+        // bodyRanges 面 filterAndClean 同构）。mention 臂二进制优先 +
+        // author_numbers 映射（quote author 同口径），Style 臂归同条目 style
+        // 键（消息面 textStyles 词表同源；NONE composer 永不出、投影丢弃
+        // 对称）；未知枚举整条丢弃；条目 ≤64（mentions 收投影 cap 同源）。
+        let quote_body_ranges: Vec<Value> = quote
+            .body_ranges
+            .iter()
+            .filter_map(|range| {
+                let start = range.start.unwrap_or(0);
+                let length = range.length.unwrap_or(0);
+                match range.associated_value.as_ref()? {
+                    presage::proto::body_range::AssociatedValue::MentionAci(aci) => Some(json!({
+                        "number": author_numbers.get(aci).cloned().unwrap_or_else(|| aci.clone()),
+                        "start": start,
+                        "length": length,
+                    })),
+                    presage::proto::body_range::AssociatedValue::MentionAciBinary(bytes) => {
+                        let aci = presage::libsignal_service::prelude::Uuid::from_slice(bytes)
+                            .ok()?
+                            .to_string();
+                        Some(json!({
+                            "number": author_numbers.get(&aci).cloned().unwrap_or(aci),
+                            "start": start,
+                            "length": length,
+                        }))
+                    }
+                    presage::proto::body_range::AssociatedValue::Style(value) => {
+                        let word = presage::proto::body_range::Style::try_from(*value)
+                            .ok()?
+                            .as_str_name();
+                        if word == "NONE" {
+                            return None;
+                        }
+                        Some(json!({ "style": word, "start": start, "length": length }))
+                    }
+                }
+            })
+            .take(64)
+            .collect();
+        if !quote_body_ranges.is_empty() {
+            quote_json["bodyRanges"] = Value::Array(quote_body_ranges);
+        }
         out["quote"] = quote_json;
     }
     if let Some(reaction) = data_message.reaction.as_ref() {
@@ -4540,6 +4819,17 @@ fn project_data_message(
         .collect();
     if !previews.is_empty() {
         out["previews"] = json!(previews);
+    }
+    // Q2：contact 卡片收投影（官方 processDataMessage processContact 行为
+    // 对齐 processDataMessage.preload.ts:263-281：slice(0,1) + avatar
+    // {avatar, isProfile:Boolean} 展开位）。slice(0,1) = 首条；键形与 backup
+    // 导出面 contact_record（history.rs）同族；address 面与展开的其余位不投
+    // （backup 导出面同边界，§5 gap 登记）；空卡片整键缺席（backup 面同
+    // 口径：空卡片即占位，永不投占位）。
+    if let Some(contact) = data_message.contact.first() {
+        if let Some(card) = project_contact_card(contact) {
+            out["contact"] = card;
+        }
     }
     let mentions: Vec<Value> = data_message
         .body_ranges
@@ -4631,6 +4921,49 @@ fn project_data_message(
         }
         out["sticker"] = value;
     }
+    // Q3：poll 三臂收投影（PollCreate=24/PollTerminate=25/PollVote=26；官方
+    // processDataMessage.preload.ts:395-441 行为对齐，backup 导出面 poll_record
+    // 键形同族）。pollVote.targetAuthor 与 pin/unpin 同口径（二进制解析 +
+    // author_numbers 命中转 E.164）；optionIndexes Set 去重保首现序（官方
+    // new Set 同构）；voteCount 0 透出（`||0` 同语义）；空 optionIndexes =
+    // 清票动作，照投空数组。
+    if let Some(poll) = data_message.poll_create.as_ref() {
+        out["poll"] = json!({
+            "question": poll.question.clone().unwrap_or_default(),
+            "options": poll.options,
+            "allowMultiple": poll.allow_multiple.unwrap_or(false),
+        });
+    }
+    if let Some(vote) = data_message.poll_vote.as_ref() {
+        let mut option_indexes = Vec::with_capacity(vote.option_indexes.len());
+        let mut seen = std::collections::HashSet::new();
+        for index in &vote.option_indexes {
+            if seen.insert(*index) {
+                option_indexes.push(*index);
+            }
+        }
+        out["pollVote"] = json!({
+            "targetAuthor": targeted_author_json(
+                vote.target_author_aci_binary.as_deref(),
+                author_numbers,
+            ),
+            "targetSentTimestamp": vote.target_sent_timestamp.unwrap_or(0),
+            "optionIndexes": option_indexes,
+            "voteCount": vote.vote_count.unwrap_or(0),
+        });
+    }
+    if let Some(terminate) = data_message.poll_terminate.as_ref() {
+        out["pollTerminate"] =
+            json!({ "targetSentTimestamp": terminate.target_sent_timestamp.unwrap_or(0) });
+    }
+    // Q4：groupCallUpdate 收投影（field 19，官方群通话开始/结束信令；收侧
+    // background.preload.ts:3535-3543 只在群上下文消费 eraId）。eraId 缺席/
+    // 空串整键缺席（宁缺勿错——官方 `eraId != null` 判面同域）。
+    if let Some(update) = data_message.group_call_update.as_ref() {
+        if let Some(era_id) = update.era_id.as_deref().filter(|era| !era.is_empty()) {
+            out["groupCallUpdate"] = json!({ "eraId": era_id });
+        }
+    }
     // story 回复投影（Stories 接收批，E2）：storyContext → `storyReply
     // {authorAci, sentTimestamp}`（author binary 形态优先、string 兜底——
     // mentions 同款二进制优先纪律；两者皆缺/不可解析 = 整键缺席宁缺勿错，
@@ -4683,6 +5016,180 @@ fn story_reply_author(context: &presage::proto::data_message::StoryContext) -> O
         }
     }
     context.author_aci.clone().filter(|aci| !aci.is_empty())
+}
+
+/// Q2 contact 卡片投影（官方 processContact 展开位 + backup 导出面
+/// contact_record 键形同族）：name 六子字段（空串省略）、number[]/email[]
+/// （条目 {value, type, label?}——value 空整条丢弃官方 `!value → undefined`
+/// 同口径、type 词表见 `contact_field_type_word`、label 非空才投）、
+/// organization（非空）、avatar（指针走附件指针元数据面 + isProfile 恒投
+/// Boolean；avatar 位在场但指针缺席 → 整键缺席）。全空 → None（整键缺席）。
+fn project_contact_card(
+    contact: &presage::proto::data_message::Contact,
+) -> Option<serde_json::Value> {
+    let mut face = serde_json::Map::new();
+    if let Some(name) = contact.name.as_ref() {
+        let mut projected = serde_json::Map::new();
+        for (key, value) in [
+            ("givenName", name.given_name.as_deref()),
+            ("familyName", name.family_name.as_deref()),
+            ("prefix", name.prefix.as_deref()),
+            ("suffix", name.suffix.as_deref()),
+            ("middleName", name.middle_name.as_deref()),
+            ("nickname", name.nickname.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                projected.insert(key.into(), json!(value));
+            }
+        }
+        if !projected.is_empty() {
+            face.insert("name".into(), serde_json::Value::Object(projected));
+        }
+    }
+    let numbers: Vec<serde_json::Value> = contact
+        .number
+        .iter()
+        .filter_map(|phone| {
+            contact_field_entry(phone.value.as_deref(), phone.r#type, phone.label.as_deref())
+        })
+        .collect();
+    if !numbers.is_empty() {
+        face.insert("number".into(), json!(numbers));
+    }
+    let emails: Vec<serde_json::Value> = contact
+        .email
+        .iter()
+        .filter_map(|email| {
+            contact_field_entry(email.value.as_deref(), email.r#type, email.label.as_deref())
+        })
+        .collect();
+    if !emails.is_empty() {
+        face.insert("email".into(), json!(emails));
+    }
+    if let Some(organization) = contact
+        .organization
+        .as_deref()
+        .filter(|organization| !organization.is_empty())
+    {
+        face.insert("organization".into(), json!(organization));
+    }
+    if let Some(avatar) = contact.avatar.as_ref() {
+        if let Some(pointer) = avatar.avatar.as_ref() {
+            face.insert(
+                "avatar".into(),
+                json!({
+                    "avatar": project_attachment_pointer(pointer),
+                    // 官方 Boolean(item.avatar.isProfile) 同构：缺席 = false。
+                    "isProfile": avatar.is_profile.unwrap_or(false),
+                }),
+            );
+        }
+    }
+    (!face.is_empty()).then_some(serde_json::Value::Object(face))
+}
+
+/// contact number/email 条目（backup 导出面 contact_field_record 同构；data
+/// 面 value/label 均为 optional，缺席=value 空）。
+fn contact_field_entry(
+    value: Option<&str>,
+    field_type: Option<i32>,
+    label: Option<&str>,
+) -> Option<serde_json::Value> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    let mut record = json!({
+        "value": value,
+        "type": contact_field_type_word(field_type),
+    });
+    if let Some(label) = label.filter(|label| !label.is_empty()) {
+        record["label"] = serde_json::Value::String(label.to_string());
+    }
+    Some(record)
+}
+
+/// contact 条目 type 词（官方 contactFieldTypeName 同构，backup 导出面同
+/// 词表）：MOBILE/WORK/CUSTOM 识别；HOME/缺席/未知归 HOME。phone/email 两
+/// 枚举同编号（HOME=1/MOBILE=2/WORK=3/CUSTOM=4），词源统一取 phone 枚举。
+fn contact_field_type_word(field_type: Option<i32>) -> &'static str {
+    use presage::proto::data_message::contact::phone::Type;
+    match field_type.and_then(|value| Type::try_from(value).ok()) {
+        Some(Type::Mobile) => "MOBILE",
+        Some(Type::Work) => "WORK",
+        Some(Type::Custom) => "CUSTOM",
+        _ => "HOME",
+    }
+}
+
+/// DeleteForMe 投影（Q6②，compat 批块）：messageDeletes 臂逐组投影——
+/// `[{conversationId?, messages: [{author, timestamp}]}]`。author 二进制
+/// （ACI/PNI 16/17B）优先、字符串/e164 直通；author 不可解析或 messages 组
+/// 清空后丢弃（宁缺勿错）；conversation 见
+/// `delete_for_me_conversation_id`（缺席键不在）。全组无效 → None（调用方
+/// 整信封丢弃）。
+fn project_delete_for_me(delete: &presage::proto::sync_message::DeleteForMe) -> Option<Value> {
+    let groups: Vec<Value> = delete
+        .message_deletes
+        .iter()
+        .filter_map(|group| {
+            let messages: Vec<Value> = group
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    let author = match message.author.as_ref()? {
+                        presage::proto::addressable_message::Author::AuthorServiceId(id) => {
+                            Some(id.clone()).filter(|id| !id.is_empty())
+                        }
+                        presage::proto::addressable_message::Author::AuthorServiceIdBinary(
+                            bytes,
+                        ) => ServiceId::parse_from_service_id_binary(bytes)
+                            .map(|sid| sid.service_id_string()),
+                        presage::proto::addressable_message::Author::AuthorE164(number) => {
+                            Some(number.clone()).filter(|number| !number.is_empty())
+                        }
+                    }?;
+                    Some(json!({
+                        "author": author,
+                        "timestamp": message.sent_timestamp.unwrap_or(0),
+                    }))
+                })
+                .collect();
+            if messages.is_empty() {
+                return None;
+            }
+            let mut face = serde_json::Map::new();
+            if let Some(conversation) = delete_for_me_conversation_id(&group.conversation) {
+                face.insert("conversationId".into(), json!(conversation));
+            }
+            face.insert("messages".into(), Value::Array(messages));
+            Some(Value::Object(face))
+        })
+        .collect();
+    (!groups.is_empty()).then_some(json!({ "messageDeletes": groups }))
+}
+
+/// DeleteForMe 会话标识（ConversationIdentifier oneof）：serviceId/binary →
+/// UUID 串（PNI 17B 同解析）、groupId → master key 标准 base64（引擎 groupId
+/// 口径）、e164 → 号码原样；缺席/空/不可解析 → None（键省略）。
+fn delete_for_me_conversation_id(
+    conversation: &Option<presage::proto::ConversationIdentifier>,
+) -> Option<String> {
+    use base64::Engine as _;
+    match conversation.as_ref()?.identifier.as_ref()? {
+        presage::proto::conversation_identifier::Identifier::ThreadServiceId(id) => {
+            Some(id.clone()).filter(|id| !id.is_empty())
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadGroupId(bytes) => {
+            (!bytes.is_empty()).then(|| base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadE164(number) => {
+            Some(number.clone()).filter(|number| !number.is_empty())
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes) => {
+            ServiceId::parse_from_service_id_binary(bytes).map(|sid| sid.service_id_string())
+        }
+    }
 }
 
 /// story 投影（Stories 接收批，E2，compat §5 Stories 接收批块）：proto 只
@@ -5508,8 +6015,47 @@ async fn assemble_quote(
     let mut q = presage::proto::data_message::Quote {
         id: Some(quote.timestamp),
         author_aci: Some(author_aci.clone()),
+        // 官方发送恒写 type（isGiftBadge ? GIFT_BADGE : NORMAL，
+        // SendMessage.preload.ts:506-509）——词表缺省 normal 同语义。
+        r#type: Some(if quote.gift_badge {
+            presage::proto::data_message::quote::Type::GiftBadge
+        } else {
+            presage::proto::data_message::quote::Type::Normal
+        } as i32),
         ..presage::proto::data_message::Quote::default()
     };
+    // Q5：quote.bodyRanges 发送面（官方 quote.bodyRanges?.map(toBodyRange)
+    // 同构）：mention number→ACI（与 quote author 同解析，不可解析
+    // fail-closed）、style 五值词表（解析闸之后服务层防御，与 textStyle 同
+    // 口径）。官方「bodyRanges 在场抬 requiredProtocolVersion 至 MENTIONS」
+    // 是桌面进程内断言面，wire 由加密层协商，引擎不设（§5 登记）。
+    for range in &quote.body_ranges {
+        let associated_value = match (&range.mention, &range.style) {
+            (Some(number), None) => presage::proto::body_range::AssociatedValue::MentionAci(
+                resolve_author_aci(store, number)
+                    .await
+                    .ok_or(SendError::Internal)?,
+            ),
+            (None, Some(style)) => presage::proto::body_range::AssociatedValue::Style(
+                match presage::proto::body_range::Style::from_str_name(style) {
+                    Some(
+                        value @ (presage::proto::body_range::Style::Bold
+                        | presage::proto::body_range::Style::Italic
+                        | presage::proto::body_range::Style::Spoiler
+                        | presage::proto::body_range::Style::Strikethrough
+                        | presage::proto::body_range::Style::Monospace),
+                    ) => value as i32,
+                    _ => return Err(SendError::Internal),
+                },
+            ),
+            _ => return Err(SendError::Internal),
+        };
+        q.body_ranges.push(presage::proto::BodyRange {
+            start: Some(range.start),
+            length: Some(range.length),
+            associated_value: Some(associated_value),
+        });
+    }
     if let Some(quoted) = quoted_data_message(store, &author_aci, quote.timestamp).await {
         if let Some(text) = quoted.body.clone() {
             q.text = Some(text);
@@ -5606,6 +6152,31 @@ fn build_expiration_timer_update_data_message(timestamp: u64) -> DataMessage {
         flags: Some(Flags::ExpirationTimerUpdate as u32),
         ..DataMessage::default()
     }
+}
+
+/// editMessage 体构造（官方 getContentMessage 同构：Content.editMessage
+/// {targetSentTimestamp, dataMessage{timestamp, body}}，SendMessage
+/// .preload.ts:1075-1092）。群腿由调用方携 (master_key, revision) 手注
+/// group_v2（vendored send 面不为 EditMessage 注入群上下文）；直聊腿传 None。
+fn build_edit_message_body(
+    target_timestamp: u64,
+    timestamp: u64,
+    message: &str,
+    group: Option<(Vec<u8>, Option<u32>)>,
+) -> ContentBody {
+    ContentBody::EditMessage(presage::proto::EditMessage {
+        target_sent_timestamp: Some(target_timestamp),
+        data_message: Some(DataMessage {
+            timestamp: Some(timestamp),
+            body: Some(message.to_owned()),
+            group_v2: group.map(|(master_key, revision)| presage::proto::GroupContextV2 {
+                master_key: Some(master_key),
+                revision,
+                group_change: None,
+            }),
+            ..DataMessage::default()
+        }),
+    })
 }
 
 /// 阅后即焚媒体族判定（E1/E2 共用）：`image/*|video/*` 前缀族。官方桌面
@@ -6747,6 +7318,8 @@ mod tests {
             Some(&SendQuote {
                 timestamp: 1_699_999_000_000,
                 author: aci.to_owned(),
+                gift_badge: false,
+                body_ranges: Vec::new(),
             }),
             pointer.clone(),
             1_700_000_000_000,
@@ -6765,6 +7338,8 @@ mod tests {
                 Some(&SendQuote {
                     timestamp: 1,
                     author: "+15550009999".to_owned(),
+                    gift_badge: false,
+                    body_ranges: Vec::new(),
                 }),
                 pointer,
                 1,
@@ -10290,6 +10865,503 @@ mod tests {
         )
         .await
         .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Q2/Q3/Q4 收投影：contact 卡片（键形与 backup contact_record 同族 +
+    /// type 词表 + 空 value 条目丢弃 + 空卡片整键缺席）、poll 三臂（去重保序/
+    /// voteCount 0 透出/targetAuthor E.164 映射/清票空数组）、groupCallUpdate
+    /// （eraId 在场/空串整键缺席）。
+    #[test]
+    fn data_message_projects_contact_poll_and_group_call_faces() {
+        use presage::proto::data_message::contact::{self, Avatar, Name, Phone};
+        use presage::proto::data_message::Contact;
+        use std::collections::HashMap;
+
+        let aci = "11111111-2222-4333-8444-555555555555";
+        let mut author_numbers = HashMap::new();
+        author_numbers.insert(aci.to_owned(), "+15550001111".to_owned());
+
+        // 全卡片：name 非空子字段 + number（MOBILE）+ email（HOME 缺省词）+
+        // organization + avatar（isProfile 恒投）。
+        let out = project_data_message(
+            &DataMessage {
+                timestamp: Some(1),
+                contact: vec![Contact {
+                    name: Some(Name {
+                        given_name: Some("Ada".to_owned()),
+                        family_name: Some("Lovelace".to_owned()),
+                        prefix: Some("".to_owned()),
+                        ..Name::default()
+                    }),
+                    number: vec![
+                        Phone {
+                            value: Some("+15551234567".to_owned()),
+                            r#type: Some(contact::phone::Type::Mobile as i32),
+                            label: Some("cell".to_owned()),
+                        },
+                        // value 空整条丢弃。
+                        Phone {
+                            value: Some(String::new()),
+                            r#type: Some(contact::phone::Type::Work as i32),
+                            label: None,
+                        },
+                    ],
+                    email: vec![contact::Email {
+                        value: Some("ada@example.test".to_owned()),
+                        // 缺席 type 归 HOME 词。
+                        r#type: None,
+                        label: None,
+                    }],
+                    organization: Some("KT".to_owned()),
+                    avatar: Some(Avatar {
+                        avatar: Some(AttachmentPointer {
+                            content_type: Some("image/png".to_owned()),
+                            ..AttachmentPointer::default()
+                        }),
+                        is_profile: Some(true),
+                    }),
+                    ..Contact::default()
+                }],
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        let card = &out["contact"];
+        assert_eq!(
+            card["name"],
+            json!({ "givenName": "Ada", "familyName": "Lovelace" })
+        );
+        assert_eq!(
+            card["number"],
+            json!([{ "value": "+15551234567", "type": "MOBILE", "label": "cell" }])
+        );
+        assert_eq!(
+            card["email"],
+            json!([{ "value": "ada@example.test", "type": "HOME" }])
+        );
+        assert_eq!(card["organization"], json!("KT"));
+        assert_eq!(card["avatar"]["isProfile"], json!(true));
+        assert!(card["avatar"]["avatar"].is_object(), "avatar pointer face");
+
+        // 空卡片（全部字段缺席）→ contact 键不在（永不投占位）。
+        let out = project_data_message(
+            &DataMessage {
+                contact: vec![Contact::default()],
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        assert!(out.get("contact").is_none(), "空卡片整键缺席");
+
+        // poll 三臂：optionIndexes 去重保首现序、voteCount 0 透出、
+        // targetAuthor E.164 命中转号码。
+        let out = project_data_message(
+            &DataMessage {
+                timestamp: Some(1),
+                poll_create: Some(data_message::PollCreate {
+                    question: Some("lunch?".to_owned()),
+                    allow_multiple: Some(true),
+                    options: vec!["a".to_owned(), "b".to_owned()],
+                }),
+                poll_vote: Some(data_message::PollVote {
+                    target_author_aci_binary: Some(
+                        ServiceId::parse_from_service_id_string(aci)
+                            .unwrap()
+                            .raw_uuid()
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    target_sent_timestamp: Some(1_699_999_000_000),
+                    option_indexes: vec![2, 1, 2, 3],
+                    vote_count: Some(0),
+                }),
+                poll_terminate: Some(data_message::PollTerminate {
+                    target_sent_timestamp: Some(1_699_999_000_500),
+                }),
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        assert_eq!(
+            out["poll"],
+            json!({ "question": "lunch?", "options": ["a", "b"], "allowMultiple": true })
+        );
+        assert_eq!(
+            out["pollVote"],
+            json!({
+                "targetAuthor": "+15550001111",
+                "targetSentTimestamp": 1_699_999_000_000_u64,
+                "optionIndexes": [2, 1, 3],
+                "voteCount": 0,
+            })
+        );
+        assert_eq!(
+            out["pollTerminate"],
+            json!({ "targetSentTimestamp": 1_699_999_000_500_u64 })
+        );
+
+        // groupCallUpdate：eraId 在场投影；空串整键缺席。
+        let out = project_data_message(
+            &DataMessage {
+                group_call_update: Some(data_message::GroupCallUpdate {
+                    era_id: Some("era-1".to_owned()),
+                }),
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        assert_eq!(out["groupCallUpdate"], json!({ "eraId": "era-1" }));
+        let out = project_data_message(
+            &DataMessage {
+                group_call_update: Some(data_message::GroupCallUpdate {
+                    era_id: Some(String::new()),
+                }),
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        assert!(out.get("groupCallUpdate").is_none(), "空 eraId 整键缺席");
+    }
+
+    /// Q5 quote 收投影：type 恒产（GIFT_BADGE 词 / 未知值 coerce NORMAL /
+    /// 缺席 NORMAL——官方 isKnownProtoEnumMember 同构）+ bodyRanges（mention
+    /// 二进制优先 + author_numbers 映射、Style 归同条目 style 键、NONE 丢弃）。
+    #[test]
+    fn data_message_projects_quote_type_and_body_ranges() {
+        use presage::proto::data_message::quote::Type;
+        use std::collections::HashMap;
+
+        let aci = "11111111-2222-4333-8444-555555555555";
+        let mut author_numbers = HashMap::new();
+        author_numbers.insert(aci.to_owned(), "+15550001111".to_owned());
+        let aci_bytes = ServiceId::parse_from_service_id_string(aci)
+            .unwrap()
+            .raw_uuid()
+            .as_bytes()
+            .to_vec();
+
+        let out = project_data_message(
+            &DataMessage {
+                quote: Some(data_message::Quote {
+                    id: Some(42),
+                    author_aci: Some(aci.to_owned()),
+                    r#type: Some(Type::GiftBadge as i32),
+                    body_ranges: vec![
+                        BodyRange {
+                            start: Some(0),
+                            length: Some(3),
+                            associated_value: Some(AssociatedValue::MentionAciBinary(
+                                aci_bytes.clone(),
+                            )),
+                        },
+                        BodyRange {
+                            start: Some(4),
+                            length: Some(2),
+                            associated_value: Some(AssociatedValue::Style(
+                                presage::proto::body_range::Style::Spoiler as i32,
+                            )),
+                        },
+                        // NONE：composer 永不出、投影丢弃对称。
+                        BodyRange {
+                            start: Some(6),
+                            length: Some(1),
+                            associated_value: Some(AssociatedValue::Style(
+                                presage::proto::body_range::Style::None as i32,
+                            )),
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..DataMessage::default()
+            },
+            &author_numbers,
+        );
+        assert_eq!(out["quote"]["type"], json!("GIFT_BADGE"));
+        assert_eq!(
+            out["quote"]["bodyRanges"],
+            json!([
+                { "number": "+15550001111", "start": 0, "length": 3 },
+                { "style": "SPOILER", "start": 4, "length": 2 },
+            ])
+        );
+
+        // 未知 type 值 coerce NORMAL；缺席同（官方 processQuote 同构）。
+        for type_value in [Some(99), None] {
+            let out = project_data_message(
+                &DataMessage {
+                    quote: Some(data_message::Quote {
+                        id: Some(1),
+                        r#type: type_value,
+                        ..Default::default()
+                    }),
+                    ..DataMessage::default()
+                },
+                &author_numbers,
+            );
+            assert_eq!(
+                out["quote"]["type"],
+                json!("NORMAL"),
+                "coerce {type_value:?}"
+            );
+        }
+    }
+
+    /// Q1 editMessage 体构造：直聊腿无 group_v2；群腿手注 (master_key,
+    /// revision) 上下文（vendored 不为 EditMessage 注入群上下文的引擎侧补位）。
+    #[test]
+    fn edit_message_body_injects_group_context_when_provided() {
+        use presage::libsignal_service::content::ContentBody;
+        for group in [None, Some((vec![7u8; 32], Some(5u32)))] {
+            let body = build_edit_message_body(42, 100, "edited", group.clone());
+            let ContentBody::EditMessage(edit) = body else {
+                panic!("edit body shape");
+            };
+            assert_eq!(edit.target_sent_timestamp, Some(42));
+            let inner = edit.data_message.expect("inner dataMessage");
+            assert_eq!(inner.body.as_deref(), Some("edited"));
+            assert_eq!(inner.timestamp, Some(100));
+            match group {
+                None => assert!(inner.group_v2.is_none(), "直聊腿无群上下文"),
+                Some((master_key, revision)) => {
+                    let context = inner.group_v2.expect("群腿注入 group_v2");
+                    assert_eq!(context.master_key.as_deref(), Some(master_key.as_slice()));
+                    assert_eq!(context.revision, revision);
+                }
+            }
+        }
+    }
+
+    /// Q1/Q6③ Sent sync echo 投影：editMessage 臂（sentMessage.editMessage
+    /// {targetSentTimestamp, dataMessage} + 公共位 timestamp/destination）与
+    /// storyMessage 臂（sentMessage.storyMessage 复用 story 投影单点）；
+    /// 全缺位整信封丢弃。
+    #[tokio::test]
+    async fn sent_sync_projects_edit_and_story_echoes() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{sync_message, EditMessage, StoryMessage};
+        use presage::proto::{SyncMessage, TextAttachment};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-sent-echo-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let sent_body = |sent: sync_message::Sent| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_message::Content::Sent(sent)),
+                    ..SyncMessage::default()
+                }),
+                metadata.clone(),
+            )
+        };
+
+        // editMessage echo：公共位 + editMessage 双键形。
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            destination_service_id: Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned()),
+            edit_message: Some(EditMessage {
+                target_sent_timestamp: Some(1_699_999_000_000),
+                data_message: Some(DataMessage {
+                    timestamp: Some(1_700_000_000_123),
+                    body: Some("edited body".to_owned()),
+                    ..DataMessage::default()
+                }),
+            }),
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "edit echo projects",
+        )["params"]["envelope"]
+            .clone();
+        let sent_json = &envelope["syncMessage"]["sentMessage"];
+        assert_eq!(sent_json["timestamp"], json!(1_700_000_000_123_u64));
+        assert_eq!(
+            sent_json["destinationUuid"],
+            json!("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        assert_eq!(
+            sent_json["editMessage"]["targetSentTimestamp"],
+            json!(1_699_999_000_000_u64)
+        );
+        assert_eq!(
+            sent_json["editMessage"]["dataMessage"]["message"],
+            json!("edited body")
+        );
+        assert!(sent_json.get("message").is_none(), "面臂单选");
+
+        // storyMessage echo：复用 story 投影（textAttachment.text 面）。
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            story_message: Some(StoryMessage {
+                attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                    TextAttachment {
+                        text: Some("hello story".to_owned()),
+                        ..TextAttachment::default()
+                    },
+                )),
+                ..StoryMessage::default()
+            }),
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "story echo projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["storyMessage"]["textAttachment"]["text"],
+            json!("hello story")
+        );
+
+        // 全缺位：整信封丢弃（宁缺勿错）。
+        let content = sent_body(sync_message::Sent::default());
+        assert!(project_content("acct", &store, &content, &registry)
+            .await
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Q6② deleteForMe 收包投影：messageDeletes 组投影（author 二进制解析/
+    /// e164 直通、timestamp 缺省 0、conversationId groupId→base64）、坏作者
+    /// 条目丢弃、全坏整信封丢弃。
+    #[tokio::test]
+    async fn sync_projects_delete_for_me_face() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::sync_message::delete_for_me::MessageDeletes;
+        use presage::proto::{
+            sync_message, AddressableMessage, ConversationIdentifier, SyncMessage,
+        };
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-delete-for-me-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let author_bytes =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .unwrap()
+                .raw_uuid()
+                .as_bytes()
+                .to_vec();
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe {
+                        message_deletes: vec![MessageDeletes {
+                            conversation: Some(ConversationIdentifier {
+                                identifier: Some(
+                                    presage::proto::conversation_identifier::Identifier::
+                                        ThreadGroupId(vec![7u8; 32]),
+                                ),
+                            }),
+                            messages: vec![
+                                AddressableMessage {
+                                    author: Some(
+                                        presage::proto::addressable_message::Author::
+                                            AuthorServiceIdBinary(author_bytes),
+                                    ),
+                                    sent_timestamp: Some(1_699_999_000_000),
+                                },
+                                // 坏作者条目（无 author 位）丢弃。
+                                AddressableMessage {
+                                    author: None,
+                                    sent_timestamp: Some(1_699_999_000_100),
+                                },
+                            ],
+                        }],
+                        ..sync_message::DeleteForMe::default()
+                    },
+                )),
+                ..SyncMessage::default()
+            }),
+            metadata.clone(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "deleteForMe projects",
+        )["params"]["envelope"]
+            .clone();
+        let face = &envelope["syncMessage"]["deleteForMe"];
+        let groups = face["messageDeletes"].as_array().expect("groups");
+        assert_eq!(groups.len(), 1, "坏作者条目所在组仍有有效成员");
+        assert_eq!(
+            groups[0]["conversationId"],
+            json!(base64::engine::general_purpose::STANDARD.encode([7u8; 32]))
+        );
+        assert_eq!(
+            groups[0]["messages"],
+            json!([{ "author": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "timestamp": 1_699_999_000_000_u64 }])
+        );
+
+        // 全坏（无 messageDeletes）→ 整信封丢弃。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe::default(),
+                )),
+                ..SyncMessage::default()
+            }),
+            Metadata {
+                sender: ServiceId::parse_from_service_id_string(
+                    "11111111-2222-4333-8444-555555555555",
+                )
+                .unwrap(),
+                ..metadata
+            },
+        );
+        assert!(project_content("acct", &store, &content, &registry)
+            .await
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }
