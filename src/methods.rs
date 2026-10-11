@@ -1952,6 +1952,113 @@ async fn dispatch(
             };
             jsonrpc::success_response(id, payload)
         }
+        // 自建群（createGroup，KT 扩展方法，官方 createGroupV2 行为对齐）：
+        // 协议上行面，落调度日志（terminateGroup 同纪律；avatar 键落盘前
+        // 形状摘要化——updateGroup「调度零头像字节」同纪律）。title 必填
+        // 非空（官方 createGroupV2 name: string 必填同位）；members 可选
+        //（service-id 串/联系人号码，不可解析整拒 -32603——官方桌面缺本地
+        // 联系人静默跳过是 GUI 语义，API 面不静默）；expiration/avatar
+        // 三态与 updateGroup 同形状（expiration=0 = 官方 `if (expireTimer)`
+        // falsy 落缺省同语义：建群不带 timer action）。参数面 fail-closed
+        // -32603；服务器拒绝 → -1 GROUP_CREATE_FAILED + data.status 诚实
+        // 透传；avatar 上行链失败 → GROUP_AVATAR_UPLOAD_FAILED（伴生面未
+        // 提交，updateGroup 同 data）；网络面 → STORAGE_UNAVAILABLE；
+        // self 凭据取材失败（无 presentation 服务器必拒）→ GROUP_CREATE_
+        // FAILED data.status 缺省。fake 模式形状桩 {groupId(随机 master
+        // key 标准 base64), revision: 0}（avatar data URI 臂失败同
+        // updateGroup 两臂纪律）。
+        "createGroup" => {
+            let mut logged_params = params.clone();
+            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
+                let digest = format!("[avatar data uri: {} bytes]", uri.len());
+                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
+            }
+            state.lock().await.append_dispatch(method, &logged_params);
+            let account = params.get("account").and_then(Value::as_str);
+            let title = match params.get("title") {
+                Some(Value::String(title)) if !title.is_empty() => title.to_owned(),
+                Some(_) => return internal_error(id),
+                None => return internal_error(id),
+            };
+            let expiration = params
+                .get("expiration")
+                .and_then(Value::as_u64)
+                .and_then(|seconds| u32::try_from(seconds).ok());
+            if params.get("expiration").is_some() && expiration.is_none() {
+                return internal_error(id);
+            }
+            let avatar = match params.get("avatar") {
+                None => None,
+                Some(Value::Null) => Some(crate::service::groups::AvatarWrite::Remove),
+                Some(Value::String(uri)) => {
+                    match crate::service::profile::parse_avatar_data_uri(uri) {
+                        Some((_, bytes)) => {
+                            Some(crate::service::groups::AvatarWrite::Replace(bytes))
+                        }
+                        None => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
+            let members = match params.get("members") {
+                None => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.is_empty() {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(text) => parsed.push(text.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
+            let Some(account) = account else {
+                return internal_error(id);
+            };
+            match service
+                .create_group(account, &title, expiration, avatar, &members)
+                .await
+            {
+                Ok((group_id, revision)) => jsonrpc::success_response(
+                    id,
+                    json!({ "groupId": group_id, "revision": revision }),
+                ),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::AvatarUpload) => {
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_AVATAR_UPLOAD_FAILED",
+                            json!({ "retryable": true, "textSaved": false }),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_CREATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+            }
+        }
         // 群终止（terminateGroup，KT 扩展方法）：协议上行面，落调度日志
         //（send 系/reportSpam 同纪律）。groupId 必须 32B 标准 base64 群
         // master key、缺 account/坏 groupId → 参数面 -32603 fail-closed；

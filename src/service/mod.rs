@@ -1841,6 +1841,36 @@ impl Service {
         groups::update_group_change(&context, &master_key, expiration_secs, avatar).await
     }
 
+    /// createGroup（自建群，KT 扩展方法，官方 createGroupV2 行为对齐）：
+    /// 随机 master key + zkgroup 派生链 + 初始 Group proto `PUT v1/groups`
+    /// 与本地群态落库；成员入参（service-id 串/号码）在 real 模式解析。
+    /// fake 模式形状桩（随机 master key 标准 base64 + revision 0，不触网；
+    /// avatar data URI 臂同 updateGroup fake 纪律 = AvatarUpload 错误面）。
+    pub(crate) async fn create_group(
+        self: &Arc<Self>,
+        account: &str,
+        title: &str,
+        expiration_secs: Option<u32>,
+        avatar: Option<groups::AvatarWrite>,
+        members: &[String],
+    ) -> Result<(String, u32), groups::TerminateError> {
+        if !self.real {
+            return match avatar {
+                Some(groups::AvatarWrite::Replace(_)) => Err(groups::TerminateError::AvatarUpload),
+                _ => {
+                    use base64::Engine as _;
+                    let master_key = groups::random_32_bytes_pub();
+                    Ok((
+                        base64::engine::general_purpose::STANDARD.encode(master_key),
+                        0,
+                    ))
+                }
+            };
+        }
+        let context = storage_context(self, account).await?;
+        groups::create_group(&context, title, expiration_secs, avatar, members).await
+    }
+
     /// calls.linkPresentation（KT 扩展，P4c 切一）：当天 CallLinkAuthCredential
     /// 呈现字节（compat §3 calls 族行 + §5 块）。材料面非协议上行，不落调度
     /// 日志；凭据/呈现字节零日志零落盘。fake 模式形状桩（非有效 zk 材料）。

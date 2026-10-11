@@ -733,6 +733,125 @@ fn report_spam_fake_shape_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// 自建群（createGroup，KT 扩展方法，官方 createGroupV2 行为对齐）：fake
+/// 模式形状桩 `{groupId(随机 32B master key 标准 base64), revision: 0}`
+///（落调度日志，avatar 键摘要化）；avatar data URI 臂失败
+/// GROUP_AVATAR_UPLOAD_FAILED（fake 无 CDN 上行面，updateGroup 两臂纪律）；
+/// 参数面 fail-closed（-32603：缺 account / title 缺席·空串·非字符串 /
+/// expiration 非法形状 / members 非数组·空数组·条目非字符串 / avatar 非
+/// image 族·坏 base64）；real 模式未注册账号折叠 -32603。
+#[test]
+fn create_group_fake_shape_param_fail_closed_and_log_redaction() {
+    use base64::Engine as _;
+    let dir = temp_dir("create-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let avatar = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG-fake")
+    );
+
+    // fake 合法面：title 必填（官方 createGroupV2 name 必填同位），members
+    // / expiration / avatar 缺省 → 形状桩 {groupId, revision: 0}。
+    let created = engine.request(
+        "createGroup",
+        json!({ "account": "+15550000000", "title": "作战室" }),
+    )["result"]
+        .clone();
+    let group_id = created["groupId"].as_str().expect("groupId string");
+    assert_eq!(group_id.len(), 44, "32B master key 标准 base64");
+    base64::engine::general_purpose::STANDARD
+        .decode(group_id)
+        .expect("groupId decodes");
+    assert_eq!(created["revision"], json!(0));
+
+    // expiration / avatar=null 臂同形成功。
+    assert_eq!(
+        engine.request(
+            "createGroup",
+            json!({ "account": "+15550000000", "title": "作战室", "expiration": 86_400, "avatar": null })
+        )["result"]["revision"],
+        json!(0)
+    );
+
+    // fake 失败臂：avatar data URI（换新，需上行链）→
+    // GROUP_AVATAR_UPLOAD_FAILED data {retryable:true, textSaved:false}。
+    let response = engine.request(
+        "createGroup",
+        json!({ "account": "+15550000000", "title": "作战室", "avatar": avatar }),
+    );
+    assert_eq!(response["error"]["code"], -1);
+    assert_eq!(response["error"]["message"], "GROUP_AVATAR_UPLOAD_FAILED");
+    assert_eq!(
+        response["error"]["data"],
+        json!({ "retryable": true, "textSaved": false })
+    );
+
+    // 参数面 fail-closed 逐形状（-32603）。
+    let rejects = [
+        json!({ "title": "作战室" }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "title": "" }),
+        json!({ "account": "+15550000000", "title": 7 }),
+        json!({ "account": "+15550000000", "title": "作战室", "expiration": "3600" }),
+        json!({ "account": "+15550000000", "title": "作战室", "expiration": -1 }),
+        json!({ "account": "+15550000000", "title": "作战室", "members": "not-array" }),
+        json!({ "account": "+15550000000", "title": "作战室", "members": [] }),
+        json!({ "account": "+15550000000", "title": "作战室", "members": [7] }),
+        json!({ "account": "+15550000000", "title": "作战室", "avatar": "data:text/plain;base64,aGk=" }),
+        json!({ "account": "+15550000000", "title": "作战室", "avatar": "data:image/png;base64,###" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("createGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "createGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：title/members 键逐字保留（协议上行面纪律），avatar 键
+    // 形状摘要化（data URI 载荷零字节落盘）；被拒调用同样落日志。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .filter(|entry: &Value| entry["method"] == "createGroup")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        14,
+        "成功两条 + 失败一条 + 拒绝十一条均落日志"
+    );
+    assert_eq!(entries[0]["params"]["title"], json!("作战室"));
+    assert!(
+        entries[0]["params"]["members"].is_null(),
+        "members 缺省原样保留"
+    );
+    let redacted = &entries[2]["params"]["avatar"];
+    assert!(
+        redacted.is_string()
+            && redacted
+                .as_str()
+                .expect("avatar digest")
+                .starts_with("[avatar data uri: "),
+        "avatar key digested in dispatch log: {redacted}"
+    );
+    assert!(
+        !log.contains("iVBO"),
+        "avatar base64 payload leaked into log"
+    );
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（terminateGroup
+    // 同款，细节不外泄）。
+    let real_dir = temp_dir("create-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "createGroup",
+        json!({ "account": "+15559990000", "title": "作战室" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// 群终止（terminateGroup，KT 扩展方法）：fake 模式成功投影
 /// `{status: "terminated"}`（落调度日志，协议上行面纪律）；参数面
 /// fail-closed（-32603：缺 account / 缺 groupId / groupId 非 base64 /

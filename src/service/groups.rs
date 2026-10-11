@@ -60,6 +60,7 @@ use presage::libsignal_service::groups_v2::{decrypt_group, GroupOperations};
 use presage::libsignal_service::prelude::PushService;
 use presage::libsignal_service::push_service::HttpAuthOverride;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+use presage_store_sqlite::SqliteStore;
 use prost::Message;
 
 use super::storage_sync::StorageSyncError;
@@ -768,6 +769,294 @@ fn role_name(role: &presage::libsignal_service::groups_v2::Role) -> &'static str
         Role::Default => "DEFAULT",
         Role::Administrator => "ADMINISTRATOR",
     }
+}
+
+// ---------------------------------------------------------------------------
+// 群成员写面共用件（P1 建群 + P3 加成员 + P4 移除/退群批）
+// ---------------------------------------------------------------------------
+
+/// 当前 epoch 秒（zkgroup 凭据 receive 的当日时间面）。
+fn now_epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 随机 32 字节（CSPRNG；群 master key / zk randomness 面共用）。
+fn random_32_bytes() -> [u8; 32] {
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes
+}
+
+/// fake 模式形状桩的随机 master key 面（createGroup stub 用；真实写面
+/// 不经此——`random_32_bytes` 本文件内私有面）。
+pub(crate) fn random_32_bytes_pub() -> [u8; 32] {
+    random_32_bytes()
+}
+
+/// 群写面成员入参解析：service-id 串（ACI/PNI）直通；否则按联系人号码
+/// 数字位后缀匹配 → 联系人 ACI（send 收件人解析同口径；找不到 = None，
+/// 调用方按 API 语义整拒——官方桌面缺本地联系人是静默跳过的 GUI 语义，
+/// 引擎 API 面不静默，compat §5 登记）。
+async fn resolve_group_member(
+    store: &SqliteStore,
+    entry: &str,
+) -> Option<presage::libsignal_service::protocol::ServiceId> {
+    use presage::libsignal_service::protocol::ServiceId;
+    use presage::store::ContentsStore as _;
+    if let Some(service_id) = ServiceId::parse_from_service_id_string(entry.trim()) {
+        return Some(service_id);
+    }
+    let want: String = entry.chars().filter(char::is_ascii_digit).collect();
+    if want.is_empty() {
+        return None;
+    }
+    let contacts = store.contacts().await.ok()?;
+    contacts
+        .filter_map(Result::ok)
+        .find(|contact| {
+            contact.phone_number.as_ref().is_some_and(|phone| {
+                let digits: String = phone
+                    .to_string()
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect();
+                digits.ends_with(&want)
+            })
+        })
+        .map(|contact| ServiceId::Aci(contact.uuid.into()))
+}
+
+/// profile key credential 取材链（官方 getProfiles → profileKeyCredential
+/// 面行为对齐，zkgroup 全官方原语不绕过）：ServerPublicParams 造 request
+/// context（CSPRNG）→ unauth chat WS
+/// `GET /v1/profile/{aci}/{version}/{request}?credentialType=expiringProfileKey`
+///（`Unidentified-Access-Key` 头 = AccessKey(profile_key.derive_access_key)，
+/// 官方 unidentified access 模型）→ `receive_expiring_profile_key_credential`
+/// 出 ExpiringProfileKeyCredential（当日窗口 1..=7 天校验在 receive 内）。
+/// 任一步失败 → None（调用方按官方降级：成员 → pending 面；self → 建群
+/// 整体失败——无 self presentation 服务器拒收，不硬造材料）。
+async fn fetch_profile_key_credential(
+    aci: presage::libsignal_service::protocol::Aci,
+    profile_key: presage::libsignal_service::zkgroup::profiles::ProfileKey,
+) -> Option<zkgroup::profiles::ExpiringProfileKeyCredential> {
+    use libsignal_net::chat::ChatConnection;
+    use libsignal_net_chat::api::profiles::UnauthenticatedChatApi as _;
+    use libsignal_net_chat::api::{Unauth, UserBasedAuthorization};
+
+    let server_params = super::zkgroup_consts::legacy_server_public_params();
+    let context = server_params.create_profile_key_credential_request_context(
+        random_32_bytes(),
+        aci,
+        profile_key,
+    );
+    let chat = super::cloud_backup::connect_production_chat().await.ok()?;
+    let api: &Unauth<ChatConnection> = (&chat).into();
+    let response = api
+        .get_profile_key_credential(
+            aci,
+            profile_key,
+            context.get_request(),
+            UserBasedAuthorization::AccessKey(profile_key.derive_access_key()),
+        )
+        .await
+        .ok()?;
+    server_params
+        .receive_expiring_profile_key_credential(
+            &context,
+            &response,
+            zkgroup::Timestamp::from_epoch_seconds(now_epoch_seconds()),
+        )
+        .ok()
+}
+
+/// 本机 ExpiringProfileKeyCredential（建群 self presentation 所需；官方
+/// createGroupV2 前置 getProfiles 同语义）。本机 profile key 来自注册数据
+///（presage RegistrationData::profile_key 公共面）；凭据链失败 → None。
+async fn self_profile_key_credential(
+    context: &StorageContext,
+) -> Option<zkgroup::profiles::ExpiringProfileKeyCredential> {
+    use presage::store::StateStore as _;
+    let data = context.store.load_registration_data().await.ok()??;
+    let aci = presage::libsignal_service::protocol::Aci::from(context.aci_uuid);
+    fetch_profile_key_credential(aci, data.profile_key()).await
+}
+
+/// `PUT v1/groups` 服务器建群（官方 createGroup WebAPI 同端点同形状：
+/// storage host、body = 加密 Group proto、群凭据 basic auth——新群
+/// secret params 派生的凭据在创建前即有效）；响应 GroupResponse 解出
+/// 服务器回填 version（解码失败/缺群态退化 0，交后续读面收敛）。
+async fn put_group(
+    push: &presage::libsignal_service::prelude::PushService,
+    auth: presage::libsignal_service::push_service::HttpAuth,
+    group: &presage::proto::Group,
+) -> Result<u32, TerminateError> {
+    let response = push
+        .request(
+            reqwest::Method::PUT,
+            presage::libsignal_service::configuration::Endpoint::storage("v1/groups"),
+            HttpAuthOverride::Identified(auth),
+        )
+        .map_err(|_| TerminateError::Unavailable)?
+        .header("Content-Type", "application/x-protobuf")
+        .body(group.encode_to_vec())
+        .send()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(TerminateError::Failed {
+            status: Some(status),
+        });
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    let decoded = presage::proto::GroupResponse::decode(bytes.as_ref())
+        .map_err(|_| TerminateError::Failed { status: None })?;
+    Ok(decoded.group.map(|group| group.version).unwrap_or(0))
+}
+
+/// 群态拉取后落 presage store（本地群态初始化/刷新：建群后、退群后等
+/// 自身成员面变化的写后同步，官方 createGroupV2 getOrCreateAndWait/
+/// modifyGroupV2 本地落库同语义）。best-effort：读面/落库失败不回滚写面
+///（写意图已由服务器裁决），后续群更新消息/发送前刷群态自愈。
+async fn refresh_local_group_state(context: &StorageContext, master_key: &[u8]) {
+    use presage::store::ContentsStore as _;
+    if let Ok(group) = fetch_group_state(context, master_key).await {
+        if let Ok(key) = <[u8; 32]>::try_from(master_key) {
+            let _ = context
+                .store
+                .save_group(key, presage::model::groups::Group::from(group))
+                .await;
+        }
+    }
+}
+
+/// createGroup 编排（官方 createGroupV2 行为对齐，KT 扩展方法）：随机
+/// master key（32B CSPRNG）→ zkgroup 派生链（secret params → public
+/// params → groupId = get_group_identifier，官方 deriveGroupFields 同构；
+/// wire 面 groupId = master key 标准 base64 引擎口径）→ self + 成员
+/// 凭据取材（有 profile key + 凭据 = 全成员，无 = pending 降级，官方
+/// createGroupV2 成员分流同构）→ avatar 上行链（Replace 臂，官方
+/// uploadAvatar 建群前同序）→ 初始 Group proto（version 0 + 官方
+/// accessControl 默认 + 加密 title/timer，官方 buildGroupProto 同形状）→
+/// `PUT v1/groups` → 本地群态落库。成员入参（service-id 串/号码）此处
+/// 解析，不可解析 = UnknownGroup（handler 面 -32603 整拒——官方桌面缺
+/// 本地联系人静默跳过是 GUI 语义，API 面不静默）。self 凭据取材失败 =
+/// 建群失败 Failed{None}（服务器必拒无 presentation 的创建，不硬造）。
+pub(crate) async fn create_group(
+    context: &StorageContext,
+    title: &str,
+    expiration_secs: Option<u32>,
+    avatar: Option<AvatarWrite>,
+    members: &[String],
+) -> Result<(String, u32), TerminateError> {
+    use base64::Engine as _;
+    use presage::libsignal_service::groups_v2::{AccessRequired, GroupMemberCandidate};
+    use presage::store::ContentsStore as _;
+
+    let mut resolved = Vec::with_capacity(members.len());
+    for entry in members {
+        let service_id = resolve_group_member(&context.store, entry)
+            .await
+            .ok_or(TerminateError::UnknownGroup)?;
+        if !resolved.contains(&service_id) {
+            resolved.push(service_id);
+        }
+    }
+
+    let master_key = random_32_bytes();
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+    let operations = presage::libsignal_service::groups_v2::GroupOperations::new(secret_params);
+
+    let Some(self_credential) = self_profile_key_credential(context).await else {
+        return Err(TerminateError::Failed { status: None });
+    };
+
+    // 成员分流（官方 createGroupV2 同构）：ACI + profile key + 凭据 = 全
+    // 成员；profile key 在但凭据取材失败 = pending 降级；无 profile key /
+    // PNI = pending。self 过滤（官方 conversationIds 不含 self，含了也是
+    // 服务器 400——引擎静默剔除）。
+    let own_aci = presage::libsignal_service::protocol::Aci::from(context.aci_uuid);
+    let mut candidates = Vec::new();
+    for service_id in resolved {
+        match service_id {
+            presage::libsignal_service::protocol::ServiceId::Aci(aci) => {
+                if aci == own_aci {
+                    continue;
+                }
+                let profile_key = context
+                    .store
+                    .profile_key(&presage::libsignal_service::protocol::ServiceId::Aci(aci))
+                    .await
+                    .ok()
+                    .flatten();
+                let credential = match profile_key {
+                    Some(profile_key) => fetch_profile_key_credential(aci, profile_key).await,
+                    None => None,
+                };
+                candidates.push(GroupMemberCandidate {
+                    service_id: service_id.to_owned(),
+                    credential,
+                });
+            }
+            presage::libsignal_service::protocol::ServiceId::Pni(_) => {
+                candidates.push(GroupMemberCandidate {
+                    service_id: service_id.to_owned(),
+                    credential: None,
+                });
+            }
+        }
+    }
+
+    // avatar 上行链（Replace 臂；官方 uploadAvatar 建群前同序——失败 =
+    // 整建群意图未落地，AvatarUpload 族诚实呈现）。
+    let avatar_url = match avatar {
+        Some(AvatarWrite::Replace(bytes)) => {
+            upload_group_avatar(context, &master_key, &bytes).await?
+        }
+        Some(AvatarWrite::Remove) | None => String::new(),
+    };
+
+    // 初始 Group proto（官方 buildGroupProto + createGroupV2 accessControl
+    // 默认面：attributes/members/memberLabel = MEMBER、addFromInviteLink =
+    // UNSATISFIABLE；version = 0；timer 仅正数在场——官方 `if (expireTimer)`
+    // 0 值 falsy 落缺省同语义）。
+    let timer = expiration_secs
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| presage::libsignal_service::groups_v2::Timer { duration: seconds });
+    let access_control = presage::libsignal_service::groups_v2::AccessControl {
+        attributes: AccessRequired::Member,
+        members: AccessRequired::Member,
+        add_from_invite_link: AccessRequired::Unsatisfiable,
+        member_label: AccessRequired::Member,
+    };
+    let group = operations
+        .encrypt_group_with_credentials(
+            title,
+            None,
+            timer.as_ref(),
+            Some(&access_control),
+            &self_credential,
+            &candidates,
+            &super::zkgroup_consts::legacy_server_public_params(),
+            avatar_url,
+            &mut rand::rng(),
+        )
+        .map_err(|_| TerminateError::Failed { status: None })?;
+
+    let authorization = group_authorization(context, &master_key).await?;
+    let revision = put_group(&context.push, authorization, &group).await?;
+    refresh_local_group_state(context, &master_key).await;
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(master_key),
+        revision,
+    ))
 }
 
 #[cfg(test)]
@@ -1758,5 +2047,51 @@ mod tests {
         )
         .is_none());
         // epoch = 7（支持面边界）照常处理（上面首分支已覆盖）。
+    }
+
+    /// createGroup 派生链 sanity（zkgroup 官方原语不绕过面）：随机 master
+    /// key 非零且不重复；secret params 派生确定性（同 master key 同 groupId
+    /// = get_group_identifier，同 public params 序列化）。
+    #[test]
+    fn create_group_derivation_is_csprng_and_deterministic() {
+        let a = random_32_bytes();
+        let b = random_32_bytes();
+        assert_ne!(a, b, "CSPRNG master keys differ");
+        assert!(a.iter().any(|byte| *byte != 0), "master key non-zero");
+
+        let params_a = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(a));
+        let params_a2 = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(a));
+        assert_eq!(
+            params_a.get_group_identifier(),
+            params_a2.get_group_identifier(),
+            "derive deterministic"
+        );
+        let params_b = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(b));
+        assert_ne!(
+            params_a.get_group_identifier(),
+            params_b.get_group_identifier()
+        );
+    }
+
+    /// 群写面成员入参解析（service-id 串直通 / 未知号码 None）：ACI/PNI
+    /// uuid 串形状直接解析不触 store；非 service-id 非号码形状 None。
+    #[tokio::test]
+    async fn resolve_group_member_service_id_faces() {
+        let dir = std::env::temp_dir().join(format!(
+            "kt-engine-group-resolve-{:016x}",
+            crate::service::mix_seed_step(crate::service::mix_seed())
+        ));
+        let store = crate::service::open_store(&dir).await.expect("store opens");
+        use presage::libsignal_service::protocol::ServiceId;
+
+        let aci = resolve_group_member(&store, "11111111-2222-4333-8444-555555555555")
+            .await
+            .expect("aci parses");
+        assert!(matches!(aci, ServiceId::Aci(_)));
+        let pni = resolve_group_member(&store, "PNI:22222222-3333-4444-8555-666666666666")
+            .await
+            .expect("pni parses");
+        assert!(matches!(pni, ServiceId::Pni(_)));
+        assert!(resolve_group_member(&store, "not-a-member").await.is_none());
     }
 }
