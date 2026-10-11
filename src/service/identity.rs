@@ -19,6 +19,13 @@
 //! 臂以三形态码比对为闸（60 位数字/66 位 hex fingerprint/base64
 //! scannable，signal-cli IdentityVerificationCode.parse 同构），比对不过
 //! 不落 TRUSTED_VERIFIED。
+//!
+//! `pending` 位（P9 身份拒发批）：身份钥已被替换且未获确认的发送闸标记
+//! ——接收循环 IdentityChange 臂经 [`mark_identity_replaced`] 置位
+//! （verified 态随换钥降级 unverified，官方 saveIdentity 换钥同位），
+//! [`send_gate_blocked`] 在发送链判定拒发；确认钩子 = 既有 trust 写面
+//! （verified 臂 / `state: "default"` 清标放行，`state: "unverified"`
+//! 保持挂起）。首联系人无条目恒放行。
 
 use std::path::Path;
 
@@ -86,11 +93,14 @@ pub(crate) fn trust_level_word(sidecar_state: Option<&str>) -> &'static str {
 
 const SIDECAR_FILE: &str = "identity-trust.json";
 
+/// 读 sidecar 根对象（文件/解析失败 → None；调用方逐键容错）。
+fn sidecar_root(account_dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(account_dir.join(SIDECAR_FILE)).ok()?).ok()
+}
+
 /// 既有条目（state 词, addedAtMs）；文件/键缺席 → None。
 fn sidecar_entry(account_dir: &Path, sid: &str) -> Option<(String, u64)> {
-    let root: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(account_dir.join(SIDECAR_FILE)).ok()?)
-            .ok()?;
+    let root = sidecar_root(account_dir)?;
     let entry = root.get("identities")?.get(sid)?;
     Some((
         entry.get("state")?.as_str()?.to_string(),
@@ -98,15 +108,22 @@ fn sidecar_entry(account_dir: &Path, sid: &str) -> Option<(String, u64)> {
     ))
 }
 
-/// 建档/迁移（read-modify-write 保其余条目原样；tmp+rename 原子替换，
-/// storage-manifest-state.json 先例同构）。写失败 false（trust 写面折叠
-/// [`TrustError::Io`]，读建档面静默——档案位不影响主读）。
-fn save_trust_state(
+/// sidecar `pending` 位（P9 身份拒发批）：身份钥已被替换且未获确认的
+/// 标记；键缺席/非布尔 = false（存量条目无该键 = 未挂起）。
+fn sidecar_pending(account_dir: &Path, sid: &str) -> bool {
+    sidecar_root(account_dir)
+        .and_then(|root| root.get("identities")?.get(sid)?.get("pending")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// 词表态写面（[`mark_identity_replaced`] 专用：换钥挂起任意词态落盘）。
+fn save_trust_state_word(
     account_dir: &Path,
     sid: &str,
-    state: TrustState,
+    state_word: &str,
     added_at: u64,
     changed_at: u64,
+    pending: bool,
 ) -> bool {
     let mut root: serde_json::Value = std::fs::read_to_string(account_dir.join(SIDECAR_FILE))
         .ok()
@@ -125,9 +142,10 @@ fn save_trust_state(
     identities.insert(
         sid.to_string(),
         serde_json::json!({
-            "state": state.word(),
+            "state": state_word,
             "addedAtMs": added_at,
             "changedAtMs": changed_at,
+            "pending": pending,
         }),
     );
     let Ok(bytes) = serde_json::to_vec_pretty(&root) else {
@@ -139,6 +157,55 @@ fn save_trust_state(
         return false;
     }
     std::fs::rename(&tmp, &path).is_ok()
+}
+
+/// 建档/迁移（read-modify-write 保其余条目原样；tmp+rename 原子替换，
+/// storage-manifest-state.json 先例同构）。写失败 false（trust 写面折叠
+/// [`TrustError::Io`]，读建档面静默——档案位不影响主读）。`pending` 随
+/// 态推导：unverified（用户显式不信任，含换钥后未确认）= 挂起拒发，
+/// verified / default（官方 send-anyway 非阻断批准同位）= 清标放行
+/// （确认钩子语义见 [`send_gate_blocked`]）。
+fn save_trust_state(
+    account_dir: &Path,
+    sid: &str,
+    state: TrustState,
+    added_at: u64,
+    changed_at: u64,
+) -> bool {
+    save_trust_state_word(
+        account_dir,
+        sid,
+        state.word(),
+        added_at,
+        changed_at,
+        matches!(state, TrustState::Unverified),
+    )
+}
+
+/// 身份钥替换落标（P9，接收循环 IdentityChange 臂调用）：置位 `pending`
+/// 并把 verified 态降级（verified 属于旧钥，不随新钥延续——官方
+/// saveIdentity 换钥 VERIFIED/UNVERIFIED → UNVERIFIED 同位，
+/// ts/SignalProtocolStore.preload.ts:2160-2170）。首条目（对端首次入
+/// sidecar）以 default 建档。addedAt 跨迁移保留。
+pub(crate) fn mark_identity_replaced(account_dir: &Path, sid: &str, now: u64) -> bool {
+    let (state_word, added_at) = sidecar_entry(account_dir, sid)
+        .unwrap_or_else(|| (TrustState::Default.word().to_string(), now));
+    let state_word = if state_word == TrustState::Verified.word() {
+        TrustState::Unverified.word()
+    } else {
+        state_word.as_str()
+    };
+    save_trust_state_word(account_dir, sid, state_word, added_at, now, true)
+}
+
+/// 发送闸判定（P9 身份拒发批）：条目挂起（换钥未确认）且态非 verified →
+/// 拒发。首联系人（无条目）与已确认（verified，或经确认钩子清标）恒
+/// 放行。确认钩子 = 既有 trust 写面（`trust` RPC）：verified 臂与
+/// `state: "default"`（官方 send-anyway = 非阻断批准同位）清标，
+/// `state: "unverified"` 保持挂起（用户显式不信任）。
+pub(crate) fn send_gate_blocked(account_dir: &Path, sid: &str) -> bool {
+    sidecar_pending(account_dir, sid)
+        && sidecar_entry(account_dir, sid).map(|(state, _)| state) != Some("verified".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +442,8 @@ pub(crate) async fn write_trust<K: IdentityKeyStore>(
             TrustState::Verified
         }
     };
-    // addedAtMs 跨态迁移保留（首次建档 = now）。
+    // addedAtMs 跨态迁移保留（首次建档 = now）；pending 随态推导规则在
+    // [`save_trust_state`] 单点（unverified 挂起 / verified·default 清标）。
     let added_at = sidecar_entry(account_dir, &sid)
         .map(|(_, added)| added)
         .unwrap_or(now);
@@ -391,7 +459,8 @@ pub(crate) async fn write_trust<K: IdentityKeyStore>(
 /// 收向 verified 同步落 sidecar（B4 身份事件面）：多设备信任态收敛——
 /// 主设备 verify/clear 后其他链接设备同步收口。比对闸已由发起设备完成，
 /// 收侧直接落态（write_trust 的 SetState 臂同型，免对端 identity 依赖）；
-/// addedAtMs 跨态迁移保留（首次建档 = now）。
+/// addedAtMs 跨态迁移保留（首次建档 = now）；pending 随态推导规则与
+/// [`write_trust`] 同（unverified 挂起，verified/default 清标）。
 pub(crate) fn apply_synced_trust(
     account_dir: &Path,
     sid: &str,
@@ -673,6 +742,126 @@ mod tests {
         assert_eq!(trust_level_word(Some("default")), "TRUSTED_UNVERIFIED");
         assert_eq!(trust_level_word(None), "TRUSTED_UNVERIFIED");
         assert_eq!(trust_level_word(Some("bogus")), "TRUSTED_UNVERIFIED");
+    }
+
+    // P9 身份拒发闸三态（首次放行 / 换钥拒发 / 确认后放行）+ 确认钩子
+    // 分臂语义（verified·default 清标放行，unverified 保持挂起）。
+    #[test]
+    fn identity_send_gate_three_states() {
+        let dir = temp_dir("send-gate");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sid = service_id(TEST_PEER_UUID).service_id_string();
+
+        // 态一（首次放行）：无条目（新联系人）恒放行——硬边界。
+        assert!(!send_gate_blocked(&dir, &sid));
+
+        // 建档 default 后仍放行（无换钥挂起）。
+        assert!(save_trust_state(
+            &dir,
+            &sid,
+            TrustState::Default,
+            1000,
+            1000
+        ));
+        assert!(!send_gate_blocked(&dir, &sid));
+
+        // 态二（换钥拒发）：mark_identity_replaced 落 pending → 拒发；
+        // verified 态随换钥降级 unverified（官方 saveIdentity 换钥同位），
+        // addedAt 保留。
+        assert!(save_trust_state(
+            &dir,
+            &sid,
+            TrustState::Verified,
+            1000,
+            1500
+        ));
+        assert!(mark_identity_replaced(&dir, &sid, 2000));
+        assert!(send_gate_blocked(&dir, &sid), "换钥未确认必须拒发");
+        assert_eq!(sidecar_entry(&dir, &sid), Some(("unverified".into(), 1000)));
+        assert!(sidecar_pending(&dir, &sid));
+
+        // 重复换钥（对端再次重装）：挂起维持不翻转。
+        assert!(mark_identity_replaced(&dir, &sid, 2500));
+        assert!(send_gate_blocked(&dir, &sid));
+
+        // 态三（确认后放行）：verified 写入（模拟 trust verified 臂比对
+        // 通过的落态）→ 清标放行。
+        assert!(save_trust_state(
+            &dir,
+            &sid,
+            TrustState::Verified,
+            1000,
+            3000
+        ));
+        assert!(!send_gate_blocked(&dir, &sid), "verified 确认后放行");
+
+        // 再次换钥 → 拒发；default 写入（官方 send-anyway 非阻断批准同位
+        // 钩子）→ 放行（态维持 default = TRUSTED_UNVERIFIED 投影面）。
+        assert!(mark_identity_replaced(&dir, &sid, 4000));
+        assert!(send_gate_blocked(&dir, &sid));
+        assert!(save_trust_state(
+            &dir,
+            &sid,
+            TrustState::Default,
+            1000,
+            5000
+        ));
+        assert!(!send_gate_blocked(&dir, &sid), "default 确认后放行");
+
+        // 再次换钥 → 拒发；unverified 写入（用户显式不信任）→ 保持挂起。
+        assert!(mark_identity_replaced(&dir, &sid, 6000));
+        assert!(save_trust_state(
+            &dir,
+            &sid,
+            TrustState::Unverified,
+            1000,
+            7000
+        ));
+        assert!(send_gate_blocked(&dir, &sid), "显式 unverified 保持拒发");
+
+        // 同文件其他条目互不干扰（隔离面）。
+        let other = service_id(TEST_OWN_UUID).service_id_string();
+        assert!(!send_gate_blocked(&dir, &other));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // write_trust 确认钩子端到端：比对通过的 verified 臂清 pending。
+    #[test]
+    fn write_trust_clears_pending_gate() {
+        let own = service_id(TEST_OWN_UUID);
+        let peer = service_id(TEST_PEER_UUID);
+        let dir = temp_dir("write-trust-gate");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = inmem_store(
+            ALICE_IDENTITY_HEX,
+            &peer.service_id_string(),
+            BOB_IDENTITY_HEX,
+        );
+        let sid = peer.service_id_string();
+        assert!(mark_identity_replaced(&dir, &sid, 1000));
+        assert!(send_gate_blocked(&dir, &sid));
+        let own_pair = futures::executor::block_on(store.get_identity_key_pair()).expect("own");
+        let digits = uuid_pair_fingerprint(
+            &own,
+            own_pair.identity_key(),
+            &peer,
+            &key_of(BOB_IDENTITY_HEX),
+        )
+        .display_string()
+        .expect("display");
+        futures::executor::block_on(write_trust(
+            &store,
+            &own,
+            peer,
+            &TrustIntent::Verified {
+                code: format_safety_number(&digits),
+            },
+            &dir,
+            2000,
+        ))
+        .expect("verified write");
+        assert!(!send_gate_blocked(&dir, &sid), "trust verified 臂清标放行");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 端到端（store 面）：libsignal 自带 InMemIdentityKeyStore 播种对端

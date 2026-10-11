@@ -640,15 +640,28 @@ impl IdentityKeyStore for SqliteProtocolStore {
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-        _direction: Direction,
+        direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
         if let Some(trusted_key) = self.get_identity(address).await? {
             // when we encounter some identity we know, we need to decide whether we trust it or not
             if identity == &trusted_key {
                 Ok(true)
             } else {
+                // KT (identity send gate, P9): a key that differs from the
+                // stored one is accepted on the receiving path only (official
+                // Desktop `isTrustedIdentity` Receiving arm → true,
+                // ts/SignalProtocolStore.preload.ts:1960-1966), so incoming
+                // traffic still replaces the key and surfaces the change.
+                // Sending against a changed key is refused — libsignal turns
+                // this into `SignalProtocolError::UntrustedIdentity` on both
+                // the session-build (session.rs process_prekey_bundle) and
+                // the encrypt path (session_management.rs) — same face as
+                // official `isTrustedForSending` (mismatch → false,
+                // ts/SignalProtocolStore.preload.ts:1986-2023). First-time
+                // contacts stay trusted below (no record → no change to
+                // gate).
                 match self.store.trust_new_identities {
-                    OnNewIdentity::Trust => Ok(true),
+                    OnNewIdentity::Trust => Ok(direction == Direction::Receiving),
                     OnNewIdentity::Reject => Ok(false),
                 }
             }
@@ -814,6 +827,61 @@ mod test {
                 .mark_kyber_pre_key_used(id, ec_prekey_id, &keypair.public_key)
                 .await
                 .is_err()
+        );
+
+        Ok(())
+    }
+
+    // KT (identity send gate, P9): a changed key is refused on the sending
+    // direction and accepted on receiving; first-time contacts (no stored
+    // identity) stay trusted in both directions.
+    #[tokio::test]
+    async fn identity_gate_sending_refuses_changed_key_receiving_accepts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        let device = DeviceId::new(1)?;
+        let address = ProtocolAddress::new("10000000-0000-0000-0000-000000000001".to_owned(), device);
+        let old_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let new_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        assert_ne!(old_key, new_key);
+
+        // First-time contact: no stored identity → trusted both directions.
+        let stranger = ProtocolAddress::new("10000000-0000-0000-0000-000000000002".to_owned(), device);
+        assert!(
+            protocol_store
+                .is_trusted_identity(&stranger, &new_key, Direction::Sending)
+                .await?
+        );
+        assert!(
+            protocol_store
+                .is_trusted_identity(&stranger, &new_key, Direction::Receiving)
+                .await?
+        );
+
+        protocol_store.save_identity(&address, &old_key).await?;
+        // Unchanged key: trusted for sending.
+        assert!(
+            protocol_store
+                .is_trusted_identity(&address, &old_key, Direction::Sending)
+                .await?
+        );
+        // Changed key: refused for sending (official isTrustedForSending
+        // mismatch → false), accepted for receiving (replacement path keeps
+        // working, identity change event still fires).
+        assert!(
+            !protocol_store
+                .is_trusted_identity(&address, &new_key, Direction::Sending)
+                .await?
+        );
+        assert!(
+            protocol_store
+                .is_trusted_identity(&address, &new_key, Direction::Receiving)
+                .await?
         );
 
         Ok(())

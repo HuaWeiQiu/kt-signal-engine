@@ -39,6 +39,12 @@ const PROOF_REQUIRED_MESSAGE: &str =
 /// "(ServerUnavailableException)" 供分类器命中）。
 const SERVER_UNAVAILABLE_MESSAGE: &str =
     "Failed to send message: Signal server unavailable. (ServerUnavailableException)";
+/// 身份拒发闸错误原文（P9，wire 字面量与 connector 侧配套；锚词
+/// "(UntrustedIdentityException)" 供分类器命中——官方桌面同因抛
+/// UntrustedIdentityKeyException，对端身份钥变更未经确认拒发，
+/// compat §3/§5）。
+const IDENTITY_UNVERIFIED_MESSAGE: &str =
+    "Failed to send message: Identity unverified. (UntrustedIdentityException)";
 
 pub(crate) enum Inbound {
     Line(String),
@@ -2583,6 +2589,9 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         SendError::ServerUnavailable => {
             jsonrpc::error_response(id, &RpcError::new(-32603, SERVER_UNAVAILABLE_MESSAGE))
         }
+        SendError::IdentityUnverified => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, IDENTITY_UNVERIFIED_MESSAGE))
+        }
         SendError::UnknownAccount | SendError::Internal => internal_error(id),
     }
 }
@@ -2630,6 +2639,11 @@ mod tests {
                 crate::service::SendError::ServerUnavailable,
                 SERVER_UNAVAILABLE_MESSAGE,
                 "(ServerUnavailableException)",
+            ),
+            (
+                crate::service::SendError::IdentityUnverified,
+                IDENTITY_UNVERIFIED_MESSAGE,
+                "(UntrustedIdentityException)",
             ),
         ];
         for (error, message, anchor) in cases {

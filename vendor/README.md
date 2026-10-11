@@ -9,7 +9,7 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 |---|---|---|---|
 | `libsignal-service/` | github.com/whisperfish/libsignal-service-rs | `9e6c08b8e6d413391831dc49065e5b05490d6c82` | AGPL-3.0-only（LICENSE.md 随目录） |
 | `presage/presage` | github.com/whisperfish/presage | `33dd1491130793390e356e15a5711f1e6ca14fdb` | AGPL-3.0-only（LICENSE.md 随目录） |
-| `presage/presage-store-sqlite` | 同上 | 同上 | AGPL-3.0-only，**零改动** |
+| `presage/presage-store-sqlite` | 同上 | 同上 | AGPL-3.0-only（fork 叠加见下方清单） |
 
 为什么 vendor：上游（含 presage 传递钉定的 libsignal-service）没有 story
 发送面；任务口径 = 「薄 fork、只扩最小 story 发送面」。`[patch]` 指本地
@@ -114,6 +114,12 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   drain）。
 - `src/lib.rs`（2026-10-11 B4）— `SqliteStore` 身份变更日志字段与
   `take_identity_changes` 覆盖（Arc 共享，clone 语义不变）。
+- `src/protocol.rs`（2026-10-11 P9 身份安全闸批追加）— ①
+  `is_trusted_identity` 存储钥不匹配时按方向裁定：Receiving 放行（收向
+  换钥/事件链不变）、Sending 拒绝（官方 isTrustedForSending 不匹配 →
+  false 同位；libsignal 建会话/加密两路以 Sending 咨询，false →
+  UntrustedIdentity → 引擎 IDENTITY_UNVERIFIED 错误面）；首次信任建立
+  两向恒放行；②新增方向闸单测。
 
 ## 更新纪律
 

@@ -404,6 +404,12 @@ pub(crate) enum SendError {
     /// 兜底臂 status≥500；vendored 无独立 ServerError 变体）。建议可重试，
     /// 重试决策在 connector/desktop；错误面 -32603（compat §3）。
     ServerUnavailable,
+    /// 对端身份钥已变更且未经确认（P9 身份拒发闸，compat §3/§5）：协议层
+    /// 旧钥会话/换钥 bundle 拒加密（vendored `is_trusted_identity`
+    /// Direction::Sending + 不匹配 → UntrustedIdentity），或服务层 sidecar
+    /// `pending` 闸命中（接收侧换钥后未获 trust 确认）。确定性失败不
+    /// 重试；错误面 -32603 + 固定原文（锚词 UntrustedIdentityException）。
+    IdentityUnverified,
     Internal,
 }
 
@@ -438,10 +444,33 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
         presage::Error::MessageSenderError(sender_error) => match *sender_error {
             MessageSenderError::ServiceError(service_error) => service_error_face(service_error),
             MessageSenderError::ProofRequired { .. } => SendError::ProofRequired,
+            // P9 身份拒发闸：sender 对 process_prekey_bundle 失败统一再包
+            // UntrustedIdentity（vendor sender.rs），协议层拒发（旧钥会话/
+            // 换钥 bundle）落到此臂；ProtocolError 面的裸
+            // SignalProtocolError::UntrustedIdentity 同因同归型。
+            MessageSenderError::UntrustedIdentity { .. } => SendError::IdentityUnverified,
+            MessageSenderError::ProtocolError(
+                presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_),
+            ) => SendError::IdentityUnverified,
             _ => SendError::Internal,
         },
         presage::Error::ServiceError(service_error) => service_error_face(service_error),
+        presage::Error::ProtocolError(
+            presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_),
+        ) => SendError::IdentityUnverified,
         _ => SendError::Internal,
+    }
+}
+
+/// P9 身份拒发闸（服务层）：对端 sidecar 条目挂起（接收侧换钥未获确认）
+/// → 拒发。直聊内容发送单点判定（闸面与确认钩子见 identity 模块注与
+/// compat §5）；首联系人（无条目）恒放行。sidecar 读失败 = 未挂起
+/// （fail-open，主干保护）。
+fn identity_send_gate(account_dir: &Path, service_id: &ServiceId) -> Result<(), SendError> {
+    if identity::send_gate_blocked(account_dir, &service_id.service_id_string()) {
+        Err(SendError::IdentityUnverified)
+    } else {
+        Ok(())
     }
 }
 
@@ -869,7 +898,7 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -891,6 +920,9 @@ impl Service {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
+            // P9 身份拒发闸：对端换钥未确认 → 拒发（直聊内容发送面统一
+            // 判定；整批失败与既有逐收件人失败同语义，compat §3）。
+            identity_send_gate(&account_dir, &service_id)?;
             let body = match sticker {
                 Some(sticker) => {
                     build_sticker_data_message(
@@ -939,7 +971,7 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -948,6 +980,8 @@ impl Service {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
+            // P9 身份拒发闸（撤回同为内容面）。
+            identity_send_gate(&account_dir, &service_id)?;
             let body = DataMessage {
                 timestamp: Some(timestamp),
                 delete: Some(presage::proto::data_message::Delete {
@@ -1008,7 +1042,7 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -1023,6 +1057,8 @@ impl Service {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
+            // P9 身份拒发闸（回应面同为直聊内容发送）。
+            identity_send_gate(&account_dir, &service_id)?;
             let body = DataMessage {
                 timestamp: Some(timestamp),
                 reaction: Some(presage::proto::data_message::Reaction {
@@ -1205,7 +1241,7 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -1220,6 +1256,8 @@ impl Service {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
+            // P9 身份拒发闸（pin/unpin 同为直聊内容发送）。
+            identity_send_gate(&account_dir, &service_id)?;
             manager
                 .send_message(service_id, body(aci_bytes.clone(), timestamp), timestamp)
                 .await
@@ -1282,13 +1320,17 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
+        // P9 身份拒发闸（官方 conversationJobQueue 对 untrusted 目标取消
+        // Receipts 任务同位——conversationJobQueue.preload.ts:1141-1146；
+        // 自动 delivery receipt flush 复用本面，失败静默弃批）。
+        identity_send_gate(&account_dir, &service_id)?;
         for chunk in timestamps.chunks(RECEIPT_CHUNK_SIZE) {
             let timestamp = now_ms();
             let body = ContentBody::ReceiptMessage(presage::proto::ReceiptMessage {
@@ -1412,13 +1454,15 @@ impl Service {
         if !self.real {
             return Ok(now_ms());
         }
-        let shared = open_registered(self, account)
+        let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
             .ok_or(SendError::Internal)?;
+        // P9 身份拒发闸（直聊通话信令臂；群臂走群发送通路不在此闸）。
+        identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
         let body = build_call_message(&payload);
         manager
@@ -3241,10 +3285,17 @@ async fn serve_account_stream(
                     ack.ack();
                 }
                 // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
-                // identity 被替换（会话按新钥重建，OnNewIdentity::Trust 纪律
-                // 不动——无提示 UI 前引入阻断会破坏现有会话）。结构化上抛
+                // identity 被替换（会话按新钥重建，OnNewIdentity::Trust
+                // Receiving 纪律不动——收向照常换钥上事件）。结构化上抛
                 // connector；同信封本体解密成功，照常走投影面，单次 ack。
+                // P9 身份拒发批：sidecar `pending` 落标（换钥未确认 → 发送
+                // 链拒发）+ verified 态随换钥降级（官方 saveIdentity 换钥
+                // VERIFIED/UNVERIFIED → UNVERIFIED 同位）；写失败静默
+                // fail-open（闸缺位不阻断主收发，compat §5 如实登记）。
+                // 确认钩子 = trust 写面（verified / state:"default" 清标）。
                 Some(Received::IdentityChange(sender, content, ack)) => {
+                    let sid_string = sender.service_id_string();
+                    let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
                     let _ = service.outbound.send(identity_changed_notification(
                         number,
                         &sender,
