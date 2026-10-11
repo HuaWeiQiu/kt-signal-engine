@@ -169,6 +169,14 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   字段 reportSpamToken——组5 adminKey 先例同款），connector 举报面
   （reportSpam 方法 token 参数）的引擎侧真数据源；ephemeral 官方桌面零
   消费（P14 组 7 核对结论），如实投位由消费方自判。
+  `serverTimestamp`（2026-10-11，P15c 项5，官方信封事件面同位
+  MessageReceiver.preload.ts:1178）：Envelope.serverTimestamp 恒投
+  （毫秒，服务器为该条消息记录的接收时间；vendored
+  Metadata.server_timestamp 同源捕获，wire 缺席 = proto 缺省 0，官方
+  `?? 0n` 同口径照投 0 不省键）。消费面：48h 编辑窗判据
+  （isTooOldToEditMessage，多设备编辑 echo 补齐面——P15c 项1 记档的
+  键位由此落地）、消息行服务器时间/服务器停留时长（官方 getMessageAge
+  同源）；dataMessage/editMessage/sent echo 同走本信封单键齐备。
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?, type(NORMAL\|GIFTBADGE——proto 词原值恒产，缺席/枚举外 coerce NORMAL，官方 isKnownProtoEnumMember 同构；六问批 Q5), bodyRanges?: [{number?, style?, start, length}] ≤64（mention 二进制优先 + author_numbers E.164 映射、Style 臂归同条目 style 键、NONE 丢、未知枚举整条丢；六问批 Q5）}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
@@ -3609,6 +3617,28 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   message 非投影，无新事件无新方法；主设备回传经接收流既有各面落库
   （contacts → Received::Contacts 投影、configuration/block → 收包臂既有
   投影）。单测 sync_request_frame_carries_type 钉枚举直通。
+- **项5 信封 serverTimestamp 投影（收包面缺键补齐，wire additive）**：
+  审计原文「官方 handleEditMessage 依赖 envelope serverTimestamp 判 48h
+  编辑窗，引擎 receive 面缺该键」——求证结论：缺口属实。引擎信封公共位
+  此前有 sourceUuid/sourceDevice/timestamp（client 时钟）/serverGuid/
+  urgent/ephemeral/reportingToken，唯 serverTimestamp 缺席——P15b 项8
+  时钟偏移闸已把该值用作服务器时间权威（Received::Content 与
+  IdentityChange 两臂同携），却从未投影给 connector；官方桌面每个事件面
+  均带 serverTimestamp（MessageReceiver.preload.ts:1178 收包解构同位），
+  消费面三处：48h 编辑窗判据（isTooOldToEditMessage，P15c 项1 记档的
+  编辑 echo 补齐键）、消息行服务器时间（多设备消息排序/展示）、服务器
+  停留时长（getMessageAge）。落法：`project_content` 信封公共位加
+  `serverTimestamp`（毫秒 u64，恒投）——值源 = vendored
+  Metadata.server_timestamp（cipher 解密自 Envelope.server_timestamp
+  proto 位，与官方 `ServerTimestampMs.fromBigInt(decoded.serverTimestamp
+  ?? 0n)` 同源同权威）；wire 缺席 = proto 缺省 0，官方同口径照投 0 不省
+  键不发明；dataMessage/editMessage/typingMessage/receiptMessage/sent
+  echo 同走本信封单键齐备。边界：groupTerminated/groupUpdated/
+  groupChanged/contactProfileUpdated/identityChanged 等最小事件信封不随
+  批（serverGuid 先例同口径——信封公共位只落主投影面）；decryptionError
+  不投（解密失败臂无服务器时间可取，P15b 项8 已登记该臂 client 时钟非
+  权威）。单测 receive_envelope_projects_server_timestamp 钉 dataMessage
+  与 editMessage 两体面恒投 + client/server 两时间戳不串。
 
 
 ## 6. fake 服务模式（仅测试）

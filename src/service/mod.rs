@@ -4347,6 +4347,16 @@ async fn project_content(
         "sourceDevice": u32::from(content.metadata.sender_device),
         "timestamp": envelope_ts,
     });
+    // P15c 项5（compat §3/§5）：Envelope.serverTimestamp 信封公共位投影
+    // （服务器为该条消息记录的接收时间，官方事件面同位
+    // MessageReceiver.preload.ts:1178）。vendored Metadata.server_timestamp
+    // 同源捕获（cipher 解密自 Envelope.server_timestamp proto 位），恒有值
+    // 恒投（wire 缺席 = proto 缺省 0，官方 ?? 0n 同口径照投，不发明不省
+    // 键）；消费面 = 48h 编辑窗判据（isTooOldToEditMessage，多设备编辑
+    // echo 补齐面）+ 消息行服务器时间。editMessage/sent echo 同走本信封，
+    // 单键齐备编辑消费面。
+    envelope["serverTimestamp"] =
+        json!(content.metadata.server_timestamp.timestamp_millis().max(0) as u64);
     // 举报面（reportSpam 批）：server_guid = 信封公共位（服务器为该条消息
     // 分配的 UUID，举报 API 的路径参数；proto 只投影不发明，缺席键不在）。
     if let Some(server_guid) = content.metadata.server_guid.as_ref() {
@@ -10665,6 +10675,75 @@ mod tests {
         assert!(envelope.get("ephemeral").is_none());
         assert!(envelope.get("urgent").is_none());
         assert!(envelope.get("reportingToken").is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// P15c 项5 信封 serverTimestamp 投影（compat §3 信封公共位）：vendored
+    /// Metadata.server_timestamp 恒投（wire 缺席 = proto 缺省 0，官方 ??
+    /// 0n 同口径）；dataMessage 与 editMessage 两体面同信封（编辑 48h 窗
+    /// isTooOldToEditMessage 消费面由此齐备），client/server 两时间戳不串。
+    #[tokio::test]
+    async fn receive_envelope_projects_server_timestamp() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-envelope-servertimestamp-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_004_321)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+
+        // dataMessage 面：serverTimestamp 恒投，与 client timestamp 各归各键。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata.clone(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "dataMessage projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["serverTimestamp"], json!(1_700_000_004_321_u64));
+        assert_eq!(envelope["timestamp"], json!(1_700_000_000_000_u64));
+
+        // editMessage 面（P15c 项1 编辑消费面）：同一信封位随行。
+        let content = Content::from_body(
+            ContentBody::EditMessage(presage::proto::EditMessage {
+                target_sent_timestamp: Some(1_699_000_000_000),
+                data_message: Some(DataMessage::default()),
+            }),
+            metadata,
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "editMessage projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["serverTimestamp"], json!(1_700_000_004_321_u64));
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }
