@@ -583,6 +583,17 @@ impl IdentityKeyStore for SqliteProtocolStore {
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> Result<IdentityChange, SignalProtocolError> {
+        // KT (session archive on identity change, P9): official Desktop
+        // saveIdentity compares the stored key and only archives sibling
+        // sessions when the key actually CHANGED
+        // (ts/SignalProtocolStore.preload.ts:2140-2192,
+        // archiveSiblingSessions :2188-2192). Upstream's
+        // UPDATE-affected-rows check below conflates "row existed" with
+        // "key changed" — a same-key re-save must not wipe sessions — so
+        // the change decision is taken from the stored identity before it
+        // is overwritten.
+        let previous = self.get_identity(address).await?;
+
         let address = address.name();
         let bytes = identity.serialize();
 
@@ -614,6 +625,22 @@ impl IdentityKeyStore for SqliteProtocolStore {
             .execute(&mut *tx)
             .await
             .into_protocol_error()?;
+        }
+
+        // KT: the key actually changed → archive the sessions built under
+        // the old key (official archiveSiblingSessions face), same
+        // transaction as the identity overwrite. The next send/receive
+        // rebuilds from the new identity (DERM/MRM self-heal covers the
+        // far end). Outbound group sender-key reset is NOT done (no
+        // group-member face in the engine; deviation logged,
+        // docs/jsonrpc-compat.md §5).
+        if is_replaced && previous.as_ref() != Some(identity) {
+            sqlx::query("DELETE FROM sessions WHERE address = ? AND identity = ?")
+                .bind(address)
+                .bind(self.identity)
+                .execute(&mut *tx)
+                .await
+                .into_protocol_error()?;
         }
 
         tx.commit().await.into_protocol_error()?;
@@ -883,6 +910,47 @@ mod test {
                 .is_trusted_identity(&address, &new_key, Direction::Receiving)
                 .await?
         );
+
+        Ok(())
+    }
+
+    // KT (session archive, P9): a CHANGED identity key drops the sessions
+    // built under the old key (official archiveSiblingSessions face,
+    // Signal-Desktop ts/SignalProtocolStore.preload.ts:2140-2192 /
+    // :2188-2192); a same-key re-save must keep them.
+    #[tokio::test]
+    async fn identity_replacement_archives_sessions_unchanged_keeps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use presage::libsignal_service::protocol::SessionRecord;
+
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        let device = DeviceId::new(1)?;
+        let address =
+            ProtocolAddress::new("10000000-0000-0000-0000-000000000003".to_owned(), device);
+        let old_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let new_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        assert_ne!(old_key, new_key);
+
+        // Seed: identity + one session row.
+        protocol_store.save_identity(&address, &old_key).await?;
+        protocol_store
+            .store_session(&address, &SessionRecord::new_fresh())
+            .await?;
+        assert!(protocol_store.load_session(&address).await?.is_some());
+
+        // Unchanged key re-save: session survives.
+        protocol_store.save_identity(&address, &old_key).await?;
+        assert!(protocol_store.load_session(&address).await?.is_some());
+
+        // Changed key: session archived — next send/receive rebuilds from
+        // the new identity.
+        protocol_store.save_identity(&address, &new_key).await?;
+        assert!(protocol_store.load_session(&address).await?.is_none());
 
         Ok(())
     }

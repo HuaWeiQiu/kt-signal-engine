@@ -129,7 +129,13 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   换钥/事件链不变）、Sending 拒绝（官方 isTrustedForSending 不匹配 →
   false 同位；libsignal 建会话/加密两路以 Sending 咨询，false →
   UntrustedIdentity → 引擎 IDENTITY_UNVERIFIED 错误面）；首次信任建立
-  两向恒放行；②新增方向闸单测。
+  两向恒放行；②新增方向闸单测；③（S4）`save_identity` 换钥 archive
+  会话——存储钥与新钥真异（先读旧钥比对；上游 rows_affected 把「行
+  存在」当「钥变」，同钥重存会误伤）→ 同事务 `DELETE FROM sessions`
+  （官方 saveIdentity 换钥 archiveSiblingSessions 同位，
+  SignalProtocolStore.preload.ts:2140-2192/:2188-2192），同钥重存保留
+  会话；群 outbound sender key 复位不做（引擎无群成员面，取舍登记
+  compat §5）；④换钥 archive/同钥保留单测。
 
 ## 更新纪律
 

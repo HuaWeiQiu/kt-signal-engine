@@ -2474,6 +2474,14 @@ B 批「强制闸待桌面批」遗留闭合 + 身份防护三面，wire additiv
   `send_message` 拆 `send_message_with_profile_sharing`（前者行为不变，
   后者注入位受参）；群发送/story 面不在本闸（vendored 群发送无本机
   profile_key 注入点）；typing/回执面无 profile_key 字段，无关。
+- **会话 archive（S4）**：vendored presage `save_identity` 存储钥与新钥
+  真异时，同事务清除该 address 名下会话（官方 saveIdentity 换钥
+  archiveSiblingSessions 同位，ts/SignalProtocolStore.preload.ts:
+  2140-2192/:2188-2192——旧钥下建的会话不得在换钥后存活，下一收发自新
+  钥重建，DERM 重发/MRM 重试自愈面承接对端旧会话残留）。以先读旧钥
+  比对为判定：上游 rows_affected 语义把「行存在」当「钥变」，同钥重存
+  （如正常建会话路径）不得清会话。群 outbound sender key 复位未做
+  （引擎无群成员面，取舍登记）；inbound sender key 不清（群收向自愈）。
 
 ## 6. fake 服务模式（仅测试）
 
