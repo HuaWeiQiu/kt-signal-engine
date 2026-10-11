@@ -873,6 +873,49 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // markRead/markViewed（P14 组 6，自发多设备读态 sync 写面）：官方
+        // syncReadMessages/syncView 同构——向自己 ACI 发 SyncMessage.read=5/
+        // viewed=16（直接 repeated 字段），多设备同步「这些消息已读/已看」；
+        // 与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执）
+        // 双通道独立（官方 markConversationRead.preload.ts:252 注同位）。
+        // params `{account, reads?|viewed?: [{sender, timestamp}]}`：条目
+        // 非空数组（sendReadReceipt timestamps 非空纪律同构）、条目
+        // {sender, timestamp} 双键齐备且形状合法否则 fail-closed -32603、
+        // sender 号码/UUID 双解析（viewOnceOpen 同口径，不可解析 -32603）、
+        // 100 条/chunk 分信封（官方 syncHelpers CHUNK_SIZE=100 同构）；
+        // 成功答空结果对象（写面惯例）；协议上行面落调度日志（send 系同纪律）。
+        "markRead" | "markViewed" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let list_key = if method == "markRead" {
+                "reads"
+            } else {
+                "viewed"
+            };
+            let entries = params.get(list_key).and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Some((
+                            item.get("sender")?.as_str()?.to_owned(),
+                            item.get("timestamp")?.as_u64()?,
+                        ))
+                    })
+                    .collect::<Option<Vec<(String, u64)>>>()
+            });
+            match (account, entries) {
+                (Some(account), Some(Some(entries))) if !entries.is_empty() => {
+                    match service
+                        .mark_read_state(account, method == "markViewed", entries)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // sendCallMessage（通话消息面，KT 扩展方法）：官方 Content.callMessage=3
         // 信封。协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
         //（-32603）：recipient/group 两腿恰一闸、data 非 base64/空、urgency

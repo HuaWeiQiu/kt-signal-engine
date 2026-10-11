@@ -90,6 +90,7 @@ send message: Signal server unavailable.
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
 | `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
 | `sendViewOnceOpen` | `{account, senderAci(ACI/号码), timestamp(原消息 upstream 时间戳)}` | `{}` | 同 send；senderAci 不可解析/参数缺失或形状错 `-32603` | **P2 real（2026-10-04 阅后即焚扩面）**：官方 syncViewOnceOpen 同构——向自己 ACI 发 SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof viewOnceOpen=11，padded；多设备同步「该阅后即焚已被本机打开」），presage self-send 通路验证可行（§5，含钉定 rev 同内容二次转录重发怪癖）；与 sendViewedReceipt（作者面回执）双通道独立；fake：成功 `{}` |
+| `markRead` / `markViewed` | `{account, reads?\|viewed?: [{sender(ACI/号码), timestamp(原消息 upstream 时间戳)}]}`（markRead 用 `reads` 键、markViewed 用 `viewed` 键——官方 syncReadMessages/syncView 参数名同形；条目非空数组，列表缺席/空/非数组/条目缺 sender 或 timestamp/timestamp 非数字/sender 非字符串 `-32603`） | `{}` | sender 号码/UUID 不可解析（contacts 兜底后仍失败）`-32603`（整拒不发半批——发送面参数闸纪律）；未注册账号 `-32603` | **2026-10-11 real（KT 扩展，P14 组 6 自发多设备读态写面）**：官方 syncReadMessages/syncView 同构（SendMessage.preload.ts:2097/:2145）——向自己 ACI 发 SyncMessage.read=5/viewed=16（直接 repeated 字段，非 content oneof，多设备同步「这些消息已读/已看」）；ACI binary+string 双写（官方 isProtoBinaryEncodingEnabled 现行面/旧字符串面双兼容，viewOnceOpen 双写先例同构）；100 条/chunk 分信封（官方 syncHelpers.preload.ts:25 CHUNK_SIZE=100 同构）；padded sync message；与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执）双通道独立（官方 markConversationRead.preload.ts:252 注同位）；接收 echo 面 = §3 receive `syncMessage.read/viewed`（D2）；presage self-send 通路与 sendViewOnceOpen 同款；fake：成功 `{}`（落调度日志，reads/viewed 键逐字保留，协议上行面纪律） |
 | `sendMessageRequestResponse` | `{account, recipient(单值，ACI/号码)\|groupId(32B 标准 base64 群 master key), type}`（**两腿恰一**：direct = recipient、群 = groupId，同置/双缺 `-32603`；type = 官方驼峰词六值白名单 `accept\|delete\|block\|blockAndDelete\|spam\|blockAndSpam`，缺席/`unknown`/数字/词表外/大小写漂移 `-32603`） | `{}`（上游钉定面成功答空结果对象同款） | 参数缺失/type 闸/两腿闸/群腿非 base64 或 ≠32B/recipient 数组 `-32603`；未注册账号 `-32603` | **2026-10-06 real（KT 扩展，§4.56 写面债务批）**：官方桌面 getMessageRequestResponseSync 同构——向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary\|threadAci?, groupId?, type}（content oneof messageRequestResponse=14；ACI 可解析 16B 直写 binary 字段=官方 isProtoBinaryEncodingEnabled 现行面，群 master key 原样=官方 groupId Uint8Array 同位；presage self-send 通路，padding 同源）；与 §3 receive 通知面 `syncMessage.messageRequestResponse` 投影对称（本机写 → 多设备 echo 收）；connector §4.56 `conversations.acceptRequest`/`declineRequest` 的引擎面（上游钉定 `sendMessageRequestResponse` params 逐字对齐：connector 上游 recipient 腿 = 其 peer_key 直通本引擎双形态解析、groupId 腿 = 群 master key、type 由宿主盖章 accept/delete）；写结局即返回值、未知结局不重试纪律不变（connector §4.56 SEND_OUTCOME_UNKNOWN 终态语义的引擎侧对应位）；fake：成功 `{}`（落调度日志，协议上行面纪律） |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 | `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
@@ -329,6 +330,13 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   本机 deviceId 过滤（非指向自己的丢弃），引擎恒投原值由消费方自判；
   pniChangeNumber 只投 registrationId/newE164 两键，密钥材料不出引擎
   边界、re-key 消费不做，偏差全落 §5 组 5 块）。
+- `syncMessage.keys {mediaRootBackupKey?}`（P14 组 6 收投影，此前整信封
+  丢弃；官方 handleKeys 事件面 MessageReceiver.preload.ts:3338-3358）：云
+  媒体备份根钥（media backup 素材）标准 base64，非空才投（官方
+  Bytes.isNotEmpty 同口径），键全缺照投空对象（信号面即事件）。官方三键
+  面 {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎只投
+  mediaRootBackupKey——偏差落 §5 组 6 块；Request{Keys} 应答停答面
+  （P9 S2）与此接收投影面互不相干。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -3143,6 +3151,44 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
 - **单测**：`sync_seven_arm_projection_carries_p14_faces`（七臂形状 +
   FetchLatest/CallLinkUpdate/DeviceNameChange 缺席臂空对象 + PNI 密钥
   三键不在 + Configuration 四旗两在两缺）。
+
+### P14 proto 进阶投影收尾·组 6 自发写面（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+- **Keys.mediaRootBackupKey 收投影**：`syncMessage.keys {mediaRootBackupKey?}`
+  （content oneof keys 臂此前落兜底臂整信封丢弃）。官方 handleKeys 事件面
+  三键 {masterKey, accountEntropyPool, mediaRootBackupKey}
+  （MessageReceiver.preload.ts:3338-3358），引擎只投 mediaRootBackupKey：
+  - **偏差⑤（密钥材料不出引擎边界）**：accountEntropyPool 不投（AEP =
+    账号主熵材料，PNI 密钥/凭据面同纪律）。
+  - **偏差⑥（钉定 proto 缺字段）**：masterKey 在钉定 rev 的 vendored
+    proto 已 reserved 删字段（prost 跳未知字段无法投影）；官方线面若携
+    master=1 亦只能丢弃，属 proto 缺口（P15 升版项）。
+  - 空字节省键（官方 Bytes.isNotEmpty 同口径）；键全缺照投空对象（信号
+    面即事件，fetchLatest 同纪律）。Request{Keys} 应答停答面（P9 S2）与
+    此接收投影面互不相干。
+- **markRead/markViewed 自发写面**（新 JSON-RPC 方法，官方
+  syncReadMessages/syncView 同构 SendMessage.preload.ts:2097/:2145）：
+  向自己 ACI 发 SyncMessage.read=5/viewed=16（直接 repeated 字段，非
+  content oneof——接收 echo 面 = D2 兜底臂投影，本批接收臂/自发写面两端
+  齐备）。params `{account, reads?|viewed?: [{sender, timestamp}]}`：
+  - sender 号码/UUID 双解析（resolve_author_aci，viewOnceOpen 同口径）；
+    **任一条目不可解析整拒 `-32603` 不发半批**（发送面参数闸纪律——官方
+    normalizeAci throw 同口径；接收面宁缺勿丢逐条丢是收侧宽容，两面不对称
+    属官方同构行为）。
+  - ACI binary+string 双写（官方 isProtoBinaryEncodingEnabled 现行面/旧
+    字符串面双兼容；E4 viewOnceOpen 双写先例同构）。
+  - **100 条/chunk 分信封**（官方 syncHelpers.preload.ts:25 CHUNK_SIZE=100
+    同构；每 chunk 独立 padded SyncMessage self-send）。
+  - 与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执，
+    connector §4.29）**双通道独立**：本面向本机其他设备同步读态（官方
+    markConversationRead.preload.ts:252 注同位——syncReadMessages 发自己
+    设备、sendReadReceipts 发原作者）。
+  - presage self-send 通路与 sendViewOnceOpen 同款（§5 E4 已验证；钉定
+    rev 同内容二次转录重发怪癖同面——接收端 read sync 幂等，无副作用）。
+  - fake：成功 `{}`，落调度日志（reads/viewed 键逐字保留，协议上行面纪律）。
+- **单测**：`keys_projection_carries_media_root_backup_key`（base64 投位 +
+  AEP 不投 + 全缺空对象）、contract `mark_read_mark_viewed_sync_contract`
+  （fake 成功 + 调度日志逐字 + 参数面八形状 fail-closed）。
 
 
 ## 6. fake 服务模式（仅测试）

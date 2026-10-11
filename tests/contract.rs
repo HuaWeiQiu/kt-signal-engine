@@ -2746,6 +2746,88 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
     assert_eq!(open_entry["params"]["account"], json!(number));
 }
 
+/// markRead/markViewed（P14 组 6，官方 syncReadMessages/syncView 同构）：
+/// fake 成功 {} + 调度日志 reads/viewed 键逐字保留（IPC 形状锚）+ 参数面
+/// fail-closed 逐形状（-32603：列表缺席/空/非数组、条目缺 sender/timestamp、
+/// timestamp 非数字、sender 非字符串、account 缺席）。
+#[test]
+fn mark_read_mark_viewed_sync_contract() {
+    let dir = temp_dir("mark-read");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sender_aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+
+    // 合法面：markRead 单条目、markViewed 双条目（号码 + PNI 混排）成功 {}。
+    let read_ok = engine.request(
+        "markRead",
+        json!({ "account": number, "reads": [{ "sender": sender_aci, "timestamp": 42 }] }),
+    );
+    assert_eq!(read_ok["result"], json!({}));
+    let viewed_ok = engine.request(
+        "markViewed",
+        json!({ "account": number, "viewed": [
+            { "sender": "+15555550101", "timestamp": 43 },
+            { "sender": "PNI:00000000-0000-0000-0000-000000000001", "timestamp": 44 }
+        ] }),
+    );
+    assert_eq!(viewed_ok["result"], json!({}));
+
+    // fail-closed 逐形状。
+    let rejects = [
+        json!({ "account": number }),
+        json!({ "account": number, "reads": [] }),
+        json!({ "account": number, "reads": "x" }),
+        json!({ "account": number, "reads": [{ "timestamp": 42 }] }),
+        json!({ "account": number, "reads": [{ "sender": sender_aci }] }),
+        json!({ "account": number, "reads": [{ "sender": sender_aci, "timestamp": "42" }] }),
+        json!({ "account": number, "viewed": [{ "sender": 7, "timestamp": 42 }] }),
+        json!({ "reads": [{ "sender": "+15555550101", "timestamp": 42 }] }),
+    ];
+    for params in &rejects {
+        let response = engine.request("markRead", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "markRead rejects {params}"
+        );
+    }
+
+    // 调度日志：reads/viewed 键逐字保留。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let read_entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "markRead")
+        .expect("markRead logged");
+    assert_eq!(
+        read_entry["params"]["reads"][0]["sender"],
+        json!(sender_aci)
+    );
+    assert_eq!(read_entry["params"]["reads"][0]["timestamp"], json!(42));
+    let viewed_entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "markViewed")
+        .expect("markViewed logged");
+    assert_eq!(
+        viewed_entry["params"]["viewed"][1]["sender"],
+        json!("PNI:00000000-0000-0000-0000-000000000001")
+    );
+    assert_eq!(viewed_entry["params"]["viewed"][1]["timestamp"], json!(44));
+}
+
 /// send textStyle 透传面（connector 契约 1.69 §4.62）：fake 合法面成功 +
 /// 调度日志 textStyle 数组逐字保留（connector 上游同名直投的 IPC 形状锚）；
 /// 参数面 fail-closed 逐形状（-32603：词表外（含 NONE——官方 composer 永不出

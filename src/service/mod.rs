@@ -1473,6 +1473,87 @@ impl Service {
         Ok(())
     }
 
+    /// markRead/markViewed（P14 组 6，官方 syncReadMessages/syncView 同构，
+    /// SendMessage.preload.ts:2097/:2145）：向自己 ACI 发 SyncMessage.read=5/
+    /// viewed=16（直接 repeated 字段，非 content oneof），多设备同步「这些
+    /// 消息已读/已看」。条目 (sender, timestamp)：sender 号码/UUID 双解析
+    /// （resolve_author_aci，viewOnceOpen 同口径，不可解析 fail-closed 整拒
+    /// ——发送面参数闸纪律）；ACI binary+string 双写（官方
+    /// isProtoBinaryEncodingEnabled 现行面/旧字符串面双兼容，E4 双写先例
+    /// 同构）；100 条/chunk 分信封（官方 syncHelpers.preload.ts:25
+    /// CHUNK_SIZE=100 同构）；padded sync message。presage self-send 通路与
+    /// sendViewOnceOpen 同款（compat §5 E4 已验证）；同内容二次转录重发
+    /// 怪癖同面（接收端幂等）。与 sendReadReceipt/sendViewedReceipt（作者
+    /// 面 ReceiptMessage 回执）双通道独立（官方 markConversationRead
+    /// .preload.ts:252 注同位）。
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn mark_read_state(
+        self: &Arc<Self>,
+        account: &str,
+        viewed: bool,
+        entries: Vec<(String, u64)>,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        // 条目解析先行（fail-closed：任一 sender 不可解析整拒，不发半批）。
+        let mut resolved = Vec::with_capacity(entries.len());
+        for (sender, timestamp) in entries {
+            let aci = resolve_author_aci(manager.store(), &sender)
+                .await
+                .ok_or(SendError::Internal)?;
+            resolved.push((aci, timestamp));
+        }
+        let envelope_ts = now_ms();
+        if viewed {
+            for chunk in resolved.chunks(100) {
+                let viewed_entries = chunk
+                    .iter()
+                    .map(|(aci, timestamp)| presage::proto::sync_message::Viewed {
+                        sender_aci: Some(aci.clone()),
+                        timestamp: Some(*timestamp),
+                        sender_aci_binary: aci_to_bytes(aci),
+                    })
+                    .collect();
+                let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                    viewed: viewed_entries,
+                    ..presage::proto::SyncMessage::with_padding(&mut rng())
+                });
+                manager
+                    .send_message(own_aci, body, envelope_ts)
+                    .await
+                    .map_err(send_error_of)?;
+            }
+        } else {
+            for chunk in resolved.chunks(100) {
+                let read_entries = chunk
+                    .iter()
+                    .map(|(aci, timestamp)| presage::proto::sync_message::Read {
+                        sender_aci: Some(aci.clone()),
+                        timestamp: Some(*timestamp),
+                        sender_aci_binary: aci_to_bytes(aci),
+                    })
+                    .collect();
+                let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                    read: read_entries,
+                    ..presage::proto::SyncMessage::with_padding(&mut rng())
+                });
+                manager
+                    .send_message(own_aci, body, envelope_ts)
+                    .await
+                    .map_err(send_error_of)?;
+            }
+        }
+        Ok(())
+    }
+
     /// sendMessageRequestResponse（消息请求写面，connector 契约 1.63 §4.56
     /// 债务批，KT 扩展方法）：官方桌面 getMessageRequestResponseSync 同构——
     /// 向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary/
@@ -4252,6 +4333,30 @@ async fn project_content(
                         face.insert("newE164".into(), json!(new_e164));
                     }
                     envelope["syncMessage"] = json!({ "pniChangeNumber": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::Keys(keys)) => {
+                    // P14 组 6：mediaRootBackupKey 云媒体备份根钥投影（官方
+                    // handleKeys 事件面 MessageReceiver.preload.ts:3338-3358，
+                    // 空字节省键 Bytes.isNotEmpty 同口径）。官方三键面
+                    // {masterKey, accountEntropyPool, mediaRootBackupKey}，
+                    // 引擎只投 mediaRootBackupKey：accountEntropyPool 密钥
+                    // 材料不出引擎边界（PNI 密钥同纪律，§5）；masterKey 在
+                    // 钉定 rev proto 已 reserved 删字段（prost 跳未知，无法
+                    // 投）——两处偏差落 §5 组 6 块。Request{Keys} 应答停答
+                    // 面（P9 S2）与此接收投影面互不相干。
+                    let mut face = serde_json::Map::new();
+                    if let Some(key) = keys
+                        .media_root_backup_key
+                        .as_deref()
+                        .filter(|key| !key.is_empty())
+                    {
+                        use base64::Engine as _;
+                        face.insert(
+                            "mediaRootBackupKey".into(),
+                            json!(base64::engine::general_purpose::STANDARD.encode(key)),
+                        );
+                    }
+                    envelope["syncMessage"] = json!({ "keys": Value::Object(face) });
                 }
                 // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
                 // #handleViewed「read 专信封」调度序同位——content 面分支
@@ -8441,6 +8546,97 @@ mod tests {
         assert!(face["pniChangeNumber"]
             .get("lastResortKyberPreKey")
             .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// P14 组 6：Keys 整臂收投影——mediaRootBackupKey 标准 base64（非空才
+    /// 投，官方 Bytes.isNotEmpty 同口径）；accountEntropyPool 密钥材料不投
+    /// （键不在，§5 组 6 块）；键全缺照投空对象（信号面即事件）。
+    #[tokio::test]
+    async fn keys_projection_carries_media_root_backup_key() {
+        use base64::Engine as _;
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-keys-face-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let make = |keys| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_message::Content::Keys(keys)),
+                    ..Default::default()
+                }),
+                metadata.clone(),
+            )
+        };
+
+        // 有：mediaRootBackupKey 标准 base64 投出；AEP 不投（键不在）。
+        let envelope = pop_unwrap(
+            project_content(
+                "acct",
+                &store,
+                &make(sync_message::Keys {
+                    account_entropy_pool: Some("pool-secret".to_owned()),
+                    media_root_backup_key: Some(vec![0xAB_u8; 32]),
+                }),
+                &registry,
+            )
+            .await,
+            "keys projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["keys"]["mediaRootBackupKey"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0xAB_u8; 32])
+                    .as_str()
+            )
+        );
+        assert!(envelope["syncMessage"]["keys"]
+            .get("accountEntropyPool")
+            .is_none());
+
+        // 缺：全缺照投空对象。
+        let envelope = pop_unwrap(
+            project_content(
+                "acct",
+                &store,
+                &make(sync_message::Keys::default()),
+                &registry,
+            )
+            .await,
+            "keys projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["syncMessage"]["keys"], json!({}));
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }
