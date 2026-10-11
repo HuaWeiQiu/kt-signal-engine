@@ -3528,6 +3528,40 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   bodyRanges ✓ 均随 project_data_message 投影；官方 handleEditMessage 另需
   serverTimestamp（48h 编辑窗 isTooOldToEditMessage 判据）——该键由本批
   项5 信封 serverTimestamp 投影补齐，编辑消费面由此完整。零代码改动。
+- **项2 Storage Service 另四族核实（链组三中批 D2，三实一记档，wire 零
+  变化）**：审计原文「NotificationProfile/StoryDistributionList/
+  AccountRecord 配置/UniversalTimer 四族宿主零消费」——逐族求证结论：
+  - **NotificationProfile / StoryDistributionList：引擎已解析+投影（审计
+    过时，缺口在消费侧）**。引擎面 2026-10-08 已全量落地（commit 6bd9947
+    六方法批 / 35a8de6 Stories 名单臂）：读投影 `notificationProfiles.list`
+    /`storyDistributionLists.list`（manifest type=9/=5 identifiers 首现序
+    → vendored proto 解码 → JSON 投影，键名对齐官方
+    mergeNotificationProfileRecord/toStoryDistributionListRecord 输出面）
+    + 写面 `notificationProfiles.setRecords`/`storyDistributionLists.
+    setRecords`（upsert/墓碑/removeIds/幂等/409 采纳重放全编排）。官方桌
+    面消费面实锤（storage.preload.ts validRecordTypes + merge switch 双臂
+    在册：mergeNotificationProfileRecord/mergeStoryDistributionListRecord）。
+    宿主消费缺口移交主线：connector/desktop 未接引擎这两对方法（消费侧
+    接线归后续批）。
+  - **AccountRecord 配置：写投影已有（审计过时），JSON 读投影无——不补，
+    移交主线按需立项**。写面 2026-10-05 起逐批落地：setAccountConfiguration
+    （readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/
+    unlistedPhoneNumber(13)，commit 76d1efc）+ setUniversalExpireTimer
+    （universalExpireTimer(17)，d82e0ae）+ setProfile/username/置顶 同
+    record 写族；记录体解析 read_account_record 内部面已在（官方 vendored
+    proto 全字段保真）。官方桌面消费实锤（mergeAccountRecord 应用配置字
+    段）。JSON-RPC 读面（getAccountConfiguration 形状）无消费方——按
+    §4.50「不发明无消费方读面」纪律不补，connector/desktop 接线提出需求
+    再立项（偏差登记）。
+  - **UniversalTimer：官方桌面也不消费（族不存在于现行协议面），记档
+    跳过**。现行官方 SignalStorage.proto ManifestRecord.Identifier.Type
+    词表（UNKNOWN/CONTACT/GROUPV1/GROUPV2/ACCOUNT/STORY_DISTRIBUTION_LIST/
+    STICKER_PACK/CALL_LINK/CHAT_FOLDER/NOTIFICATION_PROFILE）无
+    UNIVERSAL_TIMER 位；官方 storage.preload.ts validRecordTypes 与 merge
+    switch 均无此臂；vendored 钉定 proto 同无。引擎已有的 universalExpire
+    Timer 面 = AccountRecord.universalExpireTimer(17) 字段写面（非独立
+    record 族），桌面 `pendingUniversalTimer` 字样属消息级计时器通知
+    （cleanup 面），与 Storage record 族无涉。零代码改动。
 
 
 ## 6. fake 服务模式（仅测试）
