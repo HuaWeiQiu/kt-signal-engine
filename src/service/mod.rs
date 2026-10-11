@@ -58,6 +58,7 @@ pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
+pub(crate) mod storage_call_link;
 pub(crate) mod storage_merge;
 pub(crate) mod storage_records;
 pub(crate) mod storage_sticker;
@@ -2950,6 +2951,34 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
+    }
+
+    /// storage.getCallLinks（窗D A6）：读全部 call link 投影（存储序 =
+    /// manifest CALL_LINK identifiers 首现序；坏条目跳过不炸面）。fake
+    /// 空表桩（读面纪律）。
+    pub(crate) async fn get_call_links(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<storage_call_link::CallLinkSync>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_call_link::read_call_links(&context).await
+    }
+
+    /// storage.setCallLink（窗D A6）：active/deleted 写面（官方
+    /// toCallLinkRecord 语义 + 409 采纳重放）；返回写后云态投影。
+    pub(crate) async fn set_call_link(
+        self: &Arc<Self>,
+        account: &str,
+        intent: storage_call_link::CallLinkWrite,
+    ) -> Result<Vec<storage_call_link::CallLinkSync>, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        storage_call_link::write_call_link(&context, &intent).await
     }
 
     /// listIdentities（安全码引擎面批，KT 扩展方法）：单引用窄读——号码/

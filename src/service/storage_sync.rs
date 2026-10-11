@@ -364,8 +364,8 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
 }
 
 /// 写面记录类别（manifest identifier type：Account=4、StickerPack=6、
-/// Contact=1、GroupV1=2、GroupV2=3、StoryDistributionList=5、ChatFolder=8、
-/// NotificationProfile=9）。
+/// Contact=1、GroupV1=2、GroupV2=3、StoryDistributionList=5、CallLink=7、
+/// ChatFolder=8、NotificationProfile=9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageRecordKind {
     Account,
@@ -374,6 +374,7 @@ pub(crate) enum StorageRecordKind {
     GroupV1,
     GroupV2,
     StoryDistributionList,
+    CallLink,
     ChatFolder,
     NotificationProfile,
 }
@@ -392,6 +393,7 @@ impl StorageRecordKind {
             Self::StoryDistributionList => {
                 manifest_record::identifier::Type::StoryDistributionList as i32
             }
+            Self::CallLink => manifest_record::identifier::Type::CallLink as i32,
             Self::ChatFolder => manifest_record::identifier::Type::ChatFolder as i32,
             Self::NotificationProfile => {
                 manifest_record::identifier::Type::NotificationProfile as i32
@@ -429,6 +431,8 @@ pub(crate) enum RecordPayload {
     NotificationProfile(storage_proto::NotificationProfile),
     /// Stories 分布名单记录（官方 vendored proto 七字段面，同批同通道）。
     StoryDistributionList(storage_proto::StoryDistributionListRecord),
+    /// Call link 记录（窗D A6，官方 CallLinkRecord 三字段面，同批同通道）。
+    CallLink(storage_proto::CallLinkRecord),
 }
 
 /// plan_record_writes 的产出：WriteOperation + 明文 manifest（调用方投影
@@ -472,14 +476,15 @@ pub(crate) fn plan_record_writes(
                     identifier.r#type() != manifest_record::identifier::Type::Account
                 });
             }
-            // 多条并存类别（贴纸包/联系人/GV1/GV2/分布名单/聊天文件夹/
-            // 通知档案）：仅清除 replaced_key 对应标识（同类型同实体的旧
-            // identifier 进 deleteKey）。
+            // 多条并存类别（贴纸包/联系人/GV1/GV2/分布名单/call link/
+            // 聊天文件夹/通知档案）：仅清除 replaced_key 对应标识（同类型
+            // 同实体的旧 identifier 进 deleteKey）。
             StorageRecordKind::StickerPack
             | StorageRecordKind::Contact
             | StorageRecordKind::GroupV1
             | StorageRecordKind::GroupV2
             | StorageRecordKind::StoryDistributionList
+            | StorageRecordKind::CallLink
             | StorageRecordKind::ChatFolder
             | StorageRecordKind::NotificationProfile => {
                 if let Some(old_key) = &upsert.replaced_key {
@@ -507,7 +512,8 @@ pub(crate) fn plan_record_writes(
             // item 加解密 shim 上行（与上游 encrypt_item 派生一致，交叉
             // 验证单测钉定）；StickerPack 同 shim（上游 proto 缺该记录）；
             // Contact/GV1/GV2 同 shim（拉黑写面，vendored 完整字段面保真）；
-            // ChatFolder/NotificationProfile/StoryDistributionList 同 shim
+            // CallLink/ChatFolder/NotificationProfile/StoryDistributionList
+            // 同 shim
             // （记录面批，vendored 完整字段面保真）。
             RecordPayload::Account(account) => encrypt_raw_item(
                 storage_key,
@@ -590,6 +596,17 @@ pub(crate) fn plan_record_writes(
                             record.clone(),
                         ),
                     ),
+                }
+                .encode_to_vec(),
+                record_ikm_opt,
+            ),
+            RecordPayload::CallLink(record) => encrypt_raw_item(
+                storage_key,
+                upsert.new_key.clone(),
+                &StorageRecord {
+                    record: Some(storage_proto::storage_record::Record::CallLink(
+                        record.clone(),
+                    )),
                 }
                 .encode_to_vec(),
                 record_ikm_opt,

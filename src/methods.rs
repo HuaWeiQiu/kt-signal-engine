@@ -1777,6 +1777,69 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // storage.getCallLinks（窗D A6，官方 mergeCallLinkRecord 读腿）：单参
+        // account（只读 Storage 面，无参数形状分叉）；fake 恒空表（读面纪律）。
+        "storage.getCallLinks" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.get_call_links(account).await {
+                Ok(links) => jsonrpc::success_response(id, call_link_sync_payload(&links)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
+        // storage.setCallLink（窗D A6 同批，官方 toCallLinkRecord 写腿）：
+        // active = rootKey+adminPasskey、deleted = rootKey+deletedAt-
+        // TimestampMs（官方 deleted 分支 adminKey 恒缺同形）；两键同置 =
+        // 官方 isBadRemoteData 同位矛盾意图，fail-closed -32603（参数面
+        // 不占用结构化码）。deletedAtTimestampMs 须正整数（0 = 不删除，
+        // 无动作语义不收）。
+        "storage.setCallLink" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(root_key) = params
+                .get("rootKey")
+                .and_then(Value::as_str)
+                .and_then(crate::service::call_links::decode_root_key)
+            else {
+                return internal_error(id);
+            };
+            let admin_passkey = match params.get("adminPasskey") {
+                None | Some(Value::Null) => Some(None),
+                Some(Value::String(text)) => {
+                    crate::service::storage_call_link::decode_admin_passkey(text).map(Some)
+                }
+                Some(_) => None,
+            };
+            let deleted_at = match params.get("deletedAtTimestampMs") {
+                None | Some(Value::Null) => Some(None),
+                Some(value) => value.as_u64().filter(|ts| *ts > 0).map(Some),
+            };
+            let (Some(admin_passkey), Some(deleted_at)) = (admin_passkey, deleted_at) else {
+                return internal_error(id);
+            };
+            if admin_passkey.is_some() && deleted_at.is_some() {
+                return internal_error(id);
+            }
+            // 空意图（两腿皆缺）不收：官方 upload 恒不写无 adminKey 的
+            // call link（storage.preload.ts adminKey==null skip 同位），
+            // rootKey 单独无动作语义。
+            if admin_passkey.is_none() && deleted_at.is_none() {
+                return internal_error(id);
+            }
+            let intent = crate::service::storage_call_link::CallLinkWrite {
+                root_key,
+                admin_passkey,
+                deleted_at_timestamp_ms: deleted_at,
+            };
+            match service.set_call_link(account, intent).await {
+                Ok(links) => jsonrpc::success_response(id, call_link_sync_payload(&links)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 安全码引擎面（KT 扩展方法，pinned signal-cli 同名动词原生面，
         // connector 契约 1.68 §4.61 上游形状逐字对位）：单引用窄读 +
         // 三形态比对闸写面。参数 fail-closed -32603；-1 两码原文位
@@ -3492,6 +3555,23 @@ fn sticker_sync_payload(packs: &[crate::service::storage_sticker::StickerPackSyn
                     }),
                     "position": pack.position,
                     "deletedAtTimestampMs": pack.deleted_at_timestamp_ms,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// call link 投影 → wire（getCallLinks/setCallLink 返回形状；键缺省 =
+/// null，贴纸包面同形）。
+fn call_link_sync_payload(links: &[crate::service::storage_call_link::CallLinkSync]) -> Value {
+    json!({
+        "callLinks": links
+            .iter()
+            .map(|link| {
+                json!({
+                    "rootKey": standard_b64(&link.root_key),
+                    "adminPasskey": link.admin_passkey.as_ref().map(|key| standard_b64(key)),
+                    "deletedAtTimestampMs": link.deleted_at_timestamp_ms,
                 })
             })
             .collect::<Vec<_>>(),

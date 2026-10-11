@@ -110,6 +110,8 @@ send message: Signal server unavailable.
 | `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状，存储序） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；fake：成功回 `{blocked: []}` |
 | `storage.mergeContacts` | `{account}` | `{recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, trustStatesSynced}`（七汇总字段；逐条 merge 幂等——同钥重跑全 no-op） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A4，官方 mergeContactRecord engine 腿，§5 块）**：Storage Service manifest → 全部 CONTACT identifier 批读 → ContactRecord 逐条 merge——identityKey 非空 → 身份库 save（官方 updateIdentityAfterSync 同构：absent 新增/同钥 no-op/异钥替换 + vendored 换钥 archive sessions）+ identityState 落 sidecar 信任态（Default/坏值归 default）；profileKey 非空且本地缺失 → upsert（官方 isFirstSync\|!localProfileKey 同闸）；联系人缺失 → contacts 建档（e164/given+family 姓名随建，已有档不动——姓名权威 = 手机 contacts sync）；本机 uuid/无 serviceId/坏形跳过（官方 shouldDrop 同位，skipped 汇总）；无引擎消费模型字段（unregisteredAt/hideStory/hidden/avatarColor/note/nickname 族）记档跳过，archived/markedUnread/muted/blocked 已有专用面不重复；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A4 块；fake：恒七字段零汇总 |
 | `storage.importGroups` | `{account}` | `{recordsRead, imported, alreadyKnown, failed}`（四汇总字段；幂等——本地已有 master key 零网络跳过） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A5，官方 mergeGroupV2Record engine 腿，§5 块）**：Storage Service manifest → 全部 GROUPV2 identifier 批读 → GroupV2Record masterKey 逐群导入——本地 `store.group()` 命中 → alreadyKnown 零网络跳过（增量纪律）；未知 → 既有 `fetch_group_state` 群态拉取（groups 服务器 GET v1/groups/）→ `save_group` 落 presage store（listGroups/open_group_sender 发现与发送面即刻可用）；master key 坏形（≠32B）/群态拉取失败/落库失败 → failed 逐群 best-effort 计数不炸批（官方桌面按需拉态，引擎 sidecar 无群快照惰性层 → 导入即拉态，偏差 §5 记档）；GV1 迁移面归窗D B8；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A5 块；fake：恒四字段零汇总 |
+| `storage.getCallLinks` | `{account}` | `{callLinks: [{rootKey(标准 base64 16/21B), adminPasskey?(标准 base64), deletedAtTimestampMs?(u64 毫秒)}]}`（存储序 = manifest CALL_LINK identifiers 首现序；坏条目跳过不炸面；deletedAtTimestampMs 在场即删除态，adminPasskey 恒缺——官方 isBadRemoteData「assume deleted」同位） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-12 real（KT 扩展，窗D A6 读面，官方 mergeCallLinkRecord engine 读腿，§5 块）**：Storage Service manifest → 全部 CALL_LINK（=7）identifier 批读 → CallLinkRecord 三字段投影（vendored 生成 proto 已含 Type::CallLink/CallLinkRecord，与引擎自有 proto 同线格式双源）；官方以 roomId 定位同链接（RingRTC derive_room_id(rootKey) 纯函数），引擎以 rootKey 字节等价定位不复制派生面；无 master key 或 manifest 404 → 空列表幂等成功；fake：恒 `{callLinks: []}` |
+| `storage.setCallLink` | `{account, rootKey(标准 base64，解码后恰 16B(V0)/21B(V1)——RingRTC CallLinkRootKey 两版本定长，calls.linkPresentation 闸同源), adminPasskey?(标准 base64 非空) \| deletedAtTimestampMs?(u64 正整数)}`（**两腿恰一**：active = adminPasskey、deleted = deletedAtTimestampMs，同置/双缺 `-32603`；deleted 腿 adminPasskey 恒不写——官方 toCallLinkRecord deleted 分支 adminKey 恒缺同形） | `{callLinks: [...]}`（写后全量，同 getCallLinks 形状，存储序） | 参数缺失/rootKey 非 base64·≠16·21B·非字符串/adminPasskey 非字符串·非法 base64·空解码/deletedAtTimestampMs 非数值·≤0·小数/两键同置（官方 isBadRemoteData 同位矛盾意图）/双缺（空意图——官方 upload 恒不写无 adminKey call link 同位）/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_WRITE_FAILED`（`-1` + message） | **2026-10-12 real（KT 扩展，窗D A6 写面，官方 toCallLinkRecord engine 写腿，§5 块）**：官方 upload 语义（storage.preload.ts callLinks 段）——读 manifest + 全部 CALL_LINK item → 定位 replaced key（rootKey 字节等价）→ 新 16B item key + 旧 key 进 deleteKey → PUT → 409 采纳重放（conflictBackOff 3 次，置顶/贴纸面同款）；云态已满足意图（投影等值）→ 幂等无写返回当前云态（官方 storageNeedsSync=false 同语义）；manifest 404 → master key 播种 + version 1 最小 AccountRecord 同批首写（置顶/贴纸面同口径）；RecordPayload::CallLink 进 storage_sync 统一 shim（StorageRecord tag=7 包裹）；fake：成功回 `{callLinks: []}` |
 | `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `sendCallMessage` | `{account, recipient(单号码/ACI)?\|group(32B 群 master key 标准 base64，listGroups/terminateGroup/updateGroup 的 groupId 同源口径)?——寻址两腿恰一互斥, data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；**两腿恰一**（2026-10-08 群臂批）——`group` 与 `recipient` 同置/都缺/任一腿形状非法 `-32603`；群腿仅 modern 面放行（官方群信令恒 opaque，legacy 裸帧族群向无先例；sender-key 群发无设备定向位——destinationDeviceId 与 group 同置 `-32603`）；`groupId` 键维持禁入（wire 参数名是 `group`）） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、group 非法 base64/≠32B/非字符串、两腿同置/都缺、groupId 键在场、群腿携 legacy 或 destinationDeviceId）/未注册账号 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-08 群臂批） | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（sent-transcript 缺席见 §5 通话消息块；online 位 2026-10-11 六问批勘误：官方桌面 call 发送链同样不设 online——仅 typing 消息设 online:true，**无偏差**，原「online=false 偏差」登记作废，§5 六问批）；**2026-10-08 群臂批（P4b，connector 契约 1.82 wire 面对位，engine-compat）**：`group` 腿 sender-key 群发（官方 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 → sendCallingMessage.preload.ts:99-118 isGroup 臂 sendContentMessageToGroup 同落点），群头 = open_group_sender（terminated 硬拒，send 系群组形态同纪律）+ `send_message_to_group`（sendTyping 群臂同原语）；单测钉群臂 wire = `CallMessage{opaque{data,urgency}}` 字段10（无 busy/hangup/destinationDeviceId 位）；fake：成功 `{"timestamp":u64}` 两臂同口径（落调度日志，协议上行面纪律） |
@@ -3880,6 +3882,61 @@ key 变成可用的本地群库。
 - **计数归真机回归**：manifest 拉取/群态导入/alreadyKnown/failed 计数
   需真机 storage 状态（fake 无 manifest 面），契约测试覆盖 fake 形状 +
   参数闸 + real 未注册折叠。
+
+### 窗D A6 Storage CallLinkRecord 读写面批（2026-10-12，官方对齐 Signal-Desktop storageRecordOps，wire additive）
+
+缺口总登记 A6 的 engine 腿：新方法 `storage.getCallLinks`（读投影）+
+`storage.setCallLink`（写面）（§3 两行）。官方锚：
+`services/storageRecordOps.preload.ts` toCallLinkRecord（:847）/
+mergeCallLinkRecord（:2626）+ `services/storage.preload.ts` upload
+callLinks 段（:685-730）。引擎此前 call link 面只有凭据材料三方法
+（calls.linkPresentation/createLinkAuth/groupProof，P4c 切一），无
+storage 同步腿——其他设备创建/删除的 call link 状态对新链接设备不可见，
+connector/desktop 侧无通道读写链接清单。
+
+- **读投影（getCallLinks）**：manifest 全部 CALL_LINK（=7）identifier
+  批读（A4/A5 同款批读纪律）→ CallLinkRecord 三字段投影：rootKey
+  （16/21B 标准 base64）+ adminPasskey（active 态在场）+
+  deletedAtTimestampMs（deleted 态在场）。删除态归一：deletedAt 在场
+  即视为删除、adminPasskey 恒不透出（官方 mergeCallLinkRecord
+  isBadRemoteData「assume deleted」同位 + toCallLinkRecord deleted
+  分支 adminKey 恒缺同形——远端坏形 deletedAt+adminPasskey 并存同样
+  归删除态）。rootKey 空 = 官方 shouldDrop 'no rootKey' 同位跳过。
+- **写面（setCallLink）**：两腿恰一——active = rootKey+adminPasskey、
+  deleted = rootKey+deletedAtTimestampMs（官方 deleted 分支 adminPasskey
+  恒不写）；官方 upload 语义：定位 replaced key → 新 16B item key 换入
+  + 旧 key 进 deleteKey → PUT → 409 采纳重放（conflictBackOff 3 次，
+  置顶/贴纸面同款）；投影等值幂等无写（官方 storageNeedsSync=false 同
+  语义）；manifest 404 → master key 播种 + version 1 最小 AccountRecord
+  同批首写（置顶/贴纸面同口径）。
+- **定位等价记档**：官方以 roomId 定位同链接（roomId = RingRTC
+  derive_room_id(rootKey) HKDF 纯函数）；引擎以 rootKey 字节等价定位
+  （同 rootKey ⇒ 同 roomId，单射派生），不复制 RingRTC HKDF 派生面——
+  引擎 roomId 从 wire 直收（calls.createLinkAuth 参数闸），无本地派生
+  需求。
+- **proto 收敛点**：vendored libsignal-service 生成 proto 已含
+  Type::CallLink=7/CallLinkRecord（tag 7 三字段），与引擎自有
+  `crate::proto::storage` 同线格式；写面 RecordPayload::CallLink 进
+  storage_sync 统一 shim（与 Account/Contact/GV1/GV2 同通道）；读面用
+  引擎自有 proto（A4 同款）。
+- **空意图闸**：仅 rootKey（两腿皆缺）不收 -32603——官方 upload 恒
+  不写无 adminKey 的 call link（storage.preload.ts adminKey==null
+  skip 同位），只读链接（无 adminKey 入库态）不构成写动作。
+- **无偏差记档面**：name/restrictions/expiration/revoked 等 call link
+  属性不在 CallLinkRecord（官方存本地 DB，storage 只同步 rootKey/
+  adminPasskey/删除态三材料——官方 upload 段 storageRecord 构造同域，
+  零偏差）。
+- **错误面**：读 account 缺席/未注册 `-32603`，链路 STORAGE_UNAVAILABLE/
+  STORAGE_READ_FAILED；写另加参数形状闸（rootKey 16/21B、adminPasskey
+  非空 base64、deletedAtTimestampMs 正整数、两键互斥、空意图拒）与
+  STORAGE_WRITE_FAILED；无 master key 或 manifest 404：读 → 空列表、
+  写 → 播种首写（置顶/贴纸面同口径）。
+- **fake**：读恒 `{callLinks: []}`；写成功回 `{callLinks: []}`（读面
+  纪律）。
+- **计数归真机回归**：manifest 拉取/写后全量投影需真机 storage 状态，
+  契约测试覆盖 fake 形状 + 参数闸逐形 + real 未注册折叠；单测钉投影
+  归一（deletedAt+adminPasskey 坏远端数据归删除态）/意图→记录构造
+  （deleted 腿 adminPasskey 恒缺）/线格式往返/幂等无写四族。
 
 
 ## 6. fake 服务模式（仅测试）

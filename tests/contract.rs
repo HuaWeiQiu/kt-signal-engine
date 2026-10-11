@@ -524,6 +524,143 @@ fn storage_import_groups_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603, "unknown account folds to internal error");
 }
 
+/// storage.getCallLinks / storage.setCallLink 契约面（窗D A6，官方
+/// mergeCallLinkRecord/toCallLinkRecord engine 腿）：fake 空表形状（读面
+/// 纪律）+ 参数面 fail-closed 逐形状（rootKey 16/21B 闸、adminPasskey/
+/// deletedAtTimestampMs 两键互斥且各自形状闸、deletedAtTimestampMs 须正
+/// 整数；-32603 参数面不占用结构化码；real 模式未注册账号折叠 -32603 不
+/// 触网——manifest 拉取/写后全量投影归真机验证）。
+#[test]
+fn storage_call_link_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("call-link-sync-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let root_key_v0 = "EREREREREREREREREREREQ=="; // 16B（V0）
+    let root_key_v1 = "ERERERERERERERERERERERERERER"; // 21B（V1）
+    let passkey = "KQ==";
+
+    // fake 读：空列表成功。
+    assert_eq!(
+        engine.request("storage.getCallLinks", json!({ "account": "+15550000000" }))["result"],
+        json!({ "callLinks": [] })
+    );
+
+    // fake 写 active（V0/V1 双版本 rootKey 皆合法）：空表成功。
+    assert_eq!(
+        engine.request(
+            "storage.setCallLink",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0, "adminPasskey": passkey }),
+        )["result"],
+        json!({ "callLinks": [] })
+    );
+    assert_eq!(
+        engine.request(
+            "storage.setCallLink",
+            json!({ "account": "+15550000000", "rootKey": root_key_v1, "adminPasskey": passkey }),
+        )["result"],
+        json!({ "callLinks": [] })
+    );
+
+    // fake 写 deleted（adminPasskey 恒缺形态）：空表成功。
+    assert_eq!(
+        engine.request(
+            "storage.setCallLink",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0, "deletedAtTimestampMs": 1720000000000u64 }),
+        )["result"],
+        json!({ "callLinks": [] })
+    );
+
+    // getCallLinks：缺 account / 非字符串 → -32603。
+    let (code, _) = engine.error_of("storage.getCallLinks", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("storage.getCallLinks", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // setCallLink：缺 account / 缺 rootKey → -32603。
+    let (code, _) = engine.error_of("storage.setCallLink", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "adminPasskey": passkey }),
+    );
+    assert_eq!(code, -32603);
+
+    // rootKey 非 base64 / 长度不在 16/21B（15B/24B）/ 非字符串 → -32603。
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": "not-base64!!" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": "ERERERERERERERERERER" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": "ERERERERERERERERERERERERERERERERE" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": 7, "adminPasskey": passkey }),
+    );
+    assert_eq!(code, -32603);
+
+    // adminPasskey 非字符串 / 非法 base64 / 空解码 → -32603。
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": root_key_v0, "adminPasskey": 7 }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": root_key_v0, "adminPasskey": "!!" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": root_key_v0, "adminPasskey": "" }),
+    );
+    assert_eq!(code, -32603);
+
+    // deletedAtTimestampMs 非数值 / 0 / 负 / 小数 → -32603。
+    for bad in [json!("soon"), json!(0), json!(-1), json!(1.5)] {
+        let (code, _) = engine.error_of(
+            "storage.setCallLink",
+            json!({ "account": "+15550000000", "rootKey": root_key_v0, "deletedAtTimestampMs": bad }),
+        );
+        assert_eq!(code, -32603, "deletedAt shape {bad}");
+    }
+
+    // 两键同置（adminPasskey + deletedAtTimestampMs）→ -32603（官方
+    // isBadRemoteData 同位矛盾意图）。
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": root_key_v0, "adminPasskey": passkey, "deletedAtTimestampMs": 1720000000000u64 }),
+    );
+    assert_eq!(code, -32603);
+
+    // 空意图（仅 rootKey，active/deleted 两腿皆缺）→ -32603（无动作语义
+    // 不收——同 setStickerPackSync installed 必填纪律）。
+    let (code, _) = engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550000000", "rootKey": root_key_v0 }),
+    );
+    assert_eq!(code, -32603);
+
+    // real + 全新数据目录（无账号）：未注册折叠 -32603，不触网。
+    let real_dir = temp_dir("call-link-sync-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, _) =
+        real_engine.error_of("storage.getCallLinks", json!({ "account": "+15550001111" }));
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+    let (code, _) = real_engine.error_of(
+        "storage.setCallLink",
+        json!({ "account": "+15550001111", "rootKey": root_key_v0, "adminPasskey": passkey }),
+    );
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+}
+
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
 /// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
 /// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。
