@@ -137,6 +137,16 @@ pub(crate) struct SendTextStyle {
 /// receive cap 的发送侧镜像，契约 1.69 §4.62——超出整拒，不静默截断）。
 pub(crate) const MAX_SEND_TEXT_STYLES: usize = 64;
 
+/// P14 组 4：story 回复发送面（compat §3 send 行 storyReplyAuthor/
+/// storyReplyTimestamp 扩面，官方 Desktop sendMessage storyContext 同位
+/// SendMessage.preload.ts:565-577）。author 为被回复 story 作者 ACI
+/// （resolve_author_aci 解析），sent_timestamp 为被回复 story 的发送
+/// 时间戳毫秒；双参同进退（methods.rs 解析闸）。
+pub(crate) struct SendStoryContext {
+    pub(crate) author: String,
+    pub(crate) sent_timestamp: u64,
+}
+
 /// send 贴纸参数（compat §3 send 行 sticker 扩面，键名与官方桌面
 /// sendStickerMessage 序列化同构：packId hex（Bytes.fromHex 逆运算）、
 /// packKey base64（Bytes.fromBase64 逆运算）、emoji、image data URI、
@@ -939,6 +949,7 @@ impl Service {
         text_styles: &[SendTextStyle],
         attachments: &[String],
         sticker: Option<&SendSticker>,
+        story_context: Option<&SendStoryContext>,
         view_once: bool,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
@@ -996,6 +1007,7 @@ impl Service {
                         text_styles,
                         pointers.clone(),
                         preview_image.clone(),
+                        story_context,
                         timestamp,
                     )
                     .await?
@@ -1789,6 +1801,7 @@ impl Service {
         text_styles: &[SendTextStyle],
         attachments: &[String],
         sticker: Option<&SendSticker>,
+        story_context: Option<&SendStoryContext>,
         view_once: bool,
     ) -> Result<(u64, Vec<Value>), SendError> {
         if !self.real {
@@ -1819,6 +1832,7 @@ impl Service {
                     text_styles,
                     pointers,
                     preview_image,
+                    story_context,
                     timestamp,
                 )
                 .await?
@@ -4049,7 +4063,8 @@ async fn project_content(
                         // story 发送的多设备转录面——此前被整臂丢弃）。复用
                         // story 投影单点；无 attachment 位 = malformed 整信封
                         // 丢弃纪律照旧。
-                        let Some(projection) = project_story_message(story) else {
+                        let numbers = resolve_story_mention_numbers(store, story).await;
+                        let Some(projection) = project_story_message(story, &numbers) else {
                             return Vec::new();
                         };
                         sent_json.insert("storyMessage".into(), projection);
@@ -4143,14 +4158,18 @@ async fn project_content(
             };
             envelope["callMessage"] = projection;
         }
-        ContentBody::StoryMessage(story) => match project_story_message(story) {
-            Some(projection) => {
-                envelope["storyMessage"] = projection;
+        ContentBody::StoryMessage(story) => {
+            // P14 组 4：mentions 面补 E.164 解析（dataMessage 同口径）。
+            let numbers = resolve_story_mention_numbers(store, story).await;
+            match project_story_message(story, &numbers) {
+                Some(projection) => {
+                    envelope["storyMessage"] = projection;
+                }
+                // 无 attachment 位 = 官方发送面不可能产出的 malformed 行，整
+                // 信封丢弃（宁缺勿错）。
+                None => return Vec::new(),
             }
-            // 无 attachment 位 = 官方发送面不可能产出的 malformed 行，整
-            // 信封丢弃（宁缺勿错）。
-            None => return Vec::new(),
-        },
+        }
         ContentBody::NullMessage(_) | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
         // SKDM（群发 sender-key 分发，C 批）：协议内部握手行，永不投影到
         // connector（接收侧已在 cipher 层消费）。
@@ -4762,6 +4781,43 @@ async fn resolve_author_numbers(
             if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
                 candidates.push(uuid.to_string());
             }
+        }
+    }
+    let mut numbers = HashMap::new();
+    for aci in candidates {
+        if numbers.contains_key(&aci) {
+            continue;
+        }
+        if let Some(service_id) = ServiceId::parse_from_service_id_string(&aci) {
+            if let Some(peer) = describe_peer(store, &service_id).await {
+                if let Some(number) = peer.number {
+                    numbers.insert(aci, number);
+                }
+            }
+        }
+    }
+    numbers
+}
+
+/// story mentions 作者号解析（P14 组 4：project_story_message mentions 面
+/// E.164 映射，resolve_author_numbers 同口径——story.body_ranges mention
+/// 臂候选 → contacts 命中投影 E.164，未命中保留 ACI）。
+async fn resolve_story_mention_numbers(
+    store: &SqliteStore,
+    story: &presage::proto::StoryMessage,
+) -> HashMap<String, String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for range in &story.body_ranges {
+        match range.associated_value.as_ref() {
+            Some(presage::proto::body_range::AssociatedValue::MentionAci(aci)) => {
+                candidates.push(aci.clone());
+            }
+            Some(presage::proto::body_range::AssociatedValue::MentionAciBinary(bytes)) => {
+                if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(bytes) {
+                    candidates.push(uuid.to_string());
+                }
+            }
+            _ => {}
         }
     }
     let mut numbers = HashMap::new();
@@ -5590,10 +5646,20 @@ fn delete_for_me_conversation_id(
 /// 如实两面。preview.url/preview.title 引擎扩展键往返面（2026-10-09 批，
 /// 发送面 previewUrl/previewTitle 对端回声）：Some 且非空才投，同一
 /// preview 对象内与 image 并列（description 官方 story 预览面未消
-/// 费，仍不投；date 已于 P14 Preview.date 两端批补投）。无 attachment 位
+/// 费，仍不投；date 已于 P14 Preview.date 两端批补投）。P14 组 4：
+/// bodyRanges=6 分流 `mentions[]`/`textStyles[]`（dataMessage 同构——
+/// mention 二进制优先 + author_numbers E.164 映射；style 词表 NONE 丢/
+/// 未知丢，start+length 超 story 正文 UTF-16 长度的形状坏条目丢弃）与
+/// 色位投影（textForegroundColor/textBackgroundColor u32 原样、background
+/// oneof → `background {gradient{startColor?, endColor?, angle?, colors[],
+/// positions[]}}` 或 `background {color}`，官方 SendMessage TextAttachment
+/// Params 同形键）。无 attachment 位
 /// = 官方发送面不可能产出的 malformed 行，
 /// 返回 None（调用方整信封丢弃）。
-fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> {
+fn project_story_message(
+    story: &presage::proto::StoryMessage,
+    author_numbers: &HashMap<String, String>,
+) -> Option<Value> {
     use base64::Engine as _;
     let attachment = story.attachment.as_ref()?;
     let mut out = serde_json::Map::new();
@@ -5607,6 +5673,99 @@ fn project_story_message(story: &presage::proto::StoryMessage) -> Option<Value> 
                 if let Ok(word) = presage::proto::text_attachment::Style::try_from(style) {
                     value.insert("textStyle".into(), json!(word.as_str_name()));
                 }
+            }
+            // P14 组 4：story 正文样式分流（dataMessage bodyRanges 同构——
+            // mentions 臂 E.164 映射 + textStyles 臂五值词表；形状坏条目
+            // 丢弃纪律同源）。正文长度闸 = textAttachment.text UTF-16。
+            let mentions: Vec<Value> = story
+                .body_ranges
+                .iter()
+                .filter_map(|range| {
+                    let uuid = match range.associated_value.as_ref()? {
+                        presage::proto::body_range::AssociatedValue::MentionAci(aci) => aci.clone(),
+                        presage::proto::body_range::AssociatedValue::MentionAciBinary(bytes) => {
+                            presage::libsignal_service::prelude::Uuid::from_slice(bytes)
+                                .ok()?
+                                .to_string()
+                        }
+                        presage::proto::body_range::AssociatedValue::Style(_) => return None,
+                    };
+                    Some(json!({
+                        "number": author_numbers.get(&uuid).cloned().unwrap_or(uuid),
+                        "start": range.start.unwrap_or(0),
+                        "length": range.length.unwrap_or(0),
+                    }))
+                })
+                .collect();
+            if !mentions.is_empty() {
+                value.insert("mentions".into(), json!(mentions));
+            }
+            let text_utf16_len = text
+                .text
+                .as_deref()
+                .map(|body| body.encode_utf16().count())
+                .unwrap_or(0);
+            let text_styles: Vec<Value> = story
+                .body_ranges
+                .iter()
+                .filter_map(|range| {
+                    let style = match range.associated_value.as_ref()? {
+                        presage::proto::body_range::AssociatedValue::Style(value) => *value,
+                        _ => return None,
+                    };
+                    let word = presage::proto::body_range::Style::try_from(style)
+                        .ok()?
+                        .as_str_name();
+                    if word == "NONE" {
+                        return None;
+                    }
+                    let start = range.start.unwrap_or(0);
+                    let length = range.length.unwrap_or(0);
+                    if start as u64 + length as u64 > text_utf16_len as u64 {
+                        return None;
+                    }
+                    Some(json!({
+                        "style": word,
+                        "start": start,
+                        "length": length,
+                    }))
+                })
+                .collect();
+            if !text_styles.is_empty() {
+                value.insert("textStyles".into(), json!(text_styles));
+            }
+            // P14 组 4：色位/背景面（官方 TextAttachment.Params 同形键——
+            // u32 颜色数值原样透出；background oneof gradient|color 恰一，
+            // gradient 弃用位 startColor/endColor 在场照投官方同款）。
+            if let Some(color) = text.text_foreground_color {
+                value.insert("textForegroundColor".into(), json!(color));
+            }
+            if let Some(color) = text.text_background_color {
+                value.insert("textBackgroundColor".into(), json!(color));
+            }
+            match text.background.as_ref() {
+                Some(presage::proto::text_attachment::Background::Gradient(gradient)) => {
+                    let mut face = serde_json::Map::new();
+                    if let Some(start) = gradient.start_color {
+                        face.insert("startColor".into(), json!(start));
+                    }
+                    if let Some(end) = gradient.end_color {
+                        face.insert("endColor".into(), json!(end));
+                    }
+                    if let Some(angle) = gradient.angle {
+                        face.insert("angle".into(), json!(angle));
+                    }
+                    face.insert("colors".into(), json!(gradient.colors));
+                    face.insert("positions".into(), json!(gradient.positions));
+                    value.insert(
+                        "background".into(),
+                        json!({ "gradient": Value::Object(face) }),
+                    );
+                }
+                Some(presage::proto::text_attachment::Background::Color(color)) => {
+                    value.insert("background".into(), json!({ "color": color }));
+                }
+                None => {}
             }
             if let Some(preview) = text.preview.as_ref() {
                 let mut face = serde_json::Map::new();
@@ -6292,6 +6451,7 @@ async fn build_text_data_message(
     text_styles: &[SendTextStyle],
     attachment_pointers: Vec<presage::proto::AttachmentPointer>,
     preview_image: Option<presage::proto::AttachmentPointer>,
+    story_context: Option<&SendStoryContext>,
     timestamp: u64,
 ) -> Result<DataMessage, SendError> {
     let mut dm = DataMessage {
@@ -6302,6 +6462,19 @@ async fn build_text_data_message(
     };
     if let Some(quote) = quote {
         dm.quote = Some(assemble_quote(store, quote).await?);
+    }
+    // P14 组 4：storyContext 发送面（官方 storyContext = {sentTimestamp,
+    // authorAci|authorAciBinary} 二选一按 binary 模式——引擎沿 mentions/
+    // quote 先例写 string 形 authorAci，收端两侧都读互通无差，§5）。
+    if let Some(story_context) = story_context {
+        let author_aci = resolve_author_aci(store, &story_context.author)
+            .await
+            .ok_or(SendError::Internal)?;
+        dm.story_context = Some(presage::proto::data_message::StoryContext {
+            author_aci: Some(author_aci),
+            sent_timestamp: Some(story_context.sent_timestamp),
+            author_aci_binary: None,
+        });
     }
     if let Some(preview) = preview {
         dm.preview = vec![presage::proto::Preview {
@@ -8472,6 +8645,7 @@ mod tests {
             &entries,
             Vec::new(),
             None,
+            None,
             1_700_000_000_000,
         )
         .await
@@ -8519,6 +8693,7 @@ mod tests {
             }],
             Vec::new(),
             None,
+            None,
             1,
         )
         .await
@@ -8537,10 +8712,20 @@ mod tests {
 
         // 零回归锚：无参数（textStyle 键缺席）构造字节 = 旧版形状逐字节
         // 一致（无 body_ranges 字段产生）。
-        let legacy =
-            build_text_data_message(&store, "plain", None, None, &[], &[], Vec::new(), None, 1)
-                .await
-                .expect("plain text builds");
+        let legacy = build_text_data_message(
+            &store,
+            "plain",
+            None,
+            None,
+            &[],
+            &[],
+            Vec::new(),
+            None,
+            None,
+            1,
+        )
+        .await
+        .expect("plain text builds");
         assert!(legacy.body_ranges.is_empty());
         let expected_legacy = DataMessage {
             timestamp: Some(1),
@@ -8569,12 +8754,183 @@ mod tests {
                 }],
                 Vec::new(),
                 None,
+                None,
                 1,
             )
             .await
             .is_err(),
             "NONE rejected at build layer too"
         );
+    }
+
+    /// P14 组 4：story 投影面——bodyRanges=6 分流 `mentions[]`/`textStyles[]`
+    /// （mention binary 16B→UUID、形状坏条目丢弃）与色位/背景投影
+    /// （textForegroundColor/textBackgroundColor u32 原样、background oneof
+    /// gradient|color，官方 TextAttachment.Params 同形键）。
+    #[test]
+    fn story_projection_carries_body_ranges_and_color_faces() {
+        use presage::proto::text_attachment::{Background, Gradient};
+
+        let mention_uuid_bytes = [
+            0x11_u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        let story = presage::proto::StoryMessage {
+            attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                presage::proto::TextAttachment {
+                    text: Some("story body".to_owned()),
+                    text_style: Some(2),
+                    text_foreground_color: Some(0xFF00_FF00),
+                    text_background_color: Some(0),
+                    background: Some(Background::Gradient(Gradient {
+                        start_color: Some(0x1122_3344),
+                        end_color: None,
+                        angle: Some(90),
+                        colors: vec![0xA, 0xB],
+                        positions: vec![0.0, 1.0],
+                    })),
+                    preview: None,
+                },
+            )),
+            body_ranges: vec![
+                BodyRange {
+                    start: Some(0),
+                    length: Some(5),
+                    associated_value: Some(AssociatedValue::MentionAciBinary(
+                        mention_uuid_bytes.to_vec(),
+                    )),
+                },
+                BodyRange {
+                    start: Some(6),
+                    length: Some(4),
+                    associated_value: Some(AssociatedValue::Style(
+                        presage::proto::body_range::Style::Bold as i32,
+                    )),
+                },
+                // 形状坏条目：start+length 超 story 正文 UTF-16 长度 → 丢。
+                BodyRange {
+                    start: Some(50),
+                    length: Some(100),
+                    associated_value: Some(AssociatedValue::Style(
+                        presage::proto::body_range::Style::Italic as i32,
+                    )),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = project_story_message(&story, &HashMap::new()).expect("story projection");
+        let text = &out["textAttachment"];
+        assert_eq!(text["textForegroundColor"], json!(0xFF00_FF00_u32));
+        // u32 原样：Some(0) 也是线上陈述（显式 0 = 合法色值）。
+        assert_eq!(text["textBackgroundColor"], json!(0_u32));
+        assert_eq!(
+            text["background"]["gradient"]["startColor"],
+            json!(0x1122_3344_u32)
+        );
+        assert!(text["background"]["gradient"].get("endColor").is_none());
+        assert_eq!(text["background"]["gradient"]["angle"], json!(90));
+        assert_eq!(text["background"]["gradient"]["colors"], json!([10, 11]));
+        assert_eq!(
+            text["background"]["gradient"]["positions"],
+            json!([0.0, 1.0])
+        );
+        assert_eq!(text["mentions"][0]["start"], json!(0));
+        assert_eq!(text["mentions"][0]["length"], json!(5));
+        assert_eq!(
+            text["mentions"][0]["number"].as_str().map(str::len),
+            Some(36)
+        );
+        assert_eq!(text["textStyles"][0]["style"], json!("BOLD"));
+        assert_eq!(text["textStyles"].as_array().map(Vec::len), Some(1));
+
+        // color 臂：background {color} 单键。
+        let story = presage::proto::StoryMessage {
+            attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                presage::proto::TextAttachment {
+                    text: Some("hi".to_owned()),
+                    background: Some(Background::Color(0xABCDEF)),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let out = project_story_message(&story, &HashMap::new()).expect("story projection");
+        assert_eq!(
+            out["textAttachment"]["background"]["color"],
+            json!(0xABCDEF_u32)
+        );
+    }
+
+    /// P14 组 4：story 回复发送面——story_context 构造（author ACI 解析 +
+    /// sent_timestamp 直投，string 形 authorAci 沿 mentions/quote 先例，
+    /// binary 位不写）；无参数 = story_context 缺席（旧字节零变化）；作者
+    /// 不可解析 fail-closed。
+    #[tokio::test]
+    async fn story_context_send_build_faces() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-ctx-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+
+        let author = "11111111-2222-4333-8444-555555555555";
+        let dm = build_text_data_message(
+            &store,
+            "reply",
+            None,
+            None,
+            &[],
+            &[],
+            Vec::new(),
+            None,
+            Some(&SendStoryContext {
+                author: author.to_owned(),
+                sent_timestamp: 1_700_000_000_000,
+            }),
+            7,
+        )
+        .await
+        .expect("story reply builds");
+        let ctx = dm.story_context.expect("storyContext set");
+        assert_eq!(ctx.author_aci.as_deref(), Some(author));
+        assert_eq!(ctx.sent_timestamp, Some(1_700_000_000_000));
+        assert!(ctx.author_aci_binary.is_none());
+
+        // 无参数 = story_context 缺席。
+        let dm = build_text_data_message(
+            &store,
+            "plain",
+            None,
+            None,
+            &[],
+            &[],
+            Vec::new(),
+            None,
+            None,
+            7,
+        )
+        .await
+        .expect("plain builds");
+        assert!(dm.story_context.is_none());
+
+        // 作者不可解析 fail-closed。
+        assert!(build_text_data_message(
+            &store,
+            "x",
+            None,
+            None,
+            &[],
+            &[],
+            Vec::new(),
+            None,
+            Some(&SendStoryContext {
+                author: "not-a-recipient".to_owned(),
+                sent_timestamp: 1,
+            }),
+            7,
+        )
+        .await
+        .is_err());
     }
 
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构

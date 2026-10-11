@@ -16,7 +16,7 @@ use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
     capabilities, parse_legacy_call_face, storage_sync, storage_write, DeviceCapabilitiesError,
     LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange,
-    SendSticker, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -344,6 +344,27 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // P14 组 4：story 回复发送面（storyReplyAuthor/storyReplyTimestamp
+            // 双参同进退——同置或都缺合法，单边在场 fail-closed）。author 为
+            // 被回复 story 作者 ACI/号码（服务层 resolve_author_aci 再解析，
+            // 不可解析 fail-closed），timestamp 为被回复 story 发送时刻毫秒
+            // u64（0 = 无所指 fail-closed；官方 storyContext.timestamp 同位）。
+            let story_context = match (
+                params.get("storyReplyAuthor"),
+                params.get("storyReplyTimestamp"),
+            ) {
+                (None | Some(Value::Null), None | Some(Value::Null)) => None,
+                (Some(Value::String(author)), Some(Value::Number(ts))) => {
+                    match (author.is_empty(), ts.as_u64()) {
+                        (false, Some(ts)) if ts > 0 => Some(SendStoryContext {
+                            author: author.to_owned(),
+                            sent_timestamp: ts,
+                        }),
+                        _ => return internal_error(id),
+                    }
+                }
+                _ => return internal_error(id),
+            };
             // 贴纸扩面：对象形状，packId(hex)/packKey(base64)/stickerId/image
             // 必填，emoji/width/height 可选；缺字段/超 u32 fail-closed。
             let sticker = match params.get("sticker") {
@@ -434,6 +455,7 @@ async fn dispatch(
                             &text_styles,
                             &attachments,
                             sticker.as_ref(),
+                            story_context.as_ref(),
                             view_once,
                         )
                         .await
@@ -459,6 +481,7 @@ async fn dispatch(
                             &text_styles,
                             &attachments,
                             sticker.as_ref(),
+                            story_context.as_ref(),
                             view_once,
                         )
                         .await
