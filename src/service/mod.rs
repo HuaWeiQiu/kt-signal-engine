@@ -3666,16 +3666,18 @@ enum StreamOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// DERM 收发自愈（B 批，官方 Android MessageDecryptor / Desktop handleRetry
-// 行为对齐）：解密失败回发 DecryptionErrorMessage；收到重试请求按原始
-// 时间戳重发已发消息，找不到/超龄/超限 → clear_sessions 会话重建。
+// DERM 收发自愈（B 批；时序审计组四 E3/E4 官方对齐细化，Desktop
+// handleRetry 行为对齐）：解密失败回发 DecryptionErrorMessage（明文腿）；
+// 收到重试请求按官方闸序处理——超限早退（无会话动作）→ archive-on-match
+// → 新鲜度/找回重发 → 兜底（SKDM 臂未建，归档后 NullMessage，差异记档
+// compat §5）。
 // ---------------------------------------------------------------------------
 
 /// 同一 (来源, 原始时间戳) 重试请求放行上限（官方 Desktop handleRetry
 /// RETRY_LIMIT = 5 同值）。
 const DERM_RETRY_LIMIT: u32 = 5;
 /// 重试请求新鲜度窗口（官方 Desktop retryRespondMaxAge 缺省 14 天同值）：
-/// 原始消息超龄不再重发，转会话重建档。
+/// 原始消息超龄不再重发，转兜底档（官方 sendDistributionMessageOrNullMessage）。
 const DERM_RESPOND_MAX_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
 
 /// 防环计数器（进程内存，接收管线生命周期；键 = 来源 ACI + 原始时间戳，
@@ -3734,42 +3736,83 @@ async fn derm_handle(
         Failure::RetryReceipt(bytes) => {
             derm_send_receipt(manager, sender, &bytes).await;
         }
-        Failure::RetryRequest(original_ts) => {
-            derm_on_retry_request(manager, sender, original_ts, guard).await;
+        Failure::RetryRequest {
+            original_ts,
+            ratchet_key,
+            derm_device_id,
+            requester_device,
+        } => {
+            derm_on_retry_request(
+                manager,
+                sender,
+                original_ts,
+                ratchet_key,
+                derm_device_id,
+                requester_device,
+                guard,
+            )
+            .await;
         }
     }
 }
 
-/// 档一：把重试回执（DecryptionErrorMessage 序列化 proto）经发送通道回原
-/// 发送者。回执发送失败静默（事件面已上抛，官方 requestResend 队列失败
-/// 同样落会话重置兜底）。
+/// 档一：把重试回执（DecryptionErrorMessage 序列化 proto）按官方明文腿
+/// 回原发送者：PlaintextContent（0xC0 + Content{derm} + 0x80）以 Envelope
+/// type=8 直发、不做会话加密（官方 Desktop requestResend → PlaintextContent
+/// → sendMessageProtoAndWait{proto: plaintext}；OutgoingMessage 对
+/// PlaintextContent 不走 getCiphertextMessage）。回执发送失败静默（官方
+/// requestResend 队列失败同样落会话重置兜底）。
 async fn derm_send_receipt(
     manager: &mut Manager<SqliteStore, Registered>,
     sender: ServiceId,
     receipt: &[u8],
 ) {
-    use prost::Message as _;
-    let Ok(body) = presage::proto::DecryptionErrorMessage::decode(receipt) else {
+    use presage::libsignal_service::protocol::{DecryptionErrorMessage, PlaintextContent};
+    // try_from 要求 timestamp 在场：回执由 presage RetryReceiptMaterial 经
+    // for_original 构造，timestamp 恒有；坏回执静默丢弃。
+    let Ok(body) = DecryptionErrorMessage::try_from(receipt) else {
         return;
     };
+    let plaintext = PlaintextContent::from(body);
     let _ = manager
-        .send_message(sender, ContentBody::DecryptionErrorMessage(body), now_ms())
+        .send_plaintext_content(sender, &plaintext, now_ms())
         .await;
 }
 
-/// 档二：对端重试请求（DERM.RetryRequest）。闸序：防环计数 → 新鲜度 →
-/// 已发消息找回（含群成员资格）；可重发则重发原始内容，否则
-/// clear_sessions（会话重建在下一轮收发自然发生）。
+/// 档二：对端重试请求（DERM.RetryRequest）。官方 onRetryRequest 闸序对齐
+/// （handleRetry.preload.ts:129-261）：①防环超限早退（无任何会话动作，
+/// 官方 retryCount > RETRY_LIMIT 同序）；②archive-on-match（DERM 点名我
+/// 设备且携 ratchet key → 比对 (requester, 其发送设备) 会话当前 ratchet，
+/// 命中归档该单一会话）；③新鲜度 → 已发消息找回（含群成员资格）→ 命中
+/// 重发原内容（原时间戳）；④超龄/找不到/不允许 → 兜底（官方群+senderKey
+/// 重发 SKDM，否则归档过才发 NullMessage，否则不做；我方 SKDM 臂未建，
+/// 偏差登记 compat §5）。
 async fn derm_on_retry_request(
     manager: &mut Manager<SqliteStore, Registered>,
     requester: ServiceId,
     original_ts: u64,
+    ratchet_key: Option<Vec<u8>>,
+    derm_device_id: u32,
+    requester_device: u32,
     guard: &mut DermRetryGuard,
 ) {
-    if !guard.admit(&requester.service_id_string(), original_ts)
-        || !derm_request_fresh(now_ms(), original_ts)
-    {
-        let _ = manager.clear_sessions(&requester).await;
+    // ① 超限早退：官方不重发也不做会话动作（信任既有兜底已铺开）。
+    if !guard.admit(&requester.service_id_string(), original_ts) {
+        return;
+    }
+    // ② archive-on-match。
+    let did_archive = derm_archive_session_on_match(
+        manager.store(),
+        u32::from(manager.device_id()),
+        &requester,
+        ratchet_key.as_deref(),
+        derm_device_id,
+        requester_device,
+    )
+    .await;
+    // ③ 新鲜度 + 找回（含群成员资格）。
+    if !derm_request_fresh(now_ms(), original_ts) {
+        derm_send_distribution_or_null(manager, requester, did_archive).await;
         return;
     }
     let lookup = manager
@@ -3779,7 +3822,7 @@ async fn derm_on_retry_request(
         .ok()
         .flatten();
     let Some((thread, content)) = lookup else {
-        let _ = manager.clear_sessions(&requester).await;
+        derm_send_distribution_or_null(manager, requester, did_archive).await;
         return;
     };
     let group_members = match &thread {
@@ -3793,13 +3836,91 @@ async fn derm_on_retry_request(
         presage::store::Thread::Contact(_) => None,
     };
     if !derm_resend_allowed(&thread, &requester, group_members.as_deref()) {
-        let _ = manager.clear_sessions(&requester).await;
+        derm_send_distribution_or_null(manager, requester, did_archive).await;
         return;
     }
     // 重发原始内容（原始时间戳保序；本地 store INSERT OR REPLACE 同行
-    // 幂等）。resend 失败静默（请求方下轮重试或会话重建档兜底）。
+    // 幂等）。resend 失败静默（请求方下轮重试或兜底档再收敛）。
     let _ = manager
         .send_message(requester, content.body, original_ts)
+        .await;
+}
+
+/// archive-on-match（官方 archiveSessionOnMatch :338-368）：DERM 内嵌
+/// device_id 点名我设备且携 ratchet key 时，取 (requester, 其发送设备) 会
+/// 话，当前 ratchet key 与 DERM 所载一致 = 正是这把会话在对方解不开 →
+/// 归档该单一地址（不 clear 全设备会话）。任何前置不满足 = 不动会话。
+async fn derm_archive_session_on_match(
+    store: &SqliteStore,
+    own_device_id: u32,
+    requester: &ServiceId,
+    ratchet_key: Option<&[u8]>,
+    derm_device_id: u32,
+    requester_device: u32,
+) -> bool {
+    use presage::libsignal_service::protocol::{DeviceId, PublicKey, SessionStore as _};
+
+    let Some(ratchet_bytes) = ratchet_key else {
+        return false;
+    };
+    // DERM 点名我设备：不是我这台设备造成的失败，不归我修（官方
+    // ourDeviceId !== senderDevice 同闸）。
+    if derm_device_id != own_device_id {
+        return false;
+    }
+    let Ok(ratchet_key) = PublicKey::deserialize(ratchet_bytes) else {
+        return false;
+    };
+    let Some(device_id) = u8::try_from(requester_device)
+        .ok()
+        .and_then(|raw| DeviceId::new(raw).ok())
+    else {
+        return false;
+    };
+    let address = requester.to_protocol_address(device_id);
+    let mut protocol_store = store.aci_protocol_store();
+    let Some(mut session) = protocol_store.load_session(&address).await.ok().flatten() else {
+        return false;
+    };
+    let matches = session
+        .current_ratchet_key_matches(&ratchet_key)
+        .unwrap_or(false);
+    if !matches {
+        return false;
+    }
+    if session.archive_current_state().is_err() {
+        return false;
+    }
+    protocol_store
+        .store_session(&address, &session)
+        .await
+        .is_ok()
+}
+
+/// 兜底（官方 sendDistributionMessageOrNullMessage :370-440）：群 + 有
+/// sender key 分发台账 → 重发 SKDM（官方主臂）；否则归档过才发
+/// NullMessage（用新会话敲一下对端，促其重建），否则什么都不做。
+/// 偏差登记：我方 SKDM 重发臂未建（sender-key 分发只随群发送自然发生），
+/// 群兜底一律落入归档/NullMessage 同判（compat §5）。
+async fn derm_send_distribution_or_null(
+    manager: &mut Manager<SqliteStore, Registered>,
+    requester: ServiceId,
+    did_archive: bool,
+) {
+    if !did_archive {
+        return;
+    }
+    use rand::Rng as _;
+    let mut padding = vec![0u8; 64];
+    rand::rng().fill(&mut padding[..]);
+    let _ = manager
+        .send_message(
+            requester,
+            ContentBody::NullMessage(presage::proto::NullMessage {
+                padding: Some(padding),
+            }),
+            now_ms(),
+        )
         .await;
 }
 
@@ -4124,10 +4245,10 @@ async fn serve_account_stream(
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
                 // 落库事务后逐条 ack，解密失败也 ack），否则服务器队列堆积；
                 // 同时结构化上抛 connector（不再静默丢弃）。DERM 自愈两档
-                // （官方 Android MessageDecryptor / Desktop handleRetry 同型）：
-                // 我方解密失败 → 回发 DecryptionErrorMessage；收到对端重试
-                // 请求 → 按原始时间戳找回已发消息重发，找不到/超龄/超限 →
-                // clear_sessions 触发会话重建。全链路失败静默，绝不影响 ack。
+                // （官方 Desktop handleRetry 同型）：我方解密失败 → 明文腿
+                // 回发 DecryptionErrorMessage；收到对端重试请求 → 按官方闸序
+                // （超限早退 / archive-on-match / 找回重发 / 兜底）处理。
+                // 全链路失败静默，绝不影响 ack。
                 Some(Received::DecryptionError(sender, timestamp, failure, ack)) => {
                     service.notify(decryption_error_notification(number, &sender, timestamp));
                     if !service.flush_barrier().await {
@@ -13319,7 +13440,7 @@ mod tests {
     }
 
     /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内
-    /// 放行，边界外（超龄/未来时间戳）转会话重建档。
+    /// 放行，边界外（超龄/未来时间戳）转兜底档。
     #[test]
     fn derm_request_freshness_window_matches_official_14d() {
         let now = 1_700_000_000_000_u64;
@@ -13385,7 +13506,7 @@ mod tests {
             None
         ));
         // 群：成员 → 重发；非成员（仅他人/请求者在名单时第三方借道同拒）/
-        // 名单不可得 → 会话重建档。
+        // 名单不可得 → 兜底档。
         let members = vec![member(requester_aci)];
         assert!(derm_resend_allowed(
             &Thread::Group([0u8; 32]),
@@ -13572,24 +13693,138 @@ mod tests {
         ));
     }
 
-    /// 重试回执解码形状（derm_send_receipt 入参面）：序列化
-    /// DecryptionErrorMessage proto 往返后 timestamp/device_id 保真——
-    /// 请求方按这两个位找回原消息。
+    /// 重试回执解码形状（derm_send_receipt 入参面）：presage RetryReceipt
+    /// 字节（libsignal for_original 序列化面）→ DecryptionErrorMessage 保真
+    /// timestamp/device_id/ratchet_key；缺 timestamp 的坏回执拒收。
     #[test]
     fn derm_receipt_roundtrip_keeps_timestamp_and_device() {
-        use presage::proto::DecryptionErrorMessage;
+        use presage::libsignal_service::protocol::{DecryptionErrorMessage, KeyPair};
         use prost::Message as _;
 
-        let receipt = DecryptionErrorMessage {
+        // 构造面与 presage RetryReceiptMaterial::into_failure 一致
+        // （for_original：timestamp 恒有，ratchet_key 随密文类型可空）。
+        let ratchet_key = KeyPair::generate(&mut rand::rng()).public_key.serialize();
+        let receipt = presage::proto::DecryptionErrorMessage {
             timestamp: Some(1_700_000_000_000),
-            ratchet_key: Some(vec![1, 2, 3]),
+            ratchet_key: Some(ratchet_key.to_vec()),
             device_id: Some(2),
         };
         let bytes = receipt.encode_to_vec();
-        let decoded = DecryptionErrorMessage::decode(bytes.as_slice()).expect("roundtrip");
-        assert_eq!(decoded.timestamp, Some(1_700_000_000_000));
-        assert_eq!(decoded.device_id, Some(2));
-        assert_eq!(decoded.ratchet_key, Some(vec![1, 2, 3]));
+
+        let decoded = DecryptionErrorMessage::try_from(bytes.as_slice()).expect("roundtrip");
+        assert_eq!(decoded.timestamp().epoch_millis(), 1_700_000_000_000);
+        assert_eq!(decoded.device_id(), 2);
+        assert!(decoded.ratchet_key().is_some());
+
+        let broken = presage::proto::DecryptionErrorMessage {
+            timestamp: None,
+            ..receipt
+        };
+        assert!(
+            DecryptionErrorMessage::try_from(broken.encode_to_vec().as_slice()).is_err(),
+            "缺 timestamp 的回执必须拒收（请求方无法定位原消息）"
+        );
+    }
+
+    /// 明文回执腿 wire 形状钉（E3 additive）：DecryptionErrorMessage →
+    /// PlaintextContent = 0xC0 前缀 + Content proto（内嵌原始回执字节）+
+    /// 0x80 边界字节；对端 extract 可逆找回同一 timestamp/device_id——
+    /// 即 Envelope type=8 明文信封所载字节的钉形。
+    #[test]
+    fn derm_plaintext_receipt_wire_shape() {
+        use presage::libsignal_service::protocol::{
+            extract_decryption_error_message_from_serialized_content, DecryptionErrorMessage,
+            PlaintextContent,
+        };
+        use prost::Message as _;
+
+        let ratchet_key = presage::libsignal_service::protocol::KeyPair::generate(&mut rand::rng())
+            .public_key
+            .serialize();
+        let receipt = presage::proto::DecryptionErrorMessage {
+            timestamp: Some(1_700_000_000_000),
+            ratchet_key: Some(ratchet_key.to_vec()),
+            device_id: Some(2),
+        };
+        let derm =
+            DecryptionErrorMessage::try_from(receipt.encode_to_vec().as_slice()).expect("parse");
+
+        let plaintext = PlaintextContent::from(derm);
+        let wire = plaintext.serialized();
+        assert_eq!(wire.first(), Some(&0xC0), "PlaintextContent 标识前缀");
+        assert_eq!(wire.last(), Some(&0x80), "padding 边界字节");
+
+        let recovered = extract_decryption_error_message_from_serialized_content(plaintext.body())
+            .expect("对端按官方同函数找回");
+        assert_eq!(recovered.timestamp().epoch_millis(), 1_700_000_000_000);
+        assert_eq!(recovered.device_id(), 2);
+        assert!(recovered.ratchet_key().is_some());
+    }
+
+    /// archive-on-match 负路径钉（E4）：无 ratchet key / 非点名我设备 /
+    /// 坏钥字节 / 会话 ratchet 不匹配 / 无会话地址——任一前置不满足即不动
+    /// 会话（返回 false，既有会话原封）。正路径（命中→归档）完全委托上游
+    /// `current_ratchet_key_matches`/`archive_current_state` 原语（上游
+    /// 自测），此处不重建会话脚手架。
+    #[tokio::test]
+    async fn derm_archive_on_match_gates_refuse_without_match() {
+        use presage::libsignal_service::protocol::{
+            DeviceId, KeyPair, SessionRecord, SessionStore as _,
+        };
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-derm-archive-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let requester =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("requester aci");
+
+        // 落一个空会话（无 current session：current_ratchet_key_matches 恒
+        // false——真命中路径在此脚手架里不会发生）。
+        let address = requester.to_protocol_address(DeviceId::new(3).expect("device id"));
+        let mut protocol_store = store.aci_protocol_store();
+        protocol_store
+            .store_session(&address, &SessionRecord::new_fresh())
+            .await
+            .expect("seed session");
+        assert!(protocol_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .is_some());
+
+        let key_bytes = KeyPair::generate(&mut rand::rng())
+            .public_key
+            .serialize()
+            .to_vec();
+
+        // 无 ratchet key → 不动。
+        assert!(!derm_archive_session_on_match(&store, 1, &requester, None, 1, 3).await);
+        // 点名他设备 → 不动（即使带 key）。
+        assert!(
+            !derm_archive_session_on_match(&store, 1, &requester, Some(&key_bytes), 2, 3).await
+        );
+        // 点名我设备 + 带 key，但会话 ratchet 不匹配 → 不动。
+        assert!(
+            !derm_archive_session_on_match(&store, 1, &requester, Some(&key_bytes), 1, 3).await
+        );
+        // 坏钥字节 → 不动。
+        assert!(
+            !derm_archive_session_on_match(&store, 1, &requester, Some(&[1, 2, 3]), 1, 3).await
+        );
+        // 无会话地址 → 不动。
+        assert!(
+            !derm_archive_session_on_match(&store, 1, &requester, Some(&key_bytes), 1, 9).await
+        );
+
+        // 原会话原封未动。
+        assert!(protocol_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// 投影去重键（止血批①③）：presage unfold 以

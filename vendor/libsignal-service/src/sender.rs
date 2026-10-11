@@ -1,11 +1,12 @@
 use std::{collections::HashSet, time::SystemTime};
 
+use base64::prelude::*;
 use chrono::prelude::*;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
-    process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair, Pni,
-    ProtocolStore, SenderCertificate, SenderKeyStore, ServiceId,
-    SessionNotFound, SignalProtocolError,
+    process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair,
+    PlaintextContent, Pni, ProtocolStore, SenderCertificate, SenderKeyStore,
+    ServiceId, SessionNotFound, SignalProtocolError,
 };
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
@@ -29,7 +30,7 @@ use crate::{
     service_address::ServiceIdExt,
     session_store::SessionStoreExt,
     unidentified_access::UnidentifiedAccess,
-    utils::{serde_device_id, serde_service_id},
+    utils::{serde_device_id, serde_service_id, BASE64_RELAXED},
     websocket::{self, SignalWebSocket},
 };
 
@@ -448,6 +449,90 @@ where
         }
 
         result
+    }
+
+    /// Send `PlaintextContent` (e.g. a resend request) to `recipient` without
+    /// session encryption, as Envelope type PLAINTEXT_CONTENT.
+    ///
+    /// Devices without an existing session are skipped: they cannot have
+    /// decrypted the original message, so asking them to resend is pointless.
+    pub async fn send_plaintext_content(
+        &mut self,
+        recipient: &ServiceId,
+        plaintext: &PlaintextContent,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let mut devices: HashSet<DeviceId> = self
+            .protocol_store
+            .get_sub_device_sessions(recipient)
+            .await?
+            .into_iter()
+            .collect();
+
+        // always send to the primary device no matter what
+        devices.insert(*DEFAULT_DEVICE_ID);
+
+        // never try to send messages to the sender device
+        match recipient {
+            ServiceId::Aci(aci) => {
+                if *aci == self.local_aci {
+                    devices.remove(&self.device_id);
+                }
+            },
+            ServiceId::Pni(pni) => {
+                if *pni == self.local_pni {
+                    devices.remove(&self.device_id);
+                }
+            },
+        };
+
+        let content = BASE64_RELAXED.encode(plaintext.serialized());
+        let mut messages = vec![];
+        for device_id in devices {
+            let address = recipient.to_protocol_address(device_id);
+            let Some(session) =
+                self.protocol_store.load_session(&address).await?
+            else {
+                trace!("skipping plaintext send to {} (no session)", address);
+                continue;
+            };
+            messages.push(OutgoingPushMessage {
+                r#type: crate::proto::envelope::Type::PlaintextContent as u32,
+                destination_device_id: device_id,
+                destination_registration_id: session
+                    .remote_registration_id()?,
+                content: content.clone(),
+            });
+        }
+
+        if messages.is_empty() {
+            return Err(MessageSenderError::NoMessagesToSend);
+        }
+
+        let SendMessageResponse { needs_sync } = self
+            .identified_ws
+            .send_messages(OutgoingPushMessages {
+                destination: *recipient,
+                timestamp,
+                messages,
+                online: false,
+            })
+            .await?;
+
+        Ok(SentMessage {
+            recipient: *recipient,
+            used_identity_key: self
+                .protocol_store
+                .get_identity(
+                    &recipient.to_protocol_address(*DEFAULT_DEVICE_ID),
+                )
+                .await?
+                .ok_or(MessageSenderError::UntrustedIdentity {
+                    address: *recipient,
+                })?,
+            unidentified: false,
+            needs_sync,
+        })
     }
 
     /// Send a message to the recipients in a group.

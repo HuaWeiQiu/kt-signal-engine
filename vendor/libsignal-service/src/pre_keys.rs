@@ -182,6 +182,9 @@ pub struct PreKeyState {
 
 pub(crate) const PRE_KEY_MINIMUM: u32 = 10;
 pub(crate) const PRE_KEY_BATCH_SIZE: u32 = 100;
+/// Server-count ceiling (official PRE_KEY_MAX_COUNT): above it the whole
+/// one-time set is regenerated, matching official #doUpdateKeys.
+pub(crate) const PRE_KEY_MAX_COUNT: u32 = 200;
 pub(crate) const PRE_KEY_MEDIUM_MAX_VALUE: u32 = 0xFFFFFF;
 
 pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
@@ -189,6 +192,7 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     csprng: &mut R,
     identity_key_pair: &IdentityKeyPair,
     use_last_resort_key: bool,
+    force_new_last_resort: bool,
     pre_key_count: u32,
     kyber_pre_key_count: u32,
 ) -> Result<
@@ -269,7 +273,7 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
                 )
                     .instrument(tracing::trace_span!(parent: &span, "save signed pre key", signed_pre_key_id = ?next_signed_pre_key_id)).await?;
 
-    let pq_last_resort_key = if use_last_resort_key {
+    let pq_last_resort_key = if use_last_resort_key || force_new_last_resort {
         let pre_key_id = (((pq_pre_keys_offset_id + kyber_pre_key_count)
             % (PRE_KEY_MEDIUM_MAX_VALUE - 1))
             + 1)

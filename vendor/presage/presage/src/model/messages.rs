@@ -31,9 +31,17 @@ pub enum DecryptionFailure {
     /// Our own decrypt failed: a serialized `DecryptionErrorMessage` proto
     /// the consumer can send back to the sender so they re-send the original.
     RetryReceipt(Vec<u8>),
-    /// The peer asked us to retry: the timestamp of their failed message,
-    /// embedded in the received `DecryptionErrorMessage`.
-    RetryRequest(u64),
+    /// The peer asked us to retry: the embedded timestamp names their failed
+    /// message; the other fields carry the official archiveSessionOnMatch
+    /// material (handleRetry.preload.ts:338-368): `derm_device_id` names OUR
+    /// device that failed on their side (gate), `requester_device` is the
+    /// DERM sender's device (archive address target).
+    RetryRequest {
+        original_ts: u64,
+        ratchet_key: Option<Vec<u8>>,
+        derm_device_id: u32,
+        requester_device: u32,
+    },
 }
 
 #[derive(Debug)]

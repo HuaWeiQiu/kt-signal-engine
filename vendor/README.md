@@ -94,6 +94,30 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   Signal-Desktop `protos/SignalService.proto:581-605`，含 deprecated
   注释；wire additive-only，field 5/6/7 不与旧四位冲突）；引擎 Blocked
   同步收投影消费面（官方 `_handleBlocked` modern/legacy 家族判定）。
+- `src/sender.rs`（2026-10-11 时序审计组四 E3 批）— 新增 pub
+  `send_plaintext_content`：PlaintextContent（重试回执载体）按官方明文腿
+  直发——Envelope type=8、不做会话加密；设备枚举同
+  `create_encrypted_messages`（sub devices + 主设备 − 自身设备），无会话
+  设备跳过（无会话即解不开原消息，重发请求对它无意义）。官方锚：Desktop
+  requestResend → `PlaintextContent.from(DecryptionErrorMessage.forOriginal
+  (...))` → `sendMessageProtoAndWait{proto: plaintext}`
+  （handleRetry.preload.ts:659-689 / sendResendRequest.preload.ts:114-124），
+  OutgoingMessage.preload.ts:108-121 Plaintext→type 8；libsignal v0.99
+  `message_encrypt` 无明文分支，须 service 层自构 `OutgoingPushMessage`。
+- `src/pre_keys.rs`（2026-10-11 时序审计组四 E1 批）— `replenish_pre_keys`
+  增 `force_new_last_resort` 参数（按龄轮换时无条件新造 last-resort；原
+  逻辑仅首装缺失才生成）；新增 `PRE_KEY_MAX_COUNT = 200` 常量（官方
+  AccountManager.preload.ts:128 同值）。
+- `src/account_manager.rs`（2026-10-11 时序审计组四 E1/E2 批）—
+  ①`rotate_signed_pre_key_bundle` 改走 force 臂：轮换 PUT 同携新 signed +
+  新 last-resort（官方 #doUpdateKeys 同 PUT 携带、双侧 DAY*1.5 轮换龄：
+  AccountManager.preload.ts:115/:141 + #maybeUpdateLastResortKyberKey
+  :868-920）；`publish_fresh_pre_keys` last-resort 上传面改「新生成优先、
+  否则 stored newest-by-timestamp」（原 `last_resort_keys[0]` 按 rowid 取
+  最旧行，多行时会重传旧键——轮换语义顺修）；`update_pre_key_bundle` 传
+  force=false 行为不变。②水位闸补上限臂：服务器计数超 `PRE_KEY_MAX_COUNT`
+  =200 也整批重发（官方 #doUpdateKeys `count < PRE_KEY_MINIMUM ||
+  count > PRE_KEY_MAX_COUNT` 同判，一次性与 kyber 两族同闸）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -194,6 +218,20 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   两条到两个群，第二条不再被吞；线程推不出（try_from 失败）保守沿用旧
   全局抑制；batch_seen 去重键同步加 thread 维度）。单测
   `receive_batch_tests::redelivery_gate_is_thread_scoped`。
+- `presage/src/manager/registered.rs`（2026-10-11 时序审计组四 E3 批追加）—
+  新增 pub `Manager::send_plaintext_content`（单收件人明文腿包装：
+  `new_message_sender` → `MessageSender::send_plaintext_content`；不注入
+  profile key、不 restore thread timer、不落库——重试回执非 timeline
+  消息，官方 sendResendRequest 同口径）。
+- `presage/src/model/messages.rs`（2026-10-11 时序审计组四 E4 批）—
+  `DecryptionFailure::RetryRequest` 从裸 `original_ts` 扩为
+  `{ original_ts, ratchet_key, derm_device_id, requester_device }`（官方
+  RetryRequestEvent 四元：MessageReceiver.preload.ts:2690-2698——
+  derm_device_id = DERM 内嵌 device_id 点名我设备，requester_device =
+  信封源设备即归档地址目标）。
+- `presage/src/manager/registered.rs`（同批）— DERM 收信臂按上述四元构造
+  RetryRequest；DERM 无 timestamp（不点名原消息）改 ack 即弃（不投影，
+  原行为会以 None 失败体上抛）。
 
 `vendor/presage/presage-store-sqlite/`：
 
@@ -243,6 +281,15 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   story 位同款纪律）；批窗重放构造补三 `None`。
 - `src/data.rs`（同批追加）— 重放 Metadata 构造补三 `None`（同上不落库
   纪律）。
+- `migrations/20261011000000_add_pre_key_created_at.sql`（2026-10-11 时序
+  审计组四 E2 批）— `pre_keys` 加 `created_at INTEGER NOT NULL DEFAULT 0`
+  （存量行 0 = 最旧，官方 `createdAt || 0` 同语义，无回填）。
+- `src/protocol.rs`（同批）— ①`save_pre_key` 写 created_at（宏改运行时
+  query，`.sqlx/` 离线缓存不动）；②`SqliteProtocolStore` 增 `kt_` 前缀
+  清单/批量删除六方法：one-time `(id, created_at)`、signed/kyber `(id,
+  记录内嵌时间戳[, is_last_resort])`、三族按 id 批量 remove（kyber 可删
+  last-resort 行，保留窗由调用方裁定）；③`kt_pre_key_inventory_and_bulk_
+  removal` 单测（时间戳/旗标/批量删除钉形）。
 
 ## 更新纪律
 

@@ -26,7 +26,8 @@ use libsignal_service::{
         SyncMessage, Verified,
     },
     protocol::{
-        Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
+        Aci, DeviceId, IdentityKeyStore, PlaintextContent, SenderCertificate, ServiceId,
+        ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
@@ -873,14 +874,34 @@ impl<S: Store> Manager<S, Registered> {
                                             )
                                             .ok();
                                             // KT (DERM): the embedded timestamp names the
-                                            // peer's original message that failed here.
-                                            let failure =
-                                                e.timestamp.map(DecryptionFailure::RetryRequest);
+                                            // peer's original message that failed here;
+                                            // device ids/ratchet_key feed the
+                                            // archive-on-match leg (official
+                                            // RetryRequestEvent:
+                                            // MessageReceiver.preload.ts:2690-2698).
+                                            let failure = match e.timestamp {
+                                                Some(ts) => DecryptionFailure::RetryRequest {
+                                                    original_ts: ts,
+                                                    ratchet_key: e.ratchet_key.clone(),
+                                                    derm_device_id: e.device_id.unwrap_or_default(),
+                                                    requester_device: content
+                                                        .metadata
+                                                        .sender_device
+                                                        .into(),
+                                                },
+                                                // DERM without a timestamp names no
+                                                // original message; nothing to act
+                                                // on — ack and drop (no projection).
+                                                None => {
+                                                    ack.ack();
+                                                    continue;
+                                                }
+                                            };
                                             slots.push(BatchSlot::Ready(
                                                 Received::DecryptionError(
                                                     content.metadata.sender,
                                                     timestamp,
-                                                    failure,
+                                                    Some(failure),
                                                     ack,
                                                 ),
                                             ));
@@ -1509,6 +1530,28 @@ impl<S: Store> Manager<S, Registered> {
             .send_story_message(&recipient, &sender_certificate, content_body, timestamp)
             .await?;
 
+        Ok(())
+    }
+
+    /// KT fork (DERM plaintext leg, E3): send a `PlaintextContent` (the
+    /// resend-request carrier, Envelope type PLAINTEXT_CONTENT) to a single
+    /// recipient without session encryption. Official Desktop sends retry
+    /// requests exactly this way (ts/jobs/helpers/sendResendRequest.preload.ts
+    /// → sendMessageProtoAndWait{proto: plaintext}). Unlike
+    /// [`Self::send_message`] there is no profile-key injection, no
+    /// thread-timer restore and no local save — a resend request is not a
+    /// timeline message.
+    pub async fn send_plaintext_content(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        plaintext: &PlaintextContent,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let recipient = recipient.into();
+        let mut sender = self.new_message_sender().await?;
+        sender
+            .send_plaintext_content(&recipient, plaintext, timestamp)
+            .await?;
         Ok(())
     }
 

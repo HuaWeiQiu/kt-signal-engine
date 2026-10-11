@@ -3640,6 +3640,112 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   权威）。单测 receive_envelope_projects_server_timestamp 钉 dataMessage
   与 editMessage 两体面恒投 + client/server 两时间戳不串。
 
+### 组四批（2026-10-11，时序审计组四 E1-E4 + 组五记档，官方对齐 Signal-Desktop abe80d3，wire additive / 记档）
+
+- **项1 DERM 重试回执明文腿（E3，wire additive）**：审计原文「回执腿走
+  会话加密与官方不符」。求证结论：官方 requestResend
+  （handleRetry.preload.ts:659-689）= `DecryptionErrorMessage.forOriginal`
+  → `PlaintextContent.from` → ResendRequest job → `sendMessageProtoAndWait
+  {proto: plaintext}`（sendResendRequest.preload.ts:114-124），OutgoingMessage
+  对 PlaintextContent 直发 Envelope **type=8 PLAINTEXT_CONTENT**、不经
+  getCiphertextMessage 会话加密（libsignal v0.99 `message_encrypt` 亦无
+  明文分支，须 service 层自构 OutgoingPushMessage）；引擎此前走
+  `send_message(ContentBody::DecryptionErrorMessage)`（type 1/3 会话加密）
+  确与官方不符。落法：vendored libsignal-service `sender.rs` 新增
+  `send_plaintext_content`（设备枚举同 `create_encrypted_messages`：sub
+  devices + 主设备 − 自身；per-device 无会话跳过、有会话取
+  destination_registration_id，content = base64(plaintext.serialized())，
+  type=8 identified ws 发送）；vendored presage `registered.rs` 加同名包装
+  （不注 profile key/不 restore timer/不落库）；引擎 `derm_send_receipt`
+  改 `DecryptionErrorMessage::try_from(receipt)`（timestamp 恒有，缺失即
+  坏回执静默弃）→ `PlaintextContent::from` → 明文腿。wire 变化（additive
+  only）：DERM 重试回执信封 type 1/3 → **8**，体 = `0xC0` 前缀 +
+  Content proto（内嵌原回执字节）+ `0x80` 边界——type 8 接收面官方与
+  引擎 cipher 既有支持，旧版引擎收 type 8 不受影响。偏差登记：无会话
+  设备跳过（无会话即解不开原消息，重发请求无意义）。单测
+  derm_receipt_roundtrip_keeps_timestamp_and_device（坏回执拒收）、
+  derm_plaintext_receipt_wire_shape（0xC0/0x80 钉形 + 对端官方 extract
+  可逆找回）。
+- **项2 signed/last-resort prekey 轮换龄 1.5 天（E1）**：审计原文「轮换
+  龄与官方不符」。求证结论：官方 `SIGNED_PRE_KEY_ROTATION_AGE = DAY*1.5`
+  （AccountManager.preload.ts:141）且 **last-resort kyber 同 1.5 天按龄
+  轮换**（:115 + #maybeUpdateLastResortKyberKey :868-920），轮换 PUT 同携
+  signed + last-resort（#doUpdateKeys）；引擎此前 signed 14 天档且
+  last-resort 从不轮换。落法：engine `prekey.rs` 轮换龄 14d→1.5d
+  （SIGNED_PRE_KEY_MAX_AGE_MS），新增 last-resort 1.5d 判（缺键=归水位
+  补装语义不越权，`last_resort_key_over_age`）；按龄轮换挂 30min
+  quick_check 快拍（1.5d 龄细于 2 天 maintenance 节律，闸纯本地读零成本）
+  + maintenance_tick 保留幂等 + 发送前超龄闸同步收紧；vendored
+  `pre_keys.rs::replenish_pre_keys` 增 `force_new_last_resort`、
+  `account_manager.rs::rotate_signed_pre_key_bundle` 改 force 臂（轮换
+  PUT 同携新 signed + 新 last-resort，官方同 PUT 语义）、
+  `update_pre_key_bundle` 行为不变；顺修 `publish_fresh_pre_keys`
+  last-resort 上传取 `last_resort_keys[0]`（rowid 最旧行）会重传旧键的
+  语义 bug → 新生成优先、否则 stored newest-by-timestamp。偏差登记：
+  官方判据 = 最近 confirmed 键 lastUpdate，我方无 confirmed 位（store
+  先于上传，视 stored = confirmed，记录内嵌时间戳即生成时刻）。单测
+  signed_pre_key_age_gate_matches_official_15d /
+  last_resort_age_gate_matches_official_15d / rotation_due_or_gate。
+- **项3 prekey 服务器上限闸 + 本地保留窗（E2）**：审计原文「缺 >200
+  整批重发与本地清理」。求证结论：官方 `PRE_KEY_MAX_COUNT = 200`
+  （AccountManager.preload.ts:128）——服务器计数 <10 **或** >200 都整批
+  重发（#doUpdateKeys）；本地清理四族 = 一次性 newest 200 + 窗外且超
+  `PRE_KEY_ARCHIVE_AGE`=90d 才删（_cleanPreKeys/_cleanKyberPreKeys
+  :1010-1064）、signed/last-resort newest 5 + 窗外且超
+  getMessageQueueTime()（缺省 30d）删（:897-960/:962-1007）；引擎此前
+  闸只判 `>= PRE_KEY_MINIMUM`、无本地清理。落法：vendored
+  `update_pre_key_bundle` 水位闸补 `<= PRE_KEY_MAX_COUNT` 上限臂（两族
+  同闸，超限走整批重发既有路径）；vendored store-sqlite 新 migration
+  `20261011000000_add_pre_key_created_at.sql`（pre_keys 加 created_at，
+  DEFAULT 0 = 存量行视最旧，官方 `createdAt || 0` 同语义无回填）+
+  `save_pre_key` 写入（宏改运行时 query，`.sqlx/` 缓存不动）+
+  `SqliteProtocolStore` 六个 `kt_` 方法（one-time/signed/kyber 清单 + 三
+  族批量删除，kyber 可删 last-resort 行由调用方裁定）；engine
+  `prekey.rs::cleanup_tick` 四族保留窗扫删（200/90d、5/30d、5/90d 常规
+  kyber、5/30d last-resort），挂 maintenance_tick（轮换后跑，纯本地零网
+  络），`sweep_candidates` 纯函数判删（窗外且够老双条件，窗内/窗外年轻
+  恒活——在役 signed/last-resort 按构造必在窗内）。偏差登记：30d 窗取
+  官方缺省（我方无 remoteConfig 读面）。单测 sweep_candidates_keep_
+  newest_and_age_gate（engine）+ kt_pre_key_inventory_and_bulk_removal
+  （store 级，时间戳/旗标/批量删除钉形）。
+- **项4 DERM 档二兜底细化（E4）**：审计原文「失败路径一律 clear_sessions
+  全设备删除，过重且超限也清，与官方不符」。求证结论：官方 onRetryRequest
+  闸序（handleRetry.preload.ts:129-261）= 防环超限（RETRY_LIMIT=5）**早
+  退无任何会话动作** → archiveSessionOnMatch（:338-368：DERM 内嵌
+  device_id == 我设备 且携 ratchetKey → 比对 (requester, 其发送设备) 会话
+  currentRatchetKeyMatches → 命中归档**该单一地址**）→ 超龄/找不到
+  sentProto → sendDistributionMessageOrNullMessage（:370-440：群+有
+  sender key 台账 → 重发 SKDM；否则归档过才发 NullMessage；否则不做）→
+  找回则重发原 proto（原 timestamp）。落法：presage
+  `DecryptionFailure::RetryRequest` 扩四元 `{original_ts, ratchet_key,
+  derm_device_id, requester_device}`（官方 RetryRequestEvent 四元
+  MessageReceiver.preload.ts:2690-2698；DERM 无 timestamp 改 ack 即弃）；
+  引擎档二重构为官方闸序——超限早退（不再 clear_sessions）、新增
+  archive-on-match 腿（`SessionRecord::current_ratchet_key_matches` +
+  `archive_current_state` 单地址归档回存，任何前置不满足不动会话）、
+  超龄/找不到/不允许 → 兜底面。偏差登记：官方兜底群臂重发 SKDM，我方
+  SKDM 重发臂未建（sender-key 分发只随群发送自然发生）→ 群兜底与直聊
+  同判「归档过发 NullMessage（新会话敲对端促重建），否则不做」，记档
+  待 SKDM 独立重发面立项。单测 derm_archive_on_match_gates_refuse_
+  without_match（五负路径 + 既有会话原封钉形；正路径完全委托上游
+  current_ratchet_key_matches/archive_current_state 原语）。
+- **项5 组通话 join/SFU 断层求证（组五，记档无代码）**：审计原文「群
+  通话 join/SFU 断层」。求证结论：**断层不在 engine**。官方链 joinGroupCall
+  （services/calling.preload.ts:1594-1650）→ connectGroupCall（:1429-1519，
+  RingRTC.getGroupCall + observer requestMembershipProof→fetchMembershipProof
+  →setMembershipProof）→ join()，其中 **sfuUrl = 桌面 app 静态配置**
+  （config/production.json `https://sfu.voip.signal.org/`），非协议面——
+  engine 不欠 sfuUrl 读面（§4.50 不发明无消费方读面纪律）。引擎三层
+  证据全齐：sendCallMessage 群臂 + sendGroupCallUpdate 六问批 + calls.*
+  五材料面（compat §3）；connector 1.82 群信令双向已落
+  （kt-signal-connector implementation-plan.md §4.49.2）；calling sidecar
+  P4a-P4d 全落（kt-signal-calling relay-api-v2.md 台账）。断点在桌面壳
+  接线：relay-api-v2.md §8.3/§8.5 记档的前置①（壳无 groupControl
+  caller）、②（壳无 `call.config` sfuUrl 下发——白名单无配置源全部 SFU
+  HTTP fail-closed `sfu-url-missing`，connect 永停 Connecting）、③（材料
+  链壳↔引擎应答面）——join 即因此不可用。移交：KTAIorg 桌面/壳仓按
+  calling 仓台账补接线；引擎侧无代码变化。
+
 
 ## 6. fake 服务模式（仅测试）
 

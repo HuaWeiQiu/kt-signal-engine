@@ -201,14 +201,17 @@ impl PreKeyStore for SqliteProtocolStore {
     ) -> Result<(), SignalProtocolError> {
         let id: u32 = prekey_id.into();
         let record = record.serialize()?;
-        query!(
-            "INSERT INTO pre_keys (id, identity, record)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT DO UPDATE SET record = ?3",
-            id,
-            self.identity,
-            record,
+        // KT (pre-key cleanup): created_at marks insertion time for the
+        // newest-N retention sweep; 0 on legacy rows reads as oldest.
+        sqlx::query(
+            "INSERT INTO pre_keys (id, identity, record, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT DO UPDATE SET record = ?3, created_at = ?4",
         )
+        .bind(id)
+        .bind(self.identity)
+        .bind(record)
+        .bind(Utc::now().timestamp_millis())
         .execute(&self.store.db)
         .await
         .into_protocol_error()?;
@@ -541,6 +544,124 @@ impl KyberPreKeyStoreExt for SqliteProtocolStore {
         _min_count: usize,
     ) -> Result<(), SignalProtocolError> {
         unimplemented!("should not be used yet")
+    }
+}
+
+// KT (pre-key cleanup, 时序审计组四 E2): inventory + bulk removal backing the
+// engine's newest-N retention sweeps (official _cleanPreKeys/
+// _cleanKyberPreKeys family; runtime queries — no offline prepare cache).
+impl SqliteProtocolStore {
+    /// One-time prekey inventory: `(id, created_at)` ascending by age.
+    /// Legacy rows (pre-migration) carry `created_at = 0` and sort oldest.
+    pub async fn kt_list_one_time_pre_keys(&self) -> Result<Vec<(u32, i64)>, SignalProtocolError> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, created_at FROM pre_keys WHERE identity = ?1
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(self.identity)
+        .fetch_all(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        rows.into_iter()
+            .map(|(id, created_at)| {
+                let id = u32::try_from(id).map_err(|_| {
+                    SignalProtocolError::InvalidState(
+                        "kt_list_one_time_pre_keys",
+                        "pre key id out of u32 range".into(),
+                    )
+                })?;
+                Ok((id, created_at))
+            })
+            .collect()
+    }
+
+    /// Signed prekey inventory: `(id, record-embedded created-at ms)`.
+    pub async fn kt_list_signed_pre_keys(&self) -> Result<Vec<(u32, u64)>, SignalProtocolError> {
+        let rows: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT id, record FROM signed_pre_keys WHERE identity = ?1")
+                .bind(self.identity)
+                .fetch_all(&self.store.db)
+                .await
+                .into_protocol_error()?;
+        rows.into_iter()
+            .map(|(id, record)| {
+                let timestamp = SignedPreKeyRecord::deserialize(&record)?
+                    .timestamp()?
+                    .epoch_millis();
+                Ok((self.u32_id(id)?, timestamp))
+            })
+            .collect()
+    }
+
+    /// Kyber prekey inventory (last-resort rows included, flagged):
+    /// `(id, record-embedded created-at ms, is_last_resort)`.
+    pub async fn kt_list_kyber_pre_keys(
+        &self,
+    ) -> Result<Vec<(u32, u64, bool)>, SignalProtocolError> {
+        let rows: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT id, record, is_last_resort FROM kyber_pre_keys WHERE identity = ?1",
+        )
+        .bind(self.identity)
+        .fetch_all(&self.store.db)
+        .await
+        .into_protocol_error()?;
+        rows.into_iter()
+            .map(|(id, record, is_last_resort)| {
+                let timestamp = KyberPreKeyRecord::deserialize(&record)?
+                    .timestamp()?
+                    .epoch_millis();
+                Ok((self.u32_id(id)?, timestamp, is_last_resort))
+            })
+            .collect()
+    }
+
+    /// Bulk-remove one-time prekeys by id.
+    pub async fn kt_remove_pre_keys(&self, ids: &[u32]) -> Result<(), SignalProtocolError> {
+        for id in ids {
+            sqlx::query("DELETE FROM pre_keys WHERE id = ?1 AND identity = ?2")
+                .bind(id)
+                .bind(self.identity)
+                .execute(&self.store.db)
+                .await
+                .into_protocol_error()?;
+        }
+        Ok(())
+    }
+
+    /// Bulk-remove signed prekeys by id.
+    pub async fn kt_remove_signed_pre_keys(&self, ids: &[u32]) -> Result<(), SignalProtocolError> {
+        for id in ids {
+            sqlx::query("DELETE FROM signed_pre_keys WHERE id = ?1 AND identity = ?2")
+                .bind(id)
+                .bind(self.identity)
+                .execute(&self.store.db)
+                .await
+                .into_protocol_error()?;
+        }
+        Ok(())
+    }
+
+    /// Bulk-remove kyber prekeys by id (any row, last-resort included —
+    /// the caller's retention rule decides what survives).
+    pub async fn kt_remove_kyber_pre_keys(&self, ids: &[u32]) -> Result<(), SignalProtocolError> {
+        for id in ids {
+            sqlx::query("DELETE FROM kyber_pre_keys WHERE id = ?1 AND identity = ?2")
+                .bind(id)
+                .bind(self.identity)
+                .execute(&self.store.db)
+                .await
+                .into_protocol_error()?;
+        }
+        Ok(())
+    }
+
+    fn u32_id(&self, id: i64) -> Result<u32, SignalProtocolError> {
+        u32::try_from(id).map_err(|_| {
+            SignalProtocolError::InvalidState(
+                "kt_pre_key_inventory",
+                "pre key id out of u32 range".into(),
+            )
+        })
     }
 }
 
@@ -953,6 +1074,98 @@ mod test {
         // the new identity.
         protocol_store.save_identity(&address, &new_key).await?;
         assert!(protocol_store.load_session(&address).await?.is_none());
+
+        Ok(())
+    }
+
+    /// KT (pre-key cleanup): inventory reads see all four families with the
+    /// right timestamps/flags; bulk removal deletes exactly the named ids;
+    /// `created_at` is stamped on save (0 only for pre-migration rows).
+    #[tokio::test]
+    async fn kt_pre_key_inventory_and_bulk_removal() -> Result<(), Box<dyn std::error::Error>> {
+        use presage::libsignal_service::pre_keys::KyberPreKeyStoreExt;
+        use presage::libsignal_service::protocol::PreKeyStore;
+
+        let mut rng = rand::rng();
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        // One-time EC: two saves, both stamped.
+        for id in [PreKeyId::from(10), PreKeyId::from(11)] {
+            protocol_store
+                .save_pre_key(id, &PreKeyRecord::new(id, &KeyPair::generate(&mut rng)))
+                .await?;
+        }
+        let one_time = protocol_store.kt_list_one_time_pre_keys().await?;
+        assert_eq!(
+            one_time.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        assert!(one_time.iter().all(|&(_, created_at)| created_at > 0));
+
+        // Signed: embedded timestamp is surfaced.
+        let keypair = KeyPair::generate(&mut rng);
+        let signature = keypair
+            .private_key
+            .calculate_signature(&keypair.public_key.serialize(), &mut rng)?;
+        let signed_timestamp = 1_700_000_000_000u64;
+        let signed = SignedPreKeyRecord::new(
+            SignedPreKeyId::from(1),
+            Timestamp::from_epoch_millis(signed_timestamp),
+            &keypair,
+            &signature,
+        );
+        protocol_store
+            .save_signed_pre_key(SignedPreKeyId::from(1), &signed)
+            .await?;
+        assert_eq!(
+            protocol_store.kt_list_signed_pre_keys().await?,
+            vec![(1, signed_timestamp)]
+        );
+
+        // Kyber: one regular + one last-resort, flagged apart.
+        let kyber_regular = KyberPreKeyRecord::generate(
+            presage::libsignal_service::protocol::kem::KeyType::Kyber1024,
+            KyberPreKeyId::from(20),
+            &keypair.private_key,
+        )?;
+        protocol_store
+            .save_kyber_pre_key(KyberPreKeyId::from(20), &kyber_regular)
+            .await?;
+        let kyber_last_resort = KyberPreKeyRecord::generate(
+            presage::libsignal_service::protocol::kem::KeyType::Kyber1024,
+            KyberPreKeyId::from(21),
+            &keypair.private_key,
+        )?;
+        protocol_store
+            .store_last_resort_kyber_pre_key(KyberPreKeyId::from(21), &kyber_last_resort)
+            .await?;
+        let kyber = protocol_store.kt_list_kyber_pre_keys().await?;
+        assert_eq!(kyber.iter().filter(|(_, _, lr)| *lr).count(), 1);
+        assert!(kyber.iter().all(|&(_, ts, _)| ts > 0));
+
+        // Bulk removal deletes exactly the named ids.
+        protocol_store.kt_remove_pre_keys(&[10]).await?;
+        protocol_store.kt_remove_kyber_pre_keys(&[21]).await?;
+        assert_eq!(
+            protocol_store
+                .kt_list_one_time_pre_keys()
+                .await?
+                .iter()
+                .map(|&(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+        assert!(
+            protocol_store
+                .kt_list_kyber_pre_keys()
+                .await?
+                .iter()
+                .all(|&(_, _, lr)| !lr)
+        );
 
         Ok(())
     }

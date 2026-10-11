@@ -191,9 +191,14 @@ impl AccountManager {
         // locally. If we have more than the server, we should upload them.
         // Currently the trait doesn't allow us to do that, so we just upload the batch size and
         // pray.
+        // KT (E2): beyond the official ceiling the one-time set is also
+        // regenerated (official #doUpdateKeys refreshes when count is
+        // below PRE_KEY_MINIMUM or above PRE_KEY_MAX_COUNT, either family).
         if check_pre_keys
             && (prekey_status.count >= PRE_KEY_MINIMUM
-                && prekey_status.pq_count >= PRE_KEY_MINIMUM)
+                && prekey_status.count <= crate::pre_keys::PRE_KEY_MAX_COUNT
+                && prekey_status.pq_count >= PRE_KEY_MINIMUM
+                && prekey_status.pq_count <= crate::pre_keys::PRE_KEY_MAX_COUNT)
         {
             if protocol_store.signed_pre_keys_count().await? > 0
                 && protocol_store.kyber_pre_keys_count(true).await? > 0
@@ -213,6 +218,7 @@ impl AccountManager {
             protocol_store,
             service_id_kind,
             use_last_resort_key,
+            false,
         )
         .await
     }
@@ -223,25 +229,35 @@ impl AccountManager {
     /// rotates while the one-time counts are healthy, so a published signed
     /// pre-key would otherwise live forever (official clients rotate by age).
     /// Bypasses the gates and publishes a fresh signed pre-key with a
-    /// one-time/pq top-up batch; the last-resort key is left untouched (the
-    /// server keeps whatever is already registered).
+    /// one-time/pq top-up batch; a fresh last-resort kyber key rides the same
+    /// PUT (official #doUpdateKeys carries signed + last-resort together,
+    /// both on DAY*1.5 rotation ages).
     #[tracing::instrument(skip(self, protocol_store))]
     pub async fn rotate_signed_pre_key_bundle<P: PreKeysStore>(
         &mut self,
         protocol_store: &mut P,
         service_id_kind: ServiceIdKind,
     ) -> Result<(), ServiceError> {
-        self.publish_fresh_pre_keys(protocol_store, service_id_kind, false)
-            .await
+        self.publish_fresh_pre_keys(
+            protocol_store,
+            service_id_kind,
+            false,
+            true,
+        )
+        .await
     }
 
     /// The unconditional replenish+publish path shared by the watermark-gated
     /// bundle update and the age-based rotation (refresh+PUT in one step).
+    /// `force_new_last_resort` generates a replacement last-resort kyber key
+    /// even when one is already stored (rotation); the newest stored key is
+    /// uploaded otherwise.
     async fn publish_fresh_pre_keys<P: PreKeysStore>(
         &mut self,
         protocol_store: &mut P,
         service_id_kind: ServiceIdKind,
         use_last_resort_key: bool,
+        force_new_last_resort: bool,
     ) -> Result<(), ServiceError> {
         let identity_key_pair = protocol_store
             .get_identity_key_pair()
@@ -262,22 +278,35 @@ impl AccountManager {
                 &mut rand::rng(),
                 &identity_key_pair,
                 use_last_resort_key && !has_last_resort_key,
+                force_new_last_resort,
                 PRE_KEY_BATCH_SIZE,
                 PRE_KEY_BATCH_SIZE,
             )
             .await?;
 
-        let pq_last_resort_key = if has_last_resort_key {
+        // A freshly generated last-resort key wins over stored ones; the
+        // stored fallback is the newest by timestamp (rotation must not
+        // re-upload an older row).
+        let pq_last_resort_key = if let Some(fresh) = pq_last_resort_key {
+            Some(KyberPreKeyEntity::try_from(fresh)?)
+        } else if has_last_resort_key {
             if last_resort_keys.len() > 1 {
                 tracing::warn!(
-                    "More than one last resort key found; only uploading first"
+                    "More than one last resort key found; uploading newest"
                 );
             }
-            Some(KyberPreKeyEntity::try_from(last_resort_keys[0].clone())?)
+            let newest = last_resort_keys
+                .into_iter()
+                .max_by_key(|key| {
+                    use libsignal_protocol::GenericSignedPreKey as _;
+                    key.timestamp()
+                        .map(|ts| ts.epoch_millis())
+                        .unwrap_or_default()
+                })
+                .expect("has_last_resort_key implies non-empty");
+            Some(KyberPreKeyEntity::try_from(newest)?)
         } else {
-            pq_last_resort_key
-                .map(KyberPreKeyEntity::try_from)
-                .transpose()?
+            None
         };
 
         let identity_key = *identity_key_pair.identity_key();
@@ -778,6 +807,7 @@ impl AccountManager {
                     csprng,
                     &pni_identity_key_pair,
                     true,
+                    false,
                     0,
                     0,
                 )

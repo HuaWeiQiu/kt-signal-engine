@@ -296,6 +296,7 @@ pub async fn link_device<
             csprng,
             &aci_key_pair,
             true,
+            false,
             0,
             0,
         )
@@ -316,6 +317,7 @@ pub async fn link_device<
             csprng,
             &pni_key_pair,
             true,
+            false,
             0,
             0,
         )

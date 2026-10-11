@@ -369,6 +369,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             csprng,
             &aci_identity_key_pair,
             true,
+            false,
             0,
             0,
         )
@@ -384,6 +385,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             csprng,
             &pni_identity_key_pair,
             true,
+            false,
             0,
             0,
         )
