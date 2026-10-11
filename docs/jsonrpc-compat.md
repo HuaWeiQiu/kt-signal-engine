@@ -2814,6 +2814,10 @@ jobs/helpers/sendGroupCallUpdate.preload.ts:23-100。
 预览 + 经链接入群两方法（§3 新行 `previewGroupViaLink`/`joinGroupViaLink`）。
 官方锚：getPreJoinGroupInfo（groups.preload.ts:272）、getGroupFromLink
 （WebAPI.preload.ts:4892）、joinGroupV2ViaLink（conversations.preload.ts:2802）。
+任务书偏差登记两处：①链接密码长度 = **16 字节**（官方
+GROUP_INVITE_LINK_PASSWORD_LENGTH = 16，任务书「32 字节」记述有误，§3
+`generateInviteLinkPassword` 行同源）；②预览端点 = GET 路径后缀（任务书
+「POST v2/groups/join」记述不准确，见下 wire 面对位）。
 
 - **wire 面对位**：预览 = `GET v2/groups/join/<websafe password>`（任务书
   「POST v2/groups/join」记述不准确——官方 urlParameters 是**路径后缀**，
