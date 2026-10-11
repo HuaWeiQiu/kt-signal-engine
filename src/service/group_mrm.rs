@@ -11,6 +11,11 @@
 //! - 目标 < 2、endorsements 缺席、MRM 链路不可用等场景 failover 回
 //!   vendored 逐收件人路径（官方合法 fallback）。
 //! - 409/410 修复循环（missing 建会话、stale/extra 删会话）≤ 2 轮。
+//!
+//! R1 性能对齐（群发稳态 0 次额外 HTTPS，MRM 主请求除外）：群态+GSE 本地
+//! 优先（group_cache 落 kv，官方 2h-2d 窗 + 成员面失效判定），miss 才
+//! fetch；服务器 403（token 过期/成员面漂移）→ 缓存废弃 → 群态+GSE 重取
+//! 一次 → 重试（官方 didRefreshGroupState 同型），再失败 failover。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -160,6 +165,9 @@ fn outcome_failure_of(error: presage::Error<<SqliteStore as Store>::Error>) -> M
 enum MrmSendFailure {
     /// per-recipient 设备面失配（409/410，进修复循环）。
     Mismatched(Vec<ServiceId>),
+    /// GSE token 层拒发（403）：进「刷群态一次→重试」臂（官方
+    /// didRefreshGroupState 同型）。
+    Unauthorized,
     /// 群级：链路/授权不可用，failover 逐收件人路径。
     Fatal,
 }
@@ -180,12 +188,23 @@ pub(crate) async fn dispatch_group_message(
         <[u8; 32]>::try_from(master_key.as_slice()).map_err(|_| SendError::Internal)?,
     );
 
-    // 群态 + GSE 一次取回（fetch 失败回 store 缓存；群不存在 → failover
-    // 走 vendored 的 UnknownGroup 错误面）。
-    let fetched = manager
-        .fetch_group_with_endorsements(&master_key)
-        .await
-        .map_err(super::send_error_of)?;
+    // 群态 + GSE 本地优先（R1）：store 群态 + kv GSE 双校验（官方发送前
+    // 本地读面同位，groupSendEndorsements.preload.ts:363-397），命中即零
+    // 网络；miss/失效才走 fetch（官方失效→刷群态一次→重试同语义，此处刷
+    // 取在发送前完成）。fetch 失败回 store 缓存；群不存在 → failover 走
+    // vendored 的 UnknownGroup 错误面。
+    let fetched =
+        match super::group_cache::cached_group_with_endorsements(manager, &master_key).await {
+            Some(hit) => Some(hit),
+            None => {
+                let fresh = manager
+                    .fetch_group_with_endorsements(&master_key)
+                    .await
+                    .map_err(super::send_error_of)?;
+                super::group_cache::store_endorsements(manager.store(), &master_key, &fresh).await;
+                fresh
+            }
+        };
 
     // DataMessage 注入群上下文（接收方进群线程的唯一依据；B 批审计缺
     // group_v2 的修复，failover 路径同样受益）。
@@ -284,38 +303,44 @@ pub(crate) async fn dispatch_group_message(
         return failover(manager, &master_key, body, timestamp).await;
     }
 
-    // —— GSE token（无 endorsements / 验签失败 → failover）——
-    let Some(endorsement_bytes) = endorsements else {
-        return failover(manager, &master_key, body, timestamp).await;
-    };
-    let token = match build_group_send_token(
-        &endorsement_bytes,
-        &master_key,
-        &mrm_targets,
-        own_aci,
-        super::now_ms(),
-    ) {
-        Ok(token) => token,
-        Err(_) => return failover(manager, &master_key, body, timestamp).await,
-    };
+    // —— GSE token 循环内建（R1 失效→刷一次→重试，官方
+    // profiles.preload.ts:422-425「didRefreshGroupState → 重取再试」同型）：
+    // 服务器 403（GSE token 过期/成员面漂移）→ 废弃 kv 缓存 → 群态+GSE
+    // 重取一次 → 修订 body revision → 重建 token 重试；再 403 → failover。
+    let mut endorsement_bytes = endorsements;
+    let mut gse_refreshed = false;
 
-    // —— 载荷明文：expire 回填 → Content 编码 → pad（循环外一次；修复轮
-    // 只变目标会话面，明文不变）——
+    // —— 载荷明文基准：expire 回填（循环外一次：expire_timer_version 不因
+    // 修复/刷新轮重复自增；各轮按当前 body 现场编码）——
     restore_expire_timer(
         &mut body,
         manager.store().expire_timer(&thread).await.unwrap_or(None),
     );
-    let plaintext = presage::proto::Content {
-        content: Some(presage::proto::content::Content::DataMessage(body.clone())),
-        sender_key_distribution_message: None,
-        pni_signature_message: None,
-    }
-    .encode_to_vec();
 
     // —— 单请求发送 + 409/410 修复循环（每轮重枚举会话设备面并重加密：
     // 修复轮删除/重建会话后，载荷的 per-device 目标集必须跟着变）——
     let mut rounds = 0usize;
     let unregistered: Vec<ServiceId> = loop {
+        let Some(endorsement) = endorsement_bytes.clone() else {
+            return failover(manager, &master_key, body, timestamp).await;
+        };
+        let token = match build_group_send_token(
+            &endorsement,
+            &master_key,
+            &mrm_targets,
+            own_aci,
+            super::now_ms(),
+        ) {
+            Ok(token) => token,
+            Err(_) => return failover(manager, &master_key, body, timestamp).await,
+        };
+        let plaintext = presage::proto::Content {
+            content: Some(presage::proto::content::Content::DataMessage(body.clone())),
+            sender_key_distribution_message: None,
+            pni_signature_message: None,
+        }
+        .encode_to_vec();
+
         let mut destinations: Vec<(ProtocolAddress, SessionRecord)> = Vec::new();
         for target in &mrm_targets {
             let service_id = ServiceId::from(Aci::from(*target));
@@ -393,6 +418,31 @@ pub(crate) async fn dispatch_group_message(
                     info.distribution_id,
                 )
                 .await;
+            }
+            Err(MrmSendFailure::Unauthorized) => {
+                // 官方 refresh-once-retry（profiles.preload.ts:422-425）：
+                // 403 只刷一次；缓存废弃 → 群态+GSE 重取 → 修订 revision →
+                // 下轮重建 token。取回失败/仍 403 → failover 兜底。
+                if gse_refreshed {
+                    return failover(manager, &master_key, body, timestamp).await;
+                }
+                gse_refreshed = true;
+                super::group_cache::invalidate_endorsements(manager.store(), &master_key).await;
+                let refreshed = match manager.fetch_group_with_endorsements(&master_key).await {
+                    Ok(fresh) => fresh,
+                    Err(_) => return failover(manager, &master_key, body, timestamp).await,
+                };
+                super::group_cache::store_endorsements(manager.store(), &master_key, &refreshed)
+                    .await;
+                let Some((fresh_group, fresh_endorsements)) = refreshed else {
+                    return failover(manager, &master_key, body, timestamp).await;
+                };
+                endorsement_bytes = fresh_endorsements;
+                body.group_v2 = Some(GroupContextV2 {
+                    master_key: Some(master_key.clone()),
+                    revision: Some(fresh_group.revision),
+                    group_change: None,
+                });
             }
             Err(MrmSendFailure::Fatal) => {
                 return failover(manager, &master_key, body, timestamp).await;
@@ -522,7 +572,9 @@ async fn send_mrm(
                 ));
             }
             Err(RequestError::Other(MultiRecipientSendFailure::Unauthorized)) => {
-                return Err(MrmSendFailure::Fatal);
+                // GSE token 层拒发（403）：单独分型交发送循环走「刷群态
+                // 一次→重试」臂；直落 Fatal 会白炸 N 个逐收件人请求且不修因。
+                return Err(MrmSendFailure::Unauthorized);
             }
             Err(_) => {
                 // 传输层失败：摘除缓存连接重连一次；仍失败 → failover。

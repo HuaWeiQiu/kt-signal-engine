@@ -95,7 +95,16 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   ⑩（P9）`send_message_with_profile_sharing` 拆面（`send_message` 委托
   恒传 true，行为不变）——`DataMessage.profile_key` 本机注入改调用方闸
   （官方 sendNormalMessage.preload.ts:183-185 profileSharing 位闸同位；
-  `required_protocol_version` 保持无条件 = 线协议字段非同意面）。
+  `required_protocol_version` 保持无条件 = 线协议字段非同意面）；
+  ⑪（P12/R1）`Registered` 增 `groups_manager_cache` 槽位——
+  `groups_manager()` 改为槽位守卫复用（`Registered` 内
+  `Arc<Mutex<Option<GroupsManager>>>`，惰性构建、跨操作复用），内部
+  credentials cache 随之进程级存活：`/v1/certificate/auth/group` 一次
+  拉取 [today, today+7d) 窗口后 6-7 天零凭据请求（官方
+  groupCredentialFetcher 7 天窗对位；原每操作新建
+  `InMemoryCredentialsCache` 必 miss 必发凭据请求）。接收流 init 臂改走
+  `build_groups_manager()`（流内持有独立实例语义不变）；群头像/群发送/
+  fetch_group_with_endorsements 三调用点改守卫解引用，行为面零变化。
 - `presage/src/store.rs` — verified sync 存储路径 Metadata 字面量补
   `story: None`（E2，同上纯编译面）；（B4）`Store::take_identity_changes`
   默认空实现（身份变更日志 drain 面，其他 store 无感）。

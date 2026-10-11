@@ -47,6 +47,9 @@ pub(crate) mod call_links;
 pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
 pub(crate) mod delivery_receipt;
+/// R1 群发本地缓存面：GSE 按群落 kv（官方 2h-2d 窗 + 成员面失效）+ 发送
+/// 面 terminated 探针缓存。稳态群发 0 次额外 HTTPS。
+pub(crate) mod group_cache;
 pub(crate) mod groups;
 pub(crate) mod identity;
 pub(crate) mod prekey;
@@ -1919,9 +1922,12 @@ impl Service {
         Ok((shared, now_ms()))
     }
 
-    /// 发送面终止判定：进程内登记表（本进程见过 terminated change/写面
-    /// 成功）先行；real 模式下服务器群态真值兜底（读面失败不阻塞发送面
-    /// ——网络故障不误伤既有群会话，终止真值以登记表 + 服务器裁决为准）。
+    /// 发送面终止判定（R1 缓存化）：进程内登记表（本进程见过 terminated
+    /// change/写面成功）先行；kv 探针缓存（24h TTL）次之；缓存 miss 才发
+    /// 服务器群态读面并落缓存（读面失败不缓存不阻塞——网络故障不误伤既有
+    /// 群会话，终止真值以登记表 + 服务器裁决为准）。官方发送面只看本地
+    /// conversation.terminated 标志从不逐发送探测（shouldSendToConversation
+    /// 同位），本缓存即该本地标志面；稳态群发 0 次探针 HTTPS。
     async fn send_target_terminated(&self, account: &str, group_id: &str) -> bool {
         if self.terminated_groups.contains(group_id) {
             return true;
@@ -1935,10 +1941,7 @@ impl Service {
         let Ok(context) = storage_context(self, account).await else {
             return false;
         };
-        matches!(
-            groups::fetch_group_state_for_send(&context, &master_key).await,
-            Some(true)
-        )
+        group_cache::cached_terminated_probe(&context, &master_key).await
     }
 
     /// terminateGroup（群终止，KT 扩展方法）：幂等判定 → 群凭据 →

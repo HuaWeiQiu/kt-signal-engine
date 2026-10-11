@@ -505,6 +505,7 @@ pub(crate) async fn terminate_group(
     }
     if terminated {
         registry.register(&group_id);
+        super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
         return Ok(());
     }
     let authorization = group_authorization(context, master_key).await?;
@@ -515,6 +516,7 @@ pub(crate) async fn terminate_group(
     )
     .await?;
     registry.register(&group_id);
+    super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
     Ok(())
 }
 
@@ -774,6 +776,7 @@ pub(crate) async fn update_group_change(
     }
     patch_group(&context.push, authorization, &actions).await?;
     refresh_local_group_state(context, master_key).await;
+    super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
     Ok(())
 }
 
@@ -807,6 +810,7 @@ pub(crate) async fn leave_group(
     let authorization = group_authorization(context, master_key).await?;
     patch_group(&context.push, authorization, &actions).await?;
     refresh_local_group_state(context, master_key).await;
+    super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
     Ok(())
 }
 

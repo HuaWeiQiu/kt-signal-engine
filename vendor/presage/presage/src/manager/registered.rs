@@ -81,6 +81,13 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    // KT (group credentials reuse): GroupsManager slot so the credentials
+    // cache survives across group operations on this manager (official
+    // Desktop keeps group credentials in persistent storage with a 7-day
+    // request window; a fresh `InMemoryCredentialsCache` per operation made
+    // every group fetch re-request /v1/certificate/auth/group).
+    pub(crate) groups_manager_cache:
+        Arc<Mutex<Option<GroupsManager<InMemoryCredentialsCache>>>>,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -99,6 +106,7 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            groups_manager_cache: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -504,7 +512,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut gm = Box::pin(self.groups_manager()).await?;
         let Some(group) = upsert_group(
             &self.store,
-            &mut gm,
+            &mut *gm,
             context.master_key(),
             &context.revision(),
         )
@@ -576,7 +584,30 @@ impl<S: Store> Manager<S, Registered> {
         Ok(Some(avatar))
     }
 
+    /// KT (group credentials reuse): shared GroupsManager behind a per-manager
+    /// slot — the credentials cache inside it persists across calls, matching
+    /// the official groupCredentialFetcher window (one
+    /// /v1/certificate/auth/group request covering [today, today+7d) serves
+    /// subsequent operations until the window rolls over).
     async fn groups_manager(
+        &self,
+    ) -> Result<
+        tokio::sync::MappedMutexGuard<'_, GroupsManager<InMemoryCredentialsCache>>,
+        Error<S::Error>,
+    > {
+        let mut slot = self.state.groups_manager_cache.lock().await;
+        if slot.is_none() {
+            *slot = Some(Box::pin(self.build_groups_manager()).await?);
+        }
+        Ok(tokio::sync::MutexGuard::map(
+            slot,
+            |slot: &mut Option<GroupsManager<InMemoryCredentialsCache>>| {
+                slot.as_mut().expect("groups manager slot just filled")
+            },
+        ))
+    }
+
+    async fn build_groups_manager(
         &self,
     ) -> Result<GroupsManager<InMemoryCredentialsCache>, Error<S::Error>> {
         let service_configuration = self.state.service_configuration();
@@ -703,7 +734,7 @@ impl<S: Store> Manager<S, Registered> {
             message_receiver: MessageReceiver::new(identified_push_service),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
-            groups_manager: Box::pin(self.groups_manager()).await?,
+            groups_manager: Box::pin(self.build_groups_manager()).await?,
             service_ids: self.state.data.service_ids.clone(),
             message_sender: self.new_message_sender().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
@@ -1369,20 +1400,24 @@ impl<S: Store> Manager<S, Registered> {
 
         let mut sender = self.new_message_sender().await?;
 
-        let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        // KT (group send semantics): message sends refresh the group state
-        // first (the u32::MAX revision comparison always triggers the fetch),
-        // so the recipient list no longer eats stale memberships; a failed
-        // fetch falls back to the stored group (fail-open). Typing stays on
-        // the local state — official typing carries no group fetch.
-        let revision = if group_refresh_needed(&content_body) {
-            u32::MAX
-        } else {
-            0
+        // Slot guard scoped: the manager store is taken &mut below for the
+        // outgoing transcript save.
+        let upserted = {
+            let mut groups_manager = Box::pin(self.groups_manager()).await?;
+            // KT (group send semantics): message sends refresh the group state
+            // first (the u32::MAX revision comparison always triggers the fetch),
+            // so the recipient list no longer eats stale memberships; a failed
+            // fetch falls back to the stored group (fail-open). Typing stays on
+            // the local state — official typing carries no group fetch.
+            let revision = if group_refresh_needed(&content_body) {
+                u32::MAX
+            } else {
+                0
+            };
+            upsert_group(&self.store, &mut *groups_manager, &master_key_bytes, &revision)
+                .await?
         };
-        let Some(group) =
-            upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &revision).await?
-        else {
+        let Some(group) = upserted else {
             return Err(Error::UnknownGroup);
         };
 
