@@ -313,21 +313,28 @@ pub(crate) fn build_add_members_change(
 }
 
 /// removeMembers change 合成核心（官方 buildDeleteMemberChange/
-/// buildDeletePendingMemberChange 行为对齐，群写面 P4 批）：version =
+/// buildDeletePendingMemberChange/buildDeletePendingAdminApprovalMemberChange
+/// 行为对齐，群写面 P4 批 + P15b 审计项6 审批 deny 臂）：version =
 /// revision + 1（饱和不回卷）；全成员目标 = delete_members（vendored
 /// build_remove_member_action，deleted_user_id = ACI 加密）；待邀目标 =
 /// delete_members_pending_profile_key（vendored
-/// build_remove_pending_member_action，ServiceId 直通加密）。目标分类（成
-/// 员面 vs 待邀面）由调用方按群态读面裁定后分流传入。与 update_group_change
-/// 属性臂合成单 Actions（同 version 多 action）单次 PATCH（§5 合成裁定顺
-/// 延）；banned-unban 配对不入本批（§5 P3 批同口径）。
+/// build_remove_pending_member_action，ServiceId 直通加密）；审批申请者
+/// 目标 = delete_members_pending_admin_approval（deleted_user_id = ACI
+/// 加密，官方桌面 denyPendingMembershipFromGroupV2 / signal-cli
+/// GroupV2Helper.refuseJoinRequestMembers 同位——removeMembers 共享数组
+/// 三向判别的第三臂，§5 审计项6 批）。目标分类（成员/待邀/申请者面）由
+/// 调用方按群态读面裁定后分流传入。与 update_group_change 属性臂合成单
+/// Actions（同 version 多 action）单次 PATCH（§5 合成裁定顺延）；
+/// banned-unban 配对不入本批（§5 P3 批同口径）。
 pub(crate) fn build_remove_members_change(
     secret_params: &GroupSecretParams,
     revision: u32,
     members: &[presage::libsignal_service::protocol::Aci],
     pendings: &[presage::libsignal_service::protocol::ServiceId],
+    requesting: &[presage::libsignal_service::protocol::Aci],
 ) -> Result<presage::proto::group_change::Actions, TerminateError> {
     use presage::libsignal_service::groups_v2::GroupOperations;
+    use presage::libsignal_service::zkgroup;
     let operations = GroupOperations::new(*secret_params);
     let mut actions = presage::proto::group_change::Actions {
         source_user_id: Vec::new(),
@@ -347,6 +354,15 @@ pub(crate) fn build_remove_members_change(
             operations
                 .build_remove_pending_member_action(*service_id)
                 .map_err(|_| TerminateError::Failed { status: None })?,
+        );
+    }
+    for aci in requesting {
+        actions.delete_members_pending_admin_approval.push(
+            presage::proto::group_change::actions::DeleteMemberPendingAdminApprovalAction {
+                deleted_user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id((*aci).into()),
+                ),
+            },
         );
     }
     Ok(actions)
@@ -992,8 +1008,12 @@ async fn upload_group_avatar(
 /// Replace 臂先走上行链（官方 buildUpdateAttributesChange 同序：uploadAvatar
 /// 在 change 上送之前）→ 群凭据 → 单 Actions（同 version 多 action：属性臂
 /// 加 add/delete 成员臂）单次 PATCH。removeMembers 分类：群态 members 面
-/// 取 delete_members、pending 面取 delete_members_pending_profile_key、两
-/// 者皆非取 UnknownGroup（官方桌面 buildDeleteMemberChange 不设防的 GUI 前
+/// 取 delete_members、pending 面取 delete_members_pending_profile_key、
+/// 审批申请者（requesting）面取 delete_members_pending_admin_approval
+///（P15b 审计项6 审批 deny 臂，官方 denyPendingMembershipFromGroupV2 /
+/// signal-cli GroupV2Helper.refuseJoinRequestMembers 三向判别同构——此前
+/// requesting 目标落整拒臂，connector §4.53 refuse 流端到端断链）、三者
+/// 皆非取 UnknownGroup（官方桌面 buildDeleteMemberChange 不设防的 GUI 前
 /// 置，API 面整拒不静默）。avatar 链失败 = AvatarUpload（伴生 expiration/
 /// title/成员面未提交，GROUP_AVATAR_UPLOAD_FAILED data.textSaved=false 诚
 /// 实呈现）；PATCH 面失败维持 Failed/Unavailable 四码。写后本地群态刷新
@@ -1083,13 +1103,16 @@ pub(crate) async fn update_group_change(
     };
     let mut remove_member_acis: Vec<Aci> = Vec::new();
     let mut remove_pending_ids: Vec<ServiceId> = Vec::new();
+    let mut remove_requesting_acis: Vec<Aci> = Vec::new();
     if let Some(group) = group.as_ref() {
         for entry in &remove_members {
             let service_id = resolve_group_member(&context.store, entry)
                 .await
                 .ok_or(TerminateError::UnknownGroup)?;
             let already_listed = match service_id {
-                ServiceId::Aci(aci) => remove_member_acis.contains(&aci),
+                ServiceId::Aci(aci) => {
+                    remove_member_acis.contains(&aci) || remove_requesting_acis.contains(&aci)
+                }
                 ServiceId::Pni(_) => false,
             } || remove_pending_ids.contains(&service_id);
             if already_listed {
@@ -1105,6 +1128,19 @@ pub(crate) async fn update_group_change(
                     .any(|pending| pending.address == service_id) =>
                 {
                     remove_pending_ids.push(service_id);
+                }
+                // 审批申请者面（P15b 审计项6 审批 deny 臂，官方
+                // denyPendingMembershipFromGroupV2 /
+                // GroupV2Helper.refuseJoinRequestMembers 三向判别第三臂）：
+                // requesting 目标 = delete_members_pending_admin_approval，
+                // 此前落整拒 臂 → connector §4.53 refuse 流端到端断链。
+                ServiceId::Aci(aci)
+                    if group
+                        .members_pending_admin_approval
+                        .iter()
+                        .any(|requesting| requesting.aci == aci) =>
+                {
+                    remove_requesting_acis.push(aci);
                 }
                 _ => return Err(TerminateError::UnknownGroup),
             }
@@ -1141,16 +1177,22 @@ pub(crate) async fn update_group_change(
         actions.add_members = member_actions.add_members;
         actions.add_members_pending_profile_key = member_actions.add_members_pending_profile_key;
     }
-    if !remove_member_acis.is_empty() || !remove_pending_ids.is_empty() {
+    if !remove_member_acis.is_empty()
+        || !remove_pending_ids.is_empty()
+        || !remove_requesting_acis.is_empty()
+    {
         let remove_actions = build_remove_members_change(
             &secret_params,
             revision,
             &remove_member_acis,
             &remove_pending_ids,
+            &remove_requesting_acis,
         )?;
         actions.delete_members = remove_actions.delete_members;
         actions.delete_members_pending_profile_key =
             remove_actions.delete_members_pending_profile_key;
+        actions.delete_members_pending_admin_approval =
+            remove_actions.delete_members_pending_admin_approval;
     }
     patch_group(&context.push, authorization, &actions).await?;
     refresh_local_group_state(context, master_key).await;
@@ -3370,10 +3412,13 @@ mod tests {
         assert!(!actions.add_members[0].join_from_invite_link);
     }
 
-    /// removeMembers change（群写面 P4 批）：全成员目标 = delete_members
-    ///（vendored build_remove_member_action，deleted_user_id = ACI 加密可回
-    /// 读）、待邀目标 = delete_members_pending_profile_key（ServiceId 直通
-    /// 加密）；version = revision + 1；其余 action 全部缺席。
+    /// removeMembers change（群写面 P4 批 + P15b 审计项6 审批 deny 臂）：
+    /// 全成员目标 = delete_members（vendored build_remove_member_action，
+    /// deleted_user_id = ACI 加密可回读）、待邀目标 =
+    /// delete_members_pending_profile_key（ServiceId 直通加密）、审批申请
+    /// 者目标 = delete_members_pending_admin_approval（deleted_user_id =
+    /// ACI 加密可回读，官方 buildDeletePendingAdminApprovalMemberChange 同
+    /// 形）；version = revision + 1；其余 action 全部缺席。
     #[test]
     fn remove_members_change_shapes() {
         use presage::libsignal_service::protocol::{Aci, ServiceId};
@@ -3386,12 +3431,21 @@ mod tests {
         let pending_pni =
             ServiceId::parse_from_service_id_string("PNI:eeee2222-3333-4444-5555-666677778888")
                 .expect("PNI parses");
-        let actions =
-            build_remove_members_change(&secret_params, 20, &[member_aci], &[pending_pni])
-                .expect("builds");
+        let requesting_aci = Aci::from(uuid::Uuid::from_u128(
+            0xffff_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let actions = build_remove_members_change(
+            &secret_params,
+            20,
+            &[member_aci],
+            &[pending_pni],
+            &[requesting_aci],
+        )
+        .expect("builds");
         assert_eq!(actions.version, 21);
         assert_eq!(actions.delete_members.len(), 1);
         assert_eq!(actions.delete_members_pending_profile_key.len(), 1);
+        assert_eq!(actions.delete_members_pending_admin_approval.len(), 1);
         assert_eq!(
             secret_params
                 .decrypt_service_id(
@@ -3413,6 +3467,18 @@ mod tests {
                 .expect("decrypts"),
             pending_pni,
             "pending.deleted_user_id 加密回读对账"
+        );
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(
+                        &actions.delete_members_pending_admin_approval[0].deleted_user_id
+                    )
+                    .expect("ciphertext")
+                )
+                .expect("decrypts"),
+            ServiceId::Aci(requesting_aci),
+            "deny.deleted_user_id 加密回读对账（P15b 审计项6 deny 臂）"
         );
         assert!(actions.add_members.is_empty());
         assert!(actions.terminate_group.is_none());
