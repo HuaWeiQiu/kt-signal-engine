@@ -3326,13 +3326,16 @@ fn reconnect_backoff_delay(step: u32) -> Duration {
     Duration::from_millis(b.min(CAP_MS))
 }
 
-/// 退避 ±5s jitter（官方 BackOff.std 同幅度），下限 500ms 防 0/负间隔。
+/// 退避 jitter（官方 BackOff.get 同语义）：`jitter < result` 才叠加
+/// `random()*jitter` 且单向正值——短拍（≤5s 档，含首拍 1s 与 5s 档）
+/// 恒精确不被 jitter 拖慢，长拍单向上浮消重连峰。
 fn reconnect_jittered_delay(base: Duration) -> Duration {
-    const JITTER_MS: i64 = 5_000;
-    const FLOOR_MS: u64 = 500;
-    let jitter: i64 = rng().random_range(-JITTER_MS..=JITTER_MS);
-    let ms = base.as_millis() as i64 + jitter;
-    Duration::from_millis(ms.clamp(FLOOR_MS as i64, i64::MAX) as u64)
+    const JITTER_MS: u64 = 5_000;
+    if base.as_millis() <= JITTER_MS as u128 {
+        return base;
+    }
+    let jitter: u64 = rng().random_range(0..JITTER_MS);
+    base + Duration::from_millis(jitter)
 }
 
 /// 发送证书后台预轮换（止血批③，官方 Desktop 1h 轮换缓冲同语义）：周期
@@ -10643,16 +10646,28 @@ mod tests {
         assert_eq!(ms(50), 55_000, "封顶后不增长");
     }
 
-    /// 退避 jitter ±5s 界内（官方 BackOff.std 同幅度），下限 500ms。
+    /// 退避 jitter（P12/R5，官方 BackOff.get 同语义）：≤5s 档（含首拍
+    /// 1s）恒精确；>5s 单向上浮 [base, base+5s)，不下行。
     #[test]
-    fn reconnect_jitter_stays_bounded_with_floor() {
-        for base_ms in [0u64, 500, 1_000, 55_000] {
+    fn reconnect_jitter_matches_official_short_exact_long_upward() {
+        for base_ms in [0u64, 500, 1_000, 5_000] {
             for _ in 0..50 {
                 let delay = reconnect_jittered_delay(Duration::from_millis(base_ms));
-                let floor = 500u128;
-                let cap = (base_ms as u128 + 5_000).max(floor);
-                assert!(delay.as_millis() >= floor, "base={base_ms} delay={delay:?}");
-                assert!(delay.as_millis() <= cap, "base={base_ms} delay={delay:?}");
+                assert_eq!(
+                    delay,
+                    Duration::from_millis(base_ms),
+                    "短拍必须精确：base={base_ms} delay={delay:?}"
+                );
+            }
+        }
+        for base_ms in [8_000u64, 55_000] {
+            for _ in 0..50 {
+                let delay = reconnect_jittered_delay(Duration::from_millis(base_ms)).as_millis();
+                assert!(delay >= base_ms as u128, "base={base_ms} delay={delay}");
+                assert!(
+                    delay < base_ms as u128 + 5_000,
+                    "base={base_ms} delay={delay}"
+                );
             }
         }
     }
