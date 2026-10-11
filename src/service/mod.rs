@@ -4184,15 +4184,16 @@ async fn project_content(
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
                 }
-                // Q6②：deleteForMe 收包投影（SyncContent.deleteForMe=22，本机
-                // 「为我删除」多设备同步）：vendored 接收面已对 presage store
-                // 做 delete_message 消费（registered.rs save_message 臂）且
-                // Received::Content 无条件上抛，引擎投影给 connector 供其删
-                // 自有库行。v1 只投 messageDeletes 臂（vendored 消费面同界）；
-                // conversationDeletes/localOnlyConversationDeletes/
-                // attachmentDeletes 三型不投（§5 gap 登记）。作者不可解析条目
-                // 丢弃（vendored store 面 warn-and-continue 同口径）；无有效
-                // 条目整信封丢弃。
+                // Q6② + P15a 项1：deleteForMe 收包投影（SyncContent.
+                // deleteForMe=22，本机「为我删除」多设备同步）：vendored 接收
+                // 面已对 presage store 做 messageDeletes 消费（registered.rs
+                // save_message 臂）且 Received::Content 无条件上抛，引擎投影
+                // 给 connector 供其删自有库行。P15a 项1 补整会话清除族两臂
+                // （官方 handleDeleteForMeSync conversationDeletes/
+                // localOnlyConversationDeletes 同位，桌面会话清除同步面）；
+                // attachmentDeletes 臂仍不投（§5 gap 登记）。作者不可解析条
+                // 目丢弃（vendored store 面 warn-and-continue 同口径）；无有
+                // 效条目整信封丢弃。
                 Some(presage::proto::sync_message::Content::DeleteForMe(delete)) => {
                     let Some(projection) = project_delete_for_me(delete) else {
                         return Vec::new();
@@ -5806,13 +5807,22 @@ fn contact_field_type_word(field_type: Option<i32>) -> &'static str {
     }
 }
 
-/// DeleteForMe 投影（Q6②，compat 批块）：messageDeletes 臂逐组投影——
-/// `[{conversationId?, messages: [{author, timestamp}]}]`。author 二进制
-/// （ACI/PNI 16/17B）优先、字符串/e164 直通；author 不可解析或 messages 组
-/// 清空后丢弃（宁缺勿错）；conversation 见
-/// `delete_for_me_conversation_id`（缺席键不在）。全组无效 → None（调用方
-/// 整信封丢弃）。
+/// DeleteForMe 投影（Q6② + P15a 项1，compat 批块）：messageDeletes 臂逐组
+/// 投影——`[{conversationId?, messages: [{author, timestamp}]}]`（组无
+/// conversation 照投、conversationId 键省略——Q6② 既有口径不动）；
+/// conversationDeletes 臂（官方 handleDeleteForMeSync 同位
+/// MessageReceiver.preload.ts:3658-3697）——`[{conversationId,
+/// isFullDelete, mostRecentMessages, mostRecentNonExpiringMessages}]`，
+/// conversation 缺席或 mostRecentMessages 清空整组丢（官方 warn-drop 同
+/// 口径），isFullDelete 官方 Boolean() 恒布尔；localOnlyConversationDeletes
+/// 臂（:3699-3722）——`[{conversationId}]`，conversation 缺席丢。
+/// attachmentDeletes 臂不投（§5 gap 登记）。author 二进制（ACI/PNI 16/17B）
+/// 优先、字符串/e164 直通；author 不可解析条目丢弃（vendored store 面
+/// warn-and-continue 同口径）。全部臂皆无有效条目 → None（调用方整信封
+/// 丢弃，官方「Nothing found in sync message」throw 同口径）。
 fn project_delete_for_me(delete: &presage::proto::sync_message::DeleteForMe) -> Option<Value> {
+    let mut face = serde_json::Map::new();
+
     let groups: Vec<Value> = delete
         .message_deletes
         .iter()
@@ -5820,37 +5830,101 @@ fn project_delete_for_me(delete: &presage::proto::sync_message::DeleteForMe) -> 
             let messages: Vec<Value> = group
                 .messages
                 .iter()
-                .filter_map(|message| {
-                    let author = match message.author.as_ref()? {
-                        presage::proto::addressable_message::Author::AuthorServiceId(id) => {
-                            Some(id.clone()).filter(|id| !id.is_empty())
-                        }
-                        presage::proto::addressable_message::Author::AuthorServiceIdBinary(
-                            bytes,
-                        ) => ServiceId::parse_from_service_id_binary(bytes)
-                            .map(|sid| sid.service_id_string()),
-                        presage::proto::addressable_message::Author::AuthorE164(number) => {
-                            Some(number.clone()).filter(|number| !number.is_empty())
-                        }
-                    }?;
-                    Some(json!({
-                        "author": author,
-                        "timestamp": message.sent_timestamp.unwrap_or(0),
-                    }))
-                })
+                .filter_map(project_delete_for_me_message)
                 .collect();
             if messages.is_empty() {
                 return None;
             }
-            let mut face = serde_json::Map::new();
+            let mut item = serde_json::Map::new();
             if let Some(conversation) = delete_for_me_conversation_id(&group.conversation) {
-                face.insert("conversationId".into(), json!(conversation));
+                item.insert("conversationId".into(), json!(conversation));
             }
-            face.insert("messages".into(), Value::Array(messages));
-            Some(Value::Object(face))
+            item.insert("messages".into(), Value::Array(messages));
+            Some(Value::Object(item))
         })
         .collect();
-    (!groups.is_empty()).then_some(json!({ "messageDeletes": groups }))
+    if !groups.is_empty() {
+        face.insert("messageDeletes".into(), Value::Array(groups));
+    }
+
+    let conversation_deletes: Vec<Value> = delete
+        .conversation_deletes
+        .iter()
+        .filter_map(|group| {
+            let conversation = delete_for_me_conversation_id(&group.conversation)?;
+            let most_recent: Vec<Value> = group
+                .most_recent_messages
+                .iter()
+                .filter_map(project_delete_for_me_message)
+                .collect();
+            if most_recent.is_empty() {
+                return None;
+            }
+            let non_expiring: Vec<Value> = group
+                .most_recent_non_expiring_messages
+                .iter()
+                .filter_map(project_delete_for_me_message)
+                .collect();
+            let mut item = serde_json::Map::new();
+            item.insert("conversationId".into(), json!(conversation));
+            item.insert(
+                "isFullDelete".into(),
+                json!(group.is_full_delete.unwrap_or(false)),
+            );
+            item.insert("mostRecentMessages".into(), Value::Array(most_recent));
+            item.insert(
+                "mostRecentNonExpiringMessages".into(),
+                Value::Array(non_expiring),
+            );
+            Some(Value::Object(item))
+        })
+        .collect();
+    if !conversation_deletes.is_empty() {
+        face.insert(
+            "conversationDeletes".into(),
+            Value::Array(conversation_deletes),
+        );
+    }
+
+    let local_only: Vec<Value> = delete
+        .local_only_conversation_deletes
+        .iter()
+        .filter_map(|group| {
+            let conversation = delete_for_me_conversation_id(&group.conversation)?;
+            let mut item = serde_json::Map::new();
+            item.insert("conversationId".into(), json!(conversation));
+            Some(Value::Object(item))
+        })
+        .collect();
+    if !local_only.is_empty() {
+        face.insert(
+            "localOnlyConversationDeletes".into(),
+            Value::Array(local_only),
+        );
+    }
+
+    (!face.is_empty()).then_some(Value::Object(face))
+}
+
+/// DeleteForMe AddressableMessage 投影单点：{author, timestamp}（author
+/// 二进制优先、字符串/e164 直通、不可解析 None；timestamp 缺省 0——Q6②
+/// 既有口径）。
+fn project_delete_for_me_message(message: &presage::proto::AddressableMessage) -> Option<Value> {
+    let author = match message.author.as_ref()? {
+        presage::proto::addressable_message::Author::AuthorServiceId(id) => {
+            Some(id.clone()).filter(|id| !id.is_empty())
+        }
+        presage::proto::addressable_message::Author::AuthorServiceIdBinary(bytes) => {
+            ServiceId::parse_from_service_id_binary(bytes).map(|sid| sid.service_id_string())
+        }
+        presage::proto::addressable_message::Author::AuthorE164(number) => {
+            Some(number.clone()).filter(|number| !number.is_empty())
+        }
+    }?;
+    Some(json!({
+        "author": author,
+        "timestamp": message.sent_timestamp.unwrap_or(0),
+    }))
 }
 
 /// DeleteForMe 会话标识（ConversationIdentifier oneof）：serviceId/binary →
@@ -13218,6 +13292,162 @@ mod tests {
                 .unwrap(),
                 ..metadata
             },
+        );
+        assert!(project_content("acct", &store, &content, &registry)
+            .await
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// P15a 项1 deleteForMe 整会话清除族收包投影：conversationDeletes（
+    /// isFullDelete 布尔/mostRecentMessages 清空整组丢/mostRecentNonExpiring
+    /// Messages 空数组照投）、localOnlyConversationDeletes（conversation
+    /// 必需）、多臂同投、全坏整信封丢。
+    #[tokio::test]
+    async fn sync_projects_delete_for_me_conversation_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::sync_message::delete_for_me::{
+            ConversationDelete, LocalOnlyConversationDelete,
+        };
+        use presage::proto::{
+            sync_message, AddressableMessage, ConversationIdentifier, SyncMessage,
+        };
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-dfm-conversations-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let aci = |text: &str| {
+            ServiceId::parse_from_service_id_string(text)
+                .unwrap()
+                .raw_uuid()
+                .as_bytes()
+                .to_vec()
+        };
+        let author = |bytes: Vec<u8>, ts: u64| AddressableMessage {
+            author: Some(presage::proto::addressable_message::Author::AuthorServiceIdBinary(bytes)),
+            sent_timestamp: Some(ts),
+        };
+        let conversation = |bytes: Vec<u8>| ConversationIdentifier {
+            identifier: Some(
+                presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes),
+            ),
+        };
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe {
+                        conversation_deletes: vec![
+                            ConversationDelete {
+                                conversation: Some(conversation(aci(
+                                    "9d0e5f1a-2b3c-4d5e-8f60-7a8b9c0d1e2f",
+                                ))),
+                                most_recent_messages: vec![
+                                    author(
+                                        aci("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"),
+                                        1_699_999_000_000,
+                                    ),
+                                    // 坏作者条目丢弃，组内仍有有效成员。
+                                    AddressableMessage {
+                                        author: None,
+                                        sent_timestamp: Some(1_699_999_000_100),
+                                    },
+                                ],
+                                is_full_delete: Some(true),
+                                most_recent_non_expiring_messages: vec![],
+                            },
+                            // mostRecentMessages 清空 → 整组丢（官方同口径）。
+                            ConversationDelete {
+                                conversation: Some(conversation(aci(
+                                    "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283",
+                                ))),
+                                most_recent_messages: vec![],
+                                is_full_delete: Some(false),
+                                most_recent_non_expiring_messages: vec![],
+                            },
+                        ],
+                        local_only_conversation_deletes: vec![
+                            LocalOnlyConversationDelete {
+                                conversation: Some(conversation(aci(
+                                    "7c8d9e0f-1a2b-4c3d-9e4f-5a6b7c8d9e0f",
+                                ))),
+                            },
+                            // conversation 缺席 → 丢（官方 No target
+                            // conversation 同口径）。
+                            LocalOnlyConversationDelete { conversation: None },
+                        ],
+                        ..sync_message::DeleteForMe::default()
+                    },
+                )),
+                ..SyncMessage::default()
+            }),
+            metadata.clone(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "deleteForMe conversations project",
+        )["params"]["envelope"]
+            .clone();
+        let face = &envelope["syncMessage"]["deleteForMe"];
+        let deletes = face["conversationDeletes"].as_array().expect("deletes");
+        assert_eq!(deletes.len(), 1, "mostRecentMessages 清空组丢弃");
+        assert_eq!(
+            deletes[0]["conversationId"],
+            json!("9d0e5f1a-2b3c-4d5e-8f60-7a8b9c0d1e2f")
+        );
+        assert_eq!(deletes[0]["isFullDelete"], json!(true));
+        assert_eq!(
+            deletes[0]["mostRecentMessages"],
+            json!([{ "author": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "timestamp": 1_699_999_000_000_u64 }])
+        );
+        assert_eq!(deletes[0]["mostRecentNonExpiringMessages"], json!([]));
+        let local_only = face["localOnlyConversationDeletes"]
+            .as_array()
+            .expect("local only");
+        assert_eq!(local_only.len(), 1, "conversation 缺席条目丢弃");
+        assert_eq!(
+            local_only[0]["conversationId"],
+            json!("7c8d9e0f-1a2b-4c3d-9e4f-5a6b7c8d9e0f")
+        );
+        assert!(face.get("messageDeletes").is_none(), "缺席臂键不在");
+
+        // 全坏（清除族条目全部无效）→ 整信封丢弃。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe {
+                        local_only_conversation_deletes: vec![LocalOnlyConversationDelete {
+                            conversation: None,
+                        }],
+                        ..sync_message::DeleteForMe::default()
+                    },
+                )),
+                ..SyncMessage::default()
+            }),
+            metadata,
         );
         assert!(project_content("acct", &store, &content, &registry)
             .await

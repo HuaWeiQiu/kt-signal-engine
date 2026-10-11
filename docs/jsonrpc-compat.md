@@ -304,14 +304,27 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   disappearingMessagesDuration 秒数、0 = 关闭，editor = 编辑者 ACI 串）；
   epoch >7 / 非 expiration change 不处理，其余群更新消息照旧跳过（宁缺
   勿错，全投影另行立项，§5 群 expiration 批）。
-- `syncMessage.deleteForMe {messageDeletes: [{conversationId?, messages:
-  [{author, timestamp}]}]}`（六问批 Q6②，官方 SyncContent.deleteForMe=22
-  「为我删除」多设备同步）：author 二进制（ACI/PNI 16/17B）优先、e164
-  直通，不可解析条目丢、组清空后整组丢、全坏整信封丢；conversationId
-  缺席键不在（serviceId/binary→UUID 串、groupId→master key base64、
-  e164 原样）；v1 只投 messageDeletes 臂——read/viewed/其他三型不投
-  （§5 gap 登记）；vendored 接收面已消费 presage store（save_message 臂
-  delete_message），引擎投影 additive 上抛供 connector 删自有库行。
+- `syncMessage.deleteForMe {messageDeletes?: [{conversationId?, messages:
+  [{author, timestamp}]}], conversationDeletes?: [{conversationId,
+  isFullDelete, mostRecentMessages: [{author, timestamp}],
+  mostRecentNonExpiringMessages: [{author, timestamp}]}],
+  localOnlyConversationDeletes?: [{conversationId}]}`（六问批 Q6② +
+  P15a 项1，官方 SyncContent.deleteForMe=22「为我删除」多设备同步）：
+  author 二进制（ACI/PNI 16/17B）优先、e164 直通，不可解析条目丢、组清空
+  后整组丢、全坏整信封丢；conversationId 缺席键不在（serviceId/binary→
+  UUID 串、groupId→master key base64、e164 原样）。messageDeletes 臂（
+  Q6② 既有）组无 conversation 照投、conversationId 键省略；P15a 项1 补
+  整会话清除族两臂（官方 handleDeleteForMeSync 同位
+  MessageReceiver.preload.ts:3658-3722——手机「删除会话/清空聊天历史·为我
+  删除」的桌面同步面）：conversationDeletes 组 conversation 缺席或
+  mostRecentMessages 清空整组丢（官方 warn-drop 同口径），isFullDelete 恒
+  布尔（官方 Boolean() 同构），mostRecentNonExpiringMessages 空数组照投；
+  localOnlyConversationDeletes 条目 conversation 缺席丢；
+  attachmentDeletes 臂不投（§5 gap 登记，信封只含该臂时整信封丢）；
+  缺席臂键不在；vendored 接收面已消费 presage store（save_message 臂
+  delete_message，仅 messageDeletes 臂），引擎投影 additive 上抛供
+  connector 删自有库行（conversationDeletes 的引擎 store 行不删——vendored
+  TODO 面，§5 如实登记）。
 - `syncMessage.configuration {readReceipts?, unidentifiedDeliveryIndicators?,
   typingIndicators?, linkPreviews?}` / `syncMessage.fetchLatest {type?}` /
   `syncMessage.callLinkUpdate {type?, rootKey?, adminKey?}` /
@@ -2869,6 +2882,15 @@ jobs/helpers/sendGroupCallUpdate.preload.ts:23-100。
     conversationId 缺席键不在。**v1 只投 messageDeletes 臂**——
     conversationDeletes/localOnlyConversationDeletes/attachmentDeletes
     三型不投（vendored 消费面同界，gap 登记后续批）。
+    **P15a 项1 收口**：整会话清除族两臂补投（conversationDeletes/
+    localOnlyConversationDeletes，官方 handleDeleteForMeSync 同位
+    MessageReceiver.preload.ts:3658-3722，face 见 §3）——手机「删除会话/
+    清空聊天历史·为我删除」桌面端会话不同步的缺口就此闭合；
+    attachmentDeletes 臂仍不投（§5 gap 保留）。vendored store 消费面仍只有
+    messageDeletes 臂（registered.rs `TODO: Conversations, local-only
+    deletes, attachments` 上游原样）——conversationDeletes 收包后引擎
+    store 行不删，connector 自有库行删除为准；author 解析纪律两臂同源
+    （project_delete_for_me_message 单点）。
   - ③ sent echo 三臂重构：Sent 臂 message→editMessage→storyMessage 序取
     第一个在场位（proto oneof 本就互斥，序取即防御性表达）；公共位
     （timestamp/expirationStartTimestamp/destination）三臂共用；全缺整
@@ -3228,6 +3250,34 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   捕获同样需 vendored Metadata 扩位——同上跳过归 P15；上方 reportSpam
   块「token 不透投影」边界维持，处置由「上游 Metadata 升版」订正为
   「vendored Metadata 扩位（story bit 同型 fork），P15」。
+
+### P15a 批（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+- **项1 DeleteForMe 整会话清除族收投影**：`syncMessage.deleteForMe` 补
+  `conversationDeletes` / `localOnlyConversationDeletes` 两臂（face 见
+  §3；官方 handleDeleteForMeSync 同位 MessageReceiver.preload.ts:
+  3658-3722）。手机「删除会话/清空聊天历史」选「为我删除」时桌面同步的
+  缺口闭合。纯引擎投影（零 vendor 改动——vendored `Received::Content`
+  已无条件上抛 DeleteForMe 体）；投影纪律：
+  - conversationDeletes 组 = conversation（必需，缺席/不可解析整组丢，
+    官方「No target conversation」warn-drop 同口径）+ isFullDelete（恒
+    布尔，官方 `Boolean(item.isFullDelete)` 同构）+ mostRecentMessages
+    （清空整组丢，官方同口径）+ mostRecentNonExpiringMessages（空数组
+    照投，官方 map+filter 无空判同构）。
+  - localOnlyConversationDeletes 条目 = conversation（必需，缺席丢）。
+  - 与既有 messageDeletes 臂的偏差保持：messageDeletes 组无 conversation
+    照投、conversationId 键省略（Q6② 既有口径不动，官方对该臂实为
+    warn-drop——引擎更宽容，宁收勿丢）；两新臂从官方严格口径。
+  - author/timestamp 解析抽 `project_delete_for_me_message` 单点（两新臂
+    复用；author 二进制优先、e164 直通、不可解析条目丢、timestamp 缺省
+    0——Q6② 既有口径）。
+  - 全部投影臂皆无有效条目 → 整信封丢（官方「Nothing found in sync
+    message」throw 同口径）；attachmentDeletes 臂仍不投（信封只含该臂时
+    引擎整信封丢——gap 保留，消费方提出需求再立项）。
+  - vendored store 消费面不动：registered.rs 仍只消费 messageDeletes
+    （`TODO: Conversations, local-only deletes, attachments` 上游原样），
+    conversationDeletes 收包后引擎 store 行不删、connector 自有库行删除
+    为准（如实登记）。
 
 
 ## 6. fake 服务模式（仅测试）
