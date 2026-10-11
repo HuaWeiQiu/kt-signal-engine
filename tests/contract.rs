@@ -1115,6 +1115,73 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// updateGroup 群名写面（title 参数族，官方 buildUpdateAttributesChange
+/// `if (title)` 行为对齐，加密 blob 上行）：fake 成功 `{status:"sent"}`；
+/// title 与 expiration 同调组合合法；参数面 fail-closed（-32603：title
+/// null/非字符串/空串——官方空串 falsy no-op 语义不静默收——title 在场时
+/// groupId/account 形状照旧闸）；调度日志 title 键明文逐字保留（群名短标
+/// 签非敏感载荷，avatar 摘要化纪律不外溢）。
+#[test]
+fn update_group_title_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-title");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：title 单独在场 / 与 expiration 同调均成功 {status:"sent"}。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "title": "新群名" })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "title": "更名", "expiration": 3600 })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状（null/非字符串/空串；groupId/account 闸照旧）。
+    let rejects = [
+        json!({ "account": "+15550000000", "groupId": group_id, "title": null }),
+        json!({ "account": "+15550000000", "groupId": group_id, "title": 7 }),
+        json!({ "account": "+15550000000", "groupId": group_id, "title": "" }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "title": "名" }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG", "title": "名" }),
+        json!({ "groupId": group_id, "title": "名" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：title 键明文逐字保留（成功 2 + 拒绝 6 = 8 行均落日志）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(entries.len(), 8, "成功两条 + 拒绝六条均落日志");
+    assert_eq!(entries[0]["params"]["title"], json!("新群名"));
+    assert_eq!(entries[0]["params"]["groupId"], json!(group_id));
+
+    // real 模式未注册账号 + title 在场：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("update-group-title-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({ "account": "+15559990000", "groupId": group_id, "title": "名" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
 /// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
 /// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同

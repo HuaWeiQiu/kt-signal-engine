@@ -1818,17 +1818,19 @@ impl Service {
         groups::terminate_group(&context, &self.terminated_groups, &master_key).await
     }
 
-    /// updateGroup（群更新写面，KT 扩展方法）：expiration + avatar 合成单
-    /// change（同 version 多 action）单次 `PATCH v2/groups`。avatar Replace
-    /// 臂先走群头像上行链（form 拉取 → blob 加密 → CDN POST，§5 群头像
-    /// 上行面批）。fake 两臂：缺省/null 臂成功形状桩（PATCH 面，expiration
-    /// 批纪律）；data URI 臂失败 AvatarUpload——fake 无 CDN/服务器上行面，
-    /// 上行链不可达即错误面（stickers fake 错误面先例）。
+    /// updateGroup（群更新写面，KT 扩展方法）：expiration + title + avatar
+    /// 合成单 change（同 version 多 action）单次 `PATCH v2/groups`。avatar
+    /// Replace 臂先走群头像上行链（form 拉取 → blob 加密 → CDN POST，§5 群
+    /// 头像上行面批）。fake 两臂：缺省/null 臂成功形状桩（PATCH 面，
+    /// expiration 批纪律）；data URI 臂失败 AvatarUpload——fake 无 CDN/服务
+    /// 器上行面，上行链不可达即错误面（stickers fake 错误面先例）；title 臂
+    /// fake 侧无独立上行链，随缺省臂成功。
     pub(crate) async fn update_group_change(
         self: &Arc<Self>,
         account: &str,
         master_key: Vec<u8>,
         expiration_secs: Option<u32>,
+        title: Option<&str>,
         avatar: Option<groups::AvatarWrite>,
     ) -> Result<(), groups::TerminateError> {
         if !self.real {
@@ -1838,7 +1840,7 @@ impl Service {
             };
         }
         let context = storage_context(self, account).await?;
-        groups::update_group_change(&context, &master_key, expiration_secs, avatar).await
+        groups::update_group_change(&context, &master_key, expiration_secs, title, avatar).await
     }
 
     /// createGroup（自建群，KT 扩展方法，官方 createGroupV2 行为对齐）：
