@@ -486,10 +486,15 @@ async fn dispatch(
                         )
                         .await
                     {
-                        Ok((timestamp, results)) => jsonrpc::success_response(
-                            id,
-                            json!({ "timestamp": timestamp, "results": results }),
-                        ),
+                        Ok((timestamp, results, failures)) => {
+                            let mut payload = json!({ "timestamp": timestamp, "results": results });
+                            // 时序审计组二#9 additive：per-recipient 失败条目
+                            //（空表键不在，旧宿主零变化）。
+                            if !failures.is_empty() {
+                                payload["failures"] = Value::Array(failures);
+                            }
+                            jsonrpc::success_response(id, payload)
+                        }
                         Err(error) => send_error(id, error),
                     }
                 }
@@ -3480,30 +3485,24 @@ fn username_write_error(id: &Value, error: &crate::service::username::UsernameWr
 /// ——决策在 connector/desktop，compat §3/§5）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
+    let (code, message) = send_error_face(&error);
+    jsonrpc::error_response(id, &RpcError::new(code, message))
+}
+
+/// SendError → (code, message) 分类单点：send 的整批错误面（send_error）
+/// 与 per-recipient 失败条目（send failures additive 面）共用，同一错误
+/// 两处分类逐字一致（connector 分类器按 message 命中，形状即识别面）。
+pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'static str) {
     use crate::service::SendError;
     match error {
-        SendError::TargetTerminated => {
-            jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_TERMINATED"))
-        }
-        SendError::AnnouncementsOnly => {
-            jsonrpc::error_response(id, &RpcError::new(-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"))
-        }
-        SendError::Unbound => {
-            jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
-        }
-        SendError::RateLimited => {
-            jsonrpc::error_response(id, &RpcError::new(-32603, RATE_LIMITED_MESSAGE))
-        }
-        SendError::ProofRequired => {
-            jsonrpc::error_response(id, &RpcError::new(-32603, PROOF_REQUIRED_MESSAGE))
-        }
-        SendError::ServerUnavailable => {
-            jsonrpc::error_response(id, &RpcError::new(-32603, SERVER_UNAVAILABLE_MESSAGE))
-        }
-        SendError::IdentityUnverified => {
-            jsonrpc::error_response(id, &RpcError::new(-32603, IDENTITY_UNVERIFIED_MESSAGE))
-        }
-        SendError::UnknownAccount | SendError::Internal => internal_error(id),
+        SendError::TargetTerminated => (-1, "SEND_TARGET_TERMINATED"),
+        SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
+        SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
+        SendError::RateLimited => (-32603, RATE_LIMITED_MESSAGE),
+        SendError::ProofRequired => (-32603, PROOF_REQUIRED_MESSAGE),
+        SendError::ServerUnavailable => (-32603, SERVER_UNAVAILABLE_MESSAGE),
+        SendError::IdentityUnverified => (-32603, IDENTITY_UNVERIFIED_MESSAGE),
+        SendError::UnknownAccount | SendError::Internal => (-32603, "Internal error"),
     }
 }
 
@@ -3528,6 +3527,31 @@ mod tests {
         );
         assert!(USER_UNBOUND_MESSAGE.contains("AuthorizationFailedException"));
         assert!(USER_UNBOUND_MESSAGE.contains("Authorization failed"));
+    }
+
+    /// send failures additive 面分类一致性：per-recipient 失败条目的
+    /// (code, message) 与整批错误面（send_error）逐字同源（send_error_face
+    /// 单点）——connector 分类器按 message 命中，两处漂移即断。
+    #[test]
+    fn send_error_face_matches_whole_batch_error_face() {
+        use crate::service::SendError;
+        let cases = [
+            SendError::TargetTerminated,
+            SendError::AnnouncementsOnly,
+            SendError::Unbound,
+            SendError::RateLimited,
+            SendError::ProofRequired,
+            SendError::ServerUnavailable,
+            SendError::IdentityUnverified,
+            SendError::Internal,
+        ];
+        for error in cases {
+            let (code, message) = send_error_face(&error);
+            let response = send_error(&Value::from(1), error);
+            let face = response.get("error").expect("error face");
+            assert_eq!(face.get("code").and_then(Value::as_i64), Some(code));
+            assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
+        }
     }
 
     /// 发送链结构化三面（限流/人机验证/服务端不可用）wire 形状：均

@@ -2130,6 +2130,29 @@ fn call_link_materials_real_unregistered_account() {
     );
 }
 
+/// 直聊 send per-recipient 成败收集（时序审计组二#9，wire additive）：
+/// fake 全成功应答 `{timestamp, results: []}` 且无 failures 键（空表键不
+/// 在——旧宿主零变化）；真实面部分失败时 failures 条目形状由
+/// send_error_face 分类单测钉死（与整批错误面同源）。
+#[test]
+fn send_direct_fake_shape_has_no_failures_key_when_empty() {
+    let dir = temp_dir("send-direct-failures-additive");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    let response = engine.request(
+        "send",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "message": "hello"
+        }),
+    );
+    let result = response.get("result").expect("success result");
+    assert!(result.get("timestamp").and_then(Value::as_u64).is_some());
+    assert_eq!(result.get("results"), Some(&json!([])));
+    assert!(result.get("failures").is_none(), "空表键不在（additive）");
+}
+
 #[test]
 fn send_story_fake_shape_and_param_fail_closed() {
     let dir = temp_dir("send-story-fake");

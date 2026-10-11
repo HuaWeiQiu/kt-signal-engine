@@ -965,9 +965,9 @@ impl Service {
         sticker: Option<&SendSticker>,
         story_context: Option<&SendStoryContext>,
         view_once: bool,
-    ) -> Result<(u64, Vec<Value>), SendError> {
+    ) -> Result<(u64, Vec<Value>, Vec<Value>), SendError> {
         if !self.real {
-            return Ok((now_ms(), Vec::new()));
+            return Ok((now_ms(), Vec::new(), Vec::new()));
         }
         let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
@@ -988,55 +988,85 @@ impl Service {
             Some(sticker) => Some(upload_sticker_image(&manager, sticker).await?),
             None => None,
         };
+        // 时序审计组二#9：per-recipient 成败收集（不再 fail-fast 丢弃部分
+        // 成功——重试全批会对已达收件人重复投递）。results = 成功条目（旧
+        // 形状原样）；failures = 失败条目（wire additive，connector 只补
+        // 未达方）。全败 = 整批错误面维持旧状（首错分类上抛，此时零已达
+        // 收件人，整批重试无重复投递风险）。
         let mut results = Vec::new();
+        let mut failures = Vec::new();
+        let mut first_error: Option<SendError> = None;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
-            // P9 身份拒发闸：对端换钥未确认 → 拒发（直聊内容发送面统一
-            // 判定；整批失败与既有逐收件人失败同语义，compat §3）。
-            identity_send_gate(&account_dir, &service_id)?;
-            // P9 profileSharing 闸（S3）：会话未同意 profileSharing → 不注入
-            // 本机 profile_key（官方 sendNormalMessage.preload.ts:183-185）。
-            let include_profile_key = include_profile_key_for(&whitelist, &service_id);
-            let body = match sticker {
-                Some(sticker) => {
-                    build_sticker_data_message(
-                        manager.store(),
-                        sticker,
-                        quote,
-                        sticker_pointer.clone().ok_or(SendError::Internal)?,
+            let send_one = async {
+                let service_id = resolve_recipient(&manager, number)
+                    .await
+                    .ok_or(SendError::Internal)?;
+                // P9 身份拒发闸：对端换钥未确认 → 拒发（直聊内容发送面统一
+                // 判定；整批失败与既有逐收件人失败同语义，compat §3）。
+                identity_send_gate(&account_dir, &service_id)?;
+                // P9 profileSharing 闸（S3）：会话未同意 profileSharing → 不注入
+                // 本机 profile_key（官方 sendNormalMessage.preload.ts:183-185）。
+                let include_profile_key = include_profile_key_for(&whitelist, &service_id);
+                let body = match sticker {
+                    Some(sticker) => {
+                        build_sticker_data_message(
+                            manager.store(),
+                            sticker,
+                            quote,
+                            sticker_pointer.clone().ok_or(SendError::Internal)?,
+                            timestamp,
+                        )
+                        .await?
+                    }
+                    None if view_once => build_view_once_data_message(pointers.clone(), timestamp)?,
+                    None => {
+                        build_text_data_message(
+                            manager.store(),
+                            message,
+                            quote,
+                            preview,
+                            mentions,
+                            text_styles,
+                            pointers.clone(),
+                            preview_image.clone(),
+                            story_context,
+                            timestamp,
+                        )
+                        .await?
+                    }
+                };
+                manager
+                    .send_message_with_profile_sharing(
+                        service_id,
+                        body,
                         timestamp,
+                        include_profile_key,
                     )
-                    .await?
-                }
-                None if view_once => build_view_once_data_message(pointers.clone(), timestamp)?,
-                None => {
-                    build_text_data_message(
-                        manager.store(),
-                        message,
-                        quote,
-                        preview,
-                        mentions,
-                        text_styles,
-                        pointers.clone(),
-                        preview_image.clone(),
-                        story_context,
-                        timestamp,
-                    )
-                    .await?
-                }
+                    .await
+                    .map_err(send_error_of)?;
+                Ok(())
             };
-            manager
-                .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
-                .await
-                .map_err(send_error_of)?;
-            results.push(json!({
-                "recipientNumber": number,
-                "success": { "timestamp": timestamp },
-            }));
+            match send_one.await {
+                Ok(()) => results.push(json!({
+                    "recipientNumber": number,
+                    "success": { "timestamp": timestamp },
+                })),
+                Err(error) => {
+                    let (code, message) = crate::methods::send_error_face(&error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    failures.push(json!({
+                        "recipientNumber": number,
+                        "error": { "code": code, "message": message },
+                    }));
+                }
+            }
         }
-        Ok((timestamp, results))
+        if results.is_empty() && !failures.is_empty() {
+            return Err(first_error.unwrap_or(SendError::Internal));
+        }
+        Ok((timestamp, results, failures))
     }
 
     pub(crate) async fn send_remote_delete(
