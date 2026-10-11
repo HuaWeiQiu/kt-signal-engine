@@ -427,6 +427,25 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   告警一次，skewMs 带符号（正 = 本地快）、serverTimestamp = 观测源信封
   服务器毫秒；拒绝面不做（偏差登记），消费自定；§5 P15b 项8。
 
+Storage 合并共生通知（F 链路引擎腿，**非 envelope 载体**——存储态事件
+无信封可挂；wire additive，词表第五词）：
+
+- `receive.conversationState {account, conversations, overflow}`：入站
+  Storage 合并（`storage.mergeContacts`/`storage.importGroups` 读面随行
+  观测）发现他设备翻转的会话三 flag 时上抛，一次 merge 批的全部翻转
+  合成一条。`conversations` 条目 `{conversationId, kind,
+  mutedUntilTimestamp, archived, markedUnread}`——标识口径 =
+  getConversationState 参数面同构（contact=ACI service id 串 / group=
+  master key 标准 base64 / legacyGroup=id 文本），三 flag 键恒在 =
+  读投影同形状（0/false = 位缺省），消费方拿到即落本机簿无需回读。
+  `overflow` 键恒在布尔：批帽 256 截断时 true（尾标纪律，要全集走
+  getConversationState 逐会话重读）。触发纪律：仅真实翻转发（首观测
+  种子静默、值未变不发）；本机写（setConversationState / storage.write
+  三类记录臂）与读投影应答先登记「消费方已知态」防回声；远端删记录
+  不产事件（簿不清，重建与最后已知差分）；簿进程内存不跨重启。GV1
+  记录无入站读取路径不观测（legacy 族记档）；语义/帽/取舍全量见 §5
+  F 链路块。
+
 ## 4. 夹具专有动词（非引擎表面）
 
 `hang/sendHang/crash/crashSend/malformed/oversized/stallStdin/
@@ -3874,7 +3893,9 @@ presage 身份库为空，对端身份钥只能靠首次发送时服务器 preke
   avatarColor/note/nickname/system*Name 族（引擎 contacts 模型无位）、
   username（引擎不持远端 username 缓存）、archived/markedUnread/muted/
   blocked（已有专用读写面 A2/拉黑批，不重复写）。这些位的 wire 消费归
-  connector/desktop 侧直接读 storage.read 面（后续 C3/D4b 批）。
+  connector/desktop 侧直接读 storage.read 面（后续 C3/D4b 批）。**F 链路
+  批起**：三 flag 随本面 merge 读入行入站观测（`receive.conversationState`
+  通知，见 §5 F 链路块）——观测不写，本行「不重复写」语义不变。
 - **幂等与安全面**：merge 幂等（同钥/已有档重跑全 no-op）；只读 Storage
   面 + 本地库写，零 Storage 写操作（不做 storage write-back——官方桌面
   merge 后也不回写 ContactRecord，写由主设备权威）；触发时机归调用方
@@ -4293,6 +4314,61 @@ round-trip 保真单测早已钉定，仅缺写面接线）。
   窗填充/解密/批量落库三相细分）在 vendor 面，未随本批打点（vendor 纪律
   成本，engine 侧 `receive_envelope` 已含其端到端时延）——如需相细分另批
   按 vendor/README.md 纪律登记。
+
+### F 链路入站观测批（2026-10-12，connector implementation-plan §4.113 缺口引擎腿，wire additive【engine-compat】）
+
+缺口勘核（§4.113 实证原文）：引擎 Storage 面全是按需请求/应答，服务器
+manifest 修订从不主动到达；入站 merge 路径（`storage_merge` 的
+mergeContacts/importGroups 两族，§4.112 ingestion 面）落远端记录进本地
+库、答汇总，但**不发任何每会话通知**、三 flag（mutedUntilTimestamp/
+archived/markedUnread）不进任何汇总——他设备改的静音/归档/标未读到不了
+connector/desktop（反方向本机 setConversationState 云写穿是通的）。本批
+让「路过」变「观测」：merge 读到的每条会话记录与 per-account 簿差分，
+真实翻转合成一条 `receive.conversationState` 通知（§3 通知词表第五词）。
+
+- **观测面**（`storage_sync::conversation_observation_of` 单点）：
+  mergeContacts/importGroups 循环内成功解密的记录逐条出 (引擎会话标识,
+  三 flag) 观测对——Contact/GV1/GV2 三类，标识口径与写面 canonical/
+  拉黑读投影逐臂同构；观测是内容驱动（manifest 标识类型不做准），
+  merge 的 shouldDrop/本机 uuid 闸不影响观测（三 flag 不消费身份
+  材料）。零额外网络（不复读 item，merge 手里已有明文）。
+- **簿语义**（`storage_watch::ConversationStateBook`，进程内存 per-
+  account，不落盘不跨重启）：簿 = 「消费方最后被告知的态」。三面登记
+  ——入站观测差分（翻转才通知）、本机写后登记（setConversationState
+  与 storage.write 三类记录 Written 臂，写方已知**防回声**）、本机读
+  投影应答登记（getConversationState 读出态，防冗余通知）。首观测 =
+  种子静默（引擎重启簿空，首批 merge 全量登记不发——启动风暴闸；
+  消费方启动期收敛走既有按需读面）。值未变不发。远端删记录不清簿
+  （本面不建模记录生命周期；重建时与最后已知差分，收敛正确）。账号
+  删除摘簿。
+- **合流与帽**：一次 merge 批的全部翻转合成一条通知（批内合流）；
+  跨调用时间窗合流不做（merge 是 connector 驱动的离散批，启动期
+  mergeContacts+importGroups 至多两帧——定时器合流引入后台任务与
+  投递延迟，换不来的批量收益）。批帽 256（connector 侧 pinned 128/
+  sticker 256 同族量级）：超帽**截断 + `overflow: true` 尾标**——取舍
+  对「合并成全量失效信号」：截断保留已差分真值立即落消费方簿，尾标
+  保溢出诚实（要全集走 getConversationState 逐会话重读）；失效信号把
+  已知真值一并丢弃、消费代价同为全量重读，故取截断+尾标。簿帽 8192/
+  账号：超帽新会话不登记（fail-open 盲点，现实账号量级不可及；已登记
+  条目照常差分）。
+- **覆盖边界（记档）**：GV1 记录无入站读取路径（两 merge 族分别只读
+  Contact/GV2 identifiers）不观测——legacy 族三 flag 的远端翻转本面
+  不到达，读/写面（§3 getConversationState 行）不受影响；merge 失败
+  （Err）= 无观测无通知（下一轮 merge 重读收敛）；fake 模式不观测不
+  通知（fake 无 storage 面）。
+- **零内容纪律**：通知只携会话标识 + 三位值（无消息内容）；零 stderr
+  （引擎面无日志设施，会话标识不落日志）。通知帧与响应帧同一 stdout
+  writer 队列（既有序面）。
+- **消费面**：connector/desktop 接线归各自仓批（§4.113 disposition =
+  receive 车道 ControlReceive 拦截族；§4.114 的 account 域独立方法车道
+  同族）。
+- **单测**：storage_watch 六件（簿种子静默/翻转一次/同值不发/登记防
+  回声/删记录不清簿重建差分、批差分只收真实翻转按序、簿帽 fail-open、
+  通知形状钉定+批帽截断尾标、消费方测试替身严格解析）+ storage_sync
+  观测对三族映射（canonical 口径/空守卫/非会话族）+ service 层接线
+  （Service×出口帧：种子静默→翻转恰一帧→同值零帧→登记防回声→删
+  账号摘簿）+ storage.write 预观测面（三类记录出对/DELETE/坏 record
+  归 None）。契约测试不动（fake 面无观测）——68 基线原样。
 
 
 ## 6. fake 服务模式（仅测试）

@@ -108,18 +108,32 @@ fn service_id_of(contact: &storage_proto::ContactRecord) -> Option<ServiceId> {
 /// merge 编排：manifest → Contact identifiers 批读 → 逐条 merge（汇总面）。
 /// master key 缺失或 manifest 404（从未有 storage 状态）→ 零汇总幂等成功
 /// （blocked 只读面同口径）。
+/// 返回 (汇总, 观测批)：观测批 = 本轮成功解密的记录逐条过
+/// `conversation_observation_of`（F 链路入站观测——三类会话记录的三 flag
+/// 随行观测，含 merge 语义跳过的条目；观测是内容驱动，不随 merge 的
+/// shouldDrop 闸）。调用方（service 层）负责把观测批过簿发通知。
 pub(crate) async fn merge_contacts(
     mut context: StorageContext,
     now: u64,
-) -> Result<MergeOutcome, StorageSyncError> {
+) -> Result<
+    (
+        MergeOutcome,
+        Vec<(
+            storage_sync::EngineConversationId,
+            storage_sync::ConversationState,
+        )>,
+    ),
+    StorageSyncError,
+> {
     let mut outcome = MergeOutcome::default();
+    let mut observed = Vec::new();
     let Some(master_key) = context
         .store
         .fetch_master_key()
         .await
         .map_err(|_| StorageSyncError::ReadFailed)?
     else {
-        return Ok(outcome);
+        return Ok((outcome, observed));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
     let read_key = StorageServiceKey::from_master_key(&master_key);
@@ -128,7 +142,7 @@ pub(crate) async fn merge_contacts(
         Ok(manifest) => manifest,
         Err(presage::libsignal_service::StorageServiceError::Service(
             ServiceError::NotFoundError,
-        )) => return Ok(outcome),
+        )) => return Ok((outcome, observed)),
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
     let keys: Vec<Vec<u8>> = manifest
@@ -143,7 +157,7 @@ pub(crate) async fn merge_contacts(
         .map(|identifier| identifier.raw.clone())
         .collect();
     if keys.is_empty() {
-        return Ok(outcome);
+        return Ok((outcome, observed));
     }
     let record_ikm = if manifest.record_ikm.is_empty() {
         None
@@ -168,7 +182,16 @@ pub(crate) async fn merge_contacts(
             outcome.skipped += 1;
             continue;
         };
-        let Some(storage_proto::storage_record::Record::Contact(contact)) = record.record else {
+        // F 链路入站观测：记录内容驱动（merge 的 shouldDrop/本机 uuid 闸
+        // 不影响观测——三 flag 观测不消费身份材料）。
+        let Some(record) = record.record else {
+            outcome.skipped += 1;
+            continue;
+        };
+        if let Some(observation) = storage_sync::conversation_observation_of(&record) {
+            observed.push(observation);
+        }
+        let storage_proto::storage_record::Record::Contact(contact) = record else {
             outcome.skipped += 1;
             continue;
         };
@@ -271,7 +294,7 @@ pub(crate) async fn merge_contacts(
             }
         }
     }
-    Ok(outcome)
+    Ok((outcome, observed))
 }
 
 /// 群导入汇总（wire additive）。
@@ -295,17 +318,30 @@ pub(crate) struct GroupImportOutcome {
 /// getOrCreateGroupSnapshot 按需拉群态；引擎作为 sidecar 无群快照惰性层，
 /// 导入面直接拉取落库（增量：已有群零网络）。逐群独立 best-effort：单群
 /// 拉取失败记 failed 不炸批（服务器对该群无凭据/已退出等场景诚实计数）。
+/// 返回 (汇总, 观测批)：观测批口径与 merge_contacts 同（F 链路入站观测，
+/// 成功解密记录逐条过 conversation_observation_of；GV2 族观测由此补
+/// ——Contact 族在 mergeContacts）。
 pub(crate) async fn import_groups(
     context: StorageContext,
-) -> Result<GroupImportOutcome, StorageSyncError> {
+) -> Result<
+    (
+        GroupImportOutcome,
+        Vec<(
+            storage_sync::EngineConversationId,
+            storage_sync::ConversationState,
+        )>,
+    ),
+    StorageSyncError,
+> {
     let mut outcome = GroupImportOutcome::default();
+    let mut observed = Vec::new();
     let Some(master_key) = context
         .store
         .fetch_master_key()
         .await
         .map_err(|_| StorageSyncError::ReadFailed)?
     else {
-        return Ok(outcome);
+        return Ok((outcome, observed));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
     let read_key = StorageServiceKey::from_master_key(&master_key);
@@ -314,7 +350,7 @@ pub(crate) async fn import_groups(
         Ok(manifest) => manifest,
         Err(presage::libsignal_service::StorageServiceError::Service(
             ServiceError::NotFoundError,
-        )) => return Ok(outcome),
+        )) => return Ok((outcome, observed)),
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
     let keys: Vec<Vec<u8>> = manifest
@@ -329,7 +365,7 @@ pub(crate) async fn import_groups(
         .map(|identifier| identifier.raw.clone())
         .collect();
     if keys.is_empty() {
-        return Ok(outcome);
+        return Ok((outcome, observed));
     }
     let record_ikm = if manifest.record_ikm.is_empty() {
         None
@@ -351,8 +387,15 @@ pub(crate) async fn import_groups(
             outcome.failed += 1;
             continue;
         };
-        let Some(storage_proto::storage_record::Record::GroupV2(group_record)) = record.record
-        else {
+        // F 链路入站观测（merge_contacts 同位，内容驱动）。
+        let Some(record) = record.record else {
+            outcome.failed += 1;
+            continue;
+        };
+        if let Some(observation) = storage_sync::conversation_observation_of(&record) {
+            observed.push(observation);
+        }
+        let storage_proto::storage_record::Record::GroupV2(group_record) = record else {
             outcome.failed += 1;
             continue;
         };
@@ -386,7 +429,7 @@ pub(crate) async fn import_groups(
             Err(_) => outcome.failed += 1,
         }
     }
-    Ok(outcome)
+    Ok((outcome, observed))
 }
 
 #[cfg(test)]

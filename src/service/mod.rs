@@ -67,6 +67,9 @@ pub(crate) mod storage_merge;
 pub(crate) mod storage_records;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
+/// F 链路入站观测面（模块头注载语义/帽/取舍纪律）：Storage 合并驱动的会话
+/// 三 flag 变更差分簿 + `receive.conversationState` 通知构造（词表第五词）。
+pub(crate) mod storage_watch;
 pub(crate) mod storage_write;
 pub(crate) mod stories;
 pub(crate) mod username;
@@ -719,6 +722,27 @@ fn include_profile_key_for(whitelist: &HashMap<String, bool>, service_id: &Servi
     )
 }
 
+/// F 链路回声抑制预观测（storage.write 面）：三类会话记录（Contact/GV1/
+/// GV2）的 INSERT/UPDATE 明文 → (会话标识, 三 flag)；DELETE（无记录载荷）
+/// 与其余记录族 → None。标识/投影口径 = storage_sync 读面同构两函数
+/// （明文两次 decode 换零耦合，批规模小无感）。
+fn conversation_write_observation(
+    update: &storage_write::StorageItemUpdate,
+) -> Option<(
+    storage_sync::EngineConversationId,
+    storage_sync::ConversationState,
+)> {
+    match update {
+        storage_write::StorageItemUpdate::Insert { record, .. }
+        | storage_write::StorageItemUpdate::Update { record, .. } => {
+            let id = storage_sync::conversation_record_of(record)?;
+            let state = storage_sync::conversation_state_of(record)?;
+            Some((id, state))
+        }
+        storage_write::StorageItemUpdate::Delete { .. } => None,
+    }
+}
+
 /// sendMessageRequestResponse 的线程腿（connector §4.56 同款两腿恰一）：
 /// Thread = 直聊对端（recipient，号码/UUID 双形态，service 层解析为 ACI）；
 /// Group = 群 master key（groupId，32B 标准 base64，decode_group_id 闸后
@@ -1011,6 +1035,10 @@ pub(crate) struct Service {
     /// 群凭据双族缓存（进程内存 per-account ACI 键控，不落盘不跨重启；
     /// P4c 切一 call_links 模块契约，官方 groupCredentialFetcher 对位件）。
     group_credentials: Arc<call_links::GroupCredentialCache>,
+    /// F 链路入站观测簿（进程内存 per-account，不落盘不跨重启）：会话三
+    /// flag「消费方最后被告知的态」，storage_watch 模块契约（帽/种子静默/
+    /// 防回声纪律见模块头注）。delete_account 摘除。
+    conversation_state_books: StdMutex<HashMap<String, storage_watch::ConversationStateBook>>,
     /// 账号级常驻发送管理器（C 批提速）：号码 → 共享互斥管理器。发送取用
     /// 命中即复用（presage Manager 内部 identified/unidentified websocket
     /// 同生命周期常驻），死亡自愈重建在 vendor 侧（closed → 重开）；惰性
@@ -1058,6 +1086,7 @@ impl Service {
             cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
+            conversation_state_books: StdMutex::new(HashMap::new()),
             send_managers: AsyncMutex::new(HashMap::new()),
             mrm_chat: AsyncMutex::new(None),
         })
@@ -1292,6 +1321,11 @@ impl Service {
         }
         // 摘除常驻发送管理器（若有在途发送，guard 释放后管理器随 Arc 落弃）。
         self.send_managers.lock().await.remove(account);
+        // F 链路观测簿摘除（账号面随注册表生命周期）。
+        self.conversation_state_books
+            .lock()
+            .expect("conversation state books lock")
+            .remove(account);
         Ok(had_dir || !self.real)
     }
 
@@ -3156,6 +3190,8 @@ impl Service {
     /// merge/发现面——identityKey 灌 presage 身份库（官方 updateIdentity-
     /// AfterSync 同构）+ identityState 落 sidecar 信任态 + profileKey 补缺 +
     /// contacts 建档，逐条汇总返回。幂等：同钥重跑全 no-op。
+    /// F 链路：merge 读到的会话记录随行过观测簿，真实翻转合成一条
+    /// `receive.conversationState` 通知（storage_watch 契约）。
     pub(crate) async fn merge_storage_contacts(
         self: &Arc<Self>,
         account: &str,
@@ -3164,12 +3200,15 @@ impl Service {
             return Ok(storage_merge::MergeOutcome::default());
         }
         let context = storage_context(self, account).await?;
-        storage_merge::merge_contacts(context, now_ms()).await
+        let (outcome, observed) = storage_merge::merge_contacts(context, now_ms()).await?;
+        self.publish_conversation_state_observations(account, observed);
+        Ok(outcome)
     }
 
     /// storage.importGroups（窗D A5）：manifest GROUPV2 masterKey → 群态
     /// 拉取 + presage store 落库（listGroups/open_group_sender 即刻可用）。
-    /// fake 模式零汇总早退（与 mergeContacts 同纪律）。
+    /// fake 模式零汇总早退（与 mergeContacts 同纪律）。F 链路观测随行
+    /// （GV2 族观测腿，merge_storage_contacts 同位）。
     pub(crate) async fn import_storage_groups(
         self: &Arc<Self>,
         account: &str,
@@ -3178,7 +3217,56 @@ impl Service {
             return Ok(storage_merge::GroupImportOutcome::default());
         }
         let context = storage_context(self, account).await?;
-        storage_merge::import_groups(context).await
+        let (outcome, observed) = storage_merge::import_groups(context).await?;
+        self.publish_conversation_state_observations(account, observed);
+        Ok(outcome)
+    }
+
+    /// F 链路观测发布（merge 两族共用单点）：观测批过 per-account 簿差分，
+    /// 真实翻转非空才合成一条 `receive.conversationState` 通知（批内合流
+    /// + 批帽截断在 storage_watch 内；簿锁内无 await/无 notify）。
+    fn publish_conversation_state_observations(
+        &self,
+        account: &str,
+        observed: Vec<(
+            storage_sync::EngineConversationId,
+            storage_sync::ConversationState,
+        )>,
+    ) {
+        if observed.is_empty() {
+            return;
+        }
+        let flips = {
+            let mut books = self
+                .conversation_state_books
+                .lock()
+                .expect("conversation state books lock");
+            storage_watch::observe_batch(books.entry(account.to_owned()).or_default(), &observed)
+        };
+        if flips.is_empty() {
+            return;
+        }
+        self.notify(storage_watch::conversation_state_notification(
+            account, &flips,
+        ));
+    }
+
+    /// F 链路消费方已知态登记（防回声/防冗余单点）：本机写后
+    /// （setConversationState 与 storage.write 三类记录臂）与读投影应答
+    /// （getConversationState）登记写后/读出态——簿语义 = 「消费方最后
+    /// 被告知的态」，本机动作不再随下次 merge 差分出通知。
+    fn note_conversation_state_known(
+        &self,
+        account: &str,
+        canonical: storage_sync::EngineConversationId,
+        state: storage_sync::ConversationState,
+    ) {
+        self.conversation_state_books
+            .lock()
+            .expect("conversation state books lock")
+            .entry(account.to_owned())
+            .or_default()
+            .note_known(canonical, state);
     }
 
     /// setConversationPinned（P4 扩面）：官方写语义（读改写 AccountRecord，
@@ -3215,6 +3303,7 @@ impl Service {
     /// getConversationState（P15b 项2）：读 Storage Service 目标会话记录
     /// 三 flag（mutedUntilTimestamp/archived/markedUnread）→ 读投影；目标
     /// 记录缺席 / 无 storage 状态 = 全缺省（诚实幂等）。fake 模式缺省桩。
+    /// F 链路：读出态登记观测簿（读投影 = 消费方已知态，防冗余通知）。
     pub(crate) async fn conversation_state(
         self: &Arc<Self>,
         account: &str,
@@ -3224,13 +3313,16 @@ impl Service {
             return Ok(storage_sync::ConversationState::default());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::read_conversation_state(&context, &conversation).await
+        let (canonical, state) =
+            storage_sync::read_conversation_state(&context, &conversation).await?;
+        self.note_conversation_state_known(account, canonical, state);
+        Ok(state)
     }
 
     /// setConversationState（P15b 项2）：三 flag 部分写意图（缺席位不动）
     /// → Storage Service 目标会话记录读改写 + 409 冲突重放；返回写后三
     /// flag（官方 upload 成功语义 = 本地写后面为准）。fake 模式缺省态叠
-    /// 意图回显。
+    /// 意图回显。F 链路：写后态登记观测簿（写方已知，防回声）。
     pub(crate) async fn set_conversation_state(
         self: &Arc<Self>,
         account: &str,
@@ -3245,7 +3337,10 @@ impl Service {
             });
         }
         let context = storage_context(self, account).await?;
-        storage_sync::write_conversation_state(&context, &conversation, intent).await
+        let (canonical, written) =
+            storage_sync::write_conversation_state(&context, &conversation, intent).await?;
+        self.note_conversation_state_known(account, canonical, written);
+        Ok(written)
     }
 
     /// getStickerPackSyncs（P5 扩面）：读全部贴纸包安装状态（存储序 =
@@ -3752,8 +3847,26 @@ impl Service {
         if !self.real {
             return Ok(storage_write::fake_outcome(&updates));
         }
+        // F 链路回声抑制：批内三类会话记录（Contact/GV1/GV2）的 INSERT/
+        // UPDATE 先预观测（record 明文 → 会话标识 + 三 flag），写成功后仅
+        // 对 Written 条目登记观测簿（Noop 未落云不登记；写方已知不自我
+        // 通知，setConversationState 登记同纪律）。
+        let pre_observed: Vec<
+            Option<(
+                storage_sync::EngineConversationId,
+                storage_sync::ConversationState,
+            )>,
+        > = updates.iter().map(conversation_write_observation).collect();
         let context = storage_context(self, account).await?;
-        storage_write::write_items(&context, updates).await
+        let outcome = storage_write::write_items(&context, updates).await?;
+        for (observation, result) in pre_observed.into_iter().zip(&outcome.results) {
+            if let (Some((canonical, state)), storage_write::ItemOutcome::Written { .. }) =
+                (observation, &result.outcome)
+            {
+                self.note_conversation_state_known(account, canonical, state);
+            }
+        }
+        Ok(outcome)
     }
 
     /// 云备份 restore 启动（cloud-backup-contract §2：`backups.restoreFromCloud`；
@@ -14157,6 +14270,125 @@ mod tests {
             json!(1_700_000_000_000_u64)
         );
         assert!(notification["params"].get("envelope").is_none());
+    }
+
+    /// F 链路引擎腿接线（storage_watch × Service 出口）：入站观测批过
+    /// per-account 簿——首批种子静默（零帧，启动风暴闸）、真实翻转合成
+    /// 恰一条 `receive.conversationState` 通知帧（形状钉定）、值未变零帧；
+    /// 本机已知态登记（写后/读出面同入口）防回声——登记后观测同态零帧、
+    /// 观测异态（他设备真改）照常通知；账号删除摘簿（删后重观测 = 种子
+    /// 静默而非翻转）。
+    #[tokio::test]
+    async fn conversation_state_watch_publish_and_echo_suppression() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-conv-watch-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir, Arc::clone(&state), tx);
+
+        let contact = storage_sync::EngineConversationId::Contact(
+            "11111111-2222-4333-8444-555555555555".to_owned(),
+        );
+        let flags = |muted: u64| storage_sync::ConversationState {
+            muted_until_timestamp: muted,
+            archived: true,
+            marked_unread: false,
+        };
+
+        // 首批观测 = 种子静默。
+        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(0))]);
+        assert!(rx.try_recv().is_err(), "首观测种子静默");
+
+        // 真实翻转 → 恰一条通知帧（批内合流），形状 = 词表第五词钉定面。
+        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))]);
+        let crate::OutboundFrame::Notice(value) = rx.try_recv().expect("flip notifies") else {
+            panic!("notice frame");
+        };
+        assert_eq!(value["jsonrpc"], json!("2.0"));
+        assert_eq!(value["method"], json!("receive.conversationState"));
+        assert_eq!(value["params"]["account"], json!("acct"));
+        assert_eq!(value["params"]["overflow"], json!(false));
+        let entry = &value["params"]["conversations"][0];
+        assert_eq!(
+            entry["conversationId"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(entry["kind"], json!("contact"));
+        assert_eq!(entry["mutedUntilTimestamp"], json!(7));
+        assert_eq!(entry["archived"], json!(true));
+        assert_eq!(entry["markedUnread"], json!(false));
+        assert!(rx.try_recv().is_err(), "一次 merge 批合成恰一条");
+
+        // 值未变（合并但无翻转）→ 零帧。
+        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))]);
+        assert!(rx.try_recv().is_err(), "值未变不发");
+
+        // 本机写/读登记防回声：登记写后态 → 观测同态零帧；观测异态照常。
+        service.note_conversation_state_known("acct", contact.clone(), flags(9));
+        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(9))]);
+        assert!(rx.try_recv().is_err(), "本机写不自我通知");
+        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(11))]);
+        assert!(rx.try_recv().is_ok(), "他设备真改照常通知");
+
+        // 空批零帧。
+        service.publish_conversation_state_observations("acct", Vec::new());
+        assert!(rx.try_recv().is_err());
+
+        // 账号删除摘簿：删后同会话重观测 = 种子静默（非翻转通知）。
+        state
+            .lock()
+            .await
+            .add_account("acct".to_owned(), None)
+            .expect("add account");
+        service.note_conversation_state_known("acct", contact.clone(), flags(13));
+        service.delete_account("acct").await.expect("delete");
+        service.publish_conversation_state_observations("acct", vec![(contact, flags(16))]);
+        assert!(rx.try_recv().is_err(), "摘簿后重观测 = 种子静默");
+    }
+
+    /// F 链路回声抑制预观测（storage.write 面）：三类会话记录 INSERT/
+    /// UPDATE 明文出 (标识, 三 flag) 观测对；DELETE（无载荷）与非会话族
+    /// /坏 record → None。
+    #[test]
+    fn conversation_write_observation_faces() {
+        let contact_wire = crate::proto::storage::StorageRecord {
+            record: Some(crate::proto::storage::storage_record::Record::Contact(
+                crate::proto::storage::ContactRecord {
+                    aci: "11111111-2222-4333-8444-555555555555".to_owned(),
+                    archived: true,
+                    ..Default::default()
+                },
+            )),
+        }
+        .encode_to_vec();
+        let update = storage_write::StorageItemUpdate::Update {
+            key: vec![1u8; 16],
+            record: contact_wire,
+            kind: storage_sync::StorageRecordKind::Contact,
+        };
+        let (id, state) = conversation_write_observation(&update).expect("observed");
+        assert_eq!(
+            id,
+            storage_sync::EngineConversationId::Contact(
+                "11111111-2222-4333-8444-555555555555".to_owned()
+            )
+        );
+        assert!(state.archived);
+        assert!(!state.marked_unread);
+        assert_eq!(state.muted_until_timestamp, 0);
+
+        let delete = storage_write::StorageItemUpdate::Delete { key: vec![1u8; 16] };
+        assert!(conversation_write_observation(&delete).is_none());
+        let bad = storage_write::StorageItemUpdate::Insert {
+            key: vec![2u8; 16],
+            record: vec![0xff, 0xff],
+            kind: storage_sync::StorageRecordKind::Contact,
+        };
+        assert!(conversation_write_observation(&bad).is_none());
     }
 
     /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内

@@ -116,8 +116,8 @@ pub(crate) struct PinnedEntry {
 
 /// 引擎会话标识口径（compat §3 pinned 行）：contact=ACI service id 字符串
 /// （listContacts uuid 同源）、group=master key 标准 base64（send 的 groupId
-/// 同口径）、legacyGroup=legacy groupId bytes。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 同口径）、legacyGroup=legacy groupId bytes。Hash = storage_watch 簿键。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum EngineConversationId {
     Contact(String),
     Group(String),
@@ -1197,7 +1197,8 @@ pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<S
 
 /// 会话明文记录 → 引擎会话标识（不看 blocked 位；Contact/GV1/GV2 三类参
 /// 与，写面定位目标用；标识口径与 `blocked_conversation_of` 读投影同构）。
-fn conversation_record_of(plaintext: &[u8]) -> Option<EngineConversationId> {
+/// pub(crate)：storage.write 回声抑制观测面（service 层）复用。
+pub(crate) fn conversation_record_of(plaintext: &[u8]) -> Option<EngineConversationId> {
     let record = storage_proto::StorageRecord::decode(plaintext)
         .ok()?
         .record?;
@@ -1804,7 +1805,8 @@ pub(crate) struct ConversationStateWrite {
 }
 
 /// 单条明文记录 → 三 flag 投影（Contact/GV1/GV2 三类参与）。
-fn conversation_state_of(plaintext: &[u8]) -> Option<ConversationState> {
+/// pub(crate)：storage.write 回声抑制观测面（service 层）复用。
+pub(crate) fn conversation_state_of(plaintext: &[u8]) -> Option<ConversationState> {
     let record = storage_proto::StorageRecord::decode(plaintext)
         .ok()?
         .record?;
@@ -1824,6 +1826,48 @@ fn conversation_state_of(plaintext: &[u8]) -> Option<ConversationState> {
             archived: group.archived,
             marked_unread: group.marked_unread,
         }),
+        _ => None,
+    }
+}
+
+/// 解码记录 → (引擎会话标识, 三 flag) 观测对（F 链路入站观测单点，
+/// storage_merge 两 merge 循环复用）：Contact/GV1/GV2 三类参与，标识
+/// 口径与 `conversation_record_of` 逐臂同构（GV1 空 id / GV2 空 master
+/// key / Contact 无 ACI = 不可寻址不观测）；其余记录族（Account/贴纸/
+/// 故事分发等） None。观测是内容驱动的：manifest 标识类型不做准（标识
+/// 面撒谎时按真实记录内容观测）。
+pub(crate) fn conversation_observation_of(
+    record: &storage_proto::storage_record::Record,
+) -> Option<(EngineConversationId, ConversationState)> {
+    match record {
+        storage_proto::storage_record::Record::Contact(contact) => Some((
+            contact_engine_id(contact)?,
+            ConversationState {
+                muted_until_timestamp: contact.muted_until_timestamp,
+                archived: contact.archived,
+                marked_unread: contact.marked_unread,
+            },
+        )),
+        storage_proto::storage_record::Record::GroupV1(group) if !group.id.is_empty() => Some((
+            EngineConversationId::LegacyGroup(String::from_utf8_lossy(&group.id).into_owned()),
+            ConversationState {
+                muted_until_timestamp: group.muted_until_timestamp,
+                archived: group.archived,
+                marked_unread: group.marked_unread,
+            },
+        )),
+        storage_proto::storage_record::Record::GroupV2(group) if !group.master_key.is_empty() => {
+            Some((
+                EngineConversationId::Group(
+                    base64::engine::general_purpose::STANDARD.encode(&group.master_key),
+                ),
+                ConversationState {
+                    muted_until_timestamp: group.muted_until_timestamp,
+                    archived: group.archived,
+                    marked_unread: group.marked_unread,
+                },
+            ))
+        }
         _ => None,
     }
 }
@@ -1972,11 +2016,12 @@ async fn fresh_conversation_state_record(
 
 /// getConversationState 读面：canonical 解析 → 全量 conversation item 定位
 /// 目标 → 三 flag 投影（记录缺席 / 无 storage 状态 / manifest 404 = 全
-/// 缺省，诚实幂等）。
+/// 缺省，诚实幂等）。返回 (canonical 标识, 投影)——canonical 供调用方
+/// 登记入站观测簿（storage_watch：读投影 = 消费方已知态，防重复通知）。
 pub(crate) async fn read_conversation_state(
     context: &StorageContext,
     target: &EngineConversationId,
-) -> Result<ConversationState, StorageSyncError> {
+) -> Result<(EngineConversationId, ConversationState), StorageSyncError> {
     let canonical = blocked_target_canonical(context, target).await?;
     let Some(master_key) = context
         .store
@@ -1984,7 +2029,7 @@ pub(crate) async fn read_conversation_state(
         .await
         .map_err(|_| StorageSyncError::ReadFailed)?
     else {
-        return Ok(ConversationState::default());
+        return Ok((canonical, ConversationState::default()));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
     let storage = open_storage_service(
@@ -1995,7 +2040,7 @@ pub(crate) async fn read_conversation_state(
     let manifest = match storage.manifest().await {
         Ok(manifest) => manifest,
         Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok(ConversationState::default());
+            return Ok((canonical, ConversationState::default()));
         }
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
@@ -2003,21 +2048,25 @@ pub(crate) async fn read_conversation_state(
     let found = items
         .iter()
         .find(|item| conversation_record_of(&item.plaintext).as_ref() == Some(&canonical));
-    Ok(found
-        .and_then(|item| conversation_state_of(&item.plaintext))
-        .unwrap_or_default())
+    Ok((
+        canonical,
+        found
+            .and_then(|item| conversation_state_of(&item.plaintext))
+            .unwrap_or_default(),
+    ))
 }
 
 /// setConversationState 写面编排（write_blocked 同款骨架：本地意图解析 →
 /// 逐 item 读改写（decode→mutate 只动三 flag）→ 新 16B item id 重加密 →
 /// WriteOperation version+1 → PUT → 409 采纳重放 3 次；manifest 404 播种
-/// 分支与幂等无写面同口径）。返回写后目标三 flag（官方 upload 成功语义
-/// = 本地写后面为准）。
+/// 分支与幂等无写面同口径）。返回 (canonical 标识, 写后目标三 flag)（官方
+/// upload 成功语义 = 本地写后面为准）；canonical 供调用方登记入站观测簿
+/// （storage_watch：本机写 = 消费方已知态，防回声）。
 pub(crate) async fn write_conversation_state(
     context: &StorageContext,
     target: &EngineConversationId,
     intent: ConversationStateWrite,
-) -> Result<ConversationState, StorageSyncError> {
+) -> Result<(EngineConversationId, ConversationState), StorageSyncError> {
     let canonical = blocked_target_canonical(context, target).await?;
     let master_key = match context
         .store
@@ -2035,7 +2084,7 @@ pub(crate) async fn write_conversation_state(
                 marked_unread: intent.marked_unread.unwrap_or(false),
             };
             if over_defaults == ConversationState::default() {
-                return Ok(over_defaults);
+                return Ok((canonical, over_defaults));
             }
             let generated = MasterKey::generate(&mut rand::rng());
             context
@@ -2087,9 +2136,12 @@ pub(crate) async fn write_conversation_state(
         };
         let Some((kind, payload)) = mutation else {
             // 幂等（意图已满足）/ 无可写：返回现状投影。
-            return Ok(found
-                .and_then(|item| conversation_state_of(&item.plaintext))
-                .unwrap_or_default());
+            return Ok((
+                canonical,
+                found
+                    .and_then(|item| conversation_state_of(&item.plaintext))
+                    .unwrap_or_default(),
+            ));
         };
         let replaced_key = found.map(|item| item.key.clone());
 
@@ -2136,7 +2188,7 @@ pub(crate) async fn write_conversation_state(
                         sticker_item_keys: None,
                     },
                 );
-                return Ok(written);
+                return Ok((canonical, written));
             }
             PutOutcome {
                 conflict_manifest: Some(server_manifest),
@@ -2957,6 +3009,89 @@ mod tests {
             apply_conversation_state(&account_wire, &full),
             Err(StorageSyncError::ReadFailed)
         ));
+    }
+
+    /// F 链路观测对（conversation_observation_of）：三类会话记录逐臂出
+    /// (canonical 标识, 三 flag)——Contact aciBinary 优先/aci 串兜底、
+    /// GV2 master key 标准 base64、GV1 id 文本；空 id/master key、Contact
+    /// 无 ACI、非会话族（Account）→ None（不可寻址/不相干不观测）。
+    #[test]
+    fn conversation_observation_of_maps_three_record_families() {
+        use storage_proto::{ContactRecord, GroupV1Record, GroupV2Record};
+
+        // Contact：aciBinary 16B 优先（canonical = 小写连字符 uuid 串）。
+        let uuid_bytes = [
+            0x11u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        let contact = storage_proto::storage_record::Record::Contact(ContactRecord {
+            aci_binary: uuid_bytes.to_vec(),
+            muted_until_timestamp: 42,
+            archived: true,
+            ..Default::default()
+        });
+        let (id, state) = conversation_observation_of(&contact).expect("contact observed");
+        assert_eq!(
+            id,
+            EngineConversationId::Contact("11111111-2222-4333-8444-555555555555".to_owned())
+        );
+        assert_eq!(
+            state,
+            ConversationState {
+                muted_until_timestamp: 42,
+                archived: true,
+                marked_unread: false,
+            }
+        );
+
+        // Contact aci 串兜底（无 binary）；无 ACI（空 binary + 空串）→ None。
+        let by_string = storage_proto::storage_record::Record::Contact(ContactRecord {
+            aci: "22222222-2222-4333-8444-555555555555".to_owned(),
+            ..Default::default()
+        });
+        let (id, _) = conversation_observation_of(&by_string).expect("aci string observed");
+        assert_eq!(
+            id,
+            EngineConversationId::Contact("22222222-2222-4333-8444-555555555555".to_owned())
+        );
+        let no_aci = storage_proto::storage_record::Record::Contact(ContactRecord::default());
+        assert!(conversation_observation_of(&no_aci).is_none());
+
+        // GV2：master key 标准 base64；空 master key → None。
+        let gv2 = storage_proto::storage_record::Record::GroupV2(GroupV2Record {
+            master_key: vec![9u8; 32],
+            marked_unread: true,
+            ..Default::default()
+        });
+        let (id, state) = conversation_observation_of(&gv2).expect("gv2 observed");
+        assert_eq!(
+            id,
+            EngineConversationId::Group(
+                base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+            )
+        );
+        assert!(state.marked_unread);
+        let empty_gv2 = storage_proto::storage_record::Record::GroupV2(GroupV2Record::default());
+        assert!(conversation_observation_of(&empty_gv2).is_none());
+
+        // GV1：id 文本；空 id → None。
+        let gv1 = storage_proto::storage_record::Record::GroupV1(GroupV1Record {
+            id: b"old-group-id".to_vec(),
+            archived: true,
+            ..Default::default()
+        });
+        let (id, state) = conversation_observation_of(&gv1).expect("gv1 observed");
+        assert_eq!(
+            id,
+            EngineConversationId::LegacyGroup("old-group-id".to_owned())
+        );
+        assert!(state.archived);
+        let empty_gv1 = storage_proto::storage_record::Record::GroupV1(GroupV1Record::default());
+        assert!(conversation_observation_of(&empty_gv1).is_none());
+
+        // 非会话族 → None。
+        let account = storage_proto::storage_record::Record::Account(AccountRecord::default());
+        assert!(conversation_observation_of(&account).is_none());
     }
 
     /// 写后 blocked 名单投影（project_blocked_after）：被换写条目按写后
