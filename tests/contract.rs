@@ -3512,6 +3512,58 @@ fn read_only_stubs_and_user_status_shapes() {
     assert_eq!(status["result"], json!({ "isRegistered": true }));
 }
 
+/// listGroups 可选 groupId 过滤（P15b 审计项5 单群读投影，wire additive）：
+/// 缺席/null = 全表（fake 恒空表）；well-formed 过滤过参数闸（fake 空
+/// store 回空表）；坏形状 fail-closed -32603（fake 面同口径）——空数组/
+/// 条目非字符串/坏 base64/≠32B/标量形/混合坏条目整拒。well-formed 但
+/// store 不在的 id 掉出结果（不报错，connector fold 侧诚实降级）。
+#[test]
+fn list_groups_group_id_filter_param_face() {
+    let dir = temp_dir("list-groups-filter");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let valid = "UVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVE="; // [0x51;32]
+    let valid_b = "Ug=="; // 1 字节：合法 base64 但 ≠32B
+    assert_eq!(
+        engine.request("listGroups", json!({ "account": "+15550000000" }))["result"],
+        json!([]),
+        "缺席 = 全表"
+    );
+    assert_eq!(
+        engine.request(
+            "listGroups",
+            json!({ "account": "+15550000000", "groupId": null })
+        )["result"],
+        json!([]),
+        "显式 null 同缺席"
+    );
+    assert_eq!(
+        engine.request(
+            "listGroups",
+            json!({ "account": "+15550000000", "groupId": [valid] })
+        )["result"],
+        json!([]),
+        "well-formed 过滤过闸（fake 空 store 空表）"
+    );
+    for bad in [
+        json!([]),
+        json!([42]),
+        json!(["not-base64!!"]),
+        json!([valid_b]),
+        json!(valid),
+        json!([valid, valid_b]),
+    ] {
+        let (code, message) = engine.error_of(
+            "listGroups",
+            json!({ "account": "+15550000000", "groupId": bad }),
+        );
+        assert_eq!(
+            (code, message.as_str()),
+            (-32603, "Internal error"),
+            "坏形状整拒：{bad}",
+        );
+    }
+}
+
 /// 备份导出消费面（compat §5 注册块 + 契约 §10.4/§10.7）：参数面一律
 /// fail-closed -32603（缺 account / 未注册 / fake 账号）；结构化码 -1 需要
 /// 真工件与真 presage 材料，由 backup_task 单元测试覆盖；backup.* 命名

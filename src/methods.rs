@@ -105,16 +105,42 @@ async fn dispatch(
             )
         }
         // listContacts/listGroups：store 投影（fake 模式回空表）；未注册
-        // 账号 -32603（细节不外泄）。
+        // 账号 -32603（细节不外泄）。listGroups 可选 groupId 过滤（P15b
+        // 审计项5 单群读投影，connector §4.53/§4.57/§4.62 fold 读派发的
+        // `groupId: [id]` 数组形）：非空字符串数组、条目 32B 标准 base64
+        // 群 master key（decode_group_id 闸），坏形状 fail-closed -32603
+        //（fake 面同口径）；well-formed 但 store 不在 → 掉出结果（结果可
+        // 空）。缺席/null = 全表（wire additive，旧行为不变）。
         "listContacts" | "listGroups" => {
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let group_filter = if method == "listGroups" {
+                match params.get("groupId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(entries)) => {
+                        if entries.is_empty() {
+                            return internal_error(id);
+                        }
+                        let mut parsed = Vec::with_capacity(entries.len());
+                        for entry in entries {
+                            match entry.as_str().and_then(crate::service::decode_group_id) {
+                                Some(key) => parsed.push(key),
+                                None => return internal_error(id),
+                            }
+                        }
+                        Some(parsed)
+                    }
+                    Some(_) => return internal_error(id),
+                }
+            } else {
+                None
+            };
             let rows = if method == "listContacts" {
                 service.list_contacts(account).await
             } else {
-                service.list_groups(account).await
+                service.list_groups(account, group_filter.as_deref()).await
             };
             match rows {
                 Ok(rows) => jsonrpc::success_response(id, json!(rows)),

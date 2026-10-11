@@ -1876,9 +1876,12 @@ impl Service {
     /// 改计算值——own ACI ∈ members，早期「入库即成员恒 true」口径废止）。
     /// `terminated` 位 = 进程内终止登记（groups 模块；presage Group 模型无
     /// 该字段，读面以登记表为准，compat §5 终止批登记）。
+    /// `filter` = 可选 groupId 过滤（P15b 审计项5 单群读投影）：Some 只投
+    /// 命中的群，None 全表（wire additive，缺席 = 旧行为）。
     pub(crate) async fn list_groups(
         self: &Arc<Self>,
         account: &str,
+        filter: Option<&[Vec<u8>]>,
     ) -> Result<Vec<Value>, SendError> {
         if !self.real {
             return Ok(Vec::new());
@@ -1898,6 +1901,9 @@ impl Service {
             .map_err(|_| SendError::Internal)?;
         let mut out = Vec::new();
         for (master_key, group) in groups.filter_map(Result::ok) {
+            if !group_key_passes_filter(&master_key, filter) {
+                continue;
+            }
             let terminated = {
                 use base64::Engine as _;
                 let id = base64::engine::general_purpose::STANDARD.encode(master_key);
@@ -6918,6 +6924,18 @@ pub(crate) fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
         .decode(group_id.trim())
         .ok()?;
     (key.len() == 32).then_some(key)
+}
+
+/// listGroups 单群读过滤判定（P15b 审计项5：可选 groupId 过滤参数，
+/// connector §4.53/§4.57/§4.62 fold 读已派发 `groupId: [id]` 数组形）：
+/// filter 缺席 = 全放行（全表旧行为）；在场 = master key 逐字节命中任一
+/// id 才放行——well-formed 但 store 不在的 id 掉出结果（结果可空，调用方
+/// fold 侧 `first()` → 空集诚实降级），不做错误面（读面只投影 store 实有）。
+fn group_key_passes_filter(master_key: &[u8], filter: Option<&[Vec<u8>]>) -> bool {
+    match filter {
+        None => true,
+        Some(ids) => ids.iter().any(|id| id.as_slice() == master_key),
+    }
 }
 
 /// 群 typing 体（止血批④）：groupId 携带 32 字节群 master key（proto tag
@@ -14187,5 +14205,28 @@ mod tests {
             .is_empty());
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// listGroups 单群读过滤判定（P15b 审计项5）：filter 缺席全放行（全表
+    /// 旧行为）；在场 = 逐字节命中任一 id 才放行，未命中掉出（结果可空）。
+    #[test]
+    fn group_key_filter_semantics() {
+        let a = vec![0x51u8; 32];
+        let b = vec![0x52u8; 32];
+        let both = vec![a.clone(), b.clone()];
+        assert!(group_key_passes_filter(&a, None), "缺席 = 全放行");
+        assert!(group_key_passes_filter(&b, None), "缺席 = 全放行");
+        assert!(
+            group_key_passes_filter(&b, Some(&both)),
+            "命中任一 id 即放行"
+        );
+        assert!(
+            !group_key_passes_filter(&b, Some(std::slice::from_ref(&a))),
+            "未命中掉出结果"
+        );
+        assert!(
+            !group_key_passes_filter(&[0x53u8; 32], Some(&both)),
+            "store 实有但不在过滤集 → 掉出"
+        );
     }
 }
