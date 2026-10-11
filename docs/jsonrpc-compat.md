@@ -160,7 +160,8 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   `serverGuid`（2026-10-06，reportSpam 面配套）：服务器为该条消息分配的
   UUID（举报 API 的路径参数），信封元数据公共位，有值才投（proto 只投影
   不发明）；envelope 级 reportSpamToken 经 presage Content 转换丢弃
-  （Metadata 不携带），不在投影（§5 reportSpam 块）。
+  （Metadata 不携带），不在投影（§5 reportSpam 块；P14 组 7 核对批：
+  捕获需 vendored Metadata 扩位，归 P15）。
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?, type(NORMAL\|GIFTBADGE——proto 词原值恒产，缺席/枚举外 coerce NORMAL，官方 isKnownProtoEnumMember 同构；六问批 Q5), bodyRanges?: [{number?, style?, start, length}] ≤64（mention 二进制优先 + author_numbers E.164 映射、Style 臂归同条目 style 键、NONE 丢、未知枚举整条丢；六问批 Q5）}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
@@ -1115,8 +1116,9 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   有值才投；proto 只投影不发明）。**已知边界（token 不透投影）**：
   envelope 级 `reportSpamToken` 经 presage Content 转换丢弃（Metadata
   仅携带 server_guid），引擎收投影无 token 可透——调用方举报时可自选
-  透传 token 参数，token 从 receive 面拿不到（上游 Metadata 升版携带后
-  再接，不发明）。
+  透传 token 参数，token 从 receive 面拿不到。**处置订正（P14 组 7 核对
+  批）**：捕获需 vendored Metadata 扩位（story bit 同型 fork 先例，非
+  「上游 Metadata 升版」），vendor/ 不动硬边界，归 P15。
 - **fake 纪律**：`getAvatar` → `AVATAR_UNAVAILABLE`、
   `setConversationBlocked` → `{blocked: []}`、`reportSpam` → 全量成功
   `{reported: N, failures: []}`。调度日志：`reportSpam` 落（协议上行面，
@@ -3189,6 +3191,43 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
 - **单测**：`keys_projection_carries_media_root_backup_key`（base64 投位 +
   AEP 不投 + 全缺空对象）、contract `mark_read_mark_viewed_sync_contract`
   （fake 成功 + 调度日志逐字 + 参数面八形状 fail-closed）。
+
+### P14 proto 进阶投影收尾·组 7 扩项核对批（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire 无变化不改码）
+
+四项逐一核对结论（两项核实已闭合、两项 vendored 边界跳过归 P15）：
+
+- **Envelope.sourceServiceIdBinary 投影——核对闭合，无需改码**：vendored
+  解密面 `cipher.rs` `envelope.parse_source_service_id()`（binary 16B ACI/
+  17B PNI 优先、字符串兜底 `parse_service_id_with_fallback`）→
+  `Metadata.sender` → 引擎 `sourceUuid` 投影——官方 decodeEnvelope
+  （MessageReceiver.preload.ts:301 `sourceServiceId || source`、binary 为
+  现行面）同构。binary-only 信封（无字符串 source）照常解析，无缺口。
+- **CallLinkUpdate 经 Storage 通道冗余送达——核对闭合，无需改码**：官方
+  发侧双通道——① Storage Service 写 CallLinkRecord（manifest/item 持久
+  态，storageRecordOps.preload.ts toCallLinkRecord/toPendingCallLinkRecord）
+  + ② CallLinkUpdate sync message（rootKey/adminKey live 面）；官方收侧
+  sync 面 = handleCallLinkUpdate 消费 rootKey/adminKey（组 5 已接投影），
+  Storage 面 = storage sync 时把 CallLinkRecord 落本地库（持久态恢复/
+  新设备初始化场景）。**结论：sync-message 通道即 rootKey/adminKey 的
+  live 送达主通道，组 5 接投影后接收面已闭环**；Storage 通道为持久态
+  冗余，引擎 Storage 读面只有 pinned/blocked 专用面、通用写面白名单显式
+  fail-closed 拒收 CallLink arm（§3 storage.write 行同域）——CallLinkRecord
+  消费不做的 gap 维持登记，消费方提出需求再立项。
+- **Envelope.ephemeral/urgent 消费面——vendored 边界跳过，归 P15**：官方
+  proto 注释锚 ephemeral=12「recipient offline 不持久化」（服务器离线
+  队列语义为主，官方桌面 MessageReceiver 对该位零消费——grep 全文无命中）、
+  urgent=14 default true（官方消费 = 桌面自身信封队列优先级位 +
+  logUnexpectedUrgentValue 校验日志，后者 LOG_UNEXPECTED_URGENT_VALUES=
+  false 缺省关闭——均非协议安全面）。引擎接收循环只见
+  `Received::Content`（vendored `Received` 六变体无 Envelope 载体），两位
+  在 vendored decrypt 的 Metadata 构造处丢弃（Metadata 无字段）；捕获投影
+  需 vendored Metadata 扩位（story bit 同型 fork 先例）——**vendor/ 不动
+  硬边界，跳过归 P15**。
+- **report_spam_token 捕获投影——vendored 边界跳过，归 P15**：token 在
+  vendored decrypt Metadata 构造处丢弃（Metadata 仅 server_guid/story），
+  捕获同样需 vendored Metadata 扩位——同上跳过归 P15；上方 reportSpam
+  块「token 不透投影」边界维持，处置由「上游 Metadata 升版」订正为
+  「vendored Metadata 扩位（story bit 同型 fork），P15」。
 
 
 ## 6. fake 服务模式（仅测试）
