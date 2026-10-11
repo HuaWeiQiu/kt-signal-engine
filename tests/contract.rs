@@ -448,6 +448,48 @@ fn blocked_conversations_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603);
 }
 
+/// storage.mergeContacts 契约面（窗D A4，官方 mergeContactRecord engine 腿）：
+/// fake 零汇总形状（读面纪律）+ 参数面 fail-closed（-32603：account 缺席/
+/// 非字符串；real 模式未注册账号折叠 -32603 不触网——无 storage 状态账号
+/// 零汇总幂等面归真机验证）。
+#[test]
+fn storage_merge_contacts_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("merge-contacts-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake：零汇总幂等形状（七字段 camelCase 全键在场）。
+    assert_eq!(
+        engine.request(
+            "storage.mergeContacts",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({
+            "recordsRead": 0,
+            "skipped": 0,
+            "identitiesNew": 0,
+            "identitiesReplaced": 0,
+            "profileKeysSet": 0,
+            "contactsCreated": 0,
+            "trustStatesSynced": 0,
+        })
+    );
+
+    // 缺 account / account 非字符串形状 → -32603。
+    let (code, _) = engine.error_of("storage.mergeContacts", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("storage.mergeContacts", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // real + 全新数据目录（无账号）：未注册折叠 -32603，不触网。
+    let real_dir = temp_dir("merge-contacts-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, _) = real_engine.error_of(
+        "storage.mergeContacts",
+        json!({ "account": "+15550001111" }),
+    );
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+}
+
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
 /// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
 /// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。

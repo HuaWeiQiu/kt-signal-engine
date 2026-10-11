@@ -108,6 +108,7 @@ send message: Signal server unavailable.
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup}]}`（存储序；条目形状与置顶面同构；v1 不含 blockedAtTimestamp） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
 | `getAvatar` | `{account, conversationId}`（形状分派：ACI/PNI ServiceId UUID 直通、手机号文本（E.164/裸数字）经 contacts 反查、群 = master key 标准 base64（listGroups id 同源）；三者皆不中 `-32603`） | `{dataUri, size}`（data URI = `data:<mime>;base64,<payload>`，MIME 魔数嗅探、未识别回退 `application/octet-stream`；size = 原始字节数） | 参数缺失/会话标识形状非法/未注册账号 `-32603`（参数面不占用结构化码）；无头像（未同步 profile_key/对端或群未设头像/服务器 403/404）→ `AVATAR_UNAVAILABLE`；网络/下载/解密失败 → `AVATAR_FETCH_FAILED`；超 10MB 帽 → `AVATAR_TOO_LARGE`（均 `-1` + message 码位） | **2026-10-06 real（KT 扩展）**：1:1 走 presage `retrieve_profile_avatar_by_uuid`（profileKey = presage store `profile_key(service_id)`，contacts 同步随行落库；未同步 → 诚实「无头像」）；群走 presage `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密）；缓存/CDN/解密/入库由 presage 承担；10MB 帽照 presage 注释口径，超出 fail-closed；fake：`AVATAR_UNAVAILABLE`（不落调度日志，读面纪律） |
 | `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状，存储序） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；fake：成功回 `{blocked: []}` |
+| `storage.mergeContacts` | `{account}` | `{recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, trustStatesSynced}`（七汇总字段；逐条 merge 幂等——同钥重跑全 no-op） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A4，官方 mergeContactRecord engine 腿，§5 块）**：Storage Service manifest → 全部 CONTACT identifier 批读 → ContactRecord 逐条 merge——identityKey 非空 → 身份库 save（官方 updateIdentityAfterSync 同构：absent 新增/同钥 no-op/异钥替换 + vendored 换钥 archive sessions）+ identityState 落 sidecar 信任态（Default/坏值归 default）；profileKey 非空且本地缺失 → upsert（官方 isFirstSync\|!localProfileKey 同闸）；联系人缺失 → contacts 建档（e164/given+family 姓名随建，已有档不动——姓名权威 = 手机 contacts sync）；本机 uuid/无 serviceId/坏形跳过（官方 shouldDrop 同位，skipped 汇总）；无引擎消费模型字段（unregisteredAt/hideStory/hidden/avatarColor/note/nickname 族）记档跳过，archived/markedUnread/muted/blocked 已有专用面不重复；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A4 块；fake：恒七字段零汇总 |
 | `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `sendCallMessage` | `{account, recipient(单号码/ACI)?\|group(32B 群 master key 标准 base64，listGroups/terminateGroup/updateGroup 的 groupId 同源口径)?——寻址两腿恰一互斥, data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；**两腿恰一**（2026-10-08 群臂批）——`group` 与 `recipient` 同置/都缺/任一腿形状非法 `-32603`；群腿仅 modern 面放行（官方群信令恒 opaque，legacy 裸帧族群向无先例；sender-key 群发无设备定向位——destinationDeviceId 与 group 同置 `-32603`）；`groupId` 键维持禁入（wire 参数名是 `group`）） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、group 非法 base64/≠32B/非字符串、两腿同置/都缺、groupId 键在场、群腿携 legacy 或 destinationDeviceId）/未注册账号 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-08 群臂批） | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（sent-transcript 缺席见 §5 通话消息块；online 位 2026-10-11 六问批勘误：官方桌面 call 发送链同样不设 online——仅 typing 消息设 online:true，**无偏差**，原「online=false 偏差」登记作废，§5 六问批）；**2026-10-08 群臂批（P4b，connector 契约 1.82 wire 面对位，engine-compat）**：`group` 腿 sender-key 群发（官方 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 → sendCallingMessage.preload.ts:99-118 isGroup 臂 sendContentMessageToGroup 同落点），群头 = open_group_sender（terminated 硬拒，send 系群组形态同纪律）+ `send_message_to_group`（sendTyping 群臂同原语）；单测钉群臂 wire = `CallMessage{opaque{data,urgency}}` 字段10（无 busy/hangup/destinationDeviceId 位）；fake：成功 `{"timestamp":u64}` 两臂同口径（落调度日志，协议上行面纪律） |
@@ -3794,6 +3795,54 @@ SignalService.proto 既有，零 proto 改动。
 - **单测**：poll_send_proto_faces（三臂 proto 构造 + optionIndexes 去重保
   序钉形）+ contract poll_send_param_faces_and_dispatch_log（26 形状闸逐
   形 + fake 成功三臂 + 调度日志逐键）。
+
+### 窗D A4 Storage ContactRecord merge/发现面批（2026-10-11，官方对齐 Signal-Desktop storageRecordOps，wire additive）
+
+缺口总登记 A4 的 engine 腿：新方法 `storage.mergeContacts`（§3 行）。
+官方锚：`services/storageRecordOps.preload.ts` mergeContactRecord +
+`SignalProtocolStore.preload.ts` updateIdentityAfterSync。此前 engine 的
+Storage 同步面全部按需读写（置顶/拉黑/三 flag/配置/贴纸包等），没有把
+ContactRecord 的身份材料 merge 进引擎本地库的通道——新链接设备/换机后
+presage 身份库为空，对端身份钥只能靠首次发送时服务器 prekey 面旁路回填，
+安全号计算、P9 信任闸、头像发现（profileKey）全部无从起步。
+
+- **官方 merge 语义的 engine 协议面子集**（其余字段无引擎消费模型，记档
+  跳过，见下）：
+  1. identityKey 非空 → `save_identity`（官方 updateIdentityAfterSync 同
+     构：absent→新增、同钥→no-op、异钥→替换；替换腿 archive sessions 由
+     vendored save_identity 承担——窗口 C 批已修的同钥不误归档语义保持）；
+     ACI/PNI 双库分流（官方 serviceId 路由同构）。identityState 随行落
+     P9 sidecar 信任态（apply_synced_trust，verified 同步收口同通道语义；
+     Default/坏值归 default——官方 identityState null→DEFAULT 同域）。
+  2. profileKey 非空且本地缺失 → `upsert_profile_key`（官方
+     isFirstSync || !localProfileKey 同闸，已有不覆盖）；≠32B 坏长度诚实
+     跳过。
+  3. 联系人缺失 → `save_contact` 建档（e164 解析 + given+family 复合名 +
+     profileKey 随建）；**已有档不动**——手机 contacts sync 是姓名权威
+     （P15a 项3 落库面），engine 不发明 system/nickname 建模。
+  4. service id 解析：aciBinary 16B → aci 串（只收 ACI 形态）→ pniBinary
+     → pni 串（untagged 裸 UUID 即 PNI，官方 fromPniUuidBytesOrUntagged-
+     String 字段声明种类同构；"PNI:" 标签形宽容）。无 serviceId/本机
+     uuid → 官方 shouldDrop 同位跳过（skipped 汇总，零 stderr）。
+- **记档跳过（无引擎消费模型，官方有消费）**：unregisteredAtTimestamp
+  （注册态引擎无建模）、hideStory/hidden（故事/隐藏面引擎无建模）、
+  avatarColor/note/nickname/system*Name 族（引擎 contacts 模型无位）、
+  username（引擎不持远端 username 缓存）、archived/markedUnread/muted/
+  blocked（已有专用读写面 A2/拉黑批，不重复写）。这些位的 wire 消费归
+  connector/desktop 侧直接读 storage.read 面（后续 C3/D4b 批）。
+- **幂等与安全面**：merge 幂等（同钥/已有档重跑全 no-op）；只读 Storage
+  面 + 本地库写，零 Storage 写操作（不做 storage write-back——官方桌面
+  merge 后也不回写 ContactRecord，写由主设备权威）；触发时机归调用方
+  （connector 链接完成/manifest 变更时调用，引擎不自动后台跑——按需面
+  纪律）。
+- **错误面**：account 缺席/未注册 `-32603`；storage 链路 STORAGE_UNAVAILABLE/
+  STORAGE_READ_FAILED（-1 + message，置顶面同码位）；无 master key 或
+  manifest 404 → 七字段零汇总幂等成功（blocked 只读面同口径）。
+- **fake**：恒七字段零汇总（读面纪律）。
+- **单测**：service_id_resolution_precedence（binary 优先/aci 串 ACI-only/
+  pni untagged 裸 UUID/标签形/全缺/invalid-aci 逐形）+ trust_state_mapping
+  （三态直映 + 坏值归 default）+ contract storage_merge_contacts_fake_
+  shapes_and_param_fail_closed（fake 零汇总 + 参数闸 + real 未注册折叠）。
 
 
 ## 6. fake 服务模式（仅测试）

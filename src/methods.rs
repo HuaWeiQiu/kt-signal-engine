@@ -1665,6 +1665,30 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // storage.mergeContacts（窗D A4，官方 mergeContactRecord engine 腿）：
+        // 单参 account（只读 Storage 面 + 本地 ingest，无参数形状分叉）；
+        // fake 恒零汇总（读面纪律）。汇总字段名 camelCase wire 直投。
+        "storage.mergeContacts" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.merge_storage_contacts(account).await {
+                Ok(outcome) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "recordsRead": outcome.records_read,
+                        "skipped": outcome.skipped,
+                        "identitiesNew": outcome.identities_new,
+                        "identitiesReplaced": outcome.identities_replaced,
+                        "profileKeysSet": outcome.profile_keys_set,
+                        "contactsCreated": outcome.contacts_created,
+                        "trustStatesSynced": outcome.trust_states_synced,
+                    }),
+                ),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 贴纸包安装状态同步（Storage Service 真相源，带 account 参数，风格
         // 对齐置顶面）：packId 解码/packKey 形状错走 -32603 fail-closed
         //（置顶面参数处理先例，不占用结构化码）。

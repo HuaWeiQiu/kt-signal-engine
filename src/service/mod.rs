@@ -58,6 +58,7 @@ pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
+pub(crate) mod storage_merge;
 pub(crate) mod storage_records;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
@@ -2826,6 +2827,21 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         storage_sync::read_blocked_conversations(&context).await
+    }
+
+    /// storage.mergeContacts（窗D A4）：Storage Service ContactRecord 全量
+    /// merge/发现面——identityKey 灌 presage 身份库（官方 updateIdentity-
+    /// AfterSync 同构）+ identityState 落 sidecar 信任态 + profileKey 补缺 +
+    /// contacts 建档，逐条汇总返回。幂等：同钥重跑全 no-op。
+    pub(crate) async fn merge_storage_contacts(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<storage_merge::MergeOutcome, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_merge::MergeOutcome::default());
+        }
+        let context = storage_context(self, account).await?;
+        storage_merge::merge_contacts(context, now_ms()).await
     }
 
     /// setConversationPinned（P4 扩面）：官方写语义（读改写 AccountRecord，
