@@ -2177,6 +2177,9 @@ pub(crate) struct AccountConfigurationUpdate {
     /// PhoneNumberSharingMode 数值（`phone_number_sharing_mode_of` 出）。
     pub(crate) phone_number_sharing_mode: Option<i32>,
     pub(crate) unlisted_phone_number: Option<bool>,
+    /// storiesDisabled(29)（窗D B5，官方 toAccountRecord itemStorage
+    /// 'hasStoriesDisabled' 同位——Stories 面跨设备收敛写位）。
+    pub(crate) stories_disabled: Option<bool>,
 }
 
 /// AccountRecord 读-改-写保真核心（设置面）：只覆写提供的字段，其余字段
@@ -2191,6 +2194,7 @@ pub(crate) fn account_record_with_configuration(
         typing_indicators,
         phone_number_sharing_mode,
         unlisted_phone_number,
+        stories_disabled,
     } = update;
     let mut updated = record.clone();
     let mut changed = false;
@@ -2209,6 +2213,10 @@ pub(crate) fn account_record_with_configuration(
     if let Some(value) = unlisted_phone_number {
         changed |= updated.unlisted_phone_number != *value;
         updated.unlisted_phone_number = *value;
+    }
+    if let Some(value) = stories_disabled {
+        changed |= updated.stories_disabled != *value;
+        updated.stories_disabled = *value;
     }
     changed.then_some(updated)
 }
@@ -2285,8 +2293,9 @@ pub(crate) async fn write_universal_expire_timer(
 /// 账号级设置写面（setAccountConfiguration）：update_account_record 通用
 /// 骨架 + 设置面 mutate。官方 updateConfiguration 等价——真相源 =
 /// AccountRecord 的 readReceipts(6)/typingIndicators(8)/
-/// phoneNumberSharingMode(12)/unlistedPhoneNumber(13)，读改写仅动提供的
-/// 字段，其余账号设置原样（字段保真铁面同款链路）。
+/// phoneNumberSharingMode(12)/unlistedPhoneNumber(13)/storiesDisabled(29)
+///（窗D B5），读改写仅动提供的字段，其余账号设置原样（字段保真铁面同
+/// 款链路）。
 pub(crate) async fn write_account_configuration(
     context: &StorageContext,
     update: AccountConfigurationUpdate,
@@ -3376,6 +3385,7 @@ mod tests {
             unlisted_phone_number: false,
             universal_expire_timer: 86_400,
             username: "kt.01".to_owned(),
+            stories_disabled: false,
             story_view_receipts_enabled: OffOptionalBool::Enabled as i32,
             release_notes_chat_blocked_at: Some(1_720_000_000_000),
             pinned_conversations: vec![crate::proto::storage::account_record::PinnedConversation {
@@ -3425,12 +3435,23 @@ mod tests {
         assert!(!updated.read_receipts);
         assert!(!updated.typing_indicators);
 
+        // storiesDisabled（窗D B5）：写位生效，其余字段原样。
+        let update = AccountConfigurationUpdate {
+            stories_disabled: Some(true),
+            ..AccountConfigurationUpdate::default()
+        };
+        let updated = account_record_with_configuration(&base, &update).expect("changes");
+        assert!(updated.stories_disabled);
+        assert_eq!(updated.phone_number_sharing_mode, everybody);
+        assert_eq!(updated.username, "kt.01");
+
         // 幂等：提供字段与现状全等 → None（无写面）。
         let same = AccountConfigurationUpdate {
             read_receipts: Some(false),
             typing_indicators: Some(false),
             phone_number_sharing_mode: Some(everybody),
             unlisted_phone_number: Some(false),
+            stories_disabled: Some(false),
         };
         assert!(account_record_with_configuration(&base, &same).is_none());
 

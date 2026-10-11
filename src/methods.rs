@@ -2106,11 +2106,19 @@ async fn dispatch(
                 Some(value) => value,
                 None => return internal_error(id),
             };
+            // storiesDisabled（窗D B5）：AccountRecord.storiesDisabled(29)
+            // 写位，官方 toAccountRecord itemStorage 'hasStoriesDisabled'
+            // 同位——Stories 面跨设备收敛。
+            let stories_disabled = match optional_bool(params.get("storiesDisabled")) {
+                Some(value) => value,
+                None => return internal_error(id),
+            };
             // 零可写字段 = 无意图调用，fail-closed（不静默 no-op）。
             if read_receipts.is_none()
                 && typing_indicators.is_none()
                 && phone_number_sharing_mode.is_none()
                 && unlisted_phone_number.is_none()
+                && stories_disabled.is_none()
             {
                 return internal_error(id);
             }
@@ -2122,6 +2130,7 @@ async fn dispatch(
                         typing_indicators,
                         phone_number_sharing_mode,
                         unlisted_phone_number,
+                        stories_disabled,
                     },
                 )
                 .await

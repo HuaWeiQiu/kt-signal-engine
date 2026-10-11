@@ -3718,6 +3718,14 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
         )["result"],
         json!({})
     );
+    // storiesDisabled 单写（窗D B5：AccountRecord.storiesDisabled(29)）。
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "storiesDisabled": true }),
+        )["result"],
+        json!({})
+    );
 
     // 参数面 fail-closed 逐形状。
     let rejects = [
@@ -3725,6 +3733,7 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
         json!({ "account": number, "readReceipts": "yes" }),
         json!({ "account": number, "typingIndicators": 1 }),
         json!({ "account": number, "unlistedPhoneNumber": "false" }),
+        json!({ "account": number, "storiesDisabled": "yes" }),
         json!({ "account": number, "phoneNumberSharingMode": "contactsOnly" }),
         json!({ "account": number, "phoneNumberSharingMode": "" }),
         json!({ "account": number, "phoneNumberSharingMode": 1 }),
