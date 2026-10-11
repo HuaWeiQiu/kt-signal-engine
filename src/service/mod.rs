@@ -47,6 +47,7 @@ pub(crate) mod call_links;
 pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
 pub(crate) mod delivery_receipt;
+pub(crate) mod devices;
 /// R1 群发本地缓存面：GSE 按群落 kv（官方 2h-2d 窗 + 成员面失效）+ 发送
 /// 面 terminated 探针缓存。稳态群发 0 次额外 HTTPS。
 pub(crate) mod group_cache;
@@ -3249,6 +3250,34 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         report::report_spam(&context, &sender_aci, &server_guids, token.as_deref()).await
+    }
+
+    /// getDevices（设备清单读面，窗D B13，KT 扩展方法）：GET v1/devices
+    /// 投影 + 设备名引擎侧解密（本机 ACI 身份私钥）；fake 模式空表桩
+    /// （读面纪律）。
+    pub(crate) async fn list_devices(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<Vec<devices::DeviceProjection>, devices::DevicesError> {
+        if !self.real {
+            return Ok(Vec::new());
+        }
+        let context = storage_context(self, account).await?;
+        devices::list_devices(&context).await
+    }
+
+    /// unlinkDevice（服务端解绑，窗D B13 同批）：DELETE v1/devices/{id}
+    /// 直通（服务器裁决授权）；fake 模式成功桩。
+    pub(crate) async fn unlink_device(
+        self: &Arc<Self>,
+        account: &str,
+        device_id: u32,
+    ) -> Result<(), devices::DevicesError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        devices::unlink_device(&context, device_id).await
     }
 
     /// getUsername（用户名读面，KT 扩展方法）：AccountRecord.username(33)/

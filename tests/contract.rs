@@ -661,6 +661,75 @@ fn storage_call_link_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603, "unknown account folds to internal error");
 }
 
+/// getDevices / unlinkDevice 契约面（窗D B13，官方 getDevices/unlink
+/// engine 腿）：fake 空表/成功桩形状（读面纪律）+ 参数面 fail-closed
+/// （-32603：account 缺席/非字符串；deviceId 缺席/非数值/≤0；real 模式
+/// 未注册账号折叠 -32603 不触网——服务器清单拉取/解绑归真机验证）。
+#[test]
+fn devices_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("devices-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 读：空列表成功。
+    assert_eq!(
+        engine.request("getDevices", json!({ "account": "+15550000000" }))["result"],
+        json!({ "devices": [] })
+    );
+
+    // fake 写：成功空结果。
+    assert_eq!(
+        engine.request(
+            "unlinkDevice",
+            json!({ "account": "+15550000000", "deviceId": 2 })
+        )["result"],
+        json!({})
+    );
+
+    // getDevices：缺 account / 非字符串 → -32603。
+    let (code, _) = engine.error_of("getDevices", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getDevices", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // unlinkDevice：缺 account / 缺 deviceId / deviceId 非数值 / ≤0 / 小数
+    // → -32603。
+    let (code, _) = engine.error_of("unlinkDevice", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("unlinkDevice", json!({ "account": "+15550000000" }));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "unlinkDevice",
+        json!({ "account": "+15550000000", "deviceId": "2" }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "unlinkDevice",
+        json!({ "account": "+15550000000", "deviceId": 0 }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "unlinkDevice",
+        json!({ "account": "+15550000000", "deviceId": -1 }),
+    );
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "unlinkDevice",
+        json!({ "account": "+15550000000", "deviceId": 2.5 }),
+    );
+    assert_eq!(code, -32603);
+
+    // real + 全新数据目录（无账号）：未注册折叠 -32603，不触网。
+    let real_dir = temp_dir("devices-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, _) = real_engine.error_of("getDevices", json!({ "account": "+15550001111" }));
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+    let (code, _) = real_engine.error_of(
+        "unlinkDevice",
+        json!({ "account": "+15550001111", "deviceId": 2 }),
+    );
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+}
+
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
 /// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
 /// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。

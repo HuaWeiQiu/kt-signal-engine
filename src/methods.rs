@@ -2441,6 +2441,57 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // getDevices（设备清单读面，窗D B13，KT 扩展方法）：单参 account
+        // （GET v1/devices 投影 + 设备名引擎侧解密——本机 ACI 身份私钥）；
+        // fake 恒空表（读面纪律）。参数面 fail-closed -32603；服务器拒绝
+        // -1 DEVICES_FAILED（data.status? 诚实透传）；传输面 -1 DEVICES_
+        // UNAVAILABLE。
+        "getDevices" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.list_devices(account).await {
+                Ok(devices) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "devices": devices
+                            .iter()
+                            .map(|device| {
+                                json!({
+                                    "deviceId": device.device_id,
+                                    "name": device.name,
+                                    "registrationId": device.registration_id,
+                                    "lastSeenMs": device.last_seen_ms,
+                                    "createdAtCiphertext": device.created_at_ciphertext,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                Err(error) => device_error(id, &error),
+            }
+        }
+        // unlinkDevice（服务端解绑，窗D B13 同批，KT 扩展方法）：deviceId
+        // 正整数 → DELETE v1/devices/{id} 直通（官方 unlink 同端点；服务
+        // 器裁决授权：primary 解绑任意 linked、linked 解绑自身，越权/主设
+        // 备删除拒绝原样透出）；fake 成功桩。
+        "unlinkDevice" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(device_id) = params
+                .get("deviceId")
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|id| *id > 0)
+            else {
+                return internal_error(id);
+            };
+            match service.unlink_device(account, device_id).await {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                Err(error) => device_error(id, &error),
+            }
+        }
         // 备份导出消费面（compat §3/§5「备份导出消费面」注册块 + 契约
         // §10.4）：参数面 fail-closed -32603（缺 account/未注册/fake 账号/
         // AEP 缺失）；结构化码 -1 + message 码位（契约 §10.7，connector 契约
@@ -3848,6 +3899,30 @@ fn call_credential_error(
         }
         Error::Unavailable => {
             jsonrpc::error_response(id, &RpcError::new(-1, "CALL_CREDENTIALS_UNAVAILABLE"))
+        }
+    }
+}
+
+/// 设备面错误 → JSON-RPC 码（getDevices/unlinkDevice 同族）：账号参数
+/// 不指向已链接账号 -32603（参数面不占用结构化码）；服务器拒绝
+/// `DEVICES_FAILED`（-1 + message，data.status? = HTTP 状态码诚实透传）；
+/// 传输面 `DEVICES_UNAVAILABLE`（-1 + message）。
+fn device_error(id: &Value, error: &crate::service::devices::DevicesError) -> Value {
+    use crate::service::devices::DevicesError as Error;
+    match error {
+        Error::UnknownAccount => internal_error(id),
+        Error::Failed { status } => {
+            let mut data = serde_json::Map::new();
+            if let Some(status) = status {
+                data.insert("status".to_owned(), json!(status));
+            }
+            jsonrpc::error_response(
+                id,
+                &jsonrpc::RpcError::with_data(-1, "DEVICES_FAILED", Value::Object(data)),
+            )
+        }
+        Error::Unavailable => {
+            jsonrpc::error_response(id, &RpcError::new(-1, "DEVICES_UNAVAILABLE"))
         }
     }
 }
