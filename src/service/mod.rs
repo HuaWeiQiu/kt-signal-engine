@@ -2039,6 +2039,41 @@ impl Service {
         groups::join_group_via_link(&context, &master_key, &password).await
     }
 
+    /// cancelJoinRequest（撤回入群申请，KT 扩展方法，官方桌面
+    /// cancelJoinRequest 行为对齐）：重拉 join info 取 version +
+    /// delete_members_pending_admin_approval，链接授权写面单次 PATCH。
+    /// fake 模式成功形状桩 {status:"cancelled"}（leaveGroup/terminateGroup
+    /// 同纪律）。
+    pub(crate) async fn cancel_join_request_via_link(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<(), groups::TerminateError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        groups::cancel_join_request_via_link(&context, &master_key, &password).await
+    }
+
+    /// approveJoinRequest（管理员批准入群申请，KT 扩展方法，官方
+    /// approvePendingMembershipFromGroupV2 行为对齐）：群态读面本地闸
+    ///（requesting_members 在场）+ promote_members_pending_admin_approval
+    /// 普通 PATCH。fake 模式成功形状桩 {status:"approved"}。
+    pub(crate) async fn approve_join_request(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+        recipient: &str,
+    ) -> Result<(), groups::TerminateError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        groups::approve_join_request(&context, &master_key, recipient).await
+    }
+
     /// createGroup（自建群，KT 扩展方法，官方 createGroupV2 行为对齐）：
     /// 随机 master key + zkgroup 派生链 + 初始 Group proto `PUT v1/groups`
     /// 与本地群态落库；成员入参（service-id 串/号码）在 real 模式解析。

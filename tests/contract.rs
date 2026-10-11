@@ -1618,6 +1618,143 @@ fn join_group_via_link_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// cancelJoinRequest（撤回入群申请，P13/任务4，官方桌面 cancelJoinRequest
+/// 行为对齐）：fake 形状桩 `{status:"cancelled"}`（leaveGroup 同纪律）；
+/// 写面落调度日志（inviteLink 键逐字保留）；参数面 fail-closed（-32603：
+/// 缺 account/缺 inviteLink/坏形状——parseInviteLink 同闸收口）；real 模
+/// 式未注册账号折叠 -32603。
+#[test]
+fn cancel_join_request_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("cancel-join-request");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let link = "https://signal.group/#CjQKIBEREREREREREREREREREREREREREREREREREREREREREhAiIiIiIiIiIiIiIiIiIiIi";
+
+    // fake 形状桩：{status:"cancelled"}。
+    assert_eq!(
+        engine.request(
+            "cancelJoinRequest",
+            json!({ "account": "+15550000000", "inviteLink": link })
+        )["result"],
+        json!({ "status": "cancelled" })
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "inviteLink": link }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "inviteLink": "" }),
+        json!({ "account": "+15550000000", "inviteLink": "sgnl://joingroup#@@@" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("cancelJoinRequest", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "cancelJoinRequest rejects {params}"
+        );
+    }
+
+    // 调度日志：写面落日志（成功 1 + 拒绝 4 = 5 行），inviteLink 键逐字。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "cancelJoinRequest")
+        .collect();
+    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
+    assert_eq!(entries[0]["params"]["inviteLink"], json!(link));
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("cancel-join-request-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "cancelJoinRequest",
+        json!({ "account": "+15559990000", "inviteLink": link }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
+/// approveJoinRequest（管理员批准入群申请，P13/任务4，官方
+/// approvePendingMembershipFromGroupV2 行为对齐）：fake 形状桩
+/// `{status:"approved"}`；写面落调度日志（groupId/recipient 键逐字保留）；
+/// 参数面 fail-closed（-32603：缺 account/groupId 非 base64·≠32B/recipient
+/// 缺席·空串·非字符串）；real 模式未注册账号折叠 -32603。
+#[test]
+fn approve_join_request_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("approve-join-request");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 形状桩：{status:"approved"}（recipient ACI/号码两形同桩）。
+    assert_eq!(
+        engine.request(
+            "approveJoinRequest",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "recipient": "44444444-5555-4666-9777-888888888888"
+            })
+        )["result"],
+        json!({ "status": "approved" })
+    );
+    assert_eq!(
+        engine.request(
+            "approveJoinRequest",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "recipient": "+15550000002"
+            })
+        )["result"],
+        json!({ "status": "approved" })
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "groupId": group_id, "recipient": "44444444-5555-4666-9777-888888888888" }),
+        json!({ "account": "+15550000000", "recipient": "44444444-5555-4666-9777-888888888888" }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "recipient": "44444444-5555-4666-9777-888888888888" }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG", "recipient": "44444444-5555-4666-9777-888888888888" }),
+        json!({ "account": "+15550000000", "groupId": group_id }),
+        json!({ "account": "+15550000000", "groupId": group_id, "recipient": "" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "recipient": 42 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("approveJoinRequest", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "approveJoinRequest rejects {params}"
+        );
+    }
+
+    // 调度日志：写面落日志（成功 2 + 拒绝 7 = 9 行），recipient 键逐字。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "approveJoinRequest")
+        .collect();
+    assert_eq!(entries.len(), 9, "成功两条 + 拒绝七条均落日志");
+    assert_eq!(
+        entries[0]["params"]["recipient"],
+        json!("44444444-5555-4666-9777-888888888888")
+    );
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("approve-join-request-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "approveJoinRequest",
+        json!({
+            "account": "+15559990000",
+            "groupId": group_id,
+            "recipient": "44444444-5555-4666-9777-888888888888"
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// 群邀请链接族纯函数面（generateInviteLinkPassword/buildInviteLink/
 /// parseInviteLink，KT 扩展批 P13/任务1，官方 generateGroupInviteLinkPass
 /// word/buildGroupLink/parseGroupLink 行为对齐）：三方法皆 fake/real 同码路

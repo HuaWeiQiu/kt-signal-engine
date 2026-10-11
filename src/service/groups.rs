@@ -647,7 +647,6 @@ pub(crate) async fn join_group_via_link(
     master_key: &[u8],
     password: &[u8],
 ) -> Result<bool, TerminateError> {
-    use base64::Engine as _;
     use presage::libsignal_service::groups_v2::GroupOperations;
     use presage::libsignal_service::groups_v2::Role;
     use presage::proto::access_control::AccessRequired as ProtoAccess;
@@ -690,30 +689,14 @@ pub(crate) async fn join_group_via_link(
         )];
     }
     let authorization = group_authorization(context, master_key).await?;
-    let web_safe = super::group_link::to_web_safe_base64(
-        &base64::engine::general_purpose::STANDARD.encode(password),
-    );
-    let response = context
-        .push
-        .request(
-            reqwest::Method::PATCH,
-            Endpoint::storage(format!("v2/groups?inviteLinkPassword={web_safe}")),
-            HttpAuthOverride::Identified(authorization),
-        )
-        .map_err(|_| TerminateError::Unavailable)?
-        .header("Content-Type", "application/x-protobuf")
-        .body(actions.encode_to_vec())
-        .send()
-        .await
-        .map_err(|_| TerminateError::Unavailable)?;
-    let status = response.status().as_u16();
+    let (status, body) =
+        patch_group_via_link_raw(&context.push, authorization, &actions, password).await?;
     if (200..300).contains(&status) {
         let requested = approval_required;
         refresh_local_group_state(context, master_key).await;
         super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
         return Ok(requested);
     }
-    let body = response.bytes().await.unwrap_or_default();
     if status == 400
         && String::from_utf8_lossy(&body)
             .contains("cannot ask to join via invite link if already asked to join")
@@ -726,6 +709,138 @@ pub(crate) async fn join_group_via_link(
     Err(TerminateError::Failed {
         status: Some(status),
     })
+}
+
+/// `PATCH v2/groups?inviteLinkPassword=<websafe>` 链接授权写面共用件（官方
+/// modifyGroup inviteLinkBase64 同形状——链接密码 query 参数即非成员写授权
+/// 凭据）。返回 (HTTP status, 响应 body) 由调用方裁定（join 需读
+/// already-asked body；cancel 只认 2xx）；传输层失败 → Unavailable。
+async fn patch_group_via_link_raw(
+    push: &PushService,
+    auth: presage::libsignal_service::push_service::HttpAuth,
+    actions: &presage::proto::group_change::Actions,
+    password: &[u8],
+) -> Result<(u16, Vec<u8>), TerminateError> {
+    use base64::Engine as _;
+    let web_safe = super::group_link::to_web_safe_base64(
+        &base64::engine::general_purpose::STANDARD.encode(password),
+    );
+    let response = push
+        .request(
+            reqwest::Method::PATCH,
+            Endpoint::storage(format!("v2/groups?inviteLinkPassword={web_safe}")),
+            HttpAuthOverride::Identified(auth),
+        )
+        .map_err(|_| TerminateError::Unavailable)?
+        .header("Content-Type", "application/x-protobuf")
+        .body(actions.encode_to_vec())
+        .send()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    let status = response.status().as_u16();
+    let body = response.bytes().await.unwrap_or_default().to_vec();
+    Ok((status, body))
+}
+
+/// cancelJoinRequest 编排（官方桌面 cancelJoinRequest 行为对齐，KT 扩展）：
+/// 重拉 join info 取 version（申请者非成员读不到群态）→
+/// delete_members_pending_admin_approval=[{deleted_user_id = own ACI 加密}]
+///（官方 #denyPendingApprovalRequest(ourAci)/
+/// buildDeletePendingAdminApprovalMemberChange 同形，ban 配对面不入本批——
+/// §5 P3 批同口径）→ 链接授权写面单次 PATCH（官方 inviteLinkPassword
+/// query param 同位）。官方本地闸（isMemberRequestingToJoin）引擎无本地
+/// 态不设——写意图交服务器裁决（§5 登记偏差）；写后本地群态刷新
+///（best-effort）。
+pub(crate) async fn cancel_join_request_via_link(
+    context: &StorageContext,
+    master_key: &[u8],
+    password: &[u8],
+) -> Result<(), TerminateError> {
+    use presage::libsignal_service::protocol::Aci;
+    use presage::libsignal_service::zkgroup;
+    let info = fetch_group_join_info(context, master_key, password).await?;
+    let key: [u8; 32] = master_key
+        .try_into()
+        .map_err(|_| TerminateError::UnknownGroup)?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+    let own_aci = Aci::from(context.aci_uuid);
+    let actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: info.version.saturating_add(1),
+        delete_members_pending_admin_approval: vec![
+            presage::proto::group_change::actions::DeleteMemberPendingAdminApprovalAction {
+                deleted_user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id(own_aci.into()),
+                ),
+            },
+        ],
+        ..presage::proto::group_change::Actions::default()
+    };
+    let authorization = group_authorization(context, master_key).await?;
+    let (status, _) =
+        patch_group_via_link_raw(&context.push, authorization, &actions, password).await?;
+    if !(200..300).contains(&status) {
+        return Err(TerminateError::Failed {
+            status: Some(status),
+        });
+    }
+    refresh_local_group_state(context, master_key).await;
+    super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
+    Ok(())
+}
+
+/// approveJoinRequest 编排（官方 approvePendingMembershipFromGroupV2 行为
+/// 对齐，KT 扩展）：管理员有群态读面——群态读 + recipient 解析
+///（resolve_group_member，ACI 直通/号码联系面同 createGroup 链）→
+/// 不在 requesting_members 整拒 UnknownGroup（官方 isMemberRequestingToJoin
+/// 本地闸同语义，API 面不静默）→
+/// promote_members_pending_admin_approval=[{user_id = ACI 加密, role
+/// DEFAULT}]（官方 buildPromotePendingAdminApprovalMemberChange 同形）→
+/// 普通 PATCH（成员写无需 link param，官方 modifyGroupV2
+/// usingCredentialsFrom:[] 同款）→ 写后本地群态刷新（best-effort）。
+pub(crate) async fn approve_join_request(
+    context: &StorageContext,
+    master_key: &[u8],
+    recipient: &str,
+) -> Result<(), TerminateError> {
+    use presage::libsignal_service::protocol::ServiceId;
+    use presage::libsignal_service::zkgroup;
+    let group = fetch_group_state(context, master_key).await?;
+    let service_id = resolve_group_member(&context.store, recipient)
+        .await
+        .ok_or(TerminateError::UnknownGroup)?;
+    let ServiceId::Aci(aci) = service_id else {
+        return Err(TerminateError::UnknownGroup);
+    };
+    if !group
+        .members_pending_admin_approval
+        .iter()
+        .any(|r| r.aci == aci)
+    {
+        return Err(TerminateError::UnknownGroup);
+    }
+    let key: [u8; 32] = master_key
+        .try_into()
+        .map_err(|_| TerminateError::UnknownGroup)?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+    let actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: group.version.saturating_add(1),
+        promote_members_pending_admin_approval: vec![
+            presage::proto::group_change::actions::PromoteMemberPendingAdminApprovalAction {
+                user_id: zkgroup::serialize(&secret_params.encrypt_service_id(aci.into())),
+                role: presage::proto::member::Role::Default as i32,
+            },
+        ],
+        ..presage::proto::group_change::Actions::default()
+    };
+    let authorization = group_authorization(context, master_key).await?;
+    patch_group(&context.push, authorization, &actions).await?;
+    refresh_local_group_state(context, master_key).await;
+    super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
+    Ok(())
 }
 
 /// terminateGroup 编排：幂等判定（登记表 → 服务器群态 terminated 真值，

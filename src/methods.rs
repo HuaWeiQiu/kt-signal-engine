@@ -2713,6 +2713,98 @@ async fn dispatch(
                 ) => internal_error(id),
             }
         }
+        // 群审批面（P13/任务4，KT 扩展方法，官方 cancelJoinRequest/
+        // approvePendingMembershipFromGroupV2 行为对齐）：两面皆写面落调度
+        // 日志（mutating 面纪律）。cancel 以 inviteLink 寻址（申请者非成员
+        // 无群态寻址面——官方同位）；approve 以 groupId + recipient 寻址
+        //（管理员有群态读面）。服务器拒绝 → GROUP_UPDATE_FAILED +
+        // data.status；网络面 STORAGE_UNAVAILABLE；参数/本地闸面 -32603。
+        "cancelJoinRequest" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let parsed = params
+                .get("inviteLink")
+                .and_then(Value::as_str)
+                .and_then(|link| crate::service::group_link::parse_invite_link(link).ok());
+            let (Some(account), Some(parsed)) = (account, parsed) else {
+                return internal_error(id);
+            };
+            match service
+                .cancel_join_request_via_link(account, parsed.master_key, parsed.password)
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "cancelled" })),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_UPDATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+                Err(
+                    crate::service::groups::TerminateError::InviteLinkUnset
+                    | crate::service::groups::TerminateError::AvatarUpload,
+                ) => internal_error(id),
+            }
+        }
+        "approveJoinRequest" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let recipient = params.get("recipient").and_then(Value::as_str);
+            let (Some(account), Some(master_key), Some(recipient)) =
+                (account, master_key, recipient)
+            else {
+                return internal_error(id);
+            };
+            if recipient.trim().is_empty() {
+                return internal_error(id);
+            }
+            match service
+                .approve_join_request(account, master_key, recipient)
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "approved" })),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_UPDATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+                Err(
+                    crate::service::groups::TerminateError::InviteLinkUnset
+                    | crate::service::groups::TerminateError::AvatarUpload,
+                ) => internal_error(id),
+            }
+        }
         // calls.linkPresentation（call-link 凭据材料面，KT 扩展，P4c 切一；
         // compat §3 calls 族行 + §5 块）：材料供给面非协议上行，不落调度日志；
         // 凭据/呈现字节零日志零落盘（relay-api-v2 §5 纪律）。参数闸 fail-
