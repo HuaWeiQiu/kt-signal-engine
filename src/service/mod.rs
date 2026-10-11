@@ -4118,6 +4118,141 @@ async fn project_content(
                     };
                     envelope["syncMessage"] = json!({ "deleteForMe": projection });
                 }
+                // P14 组 5：sync 七整臂收投影（官方 handleConfiguration/
+                // handleFetchLatest/handleCallLinkUpdate/handleCallLogEvent/
+                // handleDeviceNameChangeSync/handleUsernameChangeSync/
+                // handlePNIChangeNumber 同位消费面——此前全部落兜底臂整信封
+                // 丢弃）。缺席键不在，旧宿主零变化。
+                Some(presage::proto::sync_message::Content::Configuration(configuration)) => {
+                    let mut face = serde_json::Map::new();
+                    if let Some(flag) = configuration.read_receipts {
+                        face.insert("readReceipts".into(), json!(flag));
+                    }
+                    if let Some(flag) = configuration.unidentified_delivery_indicators {
+                        face.insert("unidentifiedDeliveryIndicators".into(), json!(flag));
+                    }
+                    if let Some(flag) = configuration.typing_indicators {
+                        face.insert("typingIndicators".into(), json!(flag));
+                    }
+                    if let Some(flag) = configuration.link_previews {
+                        face.insert("linkPreviews".into(), json!(flag));
+                    }
+                    envelope["syncMessage"] = json!({ "configuration": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::FetchLatest(fetch)) => {
+                    // type 词 SCREAMING（as_str_name 惯例）；缺席/未知 i32 照投
+                    // 空对象、UNKNOWN 词如实投位（官方 FetchLatestEvent 原样
+                    // 透传 type、UNKNOWN 下游 no-op 同位——信号面即事件）。
+                    let kind = fetch
+                        .r#type
+                        .and_then(|raw| {
+                            presage::proto::sync_message::fetch_latest::Type::try_from(raw).ok()
+                        })
+                        .map(|kind| kind.as_str_name().to_owned());
+                    let mut face = serde_json::Map::new();
+                    if let Some(kind) = kind {
+                        face.insert("type".into(), json!(kind));
+                    }
+                    envelope["syncMessage"] = json!({ "fetchLatest": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::CallLinkUpdate(update)) => {
+                    // 官方 handleCallLinkUpdate 事件形状 {type: 'update',
+                    // rootKey, adminKey}：type 缺省 UPDATE（proto 注释同位）；
+                    // 未知 type 官方 throw（整信封丢弃）——引擎宁收勿丢只投
+                    // 已知词（§5）；rootKey/adminPasskey 空字节官方 undefined
+                    // 同口径省键。adminKey 键名沿官方事件面（proto 字段
+                    // adminPasskey）。
+                    let mut face = serde_json::Map::new();
+                    if let Some(word) = update
+                        .r#type
+                        .and_then(|raw| {
+                            presage::proto::sync_message::call_link_update::Type::try_from(raw).ok()
+                        })
+                        .map(|kind| kind.as_str_name().to_owned())
+                    {
+                        face.insert("type".into(), json!(word));
+                    }
+                    use base64::Engine as _;
+                    if let Some(root_key) = update.root_key.as_deref().filter(|key| !key.is_empty())
+                    {
+                        face.insert(
+                            "rootKey".into(),
+                            json!(base64::engine::general_purpose::STANDARD.encode(root_key)),
+                        );
+                    }
+                    if let Some(admin_key) = update
+                        .admin_passkey
+                        .as_deref()
+                        .filter(|key| !key.is_empty())
+                    {
+                        face.insert(
+                            "adminKey".into(),
+                            json!(base64::engine::general_purpose::STANDARD.encode(admin_key)),
+                        );
+                    }
+                    envelope["syncMessage"] = json!({ "callLinkUpdate": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::CallLogEvent(event)) => {
+                    // 官方 getCallLogEventForProto 透传面 {type, targetTimestamp,
+                    // conversationId(bytes), callId}：type 词 SCREAMING；proto
+                    // timestamp 键名沿 proto（官方 targetTimestamp 是 zod 归一
+                    // 名，wire 材料同源）；conversationId 原字节标准 base64
+                    // （1:1 service-id/群 id/ad-hoc roomId 三形由消费方自判，
+                    // 官方 peerId 双路解释同构）。
+                    let mut face = serde_json::Map::new();
+                    if let Some(word) = event
+                        .r#type
+                        .and_then(|raw| {
+                            presage::proto::sync_message::call_log_event::Type::try_from(raw).ok()
+                        })
+                        .map(|kind| kind.as_str_name().to_owned())
+                    {
+                        face.insert("type".into(), json!(word));
+                    }
+                    if let Some(timestamp) = event.timestamp {
+                        face.insert("timestamp".into(), json!(timestamp));
+                    }
+                    use base64::Engine as _;
+                    if let Some(conversation_id) =
+                        event.conversation_id.as_deref().filter(|id| !id.is_empty())
+                    {
+                        face.insert(
+                            "conversationId".into(),
+                            json!(base64::engine::general_purpose::STANDARD
+                                .encode(conversation_id)),
+                        );
+                    }
+                    if let Some(call_id) = event.call_id {
+                        face.insert("callId".into(), json!(call_id));
+                    }
+                    envelope["syncMessage"] = json!({ "callLogEvent": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::DeviceNameChange(change)) => {
+                    let mut face = serde_json::Map::new();
+                    if let Some(device_id) = change.device_id {
+                        face.insert("deviceId".into(), json!(device_id));
+                    }
+                    envelope["syncMessage"] = json!({ "deviceNameChange": Value::Object(face) });
+                }
+                Some(presage::proto::sync_message::Content::UsernameChange(_)) => {
+                    // 空消息纯信号面（官方 handleUsernameChangeSync 只触发
+                    // profile 重取，零字段消费）。
+                    envelope["syncMessage"] = json!({ "usernameChange": {} });
+                }
+                Some(presage::proto::sync_message::Content::PniChangeNumber(change)) => {
+                    // 只投 {registrationId?, newE164?}——identityKeyPair/
+                    // signedPreKey/lastResortKyberPreKey 密钥材料不出引擎边界
+                    // （先例：backup key/凭据面同纪律）；引擎不做 PNI re-key
+                    // 消费（官方全键消费+换钥，§5 gap 登记）。
+                    let mut face = serde_json::Map::new();
+                    if let Some(registration_id) = change.registration_id {
+                        face.insert("registrationId".into(), json!(registration_id));
+                    }
+                    if let Some(new_e164) = change.new_e164.as_deref() {
+                        face.insert("newE164".into(), json!(new_e164));
+                    }
+                    envelope["syncMessage"] = json!({ "pniChangeNumber": Value::Object(face) });
+                }
                 // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
                 // #handleViewed「read 专信封」调度序同位——content 面分支
                 // 不动，兜底臂承接直接 repeated 字段 read=5/viewed=16）。
@@ -8073,8 +8208,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// pinMessage=27/unpinMessage=28/adminDelete=29 投影（官方
-    /// processDataMessage.preload.ts processPinMessage 行为对齐）。
+    /// P14 组 5：sync 七整臂收投影——Configuration 四旗/FetchLatest type 词/
+    /// CallLinkUpdate{type,rootKey,adminKey}/CallLogEvent 四键/
+    /// DeviceNameChange{deviceId}/UsernameChange{} 纯信号面/PniChangeNumber
+    /// 仅 {registrationId,newE164}（密钥材料不出引擎边界）。缺席键不在
+    /// （旧宿主零变化）；官方 handleXxx 同位（MessageReceiver.preload.ts
+    /// :3084/:3123/:3129/:3141/:3153/:3362）。
+    #[tokio::test]
+    async fn sync_seven_arm_projection_carries_p14_faces() {
+        use base64::Engine as _;
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-sync-seven-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+        };
+        let make = |sync_content| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_content),
+                    ..Default::default()
+                }),
+                metadata.clone(),
+            )
+        };
+        async fn sync_arm_face(
+            store: &SqliteStore,
+            registry: &groups::TerminatedGroups,
+            content: presage::libsignal_service::content::Content,
+        ) -> serde_json::Value {
+            pop_unwrap(
+                project_content("acct", store, &content, registry).await,
+                "sync arm projects",
+            )["params"]["envelope"]["syncMessage"]
+                .clone()
+        }
+
+        // Configuration：Some 才投（四旗两在两缺）。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::Configuration(
+                sync_message::Configuration {
+                    read_receipts: Some(true),
+                    unidentified_delivery_indicators: None,
+                    typing_indicators: Some(false),
+                    link_previews: None,
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["configuration"]["readReceipts"], json!(true));
+        assert_eq!(face["configuration"]["typingIndicators"], json!(false));
+        assert!(face["configuration"]
+            .get("unidentifiedDeliveryIndicators")
+            .is_none());
+        assert!(face["configuration"].get("linkPreviews").is_none());
+
+        // FetchLatest：type 词 SCREAMING；缺席照投空对象（信号面即事件）。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::FetchLatest(
+                sync_message::FetchLatest {
+                    r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["fetchLatest"]["type"], json!("LOCAL_PROFILE"));
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::FetchLatest(
+                sync_message::FetchLatest { r#type: None },
+            )),
+        )
+        .await;
+        assert_eq!(face["fetchLatest"], json!({}));
+
+        // CallLinkUpdate：{type,rootKey,adminKey}（adminKey 键名沿官方事件面，
+        // proto 字段 adminPasskey）；type 缺席官方 throw 不镜像（宁收勿丢）。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::CallLinkUpdate(
+                sync_message::CallLinkUpdate {
+                    root_key: Some(vec![0xCD_u8; 32]),
+                    admin_passkey: Some(vec![0xEF_u8; 32]),
+                    r#type: Some(sync_message::call_link_update::Type::Update as i32),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["callLinkUpdate"]["type"], json!("UPDATE"));
+        assert_eq!(
+            face["callLinkUpdate"]["rootKey"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0xCD_u8; 32])
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            face["callLinkUpdate"]["adminKey"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0xEF_u8; 32])
+                    .as_str()
+            )
+        );
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::CallLinkUpdate(
+                sync_message::CallLinkUpdate {
+                    root_key: None,
+                    admin_passkey: None,
+                    r#type: None,
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["callLinkUpdate"], json!({}));
+
+        // CallLogEvent：四键透传（type 词 SCREAMING、conversationId 原字节
+        // 标准 base64）。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::CallLogEvent(
+                sync_message::CallLogEvent {
+                    r#type: Some(sync_message::call_log_event::Type::MarkedAsRead as i32),
+                    timestamp: Some(1_700_000_000_000),
+                    conversation_id: Some(vec![0x11_u8; 16]),
+                    call_id: Some(424_242),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["callLogEvent"]["type"], json!("MARKED_AS_READ"));
+        assert_eq!(
+            face["callLogEvent"]["timestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(
+            face["callLogEvent"]["conversationId"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0x11_u8; 16])
+                    .as_str()
+            )
+        );
+        assert_eq!(face["callLogEvent"]["callId"], json!(424_242_u64));
+
+        // DeviceNameChange：{deviceId}；缺席键不在。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::DeviceNameChange(
+                sync_message::DeviceNameChange { device_id: Some(2) },
+            )),
+        )
+        .await;
+        assert_eq!(face["deviceNameChange"]["deviceId"], json!(2));
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::DeviceNameChange(
+                sync_message::DeviceNameChange { device_id: None },
+            )),
+        )
+        .await;
+        assert_eq!(face["deviceNameChange"], json!({}));
+
+        // UsernameChange：空消息纯信号面。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::UsernameChange(
+                sync_message::UsernameChange {},
+            )),
+        )
+        .await;
+        assert_eq!(face["usernameChange"], json!({}));
+
+        // PniChangeNumber：只投 {registrationId,newE164}，三个密钥材料字段
+        // 不出引擎边界（键都不在）。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::PniChangeNumber(
+                sync_message::PniChangeNumber {
+                    identity_key_pair: Some(vec![0x77_u8; 32]),
+                    signed_pre_key: Some(vec![0x88_u8; 32]),
+                    last_resort_kyber_pre_key: Some(vec![0x99_u8; 32]),
+                    registration_id: Some(4242),
+                    new_e164: Some("+15550001111".to_owned()),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["pniChangeNumber"]["registrationId"], json!(4242));
+        assert_eq!(face["pniChangeNumber"]["newE164"], json!("+15550001111"));
+        assert!(face["pniChangeNumber"].get("identityKeyPair").is_none());
+        assert!(face["pniChangeNumber"].get("signedPreKey").is_none());
+        assert!(face["pniChangeNumber"]
+            .get("lastResortKyberPreKey")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     #[test]
     fn data_message_projection_carries_pin_unpin_admin_delete() {
         use presage::proto::data_message::{pin_message, AdminDelete, PinMessage, UnpinMessage};

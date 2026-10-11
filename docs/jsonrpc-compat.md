@@ -310,6 +310,25 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   e164 原样）；v1 只投 messageDeletes 臂——read/viewed/其他三型不投
   （§5 gap 登记）；vendored 接收面已消费 presage store（save_message 臂
   delete_message），引擎投影 additive 上抛供 connector 删自有库行。
+- `syncMessage.configuration {readReceipts?, unidentifiedDeliveryIndicators?,
+  typingIndicators?, linkPreviews?}` / `syncMessage.fetchLatest {type?}` /
+  `syncMessage.callLinkUpdate {type?, rootKey?, adminKey?}` /
+  `syncMessage.callLogEvent {type?, timestamp?, conversationId?, callId?}` /
+  `syncMessage.deviceNameChange {deviceId?}` / `syncMessage.usernameChange {}` /
+  `syncMessage.pniChangeNumber {registrationId?, newE164?}`（P14 组 5 sync
+  七整臂收投影，此前七位全落兜底臂整信封丢弃；官方 handleConfiguration/
+  handleFetchLatest/handleCallLinkUpdate/handleCallLogEvent/
+  handleDeviceNameChangeSync/handleUsernameChangeSync/handlePNIChangeNumber
+  dispatch 同位 MessageReceiver.preload.ts:3084-3157；type 词 SCREAMING
+  as_str_name 惯例——fetchLatest UNKNOWN/LOCAL_PROFILE/STORAGE_MANIFEST/
+  SUBSCRIPTION_STATUS、callLinkUpdate UPDATE、callLogEvent CLEAR/
+  MARKED_AS_READ/MARKED_AS_READ_IN_CONVERSATION/CLEAR_IN_CONVERSATION；
+  callLinkUpdate rootKey/adminPasskey 空字节省键，**adminKey 键名沿官方
+  事件面**（proto 字段 adminPasskey）；callLogEvent.conversationId 原字节
+  标准 base64，1:1/群/ad-hoc 三形由消费方自判；deviceNameChange 官方按
+  本机 deviceId 过滤（非指向自己的丢弃），引擎恒投原值由消费方自判；
+  pniChangeNumber 只投 registrationId/newE164 两键，密钥材料不出引擎
+  边界、re-key 消费不做，偏差全落 §5 组 5 块）。
 
 ## 4. 夹具专有动词（非引擎表面）
 
@@ -3079,6 +3098,51 @@ proto 全字段穷举审计（七项）落地：全部为「收了未投影」�
 - **单测**：`story_projection_carries_body_ranges_and_color_faces`（分流+
   坏条目丢弃+gradient/color 两臂）、`story_context_send_build_faces`（构造
   三面：ACI 解析/零回归/不可解析 fail-closed）。
+
+### P14 proto 进阶投影收尾·组 5 sync 七整臂收投影（2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+syncMessage.content oneof 的七位整臂（Configuration/FetchLatest/
+CallLinkUpdate/CallLogEvent/DeviceNameChange/UsernameChange/
+PniChangeNumber）此前全部落兜底臂（read/viewed 面）整信封丢弃；本批
+additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
+:3084/:3111/:3123/:3129/:3141/:3153/:1586+3362）。
+
+- **configuration**：readReceipts/unidentifiedDeliveryIndicators/
+  typingIndicators/linkPreviews 四旗 Some 才投（官方 handleConfiguration →
+  ConfigurationEvent 原样携带 proto 对象，消费面 storage boots 同位）。
+- **fetchLatest `{type?}`**：枚举词 SCREAMING（UNKNOWN/LOCAL_PROFILE/
+  STORAGE_MANIFEST/SUBSCRIPTION_STATUS）；缺席/未知 i32 照投空对象
+  （官方 FetchLatestEvent 原样透传 type、UNKNOWN 下游 no-op 同位——
+  信号面即事件，不再发明语义）。
+- **callLinkUpdate `{type?, rootKey?, adminKey?}`**：rootKey/adminPasskey
+  空字节省键（官方 Bytes.isNotEmpty 同口径）；**adminKey 键名沿官方事件
+  面** CallLinkUpdateSyncEvent（proto 字段叫 adminPasskey）。
+  - **偏差①（宁收勿丢不镜像 throw）**：官方 type==null 与未知 type 均
+    throw 整信封丢弃；引擎 type 缺席投空对象、未知 i32 丢词只投其余键。
+- **callLogEvent `{type?, timestamp?, conversationId?, callId?}`**：官方
+  getCallLogEventForProto 透传面同构（callDisposition.preload.ts:281）；
+  type 词 SCREAMING；**timestamp 键名沿 proto**（官方 targetTimestamp 是
+  zod 归一名，wire 材料同源）；conversationId 原字节标准 base64（1:1
+  service-id/群 id/ad-hoc roomId 三形由消费方自判，官方 peerId 双路解释
+  同构）；callId uint64 原值。
+- **deviceNameChange `{deviceId?}`**：官方 handleDeviceNameChangeSync 按
+  本机 deviceId 过滤（deviceId null 丢弃、≠localDeviceId「meant for other
+  device」丢弃），引擎恒投原值由消费方自判（引擎无本机设备 id 判面）。
+- **usernameChange `{}`**：空消息纯信号面（官方 handleUsernameChangeSync
+  只发 UsernameChangeSyncEvent 触发 profile 重取，零字段消费——事件到达
+  即信号，投影空对象保事件位）。
+- **pniChangeNumber**：只投 `{registrationId?, newE164?}`。
+  - **偏差②（密钥材料不出引擎边界）**：identityKeyPair/signedPreKey/
+    lastResortKyberPreKey 三键不投（先例：backup key/凭据面同纪律）。
+  - **偏差③（PNI re-key 消费不做）**：官方全键消费 + identity check +
+    本机换钥全链，引擎 gap 不做（投影 additive 上抛，消费方另行立项）。
+  - **偏差④（无 sourceSelf 闸）**：官方 envelope.sourceServiceId !==
+    ourAci 即 throw；引擎信封面不自证，照投（宁收勿丢）。
+- **wire 形状**：全部缺席键不在（旧宿主零变化）；七臂投影后不再落兜底
+  臂（read/viewed direct-repeated 面与七臂互斥，线上不共存）。
+- **单测**：`sync_seven_arm_projection_carries_p14_faces`（七臂形状 +
+  FetchLatest/CallLinkUpdate/DeviceNameChange 缺席臂空对象 + PNI 密钥
+  三键不在 + Configuration 四旗两在两缺）。
 
 
 ## 6. fake 服务模式（仅测试）
