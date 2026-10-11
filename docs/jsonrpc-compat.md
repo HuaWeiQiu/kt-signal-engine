@@ -2030,15 +2030,21 @@ Signal 服务器按客户端上报的 capability 做强制过滤（2026-03 曾�
 强制收紧时快速核对达标面。方法行为见 §3 表行，本块登记事实源结构与
 防漂移闸。
 
-- **两处声明，两个真相源策略**（引擎以 linked device 身份入网，主注册链
-  confirmation.rs 不在引擎路径上，但同字面值一并钉定）：
-  - 账号属性面 `DeviceCapabilities` 六位（storage/transfer/
-    attachment_backfill/spqr/profiles_v2/username_change_sync_message）：
-    接收管线首步 presage `set_account_attributes` 推送（vendored
-    presage registered.rs 构造点，`src/service/mod.rs` finishLink 收口
-    注释同位佐证）。该构造是 vendor 内联字面值、无导出常量可调用，引擎
-    持**钉定镜像**（`service::capabilities::DEVICE_CAPABILITIES`，同型
-    vendor 结构体 const 构造——vendor 增删字段时引擎编译期即断）。
+- **两处声明，两个真相源策略**（引擎以 linked device 身份入网；账号属性
+  面位值真相源 = 主注册链 confirmation.rs 构造点——该腿不在引擎链接
+  路径上，字面钉定防漂移；B4 起接收管线停发 AccountAttributes PUT，
+  引擎链接设备不再有账号属性推送面）：
+  - 账号属性面 `DeviceCapabilities` 八位（D5 补齐后全集：六位基线
+    storage/transfer/attachment_backfill/spqr/profiles_v2/
+    username_change_sync_message + D5 两位 versioned_expiration_timer/
+    optional_phone_number，位值裁定见下「协议能力补齐」块）：位值真相
+    源 = vendored presage 主注册链 confirmation.rs 构造点（设备注册协议
+    必需腿）。B4 起接收管线停发 AccountAttributes PUT（官方链接设备
+    从不 PUT attributes；vendored registered.rs `set_account_attributes`
+    构造点已删除，管线不再推送——本文初版「管线首步推送」表述随之
+    失效）。该构造是 vendor 内联字面值、无导出常量可调用，引擎持**钉定
+    镜像**（`service::capabilities::DEVICE_CAPABILITIES`，同型 vendor
+    结构体 const 构造——vendor 增删字段时引擎编译期即断）。
   - 链接面 `LinkCapabilities` 三位：`link_device` 构造
     `LinkRequest.account_attributes.capabilities` 取
     `LinkCapabilities::default()`（vendored libsignal-service
@@ -2047,10 +2053,10 @@ Signal 服务器按客户端上报的 capability 做强制过滤（2026-03 曾�
 - **反双真相源闸（四层）**：① 编译期——镜像位值 const 块钉死（位值漂移
   直接断编译），且镜像以 vendor 结构体显式全字段构造（vendor 增删字段
   同样编译期断）；② 单测扫 vendor 源码——
-  `service::capabilities` 模块单测对 registered.rs/confirmation.rs 构造
-  点与 linking.rs Default 实现做空白归一字面断言（逐位值 + provisioning
-  构造点确用 `LinkCapabilities::default()`），vendor 升级改位/改点即红
-  灯，强制人工复核后同步镜像；③ 单测 live 对账——镜像与
+  `service::capabilities` 模块单测对 confirmation.rs 构造点（B4 起唯一
+  剩余账号属性构造点）与 linking.rs Default 实现做空白归一字面断言（逐
+  位值 + provisioning 构造点确用 `LinkCapabilities::default()`），vendor
+  升级改位/改点即红灯，强制人工复核后同步镜像；③ 单测 live 对账——镜像与
   `LinkCapabilities::default()`/`DeviceCapabilities::default()` 运行时
   逐位比对（含两 Default 不得混用的 storage 位反证）；④ 基线锚钉定——
   单测硬编码钉死 presage rev/libsignal tag+commit，依赖升级必须撞闸

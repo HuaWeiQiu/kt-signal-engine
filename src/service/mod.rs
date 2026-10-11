@@ -825,7 +825,8 @@ impl Service {
         let number = slot.wait().await.map_err(|_| LinkError::Internal)?;
 
         // 成功：会话收口。设备名（ADR 0004）：改写 store 注册数据后启动接收
-        // 管线，管线首步 set_account_attributes 把用户输入的名字推上服务器。
+        // 管线；名字只落本地注册数据，管线不回写服务器（B4 起停发
+        // AccountAttributes PUT——官方链接设备从不 PUT attributes，compat §5）。
         let mut inner = self.inner.lock().await;
         if inner
             .pending

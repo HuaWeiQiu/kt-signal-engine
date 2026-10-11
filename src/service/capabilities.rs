@@ -5,13 +5,14 @@
 //! 引擎以 linked device 身份向服务器做两处协议能力声明（vendor 真相源，
 //! 本模块不发明任何位值）：
 //!
-//! 1. 账号属性面 `DeviceCapabilities`——接收管线首步 presage
-//!    `set_account_attributes` 推送（vendor/presage/presage/src/manager/
-//!    registered.rs，`capabilities: Some(DeviceCapabilities { … })` 构造点；
-//!    主注册链 confirmation.rs 同字面值一并钉定）。该构造是 vendor 内联
-//!    字面值、无导出常量可调用，故此处持**钉定镜像**（同型 vendor 结构体
-//!    const 构造——vendor 增删字段时本模块编译期即断），漂移由模块单测扫
-//!    vendor 源码拦下。
+//! 1. 账号属性面 `DeviceCapabilities`——vendor 主注册链
+//!    confirmation.rs 的 `capabilities: Some(DeviceCapabilities { … })`
+//!    构造点（设备注册协议必需腿；B4 起接收管线停发 AccountAttributes
+//!    PUT——官方链接设备从不 PUT attributes，vendored registered.rs 构造
+//!    点已删除，管线不再推送）。该构造是 vendor 内联字面值、无导出常量
+//!    可调用，故此处持**钉定镜像**（同型 vendor 结构体 const 构造——
+//!    vendor 增删字段时本模块编译期即断），漂移由模块单测扫 vendor 源码
+//!    拦下。
 //! 2. 链接面 `LinkCapabilities`——`link_device` 链路取
 //!    `LinkCapabilities::default()`（vendor/libsignal-service/src/
 //!    provisioning/mod.rs 构造点，push_service/linking.rs Default 实现）。
@@ -33,8 +34,9 @@ use presage::libsignal_service::push_service::linking::LinkCapabilities;
 use presage::libsignal_service::websocket::account::{CapabilitiesUpload, DeviceCapabilities};
 use serde_json::{json, Value};
 
-/// 账号属性面声明镜像：registered.rs `set_account_attributes`（与
-/// confirmation.rs 主注册链同值）的八位字面值。vendor 升级改位 = 单测
+/// 账号属性面声明镜像：vendor 注册链 confirmation.rs 构造点（B4 起唯一
+/// 剩余构造点——接收管线停发 AccountAttributes PUT，registered.rs 构造
+/// 点已删除）的八位字面值。vendor 升级改位 = 单测
 /// `device_capabilities_bits_match_vendor_chain` 红灯，复核后同步此处。
 /// D5 起补齐 server 真相（Signal-Server DeviceCapability.java 全集）的
 /// 两位：`versioned_expiration_timer`（官方桌面设备面不上传，引擎不声明
