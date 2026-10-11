@@ -2606,6 +2606,113 @@ async fn dispatch(
                 ) => internal_error(id),
             }
         }
+        // 群邀请链接族读写面（P13/任务3，KT 扩展方法，官方 getPreJoinGroup
+        // Info/joinGroupV2ViaLink 行为对齐）：previewGroupViaLink 读面不落
+        // 调度日志（材料面纪律）；joinGroupViaLink 写面落调度日志（mutating
+        // 面纪律；inviteLink 键照旧逐字保留——wire 面 20+ 调用方本就明文携
+        // 链接，摘要有意不设）。inviteLink 形状面 -32603（parseInviteLink
+        // 同闸收口）。preview 服务器拒绝 → GROUP_INVITE_LINK_PREVIEW_FAILED
+        // + data.status 诚实透传；join/审批面服务器拒绝 → GROUP_UPDATE_
+        // FAILED + data.status；网络面 STORAGE_UNAVAILABLE。
+        "previewGroupViaLink" => {
+            let account = params.get("account").and_then(Value::as_str);
+            let parsed = params
+                .get("inviteLink")
+                .and_then(Value::as_str)
+                .and_then(|link| crate::service::group_link::parse_invite_link(link).ok());
+            let (Some(account), Some(parsed)) = (account, parsed) else {
+                return internal_error(id);
+            };
+            match service
+                .preview_group_via_link(account, parsed.master_key, parsed.password)
+                .await
+            {
+                Ok(preview) => {
+                    let mut result = json!({
+                        "groupId": preview.group_id,
+                        "memberCount": preview.member_count,
+                        "revision": preview.revision,
+                        "addFromInviteLink": preview.add_from_invite_link,
+                        "approvalRequired": preview.approval_required,
+                        "pendingAdminApproval": preview.pending_admin_approval,
+                    });
+                    if let Some(name) = preview.name {
+                        result["name"] = json!(name);
+                    }
+                    if let Some(description) = preview.description {
+                        result["description"] = json!(description);
+                    }
+                    jsonrpc::success_response(id, result)
+                }
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_INVITE_LINK_PREVIEW_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+                Err(
+                    crate::service::groups::TerminateError::InviteLinkUnset
+                    | crate::service::groups::TerminateError::AvatarUpload,
+                ) => internal_error(id),
+            }
+        }
+        "joinGroupViaLink" => {
+            // 写面落调度日志（mutating 面先落后被拒同样记录派发）。
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let parsed = params
+                .get("inviteLink")
+                .and_then(Value::as_str)
+                .and_then(|link| crate::service::group_link::parse_invite_link(link).ok());
+            let (Some(account), Some(parsed)) = (account, parsed) else {
+                return internal_error(id);
+            };
+            match service
+                .join_group_via_link(account, parsed.master_key, parsed.password)
+                .await
+            {
+                Ok(requested) => {
+                    let status = if requested { "requested" } else { "joined" };
+                    jsonrpc::success_response(id, json!({ "status": status }))
+                }
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_UPDATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+                Err(
+                    crate::service::groups::TerminateError::InviteLinkUnset
+                    | crate::service::groups::TerminateError::AvatarUpload,
+                ) => internal_error(id),
+            }
+        }
         // calls.linkPresentation（call-link 凭据材料面，KT 扩展，P4c 切一；
         // compat §3 calls 族行 + §5 块）：材料供给面非协议上行，不落调度日志；
         // 凭据/呈现字节零日志零落盘（relay-api-v2 §5 纪律）。参数闸 fail-

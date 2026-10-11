@@ -1499,6 +1499,125 @@ fn leave_group_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// previewGroupViaLink（链接预览读面，P13/任务3，官方 getPreJoinGroupInfo
+/// 行为对齐）：fake 错误面形状桩 = GROUP_INVITE_LINK_PREVIEW_FAILED
+/// （`-1` 加 message，data 无 status——fake 无链接读面，材料不可得即错误
+/// 面）；读面不落调度日志（材料面纪律）；参数面 fail-closed（-32603：缺
+/// account/缺 inviteLink/非字符串/坏链接——parseInviteLink 同闸收口）；
+/// real 模式未注册账号折叠 -32603。
+#[test]
+fn preview_group_via_link_fake_error_face_and_param_fail_closed() {
+    let dir = temp_dir("preview-group-via-link");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 固定材料链接（masterKey = 0x11×32，password = 0x22×16，prost 同构编码）。
+    let link = "https://signal.group/#CjQKIBEREREREREREREREREREREREREREREREREREREREREREhAiIiIiIiIiIiIiIiIiIiIi";
+
+    // fake 错误面：GROUP_INVITE_LINK_PREVIEW_FAILED，无 status。
+    let response = engine.request(
+        "previewGroupViaLink",
+        json!({ "account": "+15550000000", "inviteLink": link }),
+    );
+    assert_eq!(response["error"]["code"], -1);
+    assert_eq!(
+        response["error"]["message"],
+        "GROUP_INVITE_LINK_PREVIEW_FAILED"
+    );
+    assert!(
+        response["error"]["data"]["status"].is_null(),
+        "fake 错误面无 HTTP status"
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "inviteLink": link }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "inviteLink": "" }),
+        json!({ "account": "+15550000000", "inviteLink": "https://signal.group/#" }),
+        json!({ "account": "+15550000000", "inviteLink": "https://signal.group/#@@@" }),
+        json!({ "account": "+15550000000", "inviteLink": 7 }),
+    ];
+    for params in &rejects {
+        let response = engine.request("previewGroupViaLink", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "previewGroupViaLink rejects {params}"
+        );
+    }
+
+    // 读面不落调度日志（材料面纪律，与 generateInviteLinkPassword 同位）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.lines().any(|line| line.contains("previewGroupViaLink")),
+        "preview 读面零调度日志"
+    );
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("preview-group-via-link-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "previewGroupViaLink",
+        json!({ "account": "+15559990000", "inviteLink": link }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
+/// joinGroupViaLink（经链接入群写面，P13/任务3，官方 joinGroupV2ViaLink
+/// 行为对齐）：fake 形状桩 `{status:"joined"}`（direct 臂形状——fake 无
+/// join info 读面不裁定审批臂，§5 登记偏差）；写面落调度日志（mutating
+/// 面纪律，inviteLink 键照旧逐字保留）；参数面 fail-closed（-32603 同
+/// preview 闸）；real 模式未注册账号折叠 -32603。
+#[test]
+fn join_group_via_link_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("join-group-via-link");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let link = "https://signal.group/#CjQKIBEREREREREREREREREREREREREREREREREREREREREREhAiIiIiIiIiIiIiIiIiIiIi";
+
+    // fake 形状桩：{status:"joined"}（direct 臂）。
+    assert_eq!(
+        engine.request(
+            "joinGroupViaLink",
+            json!({ "account": "+15550000000", "inviteLink": link })
+        )["result"],
+        json!({ "status": "joined" })
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "inviteLink": link }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "inviteLink": "" }),
+        json!({ "account": "+15550000000", "inviteLink": "sgnl://joingroup#not-base64!!" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("joinGroupViaLink", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "joinGroupViaLink rejects {params}"
+        );
+    }
+
+    // 调度日志：写面落日志，inviteLink 键逐字保留（成功 1 + 拒绝 4 = 5 行）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "joinGroupViaLink")
+        .collect();
+    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
+    assert_eq!(entries[0]["params"]["inviteLink"], json!(link));
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("join-group-via-link-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "joinGroupViaLink",
+        json!({ "account": "+15559990000", "inviteLink": link }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// 群邀请链接族纯函数面（generateInviteLinkPassword/buildInviteLink/
 /// parseInviteLink，KT 扩展批 P13/任务1，官方 generateGroupInviteLinkPass
 /// word/buildGroupLink/parseGroupLink 行为对齐）：三方法皆 fake/real 同码路

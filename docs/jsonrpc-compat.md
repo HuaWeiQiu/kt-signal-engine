@@ -125,6 +125,8 @@ send message: Signal server unavailable.
 | `generateInviteLinkPassword` | `{}`（无参数——纯 CSPRNG 材料面，官方 generateGroupInviteLinkPassword 不涉账号态同位；fake/real 同码路） | `{password(标准 base64，16 字节——官方 GROUP_INVITE_LINK_PASSWORD_LENGTH = 16 同长)}` | 形状面无（零参数方法，多余参数不设闸——wire 宽容） | **2026-10-11 real（KT 扩展批，群邀请链接族 P13/任务1，connector 契约 1.83 wire 面，engine-compat）**：官方 groups.preload.ts:266 行为对齐；非协议上行不落调度日志；密码字节零日志（凭据面同纪律）。任务书记述「32 字节」与官方 16B 常量不符，以官方为准（§5 链接族批偏差登记）
 | `buildInviteLink` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), password?(标准 base64 非空——显式材料臂)}` | `{inviteLink("https://signal.group/#<websafe base64(GroupInviteLink proto)>"——官方 buildGroupLink/groupInvitesRoute.toWebUrl 同形；proto = contentsV1{groupMasterKey(32B), inviteLinkPassword})}` | 参数缺失/形状错（groupId 非 base64·≠32B、password 非 base64·空串·非字符串）`-32603`；未注册账号（缺省臂）`-32603`；群未设链接密码/群态不可得 `GROUP_INVITE_LINK_UNAVAILABLE`（`-1` + message，fake 缺省臂同码）；网络面 `STORAGE_UNAVAILABLE` | **2026-10-11 real（KT 扩展批，群邀请链接族 P13/任务1，connector 契约 1.83 wire 面，engine-compat）**：官方 groups.preload.ts:287 行为对齐——password 显式臂纯构造（fake/real 同码路，零网络）；缺省臂读服务器群态 `invite_link_password`（官方 conversation.groupInviteLinkPassword 同位，群成员凭据读面）；材料面非协议上行不落调度日志
 | `parseInviteLink` | `{inviteLink(三种官方 URL 形 `https://signal.group/#…`/`sgnl://signal.group/#…`/`sgnl://joingroup#…` 或裸 inviteCode——官方桌面路由层摘 hash 后 parseGroupLink 直收 code 同口径)}` | `{groupId(32B master key 标准 base64，listGroups id 同源), password(标准 base64 原字节)}` | 参数缺失/形状错（inviteLink 缺席·空·无 hash 段·坏 base64·坏 proto·masterKey ≠32B·password 空 `-32603`；缺 contentsV1（官方 LINK_VERSION_ERROR 族——未来版本链接）同 `-32603` 折叠，无独立错误面） | **2026-10-11 real（KT 扩展批，群邀请链接族 P13/任务1，connector 契约 1.83 wire 面，engine-compat）**：官方 groups.preload.ts:316 行为对齐（容错逐条 throw 面：contentsV1 缺、masterKey 空/长不符、password 空）；纯解析零网络，fake/real 同码路，不落调度日志
+| `previewGroupViaLink` | `{account, inviteLink(同 parseInviteLink 三形+裸 code)}` | `{groupId(32B master key 标准 base64，listGroups id 同源), name?(群名——加密 blob 解密失败省略，官方桌面 GUI 兜底 unknownGroup 不搬，engine 省略键，§5 偏差), description?(同 name 省略纪律), memberCount, revision(= joinInfo.version), addFromInviteLink(词 ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE/UNKNOWN), approvalRequired(= addFromInviteLink == ADMINISTRATOR，官方 joinGroupV2ViaLink approvalRequired 同源), pendingAdminApproval}` | 参数缺失/形状错（account 缺席、inviteLink 缺席·坏形状——parseInviteLink 同闸收口）`-32603`；未注册账号 `-32603`；链接读面服务器拒绝/响应形状非法 `GROUP_INVITE_LINK_PREVIEW_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传，形状面无 status）；网络面 `STORAGE_UNAVAILABLE` | **2026-10-11 real（KT 扩展批，群邀请链接族 P13/任务3，connector 契约 1.83 wire 面，engine-compat）**：官方 getPreJoinGroupInfo（groups.preload.ts:272）+ getGroupFromLink（WebAPI.preload.ts:4892）行为对齐——`GET v2/groups/join/<websafe password>`（**路径后缀**非 query，官方 urlParameters 同位）+ 群凭据 basic auth（非成员可取任意群 auth credential，官方 makeRequestWithCredentials(deriveGroupFields(masterKey)) 同链）；GroupJoinInfo proto 投影（avatar URL 不投影——官方桌面 CDN 代理面取图，engine 读面无消费方，§5 gap 登记）；读面不落调度日志（材料面纪律）；fake 错误面形状桩 = `GROUP_INVITE_LINK_PREVIEW_FAILED` 无 status（fake 无链接读面，材料不可得即错误面，stickers 先例）
+| `joinGroupViaLink` | `{account, inviteLink(同 parseInviteLink 三形+裸 code)}` | `{status: "joined"\|"requested"}`（direct 臂 = joined；审批臂 = requested——官方 joinGroupV2ViaLink 双臂同构：addFromInviteLink == ADMINISTRATOR → add_members_pending_admin_approval → requested，否则 add_members（Role DEFAULT，join_from_invite_link 缺省——官方 `joinFromInviteLink: null` proto3 同线）→ joined；version = joinInfo.version+1 饱和） | 参数缺失/形状错（account 缺席、inviteLink 缺席·坏形状——parseInviteLink 同闸收口）`-32603`；未注册账号 `-32603`；self profile key 凭据取材失败 `GROUP_UPDATE_FAILED`（无 status，createGroup「凭据失败不硬造材料」同纪律）；链接读面/写面服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status 诚实透传：404 链接失效、403 非准入、409 revision 竞争、400 形状被拒；**官方 400 + body `cannot ask to join via invite link if already asked to join` 吞为成功 requested**——官方桌面同款吞没强制本地 pending 态）；网络面 `STORAGE_UNAVAILABLE` | **2026-10-11 real（KT 批，P13/任务3，connector 契约 1.83 wire 面，engine-compat）**：官方 joinGroupV2ViaLink（conversations.preload.ts:2802）行为对齐——`PATCH v2/groups?inviteLinkPassword=<websafe>`（官方 modifyGroup inviteLinkBase64 同形状；申请者非成员无群态读面，version 以 join info 为基数，link password 即授权凭据）；审批臂 presentation = vendored `create_member_presentation(server_params, self 凭据)`（官方 buildAddPendingAdminApprovalMemberChange 同形）；写后本地群态刷新 best-effort；写面落调度日志（mutating 面纪律，inviteLink 键逐字保留）；fake 形状桩 `{status:"joined"}`（fake 无 join info 读面不裁定审批臂，§5 登记偏差）
 | `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StoryDistributionList=5/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
 | `getUsername` | `{account}` | `{username?, usernameLink?}`（键缺席 = 未设，不发明 null/空串；usernameLink 重建为完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；链接材料形状错该键缺席） | 参数缺失/非字符串 `-32603`；未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，用户名读面批）**：真相源 = Storage Service AccountRecord.username(33)/usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」同语义；多设备经 storage sync 收敛，无第二真相源）；从未有 storage 状态（无 master key / manifest 404 / 无 Account item）→ `{}`（未设不报错）；fake：恒 `{}`，不落调度日志（读面纪律） |
 | `usernameLookup` | `{account, usernames[1..20]}`（每条 1..64 字符——connector 契约 1.59 §4.55 帧界同源镜像，帧界而非语法界；条目 = 全名或 `https://signal.me/#eu/…` 链接） | `[{recipient, username?, uuid?, isRegistered}]`（输入序逐条投影；recipient = 条目回显；单条失败诚实降级 `{recipient, isRegistered:false}` 不炸整批——语法不符/链接打不开/解不开/未命中/网络皆同） | 参数缺失/形状错（usernames 缺席·非数组·空批·超 20、条目非字符串·空·超 64）`-32603`；未注册账号 `-32603` | **2026-10-08 real（KT 扩展，用户名读面批）**：官方同款服务端匿名 lookup 通路——全名条目 hash（libsignal usernames crate 权威语法面）→ `GET v1/accounts/username_hash/{hash}`（强制匿名，200 `{uuid}`/404）；链接条目 → `GET v1/accounts/username_link/{uuid}`（200 `{usernameLinkEncryptedValue}`）→ crate `decrypt_username`（entropy 系链接自带）→ 再走 hash lookup（官方 resolveUsernameLink 同序）；base64 一律 URL-safe 无 padding；匿名 PushService（带凭据反而 400，avatar CDN 先例同构）；fake：逐条回显 `{recipient, isRegistered:false}`，不落调度日志（读面纪律） |
@@ -2804,6 +2806,44 @@ jobs/helpers/sendGroupCallUpdate.preload.ts:23-100。
     `Manager::send_message` 硬编码 `online_only=false` 与官方 call 面实际
     行为一致，**无偏差**。§5 通话消息块原「发送通路偏差」bullet 与 §3
     sendCallMessage 行同步勘误撤回。
+
+### 群邀请链接族读写面（P13/任务3，2026-10-11，官方对齐 Signal-Desktop abe80d3，wire additive）
+
+预览 + 经链接入群两方法（§3 新行 `previewGroupViaLink`/`joinGroupViaLink`）。
+官方锚：getPreJoinGroupInfo（groups.preload.ts:272）、getGroupFromLink
+（WebAPI.preload.ts:4892）、joinGroupV2ViaLink（conversations.preload.ts:2802）。
+
+- **wire 面对位**：预览 = `GET v2/groups/join/<websafe password>`（任务书
+  「POST v2/groups/join」记述不准确——官方 urlParameters 是**路径后缀**，
+  GET + 群凭据 basic auth）；join/审批 = `PATCH
+  v2/groups?inviteLinkPassword=<websafe>`（官方 modifyGroup
+  inviteLinkBase64 同形状）。websafe = 标准 base64 `+/→-_`、去 `=`，还原
+  补 `=` 到 4 倍数。
+- **join 双臂**（官方同构）：`addFromInviteLink == ADMINISTRATOR`（判定 =
+  官方 isAccessControlEnabled ANY||ADMINISTRATOR 词表的审批臂取值）→
+  add_members_pending_admin_approval=[{added:{presentation}}]（官方
+  buildAddPendingAdminApprovalMemberChange 同形，presentation = vendored
+  `create_member_presentation(server_params, self 凭据)`，其余位 proto3
+  缺省 = 服务器从 presentation 提取）→ `{status:"requested"}`；否则
+  direct 臂 add_members（vendored `build_add_member_action_with_credential`，
+  Role DEFAULT + join_from_invite_link:false——官方 `joinFromInviteLink:
+  null` proto3 缺省同线）→ `{status:"joined"}`。version = joinInfo.version
+  +1（饱和不回卷）——申请者非成员读不到群态，join info 即版本基数。
+- **400 already-asked 吞没**：官方 400 + body
+  `"cannot ask to join via invite link if already asked to join"` 吞为
+  成功（requested 臂语义，官方桌面同款强制本地 pending 态）；引擎读响应
+  body 匹配该句面吞没，其他 400 诚实 GROUP_UPDATE_FAILED + status。
+- **预览投影**：GroupJoinInfo → groupId/name?/description?/memberCount/
+  revision/addFromInviteLink 词/approvalRequired/pendingAdminApproval。
+  偏差两处：①name/description 解密失败省略键（官方桌面 GUI 兜底
+  unknownGroup 不搬，engine 省略键宁缺勿错）；②avatar URL 不投影（官方
+  桌面 CDN 代理面取图，engine 读面无消费方，**gap 登记**后续批）。
+- **fake 两桩**：preview → `GROUP_INVITE_LINK_PREVIEW_FAILED` 无 status
+  （fake 无链接读面，材料不可得即错误面）；join → `{status:"joined"}`
+  direct 臂形状（fake 无 join info 读面不裁定审批臂——**登记偏差**，
+  审批臂形状由 real 面承载）。调度日志：preview 读面不落（材料面纪律）、
+  join 写面落（mutating 面纪律，inviteLink 键逐字保留——wire 面 20+ 调用
+  方本就明文携链接，摘要有意不设）。
 
 ## 6. fake 服务模式（仅测试）
 

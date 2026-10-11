@@ -2000,6 +2000,45 @@ impl Service {
         groups::leave_group(&context, &master_key).await
     }
 
+    /// previewGroupViaLink（链接预览读面，KT 扩展方法，官方
+    /// getPreJoinGroupInfo 行为对齐）：链接已由 handler 解析（形状面
+    /// -32603 收口在方法层），此处读面 + 投影。读面非协议上行不落调度
+    /// 日志（terminateGroup mutating 面纪律的读面同位）。fake 模式错误面
+    /// 形状桩：Failed{None} → GROUP_INVITE_LINK_PREVIEW_FAILED（无
+    /// status）——fake 无链接读面，材料不可得即错误面（stickers fake 错误
+    /// 面先例）。
+    pub(crate) async fn preview_group_via_link(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<groups::GroupJoinPreview, groups::TerminateError> {
+        if !self.real {
+            return Err(groups::TerminateError::Failed { status: None });
+        }
+        let context = storage_context(self, account).await?;
+        groups::preview_group_via_link(&context, &master_key, &password).await
+    }
+
+    /// joinGroupViaLink（经链接入群，KT 扩展方法，官方 joinGroupV2ViaLink
+    /// 行为对齐，双臂同构）：返回 requested = true 为审批臂
+    ///（{status:"requested"}）、false 为 direct 臂（{status:"joined"}）。
+    /// 写面协议上行落调度日志（handler 面）。fake 模式形状桩 {status:
+    /// "joined"}（direct 臂形状——fake 无 join info 读面不裁定审批臂，§5
+    /// 登记偏差）。
+    pub(crate) async fn join_group_via_link(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<bool, groups::TerminateError> {
+        if !self.real {
+            return Ok(false);
+        }
+        let context = storage_context(self, account).await?;
+        groups::join_group_via_link(&context, &master_key, &password).await
+    }
+
     /// createGroup（自建群，KT 扩展方法，官方 createGroupV2 行为对齐）：
     /// 随机 master key + zkgroup 派生链 + 初始 Group proto `PUT v1/groups`
     /// 与本地群态落库；成员入参（service-id 串/号码）在 real 模式解析。

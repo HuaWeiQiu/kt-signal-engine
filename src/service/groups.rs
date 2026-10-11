@@ -502,6 +502,232 @@ pub(crate) async fn fetch_group_state_for_send(
         .map(|group| group.terminated)
 }
 
+// ---------------------------------------------------------------------------
+// 群邀请链接读/写面（P13/任务3：预览 + 经链接入群）
+// ---------------------------------------------------------------------------
+
+/// 链接预览投影（官方桌面 getPreJoinGroupInfo 消费面同词表：GroupJoinInfo
+/// → 详情卡；avatar URL 不投影——官方桌面经 CDN 代理面取图，engine 读面
+/// 无消费方，宁缺勿错，§5 gap 登记）。
+pub(crate) struct GroupJoinPreview {
+    pub(crate) group_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) member_count: u32,
+    pub(crate) revision: u32,
+    pub(crate) add_from_invite_link: &'static str,
+    pub(crate) approval_required: bool,
+    pub(crate) pending_admin_approval: bool,
+}
+
+/// `GET v2/groups/join/<websafe password>` 链接读面（官方 getGroupFromLink
+/// WebAPI.preload.ts:4892 同端点：urlParameters 是**路径后缀**非 query；
+/// 群凭据 basic auth——非成员可取任意群 auth credential presentation，官方
+/// makeRequestWithCredentials(deriveGroupFields(masterKey)) 同链）。服务器
+/// 拒绝 → Failed{status}；传输层失败 → Unavailable；proto 解码失败 →
+/// Failed{None}（响应形状面）。
+async fn fetch_group_join_info(
+    context: &StorageContext,
+    master_key: &[u8],
+    password: &[u8],
+) -> Result<presage::proto::GroupJoinInfo, TerminateError> {
+    use base64::Engine as _;
+    let authorization = group_authorization(context, master_key).await?;
+    let web_safe = super::group_link::to_web_safe_base64(
+        &base64::engine::general_purpose::STANDARD.encode(password),
+    );
+    let response = context
+        .push
+        .request(
+            reqwest::Method::GET,
+            Endpoint::storage(format!("v2/groups/join/{web_safe}")),
+            HttpAuthOverride::Identified(authorization),
+        )
+        .map_err(|_| TerminateError::Unavailable)?
+        .send()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(TerminateError::Failed {
+            status: Some(status),
+        });
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    presage::proto::GroupJoinInfo::decode(bytes.as_ref())
+        .map_err(|_| TerminateError::Failed { status: None })
+}
+
+/// 链接预览编排（官方 getPreJoinGroupInfo 行为对齐）：链接读面 → 解密
+/// title/description（失败省略——官方桌面 GUI 兜底 unknownGroup 不搬，
+/// engine 省略键，宁缺勿错，§5 登记）→ 投影词表。approvalRequired = 链接
+/// 访问权 == ADMINISTRATOR（官方 joinGroupV2ViaLink approvalRequired 入参
+/// 同源值，isAccessControlEnabled ANY||ADMINISTRATOR 判定的枚举直读）。
+pub(crate) async fn preview_group_via_link(
+    context: &StorageContext,
+    master_key: &[u8],
+    password: &[u8],
+) -> Result<GroupJoinPreview, TerminateError> {
+    use base64::Engine as _;
+    use presage::libsignal_service::groups_v2::AccessRequired;
+    use presage::proto::access_control::AccessRequired as ProtoAccess;
+    use presage::proto::group_attribute_blob::Content;
+    let info = fetch_group_join_info(context, master_key, password).await?;
+    let key: [u8; 32] = master_key
+        .try_into()
+        .map_err(|_| TerminateError::UnknownGroup)?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+    let name = decrypt_join_blob(&secret_params, &info.title, &|content| match content {
+        Content::Title(title) => Some(title),
+        _ => None,
+    });
+    let description = decrypt_join_blob(
+        &secret_params,
+        &info.description,
+        &|content| match content {
+            Content::DescriptionText(text) => Some(text),
+            _ => None,
+        },
+    );
+    let access = ProtoAccess::try_from(info.add_from_invite_link)
+        .map(|proto| match proto {
+            ProtoAccess::Any => AccessRequired::Any,
+            ProtoAccess::Member => AccessRequired::Member,
+            ProtoAccess::Administrator => AccessRequired::Administrator,
+            ProtoAccess::Unsatisfiable => AccessRequired::Unsatisfiable,
+            ProtoAccess::Unknown => AccessRequired::Unknown,
+        })
+        .unwrap_or(AccessRequired::Unknown);
+    Ok(GroupJoinPreview {
+        group_id: base64::engine::general_purpose::STANDARD.encode(master_key),
+        name,
+        description,
+        member_count: info.member_count,
+        revision: info.version,
+        add_from_invite_link: access_level_name(&access),
+        approval_required: access == AccessRequired::Administrator,
+        pending_admin_approval: info.pending_admin_approval,
+    })
+}
+
+/// 加密 blob 解密 helper（解密失败 = None）。
+fn decrypt_join_blob(
+    secret_params: &GroupSecretParams,
+    blob: &[u8],
+    pick: &dyn Fn(&presage::proto::group_attribute_blob::Content) -> Option<&String>,
+) -> Option<String> {
+    let decrypted = secret_params.decrypt_blob_with_padding(blob).ok()?;
+    let decoded = presage::proto::GroupAttributeBlob::decode(decrypted.as_slice()).ok()?;
+    decoded.content.as_ref().and_then(pick).cloned()
+}
+
+/// 经链接入群编排（官方 joinGroupV2ViaLink 行为对齐，双臂同构）：链接读
+/// 面取 join info（approval 判定 + version 基数）→ 双臂分流——
+/// addFromInviteLink == ADMINISTRATOR = 审批臂
+/// add_members_pending_admin_approval=[{added:{presentation}}]（官方
+/// buildAddPendingAdminApprovalMemberChange 同形，presentation =
+/// vendored `create_member_presentation(server_params, self 凭据)`）→
+/// `{status:"requested"}`；否则 direct 臂 add_members（vendored
+/// `build_add_member_action_with_credential`，Role Default +
+/// join_from_invite_link:false——官方 buildAddMember `joinFromInviteLink:
+/// null` proto3 缺省同线）→ `{status:"joined"}`。version = joinInfo.version
+/// +1（饱和不回卷）。PATCH 带 `?inviteLinkPassword=<websafe>` query
+///（官方 modifyGroup inviteLinkBase64 同形状；申请者非成员，群态读面不可
+/// 得——version 以 join info 为基数，link password 即授权凭据）。官方 400
+/// 带 body `"cannot ask to join via invite link if already asked to join"`
+/// 吞为成功（requested 臂——官方强制本地 pending 态同语义）。self 凭据
+/// 取材失败 = Failed{None}（GROUP_UPDATE_FAILED 无 status，createGroup
+/// 「凭据失败不硬造材料」同纪律）；写后本地群态刷新（best-effort，
+/// updateGroup 批同款）。
+pub(crate) async fn join_group_via_link(
+    context: &StorageContext,
+    master_key: &[u8],
+    password: &[u8],
+) -> Result<bool, TerminateError> {
+    use base64::Engine as _;
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::proto::access_control::AccessRequired as ProtoAccess;
+    let info = fetch_group_join_info(context, master_key, password).await?;
+    let approval_required = ProtoAccess::try_from(info.add_from_invite_link)
+        .is_ok_and(|proto| proto == ProtoAccess::Administrator);
+    let key: [u8; 32] = master_key
+        .try_into()
+        .map_err(|_| TerminateError::UnknownGroup)?;
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
+    let Some(credential) = self_profile_key_credential(context).await else {
+        return Err(TerminateError::Failed { status: None });
+    };
+    let operations = GroupOperations::new(secret_params);
+    let server_public_params = super::zkgroup_consts::legacy_server_public_params();
+    let mut actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: info.version.saturating_add(1),
+        ..presage::proto::group_change::Actions::default()
+    };
+    if approval_required {
+        let presentation =
+            operations.create_member_presentation(&server_public_params, &credential);
+        actions.add_members_pending_admin_approval = vec![
+            presage::proto::group_change::actions::AddMemberPendingAdminApprovalAction {
+                added: Some(presage::proto::MemberPendingAdminApproval {
+                    user_id: Vec::new(),
+                    profile_key: Vec::new(),
+                    presentation,
+                    timestamp: 0,
+                }),
+            },
+        ];
+    } else {
+        actions.add_members = vec![operations.build_add_member_action_with_credential(
+            &credential,
+            Role::Default,
+            &server_public_params,
+        )];
+    }
+    let authorization = group_authorization(context, master_key).await?;
+    let web_safe = super::group_link::to_web_safe_base64(
+        &base64::engine::general_purpose::STANDARD.encode(password),
+    );
+    let response = context
+        .push
+        .request(
+            reqwest::Method::PATCH,
+            Endpoint::storage(format!("v2/groups?inviteLinkPassword={web_safe}")),
+            HttpAuthOverride::Identified(authorization),
+        )
+        .map_err(|_| TerminateError::Unavailable)?
+        .header("Content-Type", "application/x-protobuf")
+        .body(actions.encode_to_vec())
+        .send()
+        .await
+        .map_err(|_| TerminateError::Unavailable)?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        let requested = approval_required;
+        refresh_local_group_state(context, master_key).await;
+        super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
+        return Ok(requested);
+    }
+    let body = response.bytes().await.unwrap_or_default();
+    if status == 400
+        && String::from_utf8_lossy(&body)
+            .contains("cannot ask to join via invite link if already asked to join")
+    {
+        // 官方桌面同款吞没：已申请过 = 幂等成功（requested 臂语义）。
+        refresh_local_group_state(context, master_key).await;
+        super::group_cache::invalidate_after_group_write(&context.store, master_key).await;
+        return Ok(true);
+    }
+    Err(TerminateError::Failed {
+        status: Some(status),
+    })
+}
+
 /// terminateGroup 编排：幂等判定（登记表 → 服务器群态 terminated 真值，
 /// 同值幂等纪律对齐 setConversationBlocked 先例）→ 群凭据 → PATCH 上传 →
 /// 本地登记。服务器群态不可读（网络/拒绝）不阻塞写面——写意图交服务器
