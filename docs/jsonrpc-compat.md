@@ -331,6 +331,20 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   delete_message，仅 messageDeletes 臂），引擎投影 additive 上抛供
   connector 删自有库行（conversationDeletes 的引擎 store 行不删——vendored
   TODO 面，§5 如实登记）。
+- `syncMessage.contacts {complete, records: [{aci, number?, name?,
+  expireTimer?, expireTimerVersion?, inboxPosition?}]}`（P15a 项3，官方
+  SyncMessage.contacts blob 消费面投影——handleContacts
+  MessageReceiver.preload.ts:3934 → doContactSync services/
+  contactSync.preload.ts upsert 同位）：blob 下载/解析走 vendored presage
+  既有 `retrieve_contacts`（附件下载面复用，零新平行机制），投影解析+
+  落库成功记录（parse 失败上游 filter_map 丢、store save 失败 break 后
+  剩余不投影，§5 如实登记）；aci = ContactDetails aciBinary/aci 解析
+  UUID 串；number = E.164（缺席键不在）；name 空串不投（官方 dropNull
+  同构）；expireTimer/expireTimerVersion/inboxPosition = 0 不投（presage
+  u32 模型 0 与缺席不可分，§5 记档）；avatar 字节不投影（gap 登记后续
+  批）；complete = blob complete 旗标（官方 isFullSync 同位，connector
+  据此决定全量重置语义）；空 records 照投事件（complete 旗标即信号，
+  官方 contactSync:complete 空 blob 照发同构）；信封公共位三键同面。
 - `syncMessage.configuration {readReceipts?, unidentifiedDeliveryIndicators?,
   typingIndicators?, linkPreviews?}` / `syncMessage.fetchLatest {type?}` /
   `syncMessage.callLinkUpdate {type?, rootKey?, adminKey?}` /
@@ -3300,6 +3314,22 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   = proto 缺省 true、ephemeral 缺席 = false，旧宿主零变化）；不落库
   （store-sqlite destructure `_`，story 位同款——信封位只活接收现场）。
   reportSpam 块「token 不透投影」边界同步废止（§5 reportSpam 块勘误）。
+- **项3 contacts sync 收投影（vendored `Received::Contacts` 载体扩位）**：
+  官方联系人同步 blob（SyncMessage.contacts + attachment blob 下载解析，
+  ContactsMessage→ContactDetails 处理路径）此前引擎零消费（仅 ack）——
+  vendored presage 本就经 `retrieve_contacts`（既有附件下载面复用，零新
+  平行机制）解析入库，但 `Received::Contacts(EnvelopeAck)` 载体把解析产物
+  拦在 presage 内。本批改 `Received::Contacts(ContactSync, EnvelopeAck)`
+  （载体 = 源信封 + complete 旗标 + 解析且落库成功记录，fork 清单
+  vendor/README.md 登记），引擎投影 `syncMessage.contacts {complete,
+  records[]}` 事件上抛（face 见 §3；官方 handleContacts→doContactSync
+  upsert 同位）。偏差如实登记：①records 只含落库成功条目（vendored save
+  循环 break-on-error 上游语义，break 后剩余条目不投影——store 面 =
+  投影面同界）；②avatar 字节不投影（官方落盘会话头像，engine 读面无
+  消费方，gap 登记后续批）；③expireTimer/expireTimerVersion/
+  inboxPosition 0 与缺席不可分（presage Contact u32 模型），0 不投；
+  ④无 aci 纯号码条目上游 `from_proto` MissingUuid 已滤（官方允许 e164-only
+  条目——模型面偏差，§5 如实登记）；⑤blob 本体不投（二进制）。
 
 
 ## 6. fake 服务模式（仅测试）

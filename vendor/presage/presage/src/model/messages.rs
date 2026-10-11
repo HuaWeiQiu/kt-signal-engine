@@ -1,5 +1,27 @@
 use libsignal_service::messagepipe::EnvelopeAck;
 use libsignal_service::{prelude::Content, protocol::ServiceId};
+use std::fmt;
+
+use crate::model::contacts::Contact;
+
+/// KT (P15a): contacts sync payload — the source envelope plus the parsed
+/// contact records from the sync blob (Desktop ContactSyncEvent face:
+/// services/contactSync.preload.ts). Only successfully saved records are
+/// carried; the store save loop keeps its upstream break-on-error semantics.
+pub struct ContactSync {
+    pub content: Box<Content>,
+    pub complete: bool,
+    pub contacts: Vec<Contact>,
+}
+
+impl fmt::Debug for ContactSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactSync")
+            .field("complete", &self.complete)
+            .field("contacts", &self.contacts.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// KT (DERM): retry material for a decryption failure, mirroring the two
 /// official faces (Android MessageDecryptor buildSendRetryReceiptJob,
@@ -23,7 +45,9 @@ pub enum Received {
     /// Got contacts (only applies if linked to a primary device
     /// Contacts can be later queried in the store.
     /// They are stored before yielding; the consumer acks the source envelope.
-    Contacts(EnvelopeAck),
+    /// KT (P15a): carries the parsed records and source envelope for the
+    /// engine projection.
+    Contacts(ContactSync, EnvelopeAck),
 
     // Failed to receive a message from the specified service ID.
     // A session reset with the contact may fix this.

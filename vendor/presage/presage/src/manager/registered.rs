@@ -57,7 +57,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::model::contacts::Contact;
-use crate::model::messages::DecryptionFailure;
+use crate::model::messages::{ContactSync, DecryptionFailure};
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
@@ -931,6 +931,10 @@ impl<S: Store> Manager<S, Registered> {
                                             ..
                                         }) = &content.body
                                         {
+                                            // KT (P15a): parsed records ride along
+                                            // for the engine projection; save loop
+                                            // keeps the upstream break-on-error face.
+                                            let complete = contacts.complete.unwrap_or(false);
                                             match state
                                                 .message_receiver
                                                 .retrieve_contacts(contacts)
@@ -938,23 +942,47 @@ impl<S: Store> Manager<S, Registered> {
                                             {
                                                 Ok(contacts) => {
                                                     info!("saving contacts");
-                                                    for contact in contacts.filter_map(Result::ok) {
+                                                    let mut saved = Vec::new();
+                                                    for contact in contacts.filter_map(Result::ok)
+                                                    {
+                                                        let contact: Contact = contact.into();
                                                         if let Err(error) = state
                                                             .store
-                                                            .save_contact(&contact.into())
+                                                            .save_contact(&contact)
                                                             .await
                                                         {
                                                             warn!(%error, "failed to save contacts");
                                                             break;
                                                         }
+                                                        saved.push(contact);
                                                     }
+                                                    slots.push(BatchSlot::Ready(
+                                                        Received::Contacts(
+                                                            ContactSync {
+                                                                content: Box::new(
+                                                                    content.clone(),
+                                                                ),
+                                                                complete,
+                                                                contacts: saved,
+                                                            },
+                                                            ack,
+                                                        ),
+                                                    ));
+                                                    continue;
                                                 }
                                                 Err(error) => {
                                                     warn!(%error, "failed to retrieve contacts");
                                                 }
                                             }
 
-                                            slots.push(BatchSlot::Ready(Received::Contacts(ack)));
+                                            slots.push(BatchSlot::Ready(Received::Contacts(
+                                                ContactSync {
+                                                    content: Box::new(content.clone()),
+                                                    complete,
+                                                    contacts: Vec::new(),
+                                                },
+                                                ack,
+                                            )));
                                             continue;
                                         }
 

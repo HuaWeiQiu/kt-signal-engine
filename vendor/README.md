@@ -171,6 +171,16 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
   （Metadata 新字段编译面，出站消息信封位恒无）。
 - `presage/src/store.rs`（同批追加）— verified sync 存储路径 Metadata
   字面量补三 `None`（同上编译面）。
+- `presage/src/model/messages.rs`（2026-10-11 P15a 项3 批）— `Received::
+  Contacts(EnvelopeAck)` 改 `Received::Contacts(ContactSync, EnvelopeAck)`：
+  新 `ContactSync { content: Box<Content>, complete: bool,
+  contacts: Vec<Contact> }` 载体（源信封 + 解析且落库成功的联系人记录 +
+  complete 旗标，官方桌面 ContactSyncEvent 同位 services/
+  contactSync.preload.ts；Debug 手写不展开记录体）。
+- `presage/src/manager/registered.rs`（同批）— contacts sync 臂收集解析+
+  落库成功记录入 ContactSync 上抛（save 循环保持上游 break-on-error 语义，
+  break 后剩余条目不投影；blob 下载仍走 `retrieve_contacts` 既有附件
+  下载面，零新平行机制）。
 
 `vendor/presage/presage-store-sqlite/`：
 

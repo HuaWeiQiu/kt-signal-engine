@@ -3734,10 +3734,16 @@ async fn serve_account_stream(
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
                 // messagepipe 层已就地 ack）。
                 Some(Received::QueueEmpty) => {}
-                // contacts 由 presage 自动入库（号码/名字面随之可用），
-                // 源信封处理完成 → 补 ack。
-                Some(Received::Contacts(ack)) => {
+                // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
+                // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
+                // ContactSync 载体，fork 登记 vendor/README.md），投影 receive
+                // 事件供 connector upsert 自有库（官方 contactSync 消费同位），
+                // 完成后补 ack。
+                Some(Received::Contacts(sync, ack)) => {
                     quick_seen += 1;
+                    for notification in project_contacts_sync(number, &sync) {
+                        let _ = service.outbound.send(notification);
+                    }
                     ack.ack();
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
@@ -5946,6 +5952,63 @@ fn project_delete_for_me_message(message: &presage::proto::AddressableMessage) -
         "author": author,
         "timestamp": message.sent_timestamp.unwrap_or(0),
     }))
+}
+
+/// P15a 项3 contacts sync 投影（compat §5）：解析后的联系人记录上抛事件
+/// ——官方 handleContacts（MessageReceiver.preload.ts:3934 blob 消费面）
+/// → ContactSyncEvent → doContactSync（services/contactSync.preload.ts
+/// upsert aci/number/name/inboxPosition/expireTimer 族）同位；blob 本体
+/// 不投（二进制），投解析产物。记录 = vendored presage 解析+落库成功条目
+/// （parse 失败上游 filter_map 丢、store save 失败 break 后不再投影——
+/// 如实登记）；avatar 字节不投影（gap 登记后续批）。expireTimer/
+/// expireTimerVersion/inboxPosition 0 与缺席不可分（presage u32 模型），
+/// 0 不投（§5 记档）。空记录照投事件（complete 旗标即信号，官方
+/// contactSync:complete 事件空 blob 照发同构）。
+fn project_contacts_sync(
+    account: &str,
+    sync: &presage::model::messages::ContactSync,
+) -> Vec<Value> {
+    let metadata = &sync.content.metadata;
+    let mut records = Vec::new();
+    for contact in &sync.contacts {
+        let mut entry = serde_json::Map::new();
+        entry.insert("aci".into(), json!(contact.uuid.to_string()));
+        if let Some(number) = contact.phone_number.as_ref() {
+            entry.insert("number".into(), json!(e164_string(number)));
+        }
+        if !contact.name.is_empty() {
+            entry.insert("name".into(), json!(contact.name));
+        }
+        if contact.expire_timer != 0 {
+            entry.insert("expireTimer".into(), json!(contact.expire_timer));
+        }
+        if contact.expire_timer_version != 0 {
+            entry.insert(
+                "expireTimerVersion".into(),
+                json!(contact.expire_timer_version),
+            );
+        }
+        if contact.inbox_position != 0 {
+            entry.insert("inboxPosition".into(), json!(contact.inbox_position));
+        }
+        records.push(Value::Object(entry));
+    }
+    let envelope = json!({
+        "sourceUuid": metadata.sender.service_id_string(),
+        "sourceDevice": u32::from(metadata.sender_device),
+        "timestamp": metadata.client_timestamp.timestamp_millis().max(0) as u64,
+        "syncMessage": {
+            "contacts": {
+                "complete": sync.complete,
+                "records": records,
+            }
+        }
+    });
+    vec![json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": { "account": account, "envelope": envelope },
+    })]
 }
 
 /// DeleteForMe 会话标识（ConversationIdentifier oneof）：serviceId/binary →
@@ -10067,6 +10130,122 @@ mod tests {
         assert!(envelope.get("reportingToken").is_none());
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// P15a 项3 contacts sync 投影（vendored ContactSync 载体）：records 逐
+    /// 条 aci/number/name/expireTimer 族（0 值不投、空名不投）、complete
+    /// 旗标、信封公共位（sourceUuid/sourceDevice/timestamp）、空记录照投
+    /// 事件。
+    #[test]
+    fn contacts_sync_projects_parsed_records() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::libsignal_service::utils::{phonenumber_from_signal, TryIntoE164};
+        use presage::model::contacts::Contact;
+        use presage::model::messages::ContactSync;
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let e164 = "+15551234567".try_into_e164().expect("e164");
+        let contacts = vec![
+            Contact {
+                uuid: presage::libsignal_service::prelude::Uuid::parse_str(
+                    "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                )
+                .expect("uuid"),
+                phone_number: Some(phonenumber_from_signal(&e164)),
+                name: "Alice".to_owned(),
+                verified: Default::default(),
+                profile_key: Vec::new(),
+                expire_timer: 0,
+                expire_timer_version: 2,
+                inbox_position: 3,
+                avatar: None,
+            },
+            // 全零/空名条目：0 值与空名键不投，aci 照投。
+            Contact {
+                uuid: presage::libsignal_service::prelude::Uuid::parse_str(
+                    "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283",
+                )
+                .expect("uuid"),
+                phone_number: None,
+                name: String::new(),
+                verified: Default::default(),
+                profile_key: Vec::new(),
+                expire_timer: 0,
+                expire_timer_version: 0,
+                inbox_position: 0,
+                avatar: None,
+            },
+        ];
+        let sync = ContactSync {
+            content: Box::new(Content::from_body(
+                ContentBody::DataMessage(DataMessage::default()),
+                metadata,
+            )),
+            complete: true,
+            contacts,
+        };
+        let notification = pop_unwrap(
+            project_contacts_sync("acct", &sync),
+            "contacts sync projects",
+        );
+        assert_eq!(notification["method"], json!("receive"));
+        let envelope = &notification["params"]["envelope"];
+        assert_eq!(
+            envelope["sourceUuid"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(envelope["sourceDevice"], json!(1));
+        assert_eq!(envelope["timestamp"], json!(1_700_000_000_000_u64));
+        let face = &envelope["syncMessage"]["contacts"];
+        assert_eq!(face["complete"], json!(true));
+        let records = face["records"].as_array().expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0],
+            json!({
+                "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                "number": "+15551234567",
+                "name": "Alice",
+                "expireTimerVersion": 2,
+                "inboxPosition": 3,
+            })
+        );
+        assert_eq!(
+            records[1],
+            json!({ "aci": "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283" })
+        );
+
+        // 空记录照投事件（complete 旗标即信号）。
+        let sync = ContactSync {
+            content: sync.content,
+            complete: false,
+            contacts: Vec::new(),
+        };
+        let face = &pop_unwrap(project_contacts_sync("acct", &sync), "empty projects")["params"]
+            ["envelope"]["syncMessage"]["contacts"];
+        assert_eq!(face["complete"], json!(false));
+        assert_eq!(face["records"], json!([]));
     }
 
     /// Stories 接收批（E2）：StoryMessage text 面投影——textAttachment
