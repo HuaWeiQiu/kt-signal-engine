@@ -109,6 +109,7 @@ send message: Signal server unavailable.
 | `getAvatar` | `{account, conversationId}`（形状分派：ACI/PNI ServiceId UUID 直通、手机号文本（E.164/裸数字）经 contacts 反查、群 = master key 标准 base64（listGroups id 同源）；三者皆不中 `-32603`） | `{dataUri, size}`（data URI = `data:<mime>;base64,<payload>`，MIME 魔数嗅探、未识别回退 `application/octet-stream`；size = 原始字节数） | 参数缺失/会话标识形状非法/未注册账号 `-32603`（参数面不占用结构化码）；无头像（未同步 profile_key/对端或群未设头像/服务器 403/404）→ `AVATAR_UNAVAILABLE`；网络/下载/解密失败 → `AVATAR_FETCH_FAILED`；超 10MB 帽 → `AVATAR_TOO_LARGE`（均 `-1` + message 码位） | **2026-10-06 real（KT 扩展）**：1:1 走 presage `retrieve_profile_avatar_by_uuid`（profileKey = presage store `profile_key(service_id)`，contacts 同步随行落库；未同步 → 诚实「无头像」）；群走 presage `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密）；缓存/CDN/解密/入库由 presage 承担；10MB 帽照 presage 注释口径，超出 fail-closed；fake：`AVATAR_UNAVAILABLE`（不落调度日志，读面纪律） |
 | `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状，存储序） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；fake：成功回 `{blocked: []}` |
 | `storage.mergeContacts` | `{account}` | `{recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, trustStatesSynced}`（七汇总字段；逐条 merge 幂等——同钥重跑全 no-op） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A4，官方 mergeContactRecord engine 腿，§5 块）**：Storage Service manifest → 全部 CONTACT identifier 批读 → ContactRecord 逐条 merge——identityKey 非空 → 身份库 save（官方 updateIdentityAfterSync 同构：absent 新增/同钥 no-op/异钥替换 + vendored 换钥 archive sessions）+ identityState 落 sidecar 信任态（Default/坏值归 default）；profileKey 非空且本地缺失 → upsert（官方 isFirstSync\|!localProfileKey 同闸）；联系人缺失 → contacts 建档（e164/given+family 姓名随建，已有档不动——姓名权威 = 手机 contacts sync）；本机 uuid/无 serviceId/坏形跳过（官方 shouldDrop 同位，skipped 汇总）；无引擎消费模型字段（unregisteredAt/hideStory/hidden/avatarColor/note/nickname 族）记档跳过，archived/markedUnread/muted/blocked 已有专用面不重复；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A4 块；fake：恒七字段零汇总 |
+| `storage.importGroups` | `{account}` | `{recordsRead, imported, alreadyKnown, failed}`（四汇总字段；幂等——本地已有 master key 零网络跳过） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A5，官方 mergeGroupV2Record engine 腿，§5 块）**：Storage Service manifest → 全部 GROUPV2 identifier 批读 → GroupV2Record masterKey 逐群导入——本地 `store.group()` 命中 → alreadyKnown 零网络跳过（增量纪律）；未知 → 既有 `fetch_group_state` 群态拉取（groups 服务器 GET v1/groups/）→ `save_group` 落 presage store（listGroups/open_group_sender 发现与发送面即刻可用）；master key 坏形（≠32B）/群态拉取失败/落库失败 → failed 逐群 best-effort 计数不炸批（官方桌面按需拉态，引擎 sidecar 无群快照惰性层 → 导入即拉态，偏差 §5 记档）；GV1 迁移面归窗D B8；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A5 块；fake：恒四字段零汇总 |
 | `reportSpam` | `{account, targetAci(ServiceId: ACI/PNI UUID), serverGuids[]（每项必须可解析 UUID，归一为小写连字形态入路径；urn:uuid:/花括号等宽松形态 fail-closed）, token?}`（单批 ≤1000，官方 reportSpamJobQueue zod max 同源） | `{reported, failures: [{serverGuid, status?}]}`（status = 服务器 HTTP 状态码；传输层失败该键缺席不发明 0） | 参数缺失/targetAci 非 ServiceId/serverGuids 缺失·非数组·空批·元素非 UUID/超 1000/token 非字符串形状/未注册账号 `-32603`（参数面不占用结构化码）；全部 serverGuid 均失败 → `REPORT_SPAM_FAILED`（`-1` + message） | **2026-10-06 real（KT 扩展）**：官方桌面同款 `POST v1/messages/report/{senderAci}/{serverGuid}` 逐条独立请求、JSON body `{token}`（token 缺省序列化为 `{}`，官方 jsonData 同构；本机凭据 basic auth）；部分失败诚实投影：单条 4xx/5xx/传输失败记入 failures（带状态码），至少一条成功即返回 `{reported, failures}`，全部失败才整体报错；fake：全量成功 `{reported: N, failures: []}`（落调度日志，协议上行面纪律） |
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `sendCallMessage` | `{account, recipient(单号码/ACI)?\|group(32B 群 master key 标准 base64，listGroups/terminateGroup/updateGroup 的 groupId 同源口径)?——寻址两腿恰一互斥, data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；**两腿恰一**（2026-10-08 群臂批）——`group` 与 `recipient` 同置/都缺/任一腿形状非法 `-32603`；群腿仅 modern 面放行（官方群信令恒 opaque，legacy 裸帧族群向无先例；sender-key 群发无设备定向位——destinationDeviceId 与 group 同置 `-32603`）；`groupId` 键维持禁入（wire 参数名是 `group`）） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、group 非法 base64/≠32B/非字符串、两腿同置/都缺、groupId 键在场、群腿携 legacy 或 destinationDeviceId）/未注册账号 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-08 群臂批） | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（sent-transcript 缺席见 §5 通话消息块；online 位 2026-10-11 六问批勘误：官方桌面 call 发送链同样不设 online——仅 typing 消息设 online:true，**无偏差**，原「online=false 偏差」登记作废，§5 六问批）；**2026-10-08 群臂批（P4b，connector 契约 1.82 wire 面对位，engine-compat）**：`group` 腿 sender-key 群发（官方 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 → sendCallingMessage.preload.ts:99-118 isGroup 臂 sendContentMessageToGroup 同落点），群头 = open_group_sender（terminated 硬拒，send 系群组形态同纪律）+ `send_message_to_group`（sendTyping 群臂同原语）；单测钉群臂 wire = `CallMessage{opaque{data,urgency}}` 字段10（无 busy/hangup/destinationDeviceId 位）；fake：成功 `{"timestamp":u64}` 两臂同口径（落调度日志，协议上行面纪律） |
@@ -3843,6 +3844,42 @@ presage 身份库为空，对端身份钥只能靠首次发送时服务器 preke
   pni untagged 裸 UUID/标签形/全缺/invalid-aci 逐形）+ trust_state_mapping
   （三态直映 + 坏值归 default）+ contract storage_merge_contacts_fake_
   shapes_and_param_fail_closed（fake 零汇总 + 参数闸 + real 未注册折叠）。
+
+### 窗D A5 Storage GroupV2Record 群导入批（2026-10-11，官方对齐 Signal-Desktop storageRecordOps，wire additive）
+
+缺口总登记 A5 的 engine 腿：新方法 `storage.importGroups`（§3 行）。
+官方锚：`services/storageRecordOps.preload.ts` mergeGroupV2Record →
+`getOrCreateGroupSnapshot` 按需拉群态。A4 之前 engine 无群发现通道——
+新链接设备后 presage store 群库为空，listGroups 空、群发送（sender-key
+群发/群 typing/poll 三臂）全部无从起步，本批把 manifest GROUPV2 master
+key 变成可用的本地群库。
+
+- **导入语义**：manifest 全部 GROUPV2 identifier 批读（A4 同款批读纪律）
+  → GroupV2Record.masterKey 逐群：
+  1. 本地 `store.group()` 命中 → already_known，零网络跳过（增量导入
+     纪律——重复调用幂等，不重复拉群态）。
+  2. 未知 master key → 既有 `fetch_group_state`（groups 服务器
+     `GET v1/groups/<blob>` 面，join 群/头像面同通道）→ `save_group`
+     落 presage store——listGroups/open_group_sender 发现与发送面即刻
+     可用。
+  3. master key 坏形（≠32B，官方 32B 定长同域）/群态拉取失败（服务器
+     对该群无凭据/已退出等）/落库失败 → failed 计数，**逐群 best-effort
+     不炸批**（官方桌面 merge 后按需拉态同样是单群失败不阻断全批）。
+- **偏差记档（vs 官方桌面）**：官方桌面 mergeGroupV2Record 只登记
+  master key，群态经 getOrCreateGroupSnapshot **按需惰性拉取**；引擎作
+  sidecar 无群快照惰性层（无按需触发点），导入面直接拉取落库——网络
+  行为差异（导入时拉 vs 首用时拉），最终库状态同形。导入触发时机归调
+  用方（connector 链接完成/manifest 变更时调用，引擎不自动后台跑）。
+- **GV1 记档**：manifest GROUPV1 identifier 不在本批——GV1 记录迁移
+  GV2 面（官方 conversations.migration 语义）归窗D B8 批。
+- **错误面**：account 缺席/未注册 `-32603`；storage 链路
+  STORAGE_UNAVAILABLE/STORAGE_READ_FAILED（-1 + message，置顶面同码
+  位）；无 master key 或 manifest 404 → 四字段零汇总幂等成功（A4 同
+  口径）。
+- **fake**：恒四字段零汇总（读面纪律）。
+- **计数归真机回归**：manifest 拉取/群态导入/alreadyKnown/failed 计数
+  需真机 storage 状态（fake 无 manifest 面），契约测试覆盖 fake 形状 +
+  参数闸 + real 未注册折叠。
 
 
 ## 6. fake 服务模式（仅测试）

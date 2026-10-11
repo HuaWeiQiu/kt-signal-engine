@@ -274,6 +274,121 @@ pub(crate) async fn merge_contacts(
     Ok(outcome)
 }
 
+/// 群导入汇总（wire additive）。
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub(crate) struct GroupImportOutcome {
+    /// 解码成功的 GroupV2Record 数。
+    pub(crate) records_read: u32,
+    /// 本地未知 → 群态拉取 + 落库成功（导入完成）。
+    pub(crate) imported: u32,
+    /// 本地已有（store group 命中）→ 跳过不重复拉。
+    pub(crate) already_known: u32,
+    /// master key 坏形（≠32B）/群态拉取失败/落库失败。
+    pub(crate) failed: u32,
+}
+
+/// Storage GroupV2Record masterKey → 群导入（窗D A5）：manifest 全部
+/// GROUPV2 identifier 批读 → 本地未知 master key 逐群拉群态（groups
+/// 服务器 GET v1/groups/，既有 fetch_group_state 面）→ save_group 落
+/// presage store（listGroups/open_group_sender 发现与发送面即刻可用）。
+/// 官方行为参照（AGPL 只读锚）：桌面 mergeGroupV2Record 后经
+/// getOrCreateGroupSnapshot 按需拉群态；引擎作为 sidecar 无群快照惰性层，
+/// 导入面直接拉取落库（增量：已有群零网络）。逐群独立 best-effort：单群
+/// 拉取失败记 failed 不炸批（服务器对该群无凭据/已退出等场景诚实计数）。
+pub(crate) async fn import_groups(
+    context: StorageContext,
+) -> Result<GroupImportOutcome, StorageSyncError> {
+    let mut outcome = GroupImportOutcome::default();
+    let Some(master_key) = context
+        .store
+        .fetch_master_key()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)?
+    else {
+        return Ok(outcome);
+    };
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let read_key = StorageServiceKey::from_master_key(&master_key);
+    let storage = storage_sync::open_storage_service(context.push.clone(), read_key).await?;
+    let manifest = match storage.manifest().await {
+        Ok(manifest) => manifest,
+        Err(presage::libsignal_service::StorageServiceError::Service(
+            ServiceError::NotFoundError,
+        )) => return Ok(outcome),
+        Err(_) => return Err(StorageSyncError::Unavailable),
+    };
+    let keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            matches!(
+                identifier.r#type(),
+                presage::libsignal_service::proto::manifest_record::identifier::Type::Groupv2
+            )
+        })
+        .map(|identifier| identifier.raw.clone())
+        .collect();
+    if keys.is_empty() {
+        return Ok(outcome);
+    }
+    let record_ikm = if manifest.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest.record_ikm.as_slice())
+    };
+    let auth = storage_auth(&context.push).await?;
+    let items = read_raw_items(&context.push, auth, keys.clone()).await?;
+
+    for key in &keys {
+        let Some(item) = items.iter().find(|item| &item.key == key) else {
+            continue;
+        };
+        let Ok(plaintext) = decrypt_raw_item(&storage_key, item, record_ikm) else {
+            outcome.failed += 1;
+            continue;
+        };
+        let Ok(record) = storage_proto::StorageRecord::decode(plaintext.as_slice()) else {
+            outcome.failed += 1;
+            continue;
+        };
+        let Some(storage_proto::storage_record::Record::GroupV2(group_record)) = record.record
+        else {
+            outcome.failed += 1;
+            continue;
+        };
+        if group_record.master_key.is_empty() {
+            outcome.failed += 1;
+            continue;
+        }
+        outcome.records_read += 1;
+        let Ok(group_master_key) = <[u8; 32]>::try_from(group_record.master_key.as_slice()) else {
+            outcome.failed += 1;
+            continue;
+        };
+        // 本地已有 → 零网络跳过（增量导入纪律）。
+        if matches!(context.store.group(group_master_key).await, Ok(Some(_))) {
+            outcome.already_known += 1;
+            continue;
+        }
+        match super::groups::fetch_group_state(&context, &group_record.master_key).await {
+            Ok(group) => {
+                if context
+                    .store
+                    .save_group(group_master_key, presage::model::groups::Group::from(group))
+                    .await
+                    .is_ok()
+                {
+                    outcome.imported += 1;
+                } else {
+                    outcome.failed += 1;
+                }
+            }
+            Err(_) => outcome.failed += 1,
+        }
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

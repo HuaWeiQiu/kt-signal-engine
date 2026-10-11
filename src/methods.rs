@@ -1689,6 +1689,27 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // storage.importGroups（窗D A5，官方 mergeGroupV2Record engine 腿）：
+        // 单参 account（manifest GROUPV2 → 群态拉取 + 本地 store 落库）；
+        // fake 恒零汇总（读面纪律）。汇总字段名 camelCase wire 直投。
+        "storage.importGroups" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.import_storage_groups(account).await {
+                Ok(outcome) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "recordsRead": outcome.records_read,
+                        "imported": outcome.imported,
+                        "alreadyKnown": outcome.already_known,
+                        "failed": outcome.failed,
+                    }),
+                ),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 贴纸包安装状态同步（Storage Service 真相源，带 account 参数，风格
         // 对齐置顶面）：packId 解码/packKey 形状错走 -32603 fail-closed
         //（置顶面参数处理先例，不占用结构化码）。

@@ -490,6 +490,40 @@ fn storage_merge_contacts_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603, "unknown account folds to internal error");
 }
 
+/// storage.importGroups 契约面（窗D A5，官方 mergeGroupV2Record engine 腿）：
+/// fake 零汇总形状（读面纪律，四字段 camelCase 全键在场）+ 参数面
+/// fail-closed（-32603：account 缺席/非字符串；real 模式未注册账号折叠
+/// -32603 不触网——manifest 拉取/群态导入计数归真机验证）。
+#[test]
+fn storage_import_groups_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("import-groups-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake：零汇总幂等形状。
+    assert_eq!(
+        engine.request("storage.importGroups", json!({ "account": "+15550000000" }))["result"],
+        json!({
+            "recordsRead": 0,
+            "imported": 0,
+            "alreadyKnown": 0,
+            "failed": 0,
+        })
+    );
+
+    // 缺 account / account 非字符串形状 → -32603。
+    let (code, _) = engine.error_of("storage.importGroups", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("storage.importGroups", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // real + 全新数据目录（无账号）：未注册折叠 -32603，不触网。
+    let real_dir = temp_dir("import-groups-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, _) =
+        real_engine.error_of("storage.importGroups", json!({ "account": "+15550001111" }));
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+}
+
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
 /// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
 /// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。

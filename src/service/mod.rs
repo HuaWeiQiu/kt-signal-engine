@@ -2844,6 +2844,20 @@ impl Service {
         storage_merge::merge_contacts(context, now_ms()).await
     }
 
+    /// storage.importGroups（窗D A5）：manifest GROUPV2 masterKey → 群态
+    /// 拉取 + presage store 落库（listGroups/open_group_sender 即刻可用）。
+    /// fake 模式零汇总早退（与 mergeContacts 同纪律）。
+    pub(crate) async fn import_storage_groups(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<storage_merge::GroupImportOutcome, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_merge::GroupImportOutcome::default());
+        }
+        let context = storage_context(self, account).await?;
+        storage_merge::import_groups(context).await
+    }
+
     /// setConversationPinned（P4 扩面）：官方写语义（读改写 AccountRecord，
     /// 仅动 pinned 字段）+ 409 冲突重放（conflictBackOff 3 次）。
     pub(crate) async fn set_conversation_pinned(
