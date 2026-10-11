@@ -812,6 +812,109 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // sendPollCreate/sendPollVote/sendPollTerminate（Polls 发送批，窗D
+        // A7，官方 poll 发送三臂对位）：官方桌面仅群聊形态（create 1:1 走
+        // isPollSend1to1Enabled feature flag 默认关；vote/terminate 只在群
+        // 会话触发——poll 只存在于群），三方法无直聊形态，groupId 必填且
+        // 参数层 decode_group_id 闸（sendGroupCallUpdate 同口径，fake 面
+        // 同样 fail-closed）。内容闸按官方 PollCreateSchema（types/
+        // Polls.dom.ts）：question 非空 ≤200 字符 + 字节 ≤2048（官方
+        // MAX_MESSAGE_BODY_BYTE_LENGTH）；options 2..=10 条、每条非空
+        // ≤100 字符 + 字节 ≤2048；optionIndexes 0..=9 且 ≤10 条（官方
+        // PollVoteSchema 同域），空数组 = 清票动作合法；targetTimestamp
+        // 正整数（官方 z.number().int().positive()）；voteCount 缺省 1。
+        // 长度计数 chars 而非 graphemes（无分割依赖，合成序列计数更大、
+        // 超限更保守——偏差记档 §5）。
+        "sendPollCreate" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let group = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .filter(|group| crate::service::decode_group_id(group).is_some());
+            let question = params.get("question").and_then(poll_question_face);
+            let options = params.get("options").and_then(poll_options_face);
+            let allow_multiple = match params.get("allowMultiple") {
+                None | Some(Value::Null) => Some(false),
+                Some(value) => value.as_bool(),
+            };
+            match (account, group, question, options, allow_multiple) {
+                (Some(account), Some(group), Some(question), Some(options), Some(allow)) => {
+                    match service
+                        .send_poll_create_group(account, group, &question, &options, allow)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        "sendPollVote" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let group = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .filter(|group| crate::service::decode_group_id(group).is_some());
+            let target_author = params.get("targetAuthor").and_then(Value::as_str);
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            let option_indexes = params
+                .get("optionIndexes")
+                .and_then(poll_option_indexes_face);
+            let vote_count = match params.get("voteCount") {
+                None | Some(Value::Null) => Some(1u32),
+                Some(value) => value.as_u64().and_then(|count| u32::try_from(count).ok()),
+            };
+            match (
+                account,
+                group,
+                target_author,
+                target,
+                option_indexes,
+                vote_count,
+            ) {
+                (
+                    Some(account),
+                    Some(group),
+                    Some(author),
+                    Some(target),
+                    Some(indexes),
+                    Some(count),
+                ) if target > 0 => {
+                    match service
+                        .send_poll_vote_group(account, group, author, target, &indexes, count)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        "sendPollTerminate" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let group = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .filter(|group| crate::service::decode_group_id(group).is_some());
+            let target = params.get("targetTimestamp").and_then(Value::as_u64);
+            match (account, group, target) {
+                (Some(account), Some(group), Some(target)) if target > 0 => {
+                    match service
+                        .send_poll_terminate_group(account, group, target)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         "updateContact" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
@@ -3490,6 +3593,49 @@ fn has_image_or_video_mediatype(data_uri: &str) -> bool {
         .strip_prefix("data:")
         .and_then(|rest| rest.split(';').next())
         .is_some_and(|mediatype| mediatype.starts_with("image/") || mediatype.starts_with("video/"))
+}
+
+/// Polls 发送批内容闸（官方 PollCreateSchema 对位，types/Polls.dom.ts）：
+/// question 非空 ≤200 字符 + 字节 ≤2048（官方 MAX_MESSAGE_BODY_BYTE_LENGTH
+/// 同值）。长度计数 chars（合成序列较 graphemes 计数更大，超限更保守）。
+fn poll_question_face(value: &Value) -> Option<String> {
+    let question = value.as_str()?;
+    let chars = question.chars().count();
+    ((1..=200).contains(&chars) && question.len() <= 2048).then(|| question.to_owned())
+}
+
+/// poll options 闸：2..=10 条、每条非空字符串 ≤100 字符 + 字节 ≤2048。
+fn poll_options_face(value: &Value) -> Option<Vec<String>> {
+    let entries = value.as_array()?;
+    if !(2..=10).contains(&entries.len()) {
+        return None;
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let option = entry.as_str()?;
+            let chars = option.chars().count();
+            ((1..=100).contains(&chars) && option.len() <= 2048).then(|| option.to_owned())
+        })
+        .collect()
+}
+
+/// poll optionIndexes 闸：每项 0..=9、≤10 条（官方 PollVoteSchema 同域；
+/// 空数组 = 清票动作合法）。
+fn poll_option_indexes_face(value: &Value) -> Option<Vec<u32>> {
+    let entries = value.as_array()?;
+    if entries.len() > 10 {
+        return None;
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_u64()
+                .filter(|index| *index <= 9)
+                .map(|index| index as u32)
+        })
+        .collect()
 }
 
 /// records/removeIds 双参批解析（chatFolders/notificationProfiles/

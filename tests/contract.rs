@@ -4756,10 +4756,164 @@ fn send_group_call_update_param_faces_and_dispatch_log() {
     assert_eq!(entry["params"]["account"], json!(number));
 }
 
+/// Polls 发送三臂契约面（窗D A7，官方 poll 发送面对位）：fake 成功 `{}` +
+/// 调度日志逐键保留；参数面 fail-closed 逐形状（-32603：groupId 缺席/形状
+/// 错、question/options/optionIndexes 官方 PollCreateSchema·PollVoteSchema
+/// 同域闸、targetTimestamp 非正、voteCount 超 u32、allowMultiple/voteCount
+/// 非布尔非数值）。官方桌面仅群聊形态，三方法无直聊腿。
+#[test]
+fn poll_send_param_faces_and_dispatch_log() {
+    let dir = temp_dir("poll-send");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let group = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    // 合法面：create（allowMultiple 缺省 false）/ vote（voteCount 缺省 1、
+    // 空数组 = 清票）/ terminate。
+    let ok_create = engine.request(
+        "sendPollCreate",
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"] }),
+    );
+    assert_eq!(ok_create["result"], json!({}), "fake create success");
+    let ok_create_full = engine.request(
+        "sendPollCreate",
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"], "allowMultiple": true }),
+    );
+    assert_eq!(ok_create_full["result"], json!({}));
+    let ok_vote = engine.request(
+        "sendPollVote",
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [1, 2] }),
+    );
+    assert_eq!(ok_vote["result"], json!({}), "fake vote success");
+    let ok_vote_clear = engine.request(
+        "sendPollVote",
+        json!({ "account": number, "groupId": group, "targetAuthor": "11111111-2222-4333-8444-555555555555", "targetTimestamp": 42, "optionIndexes": [], "voteCount": 3 }),
+    );
+    assert_eq!(ok_vote_clear["result"], json!({}), "clearing vote legal");
+    let ok_terminate = engine.request(
+        "sendPollTerminate",
+        json!({ "account": number, "groupId": group, "targetTimestamp": 42 }),
+    );
+    assert_eq!(ok_terminate["result"], json!({}), "fake terminate success");
+
+    let rejects = [
+        // account 缺席（三臂同面，抽 create 代表）。
+        json!({ "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"] }),
+        // groupId 缺席/非 base64/≠32B（无直聊腿，无 groupId 一律拒）。
+        json!({ "account": number, "question": "Lunch?", "options": ["Ramen", "Salad"] }),
+        json!({ "account": number, "groupId": "not-base64!!", "question": "Lunch?", "options": ["Ramen", "Salad"] }),
+        json!({ "account": number, "groupId": "QUJD", "question": "Lunch?", "options": ["Ramen", "Salad"] }),
+        // question：缺席/空/超 200 字符/非字符串。
+        json!({ "account": number, "groupId": group, "options": ["Ramen", "Salad"] }),
+        json!({ "account": number, "groupId": group, "question": "", "options": ["Ramen", "Salad"] }),
+        json!({ "account": number, "groupId": group, "question": "x".repeat(201), "options": ["Ramen", "Salad"] }),
+        json!({ "account": number, "groupId": group, "question": 7, "options": ["Ramen", "Salad"] }),
+        // options：缺席/单条/11 条/空串条目/超 100 字符条目/非数组。
+        json!({ "account": number, "groupId": group, "question": "Lunch?" }),
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen"] }),
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": (0..11).map(|i| i.to_string()).collect::<Vec<_>>() }),
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", ""] }),
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "x".repeat(101)] }),
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": "Ramen" }),
+        // allowMultiple 非布尔。
+        json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"], "allowMultiple": "yes" }),
+        // vote：targetAuthor/targetTimestamp/optionIndexes 缺席，optionIndexes
+        // 条目超 9、条目非数值、>10 条，targetTimestamp 非正，voteCount 超 u32。
+        json!({ "account": number, "groupId": group, "targetTimestamp": 42, "optionIndexes": [1] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "optionIndexes": [1] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42 }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [10] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": ["1"] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 0, "optionIndexes": [1] }),
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [1], "voteCount": 4294967296u64 }),
+        // voteCount 非数值。
+        json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [1], "voteCount": "2" }),
+        // terminate：targetTimestamp 缺席/非正。
+        json!({ "account": number, "groupId": group }),
+        json!({ "account": number, "groupId": group, "targetTimestamp": 0 }),
+    ];
+    let methods = [
+        "sendPollCreate",
+        "sendPollVote",
+        "sendPollTerminate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollCreate",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollVote",
+        "sendPollTerminate",
+        "sendPollTerminate",
+    ];
+    assert_eq!(rejects.len(), methods.len(), "reject rows aligned");
+    for (method, params) in methods.iter().zip(rejects.iter()) {
+        let response = engine.request(method, params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "{method} rejects {params}"
+        );
+    }
+
+    // 调度日志：三臂逐键保留（send 系纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let create = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendPollCreate")
+        .expect("sendPollCreate logged");
+    assert_eq!(create["params"]["question"], json!("Lunch?"));
+    assert_eq!(create["params"]["options"], json!(["Ramen", "Salad"]));
+    let vote = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendPollVote" && entry["params"]["voteCount"] == json!(3))
+        .expect("sendPollVote logged");
+    assert_eq!(vote["params"]["optionIndexes"], json!([]));
+    assert_eq!(
+        vote["params"]["targetAuthor"],
+        json!("11111111-2222-4333-8444-555555555555")
+    );
+    let terminate = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendPollTerminate")
+        .expect("sendPollTerminate logged");
+    assert_eq!(terminate["params"]["targetTimestamp"], json!(42));
+}
+
 /// send quoteType/quoteBodyRanges 契约面（Q5 扩面，官方 Quote.type 恒写 +
 /// bodyRanges toBodyRange 同构）：fake 合法面成功 + 调度日志逐键保留；参数面
-/// fail-closed 逐形状（-32603：quoteType 词表外（含 poll——引擎无 poll 发送
-/// 面）/非字符串、quoteBodyRanges 条目缺 start/length、start/length 超 u32、
+/// fail-closed 逐形状（-32603：quoteType 词表外（含 poll——官方 Quote.Type
+/// POLL 枚举在，KT quote 发送面未扩，窗D A7 批记档）/非字符串、quoteBodyRanges
+/// 条目缺 start/length、start/length 超 u32、
 /// mention/style 同置或都缺、style 词表外、>64 条、非数组、quote 键对缺席
 /// 时挂 type/bodyRanges）。
 #[test]

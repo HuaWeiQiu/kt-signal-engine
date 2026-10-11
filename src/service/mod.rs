@@ -1484,6 +1484,95 @@ impl Service {
             .map(|_| ())
     }
 
+    /// sendPollCreate（群组）：官方 DataMessage.pollCreate=24（Polls 发送
+    /// 批，窗D A7）。官方桌面仅群聊形态（enqueuePollCreateForSend.dom.ts
+    /// 1:1 走 isPollSend1to1Enabled feature flag，默认关——引擎按默认面
+    /// 群聊 only，无 1:1 形态；§5 偏差记档）。
+    pub(crate) async fn send_poll_create_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        question: &str,
+        options: &[String],
+        allow_multiple: bool,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            poll_create: Some(poll_create_proto(question, options, allow_multiple)),
+            ..DataMessage::default()
+        };
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
+    }
+
+    /// sendPollVote（群组）：官方 DataMessage.pollVote=26。voteCount 由调用
+    /// 方按官方 enqueuePollVoteForSend 语义（自身历史票 max+1，首票=1）计
+    /// 算后传入——引擎不持投票历史，缺省 1（§5 偏差记档）。
+    pub(crate) async fn send_poll_vote_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_author: &str,
+        target_timestamp: u64,
+        option_indexes: &[u32],
+        vote_count: u32,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        // 官方语义 targetAuthor 一律 ACI（被投票 poll 的作者）；群内兼容号
+        // 码/UUID 解析，未命中原样透传（sendAdminDelete 群组同口径）。
+        let target_aci = resolve_author_aci(manager.store(), target_author)
+            .await
+            .unwrap_or_else(|| target_author.trim().to_owned());
+        let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            poll_vote: Some(poll_vote_proto(
+                aci_bytes,
+                target_timestamp,
+                option_indexes,
+                vote_count,
+            )),
+            ..DataMessage::default()
+        };
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
+    }
+
+    /// sendPollTerminate（群组）：官方 DataMessage.pollTerminate=25（终止
+    /// poll）；GV1 拒发由群腿形状闸天然覆盖（decode_group_id 只收 GV2
+    /// 32B master key）。
+    pub(crate) async fn send_poll_terminate_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        target_timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let body = DataMessage {
+            timestamp: Some(timestamp),
+            poll_terminate: Some(poll_terminate_proto(target_timestamp)),
+            ..DataMessage::default()
+        };
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
+            .await
+            .map(|_| ())
+    }
+
     /// 直聊 targeted dataMessage 公共头（pin/unpin 共用）：解析作者 ACI、
     /// 逐 recipient 发送。`body` 闭包收 (16B ACI bytes, timestamp)。
     async fn send_targeted_data_message<F>(
@@ -7314,6 +7403,49 @@ fn pin_message_proto(
             Some(seconds) => PinDuration::PinDurationSeconds(seconds),
             None => PinDuration::PinDurationForever(true),
         }),
+    }
+}
+
+/// poll 三臂 proto 公共构造（窗D A7，官方 SendMessage.preload.ts toProto
+/// pollCreate / createDataMessageProtoForPollVote / …ForPollTerminate 同位）。
+fn poll_create_proto(
+    question: &str,
+    options: &[String],
+    allow_multiple: bool,
+) -> presage::proto::data_message::PollCreate {
+    presage::proto::data_message::PollCreate {
+        question: Some(question.to_owned()),
+        allow_multiple: Some(allow_multiple),
+        options: options.to_vec(),
+    }
+}
+
+fn poll_vote_proto(
+    target_author_aci_bytes: Vec<u8>,
+    target_sent_timestamp: u64,
+    option_indexes: &[u32],
+    vote_count: u32,
+) -> presage::proto::data_message::PollVote {
+    // optionIndexes 去重保首现序（官方接收面 new Set 同构，发送面调用方已
+    // 按本地票态去重，此处幂等护栏）。
+    let mut indexes = Vec::with_capacity(option_indexes.len());
+    let mut seen = std::collections::HashSet::new();
+    for index in option_indexes {
+        if seen.insert(*index) {
+            indexes.push(*index);
+        }
+    }
+    presage::proto::data_message::PollVote {
+        target_author_aci_binary: Some(target_author_aci_bytes),
+        target_sent_timestamp: Some(target_sent_timestamp),
+        option_indexes: indexes,
+        vote_count: Some(vote_count),
+    }
+}
+
+fn poll_terminate_proto(target_sent_timestamp: u64) -> presage::proto::data_message::PollTerminate {
+    presage::proto::data_message::PollTerminate {
+        target_sent_timestamp: Some(target_sent_timestamp),
     }
 }
 
@@ -14206,6 +14338,33 @@ mod tests {
         .is_none());
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Polls 发送批（窗D A7）proto 构造面：pollCreate{question,allowMultiple,
+    /// options} / pollVote{targetAuthorAciBinary,targetSentTimestamp,
+    /// optionIndexes(去重保首现序),voteCount} / pollTerminate{targetSent-
+    /// Timestamp}，三臂互斥各居其位（官方 toProto/
+    /// createDataMessageProtoForPoll* 同位）。
+    #[test]
+    fn poll_send_proto_faces() {
+        let aci_bytes = aci_to_bytes("11111111-2222-4333-8444-555555555555").unwrap();
+
+        let create = poll_create_proto("Lunch?", &["Ramen".into(), "Salad".into()], true);
+        assert_eq!(create.question.as_deref(), Some("Lunch?"));
+        assert_eq!(create.allow_multiple, Some(true));
+        assert_eq!(create.options, vec!["Ramen".to_owned(), "Salad".to_owned()]);
+
+        let vote = poll_vote_proto(aci_bytes.clone(), 42, &[3, 1, 3, 9], 7);
+        assert_eq!(
+            vote.target_author_aci_binary.as_deref(),
+            Some(aci_bytes.as_slice())
+        );
+        assert_eq!(vote.target_sent_timestamp, Some(42));
+        assert_eq!(vote.option_indexes, vec![3, 1, 9]);
+        assert_eq!(vote.vote_count, Some(7));
+
+        let terminate = poll_terminate_proto(99);
+        assert_eq!(terminate.target_sent_timestamp, Some(99));
     }
 
     /// Q2/Q3/Q4 收投影：contact 卡片（键形与 backup contact_record 同族 +
