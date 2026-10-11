@@ -1266,6 +1266,130 @@ fn update_group_add_members_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// updateGroup 移除成员写面（removeMembers 参数族，官方
+/// buildDeleteMemberChange/buildDeletePendingMemberChange 行为对齐）：fake
+/// 成功 `{status:"sent"}`（fake 无解析链/群态读面，形状桩）；参数面
+/// fail-closed（-32603：removeMembers 非数组/空数组/条目非字符串，
+/// removeMembers 在场时 groupId/account 形状照旧闸）；调度日志
+/// removeMembers 键照旧逐字保留。
+#[test]
+fn update_group_remove_members_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-remove-members");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：removeMembers 单独在场成功 {status:"sent"}。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "removeMembers": ["+15550000001"]
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状。
+    let rejects = [
+        json!({ "account": "+15550000000", "groupId": group_id, "removeMembers": "+15550000001" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "removeMembers": [] }),
+        json!({ "account": "+15550000000", "groupId": group_id, "removeMembers": [7] }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "removeMembers": ["+15550000001"] }),
+        json!({ "groupId": group_id, "removeMembers": ["+15550000001"] }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：removeMembers 键照旧逐字保留（成功 1 + 拒绝 5 = 6 行）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(entries.len(), 6, "成功一条 + 拒绝五条均落日志");
+    assert_eq!(
+        entries[0]["params"]["removeMembers"],
+        json!(["+15550000001"])
+    );
+
+    // real 模式未注册账号 + removeMembers 在场：storage 上下文打不开折叠
+    // -32603。
+    let real_dir = temp_dir("update-group-remove-members-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({
+            "account": "+15559990000",
+            "groupId": group_id,
+            "removeMembers": ["+15550000001"]
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
+/// leaveGroup（群退出，KT 扩展方法，官方桌面 leaveGroupV2 行为对齐）：fake
+/// 成功 `{status:"left"}`（形状桩，不触网）；参数面 fail-closed（-32603：
+/// 缺 account / 缺 groupId / groupId 非 base64 / ≠32B）；调度日志 groupId
+/// 逐字保留；real 模式未注册账号折叠 -32603。
+#[test]
+fn leave_group_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("leave-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    assert_eq!(
+        engine.request(
+            "leaveGroup",
+            json!({ "account": "+15550000000", "groupId": group_id })
+        )["result"],
+        json!({ "status": "left" })
+    );
+
+    let rejects = [
+        json!({ "groupId": group_id }),
+        json!({ "account": "+15550000000" }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!" }),
+        json!({ "account": "+15550000000", "groupId": "QUJDREVG" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("leaveGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "leaveGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：groupId 逐字保留（成功 1 + 拒绝 4 = 5 行）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "leaveGroup")
+        .collect();
+    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
+    assert_eq!(entries[0]["params"]["groupId"], json!(group_id));
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（terminateGroup
+    // 同款）。
+    let real_dir = temp_dir("leave-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "leaveGroup",
+        json!({ "account": "+15559990000", "groupId": group_id }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
 /// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
 /// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同

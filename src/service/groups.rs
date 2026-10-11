@@ -287,6 +287,116 @@ pub(crate) fn build_add_members_change(
     Ok(actions)
 }
 
+/// removeMembers change 合成核心（官方 buildDeleteMemberChange/
+/// buildDeletePendingMemberChange 行为对齐，群写面 P4 批）：version =
+/// revision + 1（饱和不回卷）；全成员目标 = delete_members（vendored
+/// build_remove_member_action，deleted_user_id = ACI 加密）；待邀目标 =
+/// delete_members_pending_profile_key（vendored
+/// build_remove_pending_member_action，ServiceId 直通加密）。目标分类（成
+/// 员面 vs 待邀面）由调用方按群态读面裁定后分流传入。与 update_group_change
+/// 属性臂合成单 Actions（同 version 多 action）单次 PATCH（§5 合成裁定顺
+/// 延）；banned-unban 配对不入本批（§5 P3 批同口径）。
+pub(crate) fn build_remove_members_change(
+    secret_params: &GroupSecretParams,
+    revision: u32,
+    members: &[presage::libsignal_service::protocol::Aci],
+    pendings: &[presage::libsignal_service::protocol::ServiceId],
+) -> Result<presage::proto::group_change::Actions, TerminateError> {
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    let operations = GroupOperations::new(*secret_params);
+    let mut actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: revision.saturating_add(1),
+        ..presage::proto::group_change::Actions::default()
+    };
+    for aci in members {
+        actions.delete_members.push(
+            operations
+                .build_remove_member_action(*aci)
+                .map_err(|_| TerminateError::Failed { status: None })?,
+        );
+    }
+    for service_id in pendings {
+        actions.delete_members_pending_profile_key.push(
+            operations
+                .build_remove_pending_member_action(*service_id)
+                .map_err(|_| TerminateError::Failed { status: None })?,
+        );
+    }
+    Ok(actions)
+}
+
+/// leaveGroup 退出目标（self 分类产物，群写面 P4 批）。
+pub(crate) enum LeaveTarget {
+    Member(presage::libsignal_service::protocol::Aci),
+    Pending(presage::libsignal_service::protocol::ServiceId),
+}
+
+/// self 退出目标分类（官方 leaveGroupV2 同序：ACI pending → ACI member →
+/// PNI pending；都不是 = None——官方桌面仅日志不行动的 GUI 语义，API 面整
+/// 拒不静默）。own_pni = None 对应注册数据无 PNI 的旧账号面（官方
+/// getOptionalPni 同语义）。
+pub(crate) fn classify_leave_target(
+    group: &presage::libsignal_service::groups_v2::Group,
+    own_aci: presage::libsignal_service::protocol::Aci,
+    own_pni: Option<presage::libsignal_service::protocol::ServiceId>,
+) -> Option<LeaveTarget> {
+    use presage::libsignal_service::protocol::ServiceId;
+    if group
+        .members_pending_profile_key
+        .iter()
+        .any(|pending| pending.address == ServiceId::Aci(own_aci))
+    {
+        return Some(LeaveTarget::Pending(ServiceId::Aci(own_aci)));
+    }
+    if group.members.iter().any(|member| member.aci == own_aci) {
+        return Some(LeaveTarget::Member(own_aci));
+    }
+    if let Some(pni) = own_pni {
+        if group
+            .members_pending_profile_key
+            .iter()
+            .any(|pending| pending.address == pni)
+        {
+            return Some(LeaveTarget::Pending(pni));
+        }
+    }
+    None
+}
+
+/// leaveGroup change 合成核心（官方 buildDeleteMemberChange 同形状，群写面
+/// P4 批）：version = revision + 1（饱和不回卷）；Member 目标 =
+/// delete_members[own ACI]、Pending 目标 = delete_members_pending_profile_
+/// key[target]（vendored 同款原语）。
+pub(crate) fn build_leave_group_change(
+    secret_params: &GroupSecretParams,
+    revision: u32,
+    target: LeaveTarget,
+) -> Result<presage::proto::group_change::Actions, TerminateError> {
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    let operations = GroupOperations::new(*secret_params);
+    let mut actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: revision.saturating_add(1),
+        ..presage::proto::group_change::Actions::default()
+    };
+    match target {
+        LeaveTarget::Member(aci) => actions.delete_members.push(
+            operations
+                .build_remove_member_action(aci)
+                .map_err(|_| TerminateError::Failed { status: None })?,
+        ),
+        LeaveTarget::Pending(service_id) => actions.delete_members_pending_profile_key.push(
+            operations
+                .build_remove_pending_member_action(service_id)
+                .map_err(|_| TerminateError::Failed { status: None })?,
+        ),
+    }
+    Ok(actions)
+}
+
 /// `PATCH v2/groups` 群 change 上传（上游缺口单点，官方 modifyGroup 同形状）：
 /// storage 服务 host、body = Actions protobuf、群凭据 basic auth；2xx = 成功
 ///（响应 GroupChangeResponse 不消费——终止后本机群态以登记表 + 服务器读面
@@ -418,6 +528,17 @@ pub(crate) enum AvatarWrite {
     Replace(Vec<u8>),
 }
 
+/// updateGroup 写入请求（组合参数聚合；None/空 = 该臂缺席，至少一项在场
+/// 由 handler 闸）。
+#[derive(Debug, Default)]
+pub(crate) struct GroupUpdateWrite {
+    pub(crate) expiration_secs: Option<u32>,
+    pub(crate) title: Option<String>,
+    pub(crate) avatar: Option<AvatarWrite>,
+    pub(crate) add_members: Vec<String>,
+    pub(crate) remove_members: Vec<String>,
+}
+
 /// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
 /// 闸）：群态读面取 revision（Unavailable 退化 0，expiration 批同口径）→
 /// avatar Replace 臂先走上行链（官方 buildUpdateAttributesChange 同序：
@@ -488,35 +609,50 @@ async fn upload_group_avatar(
         .map_err(|_| TerminateError::AvatarUpload)
 }
 
-/// updateGroup 合成编排（expiration/title/avatar/addMembers 任意组合，至
-/// 少一项在场由调用方闸）：成员解析分流先行（不可解析整拒 UnknownGroup，
-/// §5 P3 登记偏差；self 静默剔除——self 入 change 服务器必 400，createGroup
-/// 同纪律）→ 群态读面取 revision（Unavailable 退化 0，expiration 批同口
-/// 径）→ avatar Replace 臂先走上行链（官方 buildUpdateAttributesChange 同
-/// 序：uploadAvatar 在 change 上送之前）→ 群凭据 → 单 Actions（同 version
-/// 多 action：属性臂 + add_members/pending 臂）单次 PATCH。avatar 链失败 =
-/// AvatarUpload（伴生 expiration/title/成员面未提交，GROUP_AVATAR_UPLOAD_
-/// FAILED data.textSaved=false 诚实呈现）；PATCH 面失败维持 Failed/
-/// Unavailable 四码。写后本地群态刷新（best-effort，P3 批起 updateGroup
-/// 全路径生效——addMembers 改变本机 listGroups 投影的成员面）。
+/// updateGroup 合成编排（expiration/title/avatar/addMembers/removeMembers
+/// 任意组合，至少一项在场由调用方闸）：成员解析分流先行（不可解析整拒
+/// UnknownGroup，§5 P3 登记偏差；addMembers 的 self 静默剔除——self 入
+/// change 服务器必 400，createGroup 同纪律）→ 群态读面取 revision +
+/// removeMembers 分类基底（Unavailable：属性/add 臂退化 0，expiration 批
+/// 同口径；removeMembers 臂无群态不可分类，Unavailable 诚实透传）→ avatar
+/// Replace 臂先走上行链（官方 buildUpdateAttributesChange 同序：uploadAvatar
+/// 在 change 上送之前）→ 群凭据 → 单 Actions（同 version 多 action：属性臂
+/// 加 add/delete 成员臂）单次 PATCH。removeMembers 分类：群态 members 面
+/// 取 delete_members、pending 面取 delete_members_pending_profile_key、两
+/// 者皆非取 UnknownGroup（官方桌面 buildDeleteMemberChange 不设防的 GUI 前
+/// 置，API 面整拒不静默）。avatar 链失败 = AvatarUpload（伴生 expiration/
+/// title/成员面未提交，GROUP_AVATAR_UPLOAD_FAILED data.textSaved=false 诚
+/// 实呈现）；PATCH 面失败维持 Failed/Unavailable 四码。写后本地群态刷新
+///（best-effort，P3 批起 updateGroup 全路径生效——成员面变化改写本机
+/// listGroups 投影）。
 pub(crate) async fn update_group_change(
     context: &StorageContext,
     master_key: &[u8],
-    expiration_secs: Option<u32>,
-    title: Option<&str>,
-    avatar: Option<AvatarWrite>,
-    add_members: &[String],
+    write: GroupUpdateWrite,
 ) -> Result<(), TerminateError> {
+    let GroupUpdateWrite {
+        expiration_secs,
+        title,
+        avatar,
+        add_members,
+        remove_members,
+    } = write;
+    let title = title.as_deref();
     use presage::libsignal_service::groups_v2::GroupMemberCandidate;
     use presage::libsignal_service::protocol::{Aci, ServiceId};
     use presage::store::ContentsStore as _;
-    if expiration_secs.is_none() && title.is_none() && avatar.is_none() && add_members.is_empty() {
+    if expiration_secs.is_none()
+        && title.is_none()
+        && avatar.is_none()
+        && add_members.is_empty()
+        && remove_members.is_empty()
+    {
         // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
         return Err(TerminateError::UnknownGroup);
     }
     let own_aci = Aci::from(context.aci_uuid);
     let mut candidates: Vec<GroupMemberCandidate> = Vec::new();
-    for entry in add_members {
+    for entry in &add_members {
         let service_id = resolve_group_member(&context.store, entry)
             .await
             .ok_or(TerminateError::UnknownGroup)?;
@@ -553,11 +689,49 @@ pub(crate) async fn update_group_change(
         }
     }
     use rand::RngCore as _;
-    let revision = match fetch_group_state(context, master_key).await {
-        Ok(group) => group.version,
-        Err(TerminateError::Unavailable) => 0,
+    let group_state = fetch_group_state(context, master_key).await;
+    let (revision, group) = match group_state {
+        Ok(group) => (group.version, Some(group)),
+        Err(TerminateError::Unavailable) => {
+            if remove_members.is_empty() {
+                // 属性/add 臂群态读面退化 0（expiration 批同口径）。
+                (0, None)
+            } else {
+                // removeMembers 需群态分类成员/待邀面，Unavailable 诚实透传。
+                return Err(TerminateError::Unavailable);
+            }
+        }
         Err(error) => return Err(error),
     };
+    let mut remove_member_acis: Vec<Aci> = Vec::new();
+    let mut remove_pending_ids: Vec<ServiceId> = Vec::new();
+    if let Some(group) = group.as_ref() {
+        for entry in &remove_members {
+            let service_id = resolve_group_member(&context.store, entry)
+                .await
+                .ok_or(TerminateError::UnknownGroup)?;
+            let already_listed = match service_id {
+                ServiceId::Aci(aci) => remove_member_acis.contains(&aci),
+                ServiceId::Pni(_) => false,
+            } || remove_pending_ids.contains(&service_id);
+            if already_listed {
+                continue;
+            }
+            match service_id {
+                ServiceId::Aci(aci) if group.members.iter().any(|member| member.aci == aci) => {
+                    remove_member_acis.push(aci);
+                }
+                _ if group
+                    .members_pending_profile_key
+                    .iter()
+                    .any(|pending| pending.address == service_id) =>
+                {
+                    remove_pending_ids.push(service_id);
+                }
+                _ => return Err(TerminateError::UnknownGroup),
+            }
+        }
+    }
     let avatar_path = match avatar {
         Some(AvatarWrite::Replace(bytes)) => {
             Some(upload_group_avatar(context, master_key, &bytes).await?)
@@ -587,6 +761,50 @@ pub(crate) async fn update_group_change(
         actions.add_members = member_actions.add_members;
         actions.add_members_pending_profile_key = member_actions.add_members_pending_profile_key;
     }
+    if !remove_member_acis.is_empty() || !remove_pending_ids.is_empty() {
+        let remove_actions = build_remove_members_change(
+            &secret_params,
+            revision,
+            &remove_member_acis,
+            &remove_pending_ids,
+        )?;
+        actions.delete_members = remove_actions.delete_members;
+        actions.delete_members_pending_profile_key =
+            remove_actions.delete_members_pending_profile_key;
+    }
+    patch_group(&context.push, authorization, &actions).await?;
+    refresh_local_group_state(context, master_key).await;
+    Ok(())
+}
+
+/// leaveGroup 编排（官方 leaveGroupV2 行为对齐，KT 扩展方法）：群态读面
+///（Unavailable/Failed 诚实透传）→ self 分类（classify_leave_target：ACI
+/// pending → ACI member → PNI pending，官方同序；都不是 → UnknownGroup，
+/// handler 面 -32603——官方桌面仅日志不行动的 GUI 语义，API 面整拒不静默）
+/// → `PATCH v2/groups` → 本地群态刷新（best-effort——退群后本机群态收敛
+/// 为非成员投影，群登记不删，与 terminate 面同纪律）。
+pub(crate) async fn leave_group(
+    context: &StorageContext,
+    master_key: &[u8],
+) -> Result<(), TerminateError> {
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+    let group = fetch_group_state(context, master_key).await?;
+    let own_aci = Aci::from(context.aci_uuid);
+    let own_pni = if context.pni_uuid.is_nil() {
+        None
+    } else {
+        Some(ServiceId::Pni(context.pni_uuid.into()))
+    };
+    let Some(target) = classify_leave_target(&group, own_aci, own_pni) else {
+        return Err(TerminateError::UnknownGroup);
+    };
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(
+        master_key
+            .try_into()
+            .map_err(|_| TerminateError::UnknownGroup)?,
+    ));
+    let actions = build_leave_group_change(&secret_params, group.version, target)?;
+    let authorization = group_authorization(context, master_key).await?;
     patch_group(&context.push, authorization, &actions).await?;
     refresh_local_group_state(context, master_key).await;
     Ok(())
@@ -2244,6 +2462,178 @@ mod tests {
         );
         assert_eq!(added.role, presage::proto::member::Role::Default as i32);
         assert!(!actions.add_members[0].join_from_invite_link);
+    }
+
+    /// removeMembers change（群写面 P4 批）：全成员目标 = delete_members
+    ///（vendored build_remove_member_action，deleted_user_id = ACI 加密可回
+    /// 读）、待邀目标 = delete_members_pending_profile_key（ServiceId 直通
+    /// 加密）；version = revision + 1；其余 action 全部缺席。
+    #[test]
+    fn remove_members_change_shapes() {
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        let master_key = [0x4cu8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let member_aci = Aci::from(uuid::Uuid::from_u128(
+            0xdddd_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let pending_pni =
+            ServiceId::parse_from_service_id_string("PNI:eeee2222-3333-4444-5555-666677778888")
+                .expect("PNI parses");
+        let actions =
+            build_remove_members_change(&secret_params, 20, &[member_aci], &[pending_pni])
+                .expect("builds");
+        assert_eq!(actions.version, 21);
+        assert_eq!(actions.delete_members.len(), 1);
+        assert_eq!(actions.delete_members_pending_profile_key.len(), 1);
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(&actions.delete_members[0].deleted_user_id)
+                        .expect("ciphertext")
+                )
+                .expect("decrypts"),
+            ServiceId::Aci(member_aci),
+            "delete_members.user_id 加密回读对账"
+        );
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(
+                        &actions.delete_members_pending_profile_key[0].deleted_user_id
+                    )
+                    .expect("ciphertext")
+                )
+                .expect("decrypts"),
+            pending_pni,
+            "pending.deleted_user_id 加密回读对账"
+        );
+        assert!(actions.add_members.is_empty());
+        assert!(actions.terminate_group.is_none());
+        assert!(actions.modify_title.is_none());
+    }
+
+    /// leaveGroup self 分类（官方 leaveGroupV2 同序）：ACI pending 先判 →
+    /// ACI member → PNI pending（ACI 已不在）→ 都不是 = None。
+    #[test]
+    fn classify_leave_target_official_order() {
+        use presage::libsignal_service::groups_v2::{Group, Member, PendingMember, Role};
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        use zkgroup::profiles::ProfileKey;
+        let own_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let other_aci = Aci::from(uuid::Uuid::from_u128(
+            0xaaaa_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let own_pni =
+            ServiceId::parse_from_service_id_string("PNI:bbbb2222-3333-4444-5555-666677778888")
+                .expect("PNI parses");
+        let member = |aci: Aci| Member {
+            aci,
+            role: Role::Default,
+            profile_key: ProfileKey::create([0u8; 32]),
+            joined_at_version: 1,
+            label: None,
+            label_emoji: None,
+        };
+        let pending = |address: ServiceId| PendingMember {
+            address,
+            role: Role::Default,
+            added_by_aci: other_aci,
+            timestamp: 0,
+        };
+        let group = |members: Vec<Member>, pendings: Vec<PendingMember>| Group {
+            title: "群".to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            version: 7,
+            members,
+            members_pending_profile_key: pendings,
+            members_pending_admin_approval: vec![],
+            invite_link_password: vec![],
+            description_text: None,
+            announcements_only: false,
+            members_banned: vec![],
+            terminated: false,
+        };
+
+        // ACI pending 先于 member 判（官方 isMemberPending 先臂）。
+        let aci_pending = group(
+            vec![member(other_aci)],
+            vec![pending(ServiceId::Aci(own_aci))],
+        );
+        assert!(matches!(
+            classify_leave_target(&aci_pending, own_aci, Some(own_pni)),
+            Some(LeaveTarget::Pending(ServiceId::Aci(_)))
+        ));
+
+        // ACI member → Member 臂。
+        let aci_member = group(vec![member(own_aci)], vec![]);
+        assert!(matches!(
+            classify_leave_target(&aci_member, own_aci, Some(own_pni)),
+            Some(LeaveTarget::Member(aci)) if aci == own_aci
+        ));
+
+        // ACI 都不在、PNI pending → Pending(PNI)（官方 syncMessageOnly 面）。
+        let pni_pending = group(vec![member(other_aci)], vec![pending(own_pni)]);
+        assert!(matches!(
+            classify_leave_target(&pni_pending, own_aci, Some(own_pni)),
+            Some(LeaveTarget::Pending(sid)) if sid == own_pni
+        ));
+
+        // 都不是 → None（官方仅日志不行动，API 面整拒）。
+        let neither = group(vec![member(other_aci)], vec![]);
+        assert!(classify_leave_target(&neither, own_aci, Some(own_pni)).is_none());
+        assert!(classify_leave_target(&neither, own_aci, None).is_none());
+    }
+
+    /// leaveGroup change（群写面 P4 批）：Member 目标 = delete_members[own
+    /// ACI]（user_id 加密回读对账）、Pending 目标 =
+    /// delete_members_pending_profile_key[target]；version = revision + 1。
+    #[test]
+    fn leave_group_change_member_and_pending_shapes() {
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        let master_key = [0x4du8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let own_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let member = build_leave_group_change(&secret_params, 7, LeaveTarget::Member(own_aci))
+            .expect("builds");
+        assert_eq!(member.version, 8);
+        assert_eq!(member.delete_members.len(), 1);
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(&member.delete_members[0].deleted_user_id)
+                        .expect("ciphertext")
+                )
+                .expect("decrypts"),
+            ServiceId::Aci(own_aci),
+        );
+        assert!(member.delete_members_pending_profile_key.is_empty());
+        let own_pni =
+            ServiceId::parse_from_service_id_string("PNI:bbbb2222-3333-4444-5555-666677778888")
+                .expect("PNI parses");
+        let pending = build_leave_group_change(&secret_params, 7, LeaveTarget::Pending(own_pni))
+            .expect("builds");
+        assert_eq!(pending.version, 8);
+        assert_eq!(pending.delete_members_pending_profile_key.len(), 1);
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(
+                        &pending.delete_members_pending_profile_key[0].deleted_user_id
+                    )
+                    .expect("ciphertext")
+                )
+                .expect("decrypts"),
+            own_pni,
+        );
+        assert!(pending.delete_members.is_empty());
     }
 
     /// 群头像 CDN 载荷加密面（upload_group_avatar 内联链的纯函数钉定）：

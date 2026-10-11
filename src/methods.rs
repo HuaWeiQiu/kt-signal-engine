@@ -2103,27 +2103,30 @@ async fn dispatch(
             }
         }
         // 群更新写面（updateGroup，KT 扩展方法）：expiration + title + avatar
-        // + addMembers 参数族，协议上行面，落调度日志（terminateGroup 同纪
-        // 律；avatar 键落盘前形状摘要化——data URI/base64 载荷零字节进日志，
-        // setProfile 头像纪律；title/members 短标签照旧逐字保留）。
-        // expiration：0 = 关闭，u32 形状（null/字符串/负数/小数/超界
-        // fail-closed）；title：非空 string（null/非字符串/空串 fail-closed
-        // -32603——官方 `if (title)` 对空串 falsy no-op 的语义本引擎不静默
-        // 收，全缺整拒同纪律）；avatar 三态镜像 setProfile（缺省=保留、
-        // data:image/*;base64, 规范 base64=换新、null=移除；非 image 族/
-        // 非规范 base64/解码超 10MiB/非字符串 -32603）；addMembers：非空字
-        // 符串数组（service-id 串/联系人号码，缺联系成员解析同 createGroup
+        // + addMembers + removeMembers 参数族，协议上行面，落调度日志
+        //（terminateGroup 同纪律；avatar 键落盘前形状摘要化——data URI/base64
+        // 载荷零字节进日志，setProfile 头像纪律；title/members 短标签照旧逐
+        // 字保留）。expiration：0 = 关闭，u32 形状（null/字符串/负数/小数/
+        // 超界 fail-closed）；title：非空 string（null/非字符串/空串
+        // fail-closed -32603——官方 `if (title)` 对空串 falsy no-op 的语义本
+        // 引擎不静默收，全缺整拒同纪律）；avatar 三态镜像 setProfile（缺省=
+        // 保留、data:image/*;base64, 规范 base64=换新、null=移除；非 image
+        // 族/非规范 base64/解码超 10MiB/非字符串 -32603）；addMembers：非空
+        // 字符串数组（service-id 串/联系人号码，缺联系成员解析同 createGroup
         // ——不可解析整拒 -32603，官方桌面静默跳过是 GUI 语义；self 静默剔
         // 除——self 入 change 服务器必 400；有凭据 = 全成员、凭据失败/无
         // key/PNI = pending 邀请，官方 buildAddMembersChange 分流同构）；
-        // 全缺 = 无操作整拒 -32603（不静默 no-op），单项或组合在场均合法
-        //（同调合成单 change 一次 PATCH）；groupId/account 纪律与
-        // terminateGroup 同款；群头像上行链失败 → -1 GROUP_AVATAR_UPLOAD_
-        // FAILED + data {retryable:true, textSaved:false}（合成单 change 语
-        // 义下伴生面未提交，§5）；服务器拒绝 → -1 GROUP_UPDATE_FAILED +
-        // data.status 诚实透传；网络面 → -1 STORAGE_UNAVAILABLE；fake 两臂：
-        // 缺省/null 臂成功 {status:"sent"}、data URI 臂失败
-        // GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
+        // removeMembers：非空字符串数组（同解析；群态 members 面 →
+        // delete_members、pending 面 → delete_members_pending_profile_key、
+        // 两者皆非整拒 -32603——官方 buildDeleteMemberChange 不设防的 GUI
+        // 前置，API 面不静默）；全缺 = 无操作整拒 -32603（不静默 no-op），
+        // 单项或组合在场均合法（同调合成单 change 一次 PATCH）；groupId/
+        // account 纪律与 terminateGroup 同款；群头像上行链失败 → -1
+        // GROUP_AVATAR_UPLOAD_FAILED + data {retryable:true, textSaved:false}
+        //（合成单 change 语义下伴生面未提交，§5）；服务器拒绝 → -1
+        // GROUP_UPDATE_FAILED + data.status 诚实透传；网络面 → -1
+        // STORAGE_UNAVAILABLE；fake 两臂：缺省/null 臂成功 {status:"sent"}、
+        // data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
         "updateGroup" => {
             // 调度日志先落（mutating 面同款：被拒调用同样记录派发）；
             // avatar 键落盘前形状摘要化（头像 data URI/base64 载荷零字节
@@ -2146,6 +2149,23 @@ async fn dispatch(
                 .and_then(|seconds| u32::try_from(seconds).ok());
             let title = params.get("title").and_then(Value::as_str);
             let add_members = match params.get("addMembers") {
+                None => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.is_empty() {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(text) => parsed.push(text.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
+            let remove_members = match params.get("removeMembers") {
                 None => Vec::new(),
                 Some(Value::Array(entries)) => {
                     if entries.is_empty() {
@@ -2185,15 +2205,28 @@ async fn dispatch(
             if params.get("title").is_some() && title.map(str::is_empty).unwrap_or(true) {
                 return internal_error(id);
             }
-            if expiration.is_none() && title.is_none() && avatar.is_none() && add_members.is_empty()
+            // 全缺 = 无操作整拒（不静默 no-op）：expiration/title/avatar/
+            // addMembers/removeMembers 至少一项在场。
+            if expiration.is_none()
+                && title.is_none()
+                && avatar.is_none()
+                && add_members.is_empty()
+                && remove_members.is_empty()
             {
                 return internal_error(id);
             }
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            let write = crate::service::groups::GroupUpdateWrite {
+                expiration_secs: expiration,
+                title: title.map(str::to_owned),
+                avatar,
+                add_members,
+                remove_members,
+            };
             match service
-                .update_group_change(account, master_key, expiration, title, avatar, &add_members)
+                .update_group_change(account, master_key, write)
                 .await
             {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
@@ -2209,6 +2242,51 @@ async fn dispatch(
                         ),
                     )
                 }
+                Err(crate::service::groups::TerminateError::Failed { status }) => {
+                    let mut data = serde_json::Map::new();
+                    if let Some(status) = status {
+                        data.insert("status".to_owned(), json!(status));
+                    }
+                    jsonrpc::error_response(
+                        id,
+                        &jsonrpc::RpcError::with_data(
+                            -1,
+                            "GROUP_UPDATE_FAILED",
+                            Value::Object(data),
+                        ),
+                    )
+                }
+                Err(crate::service::groups::TerminateError::Unavailable) => {
+                    jsonrpc::error_response(id, &RpcError::new(-1, "STORAGE_UNAVAILABLE"))
+                }
+            }
+        }
+        // 群退出写面（leaveGroup，KT 扩展方法，官方桌面 leaveGroupV2 行为
+        // 对齐）：协议上行面，落调度日志（terminateGroup 同纪律）。参数
+        // {account, groupId}——terminateGroup 同款闸（groupId = 32B 群 master
+        // key 标准 base64）。群态读面 self 分类（官方同序：ACI pending → 撤
+        // pending 邀请、ACI member → delete_members 退群、ACI 都不是且 PNI
+        // pending → 撤 PNI 邀请[官方 syncMessageOnly 面]、都不是 → -32603
+        // ——官方桌面仅日志不行动的 GUI 语义，API 面整拒不静默）；写后本地
+        // 群态刷新（best-effort，群登记不删，terminate 面同纪律）；服务器拒
+        // 绝 → -1 GROUP_UPDATE_FAILED + data.status 诚实透传；网络面 → -1
+        // STORAGE_UNAVAILABLE；fake 成功 {status:"left"} 形状桩（§5 fake 两
+        // 臂纪律）。
+        "leaveGroup" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let master_key = params
+                .get("groupId")
+                .and_then(Value::as_str)
+                .and_then(crate::service::decode_group_id);
+            let (Some(account), Some(master_key)) = (account, master_key) else {
+                return internal_error(id);
+            };
+            match service.leave_group(account, master_key).await {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "left" })),
+                Err(crate::service::groups::TerminateError::UnknownAccount)
+                | Err(crate::service::groups::TerminateError::UnknownGroup) => internal_error(id),
+                Err(crate::service::groups::TerminateError::AvatarUpload) => internal_error(id),
                 Err(crate::service::groups::TerminateError::Failed { status }) => {
                     let mut data = serde_json::Map::new();
                     if let Some(status) = status {

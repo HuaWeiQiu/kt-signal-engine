@@ -1819,38 +1819,43 @@ impl Service {
     }
 
     /// updateGroup（群更新写面，KT 扩展方法）：expiration/title/avatar/
-    /// addMembers 合成单 change（同 version 多 action）单次
+    /// addMembers/removeMembers 合成单 change（同 version 多 action）单次
     /// `PATCH v2/groups`。avatar Replace 臂先走群头像上行链（form 拉取 →
-    /// blob 加密 → CDN POST，§5 群头像上行面批）；addMembers 臂成员解析
-    /// 分流（不可解析整拒，§5 P3 块）。fake 两臂：缺省/null 臂成功形状桩
-    ///（PATCH 面，expiration 批纪律；addMembers 臂随桩成功——fake 无解析
-    /// 链）；data URI 臂失败 AvatarUpload——fake 无 CDN/服务器上行面，上行
-    /// 链不可达即错误面（stickers fake 错误面先例）。
+    /// blob 加密 → CDN POST，§5 群头像上行面批）；add/remove 成员臂成员解
+    /// 析与群态分类（不可解析整拒，§5 P3/P4 块）。fake 两臂：缺省/null 臂
+    /// 成功形状桩（PATCH 面，expiration 批纪律；成员臂随桩成功——fake 无解
+    /// 析链）；data URI 臂失败 AvatarUpload——fake 无 CDN/服务器上行面，上
+    /// 行链不可达即错误面（stickers fake 错误面先例）。
     pub(crate) async fn update_group_change(
         self: &Arc<Self>,
         account: &str,
         master_key: Vec<u8>,
-        expiration_secs: Option<u32>,
-        title: Option<&str>,
-        avatar: Option<groups::AvatarWrite>,
-        add_members: &[String],
+        write: groups::GroupUpdateWrite,
     ) -> Result<(), groups::TerminateError> {
         if !self.real {
-            return match avatar {
+            return match write.avatar {
                 Some(groups::AvatarWrite::Replace(_)) => Err(groups::TerminateError::AvatarUpload),
                 _ => Ok(()),
             };
         }
         let context = storage_context(self, account).await?;
-        groups::update_group_change(
-            &context,
-            &master_key,
-            expiration_secs,
-            title,
-            avatar,
-            add_members,
-        )
-        .await
+        groups::update_group_change(&context, &master_key, write).await
+    }
+
+    /// leaveGroup（群退出，KT 扩展方法，官方桌面 leaveGroupV2 行为对齐）：
+    /// 群态读面 self 分类（ACI pending → ACI member → PNI pending，官方同
+    /// 序）→ `PATCH v2/groups` delete change → 本地群态刷新。fake 模式成功
+    /// 形状桩（terminateGroup 同纪律；fake 无群态读面，不触网）。
+    pub(crate) async fn leave_group(
+        self: &Arc<Self>,
+        account: &str,
+        master_key: Vec<u8>,
+    ) -> Result<(), groups::TerminateError> {
+        if !self.real {
+            return Ok(());
+        }
+        let context = storage_context(self, account).await?;
+        groups::leave_group(&context, &master_key).await
     }
 
     /// createGroup（自建群，KT 扩展方法，官方 createGroupV2 行为对齐）：
