@@ -1,8 +1,9 @@
 # JSON-RPC 兼容层契约（signal-cli 兼容子集）
 
-状态：P2 逐方法对齐基线 ｜ 依据：ADR 0002/0004 ｜ 上游参照：connector
+状态：P2 起逐方法对齐基线，随批增补 ｜ 依据：ADR 0002/0004 ｜ 上游参照：connector
 `docs/implementation-plan.md` §4/§5 已固化语义 + `tests/fixtures/fake-signal-cli.py`
-（黄金对照，pinned 0.14.x 行为投影）
+（黄金对照，pinned 0.14.x 行为投影；文件在 connector 仓，本仓契约测试
+自带 fake 服务直驱引擎，不经该夹具）
 
 本文件逐方法列出引擎对外暴露的 signal-cli JSON-RPC 兼容子集的参数/返回/错误码
 与对齐状态。**兼容层封顶**：只覆盖 connector 实际驱动的白名单方法；上游新增
@@ -163,6 +164,8 @@ send message: Signal server unavailable.
 | `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
 | `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
+| `getConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup}`（kind 词表与会话引用形状同 setConversationBlocked 面） | `{mutedUntilTimestamp, archived, markedUnread}`（三键恒在；目标记录缺席/无 storage 状态/manifest 404 = 全缺省 `0/false/false`，诚实幂等不报错） | 未注册账号 `-32603`；kind 缺失/词表外、会话不可解析/形状错 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2，状态收敛审计 R1，wire additive，§5 P15b 块）**：真相源 = Storage Service record 字段（非 sync message）——ContactRecord.archived/markedUnread/mutedUntilTimestamp（SignalStorage.proto 11/12/13）与 GV2/GV1 同名位（4/5/6）；MuteExpiration.toProto 语义 = 绝对毫秒、0 = 未静音；fake：恒缺省态（契约测试钉定） |
+| `setConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup, mutedUntilTimestamp?, archived?, markedUnread?}`（部分写意图——缺席位不动；mutedUntilTimestamp = 非负整数毫秒、两位布尔；null/形状错整拒；三 flag 全缺 = 无写意图 `-32603`） | `{mutedUntilTimestamp, archived, markedUnread}`（写后目标三 flag 投影，getConversationState 同形状；官方 upload 成功语义 = 本地写后面为准） | 参数形状错（见左）/kind 词表外/会话不可解析/未注册账号 `-32603`；storage 链路：PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`、服务不可达 `STORAGE_UNAVAILABLE`、读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2）**：复用 blocked/sticker 写面既有编排（read 改写 decode→mutate→encode 保真、新 16B item id、WriteOperation version+1、409 采纳重放）；同值幂等无写；目标记录缺席非缺省意图 = 最小记录首建（标识 + 三 flag，fresh_blocked_record 同构）、全缺省不空造记录；noteToSelf kind 不收（官方走 AccountRecord.noteToSelf* 位且无静音位，消费方提出再立项，偏差登记）；fake：缺省态叠意图回显（契约测试钉定） |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -408,6 +411,21 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   mediaRootBackupKey——偏差落 §5 组 6 块；Request{Keys} 应答停答面
   （P9 S2）与此接收投影面互不相干。
 
+接收流共生三通知（独立方法名即事件，**非 envelope 载体**——流态观测/
+流态事件无信封可挂；wire additive）：
+
+- `receive.emptied {account}`（P15b 项7，时序审计 G3）：服务器历史队列
+  排空标记 per-account 上抛（官方 ApiEmptyQueue→EmptyEvent 同位）；每轮
+  排空都投，消费方幂等自便（如启动期「积压回放完成」推进度旗标）；§5
+  P15b 项7。
+- `accountUnbound {account}`（B4 Unbound 停环批）：服务器 401 凭据拒绝
+  后接收循环停止，上抛一次——官方链接设备语义：凭据失效即停等重链，
+  不无限退避重连；§5「身份事件面 + Unbound 停环」块。
+- `receive.clockskew {account, skewMs, serverTimestamp}`（P15b 项8）：本地
+  −服务器时钟偏移越阈（官方 ClockSkewDetector 24h 默认阈值）边缘触发
+  告警一次，skewMs 带符号（正 = 本地快）、serverTimestamp = 观测源信封
+  服务器毫秒；拒绝面不做（偏差登记），消费自定；§5 P15b 项8。
+
 ## 4. 夹具专有动词（非引擎表面）
 
 `hang/sendHang/crash/crashSend/malformed/oversized/stallStdin/
@@ -429,8 +447,11 @@ connector 测试驱动夹具的控制面，**引擎不实现也不接受**（按
 P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）：
 
 - **群组面**：发送 P2 起 real（`send_message_to_group`，群 id = master key
-  标准 base64）；接收投影仍跳过群组消息（connector 群组行是已声明边界，
-  P3 补 groupInfo 投影后放开）。群 id 不可解/非法按 `-32603`。
+  标准 base64）；~~接收投影仍跳过群组消息（connector 群组行是已声明边界，
+  P3 补 groupInfo 投影后放开）。~~（2026-10-04 销账：群组接收投影已放开
+  ——`dataMessage.groupV2`/sent 群组带 `groupInfo {groupId}` 投影落地，
+  connector 管线零改动，见 §3 receive 面「群组接收投影」bullet。）群 id
+  不可解/非法按 `-32603`。
 - **号码解析冷启动窗口**：send 系方法的 recipient 号码 → ServiceId 经本地
   contacts 解析；链接后手机端自动推送 contacts，推送落地前的窗口内发送按
   `-32603` 内部失败。connector 侧行为不变（失败即报，不重试语义未变）。
@@ -446,10 +467,14 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
 - **URI 形状**：real 模式发官方 `sgnl://linkdevice?uuid=…&pub_key=…`；
   fake 夹具保持 `sgnl://link?…`（仅测试）。连接器对 URI 不解析、只透传
   回 finishLink，两侧均不受影响。
-- **per-recipient results**：成功仅含 `{recipientNumber, success:{timestamp}}`，
+- **per-recipient results**：~~成功仅含 `{recipientNumber, success:{timestamp}}`，
   群组发送 `results` 恒 `[]`（成员级投影 P3）；部分失败的 result 形状
   （上游 identity failure / unregistered user 等枚举）未对齐，遇到即整体
-  `-32603`（P3 逐枚举对齐）。
+  `-32603`（P3 逐枚举对齐）。~~（2026-10-11 销账：群发送语义三件批——群
+  形态 `results` 逐成员填充，失败条目 `{recipientNumber, failure:{type}}`
+  type 词表四值 additive，单成员失败不再炸批，见 §5「群发送语义三件」块；
+  `send` 直聊腿失败面同日 P15b 项4 additive `failures` 键闭合——本条
+  差异登记整体销账。）
 - **updateContact 边界**：仅本地 store 已有该号码时改名；新联系人建立需要
   contacts 同步/服务器面（P2+），未命中 `-32603`。
 - **getUserStatus**：P2 起 real——whoami 轻量探测；仅服务器 401 映射解绑态
@@ -2763,6 +2788,11 @@ afterEveryLinkedStartup → `registerCapabilities`，端点
   面，恰为引擎所需）；② 设备面 body 复用四键官方形状，不携带账号属
   性面六位（官方两面本就不同型，不并面）；③ optionalPhoneNumber 状
   态位引擎无用户号共享模型，恒 false（账号号码共享态如实声明）。
+- **fork 台账**：本批 vendor 面（libsignal-service `websocket/account.rs`
+  结构体+注册端点、presage `manager/confirmation.rs` 注册链构造点）已
+  补登 `vendor/README.md` fork 改动清单；同批补登的还有此前漏登的
+  `groups_v2/manager.rs`（MRM/GSE 地基批）与 `websocket/registration.rs`
+  （时序组四）两文件。
 
 ### P9 身份安全闸（2026-10-11 批，官方对齐 Signal-Desktop abe80d3）
 
@@ -3682,10 +3712,11 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   可逆找回）。
 - **项2 signed/last-resort prekey 轮换龄 1.5 天（E1）**：审计原文「轮换
   龄与官方不符」。求证结论：官方 `SIGNED_PRE_KEY_ROTATION_AGE = DAY*1.5`
-  （AccountManager.preload.ts:141）且 **last-resort kyber 同 1.5 天按龄
+  （AccountManager.preload.ts:142）且 **last-resort kyber 同 1.5 天按龄
   轮换**（:115 + #maybeUpdateLastResortKyberKey :868-920），轮换 PUT 同携
   signed + last-resort（#doUpdateKeys）；引擎此前 signed 14 天档且
-  last-resort 从不轮换。落法：engine `prekey.rs` 轮换龄 14d→1.5d
+  last-resort 从不轮换。落法：engine `src/service/prekey.rs` 轮换龄
+  14d→1.5d
   （SIGNED_PRE_KEY_MAX_AGE_MS），新增 last-resort 1.5d 判（缺键=归水位
   补装语义不越权，`last_resort_key_over_age`）；按龄轮换挂 30min
   quick_check 快拍（1.5d 龄细于 2 天 maintenance 节律，闸纯本地读零成本）

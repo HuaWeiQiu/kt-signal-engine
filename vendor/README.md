@@ -1,9 +1,9 @@
 # vendor/ — 原样拷贝的上游依赖（Stories 批，2026-10-08）
 
-本目录当前是两个上游仓在引擎钉定 rev 的**逐字节原样拷贝**（可 `diff -rq`
-对照 cargo git checkout 复核），经根 `Cargo.toml` 的 `[patch]` 段替换对应
-git 源。story 协议面的最小叠加随本批后续 commit 落地，届时在本文件登记
-文件级改动清单。
+本目录当前是两个上游仓在引擎钉定 rev 的**逐字节原样拷贝**，经根
+`Cargo.toml` 的 `[patch]` 段替换对应 git 源。story 协议面的最小叠加已随
+批落地，文件级 fork 改动清单见下，随 commit 递增登记（与上游的差异可
+`diff -rq` 对照 checkout 复核，见清单头）。
 
 | 目录 | 上游 | 钉定 rev | 许可 |
 |---|---|---|---|
@@ -111,13 +111,26 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `src/account_manager.rs`（2026-10-11 时序审计组四 E1/E2 批）—
   ①`rotate_signed_pre_key_bundle` 改走 force 臂：轮换 PUT 同携新 signed +
   新 last-resort（官方 #doUpdateKeys 同 PUT 携带、双侧 DAY*1.5 轮换龄：
-  AccountManager.preload.ts:115/:141 + #maybeUpdateLastResortKyberKey
+  AccountManager.preload.ts:115/:142 + #maybeUpdateLastResortKyberKey
   :868-920）；`publish_fresh_pre_keys` last-resort 上传面改「新生成优先、
   否则 stored newest-by-timestamp」（原 `last_resort_keys[0]` 按 rowid 取
   最旧行，多行时会重传旧键——轮换语义顺修）；`update_pre_key_bundle` 传
   force=false 行为不变。②水位闸补上限臂：服务器计数超 `PRE_KEY_MAX_COUNT`
   =200 也整批重发（官方 #doUpdateKeys `count < PRE_KEY_MINIMUM ||
   count > PRE_KEY_MAX_COUNT` 同判，一次性与 kyber 两族同闸）。
+- `src/groups_v2/manager.rs`（2026-10-11 MRM/GSE 地基批）— `fetch_group`
+  拆出 pub `fetch_encrypted_group_response`：完整 `GroupResponse` 包装面
+  （携 group-send-endorsements 举权 blob 与加密群态，MRM 发送链 GSE 取数
+  地基）；原单群 proto 投影面保持，取数改走 `get_group_response`。
+- `src/websocket/account.rs`（2026-10-11 D5 能力位补齐+设备面注册批）—
+  ①`DeviceCapabilities` 补 `versioned_expiration_timer`/
+  `optional_phone_number` 两位（server 真相 DeviceCapability.java 全集
+  对齐，serde camelCase，缺省 false）；②新增 `CapabilitiesUpload`（官方
+  CapabilitiesUploadType 四键）与 `register_capabilities`（PUT
+  v1/devices/capabilities 设备面注册端点）。
+- `src/websocket/registration.rs`（2026-10-11 时序审计组四 E1-E4 收口批）
+  — ACI/PNI 两 `replenish_pre_keys` 调用点补 `force_new_last_resort=false`
+  位（pre_keys E1 签名扩参的编译面，注册链行为不变）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -232,6 +245,10 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `presage/src/manager/registered.rs`（同批）— DERM 收信臂按上述四元构造
   RetryRequest；DERM 无 timestamp（不点名原消息）改 ack 即弃（不投影，
   原行为会以 None 失败体上抛）。
+- `presage/src/manager/confirmation.rs`（2026-10-11 D5 批）— 注册链
+  `DeviceCapabilities` 字面量补 `versioned_expiration_timer: false`/
+  `optional_phone_number: false` 两位（D5 字段新增的编译面，链接注册
+  声明位恒无）。
 
 `vendor/presage/presage-store-sqlite/`：
 

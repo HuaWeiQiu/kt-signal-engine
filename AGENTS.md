@@ -40,5 +40,6 @@ kt-signal-connector 眼下的外部引擎 signal-cli。架构与许可边界见
 - Rust 2021+；`cargo fmt`/`clippy -D warnings`/`test` 全绿是提交门禁。
 - 每个源码文件头部带 AGPL-3.0 声明（SPDX：`SPDX-License-Identifier: AGPL-3.0-only`）。
 - 提交信息中文、前缀 `feat/fix/docs/refactor/test/chore(engine)`；契约相关另加
-  `engine-compat` 标注。
+  `engine-compat` 标注。标注断档的历史提交不回改追溯；新提交凡 wire/契约
+  面变化强制标注。
 - 依赖最小化：新增 crate 需在 PR 描述说明用途与许可（禁止引入 GPL-ink 不兼容依赖）。
