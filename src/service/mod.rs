@@ -290,6 +290,190 @@ fn build_call_message(payload: &SendCallMessage) -> presage::proto::CallMessage 
     }
 }
 
+/// sendContact 名片参数（窗D B11，官方 EmbeddedContact/DataMessage.Contact
+/// 同构，SendMessage.preload.ts:418-492 toProto contact 段同位）：name 六
+/// 子字段、number/email 条目 {value, type?, label?}、address 九子字段条目、
+/// avatar data URI 单条（官方 EmbeddedContactWithUploadedAvatar 上传面同构
+/// ——上传后取回指针进 Contact.Avatar）、organization。type 为词表词
+///（methods.rs 解析闸钉定：number/email 四值、address 三值），此处透传。
+#[derive(Clone)]
+pub(crate) struct SendContact {
+    pub(crate) name: Option<SendContactName>,
+    pub(crate) number: Vec<SendContactField>,
+    pub(crate) email: Vec<SendContactField>,
+    pub(crate) address: Vec<SendContactAddress>,
+    pub(crate) avatar: Option<String>,
+    pub(crate) organization: Option<String>,
+}
+
+/// sendContact name 子字段（官方 Contact.Name 六位同构，displayName 保留
+/// 位无官方语义不收）。
+#[derive(Clone)]
+pub(crate) struct SendContactName {
+    pub(crate) given_name: Option<String>,
+    pub(crate) family_name: Option<String>,
+    pub(crate) prefix: Option<String>,
+    pub(crate) suffix: Option<String>,
+    pub(crate) middle_name: Option<String>,
+    pub(crate) nickname: Option<String>,
+}
+
+/// sendContact number/email 条目：value 必填非空（官方发送面 `!value →
+/// undefined` 丢弃口径的引擎侧前置闸），type 为词表词或缺省、label 透传。
+#[derive(Clone)]
+pub(crate) struct SendContactField {
+    pub(crate) value: String,
+    pub(crate) r#type: Option<String>,
+    pub(crate) label: Option<String>,
+}
+
+/// sendContact address 条目（官方 Contact.PostalAddress 九位同构；type 词
+/// 表三值，无 MOBILE——postal 枚举本无此值）。
+#[derive(Clone)]
+pub(crate) struct SendContactAddress {
+    pub(crate) r#type: Option<String>,
+    pub(crate) label: Option<String>,
+    pub(crate) street: Option<String>,
+    pub(crate) pobox: Option<String>,
+    pub(crate) neighborhood: Option<String>,
+    pub(crate) city: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) postcode: Option<String>,
+    pub(crate) country: Option<String>,
+}
+
+/// sendContact 参数解析（fail-closed，词表外 -32603）：contact 缺席/非对象、
+/// name 在场非对象/子字段非字符串、number/email/address 在场非数组/条目非
+/// 对象/value 缺席·非字符串·空串/type 词表外/label·address 子字段非字符
+/// 串、organization 非字符串、avatar 非字符串全拒。词表外引擎拒绝（官方
+/// numberTo*Type 词表外静默归 HOME——textStyle 先例同纪律，§5 偏差记档）；
+/// organization 空串 = 官方 `if (organization)` falsy 同位归缺席。
+pub(crate) fn parse_send_contact(value: Option<&Value>) -> Option<SendContact> {
+    let value = value?;
+    if !value.is_object() {
+        return None;
+    }
+    let name = match value.get("name") {
+        None | Some(Value::Null) => None,
+        Some(name) => {
+            let field = |key: &str| -> Option<Option<String>> {
+                match name.get(key) {
+                    None | Some(Value::Null) => Some(None),
+                    Some(Value::String(text)) => Some(Some(text.clone())),
+                    Some(_) => None,
+                }
+            };
+            if !name.is_object() {
+                return None;
+            }
+            Some(SendContactName {
+                given_name: field("givenName")?,
+                family_name: field("familyName")?,
+                prefix: field("prefix")?,
+                suffix: field("suffix")?,
+                middle_name: field("middleName")?,
+                nickname: field("nickname")?,
+            })
+        }
+    };
+    // number/email 同构条目族（官方两枚举同编号同词表，解析单点）。
+    let field_entries = |key: &str| -> Option<Vec<SendContactField>> {
+        match value.get(key) {
+            None | Some(Value::Null) => Some(Vec::new()),
+            Some(Value::Array(entries)) => entries
+                .iter()
+                .map(|entry| {
+                    if !entry.is_object() {
+                        return None;
+                    }
+                    let entry_value = match entry.get("value") {
+                        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+                        _ => return None,
+                    };
+                    let entry_type = match entry.get("type") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(word))
+                            if matches!(word.as_str(), "HOME" | "MOBILE" | "WORK" | "CUSTOM") =>
+                        {
+                            Some(word.clone())
+                        }
+                        _ => return None,
+                    };
+                    let label = match entry.get("label") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(text)) => Some(text.clone()),
+                        Some(_) => return None,
+                    };
+                    Some(SendContactField {
+                        value: entry_value,
+                        r#type: entry_type,
+                        label,
+                    })
+                })
+                .collect(),
+            Some(_) => None,
+        }
+    };
+    let address = match value.get("address") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                let text = |key: &str| -> Option<Option<String>> {
+                    match entry.get(key) {
+                        None | Some(Value::Null) => Some(None),
+                        Some(Value::String(text)) => Some(Some(text.clone())),
+                        Some(_) => None,
+                    }
+                };
+                if !entry.is_object() {
+                    return None;
+                }
+                let entry_type = match entry.get("type") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(word))
+                        if matches!(word.as_str(), "HOME" | "WORK" | "CUSTOM") =>
+                    {
+                        Some(word.clone())
+                    }
+                    _ => return None,
+                };
+                Some(SendContactAddress {
+                    r#type: entry_type,
+                    label: text("label")?,
+                    street: text("street")?,
+                    pobox: text("pobox")?,
+                    neighborhood: text("neighborhood")?,
+                    city: text("city")?,
+                    region: text("region")?,
+                    postcode: text("postcode")?,
+                    country: text("country")?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?,
+        Some(_) => return None,
+    };
+    let organization = match value.get("organization") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        Some(Value::String(_)) => None,
+        Some(_) => return None,
+    };
+    let avatar = match value.get("avatar") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return None,
+    };
+    Some(SendContact {
+        name,
+        number: field_entries("number")?,
+        email: field_entries("email")?,
+        address,
+        avatar,
+        organization,
+    })
+}
+
 /// 附件条数上限：与接收投影 §4.13/compat receive 32 条同口径，超出
 /// fail-closed。
 const ATTACHMENT_MAX_COUNT: usize = 32;
@@ -1982,6 +2166,86 @@ impl Service {
             .send_message_to_group(&master_key, build_call_message(&payload), timestamp)
             .await
             .map_err(send_error_of)
+            .map(|_| ())?;
+        Ok(timestamp)
+    }
+
+    /// sendContact 名片 DataMessage 组装单点（窗D B11）：avatar data URI
+    ///（若有）随批 CDN 上行取回指针（官方 EmbeddedContactWithUploadedAvatar
+    /// 上传面同构，send 附件面同 upload_attachments_for_send 原语），失败
+    /// 整体 fail-closed（半发名片比拒绝更糟）；contact_proto 单点投影，
+    /// DataMessage.contact=9 单条目（官方 sendMessage 面单条目序列化同位，
+    /// body/attachments 恒空——名片无正文位）。
+    async fn build_contact_data_message(
+        manager: &Manager<SqliteStore, Registered>,
+        payload: &SendContact,
+        timestamp: u64,
+    ) -> Result<DataMessage, SendError> {
+        let avatar = match payload.avatar.as_deref() {
+            Some(uri) => {
+                let (pointers, _) =
+                    upload_attachments_for_send(manager, &[uri.to_owned()], None).await?;
+                Some(pointers.into_iter().next().ok_or(SendError::Internal)?)
+            }
+            None => None,
+        };
+        Ok(DataMessage {
+            timestamp: Some(timestamp),
+            contact: vec![contact_proto(payload, avatar)],
+            ..DataMessage::default()
+        })
+    }
+
+    /// sendContact 1:1 臂（名片发送臂，窗D B11）：官方 sendMessage 面同一
+    /// DataMessage 通路。收件人号码/UUID 双形态解析（send 系同口径）+ P9
+    /// 身份拒发闸（名片同为内容面）；avatar 上行失败整体拒。返回信封
+    /// timestamp。
+    pub(crate) async fn send_contact(
+        self: &Arc<Self>,
+        account: &str,
+        recipient: &str,
+        payload: &SendContact,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let (shared, account_dir) = open_registered_with_dir(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let service_id = resolve_recipient(&manager, recipient)
+            .await
+            .ok_or(SendError::Internal)?;
+        // P9 身份拒发闸（直聊内容面同纪律）。
+        identity_send_gate(&account_dir, &service_id)?;
+        let timestamp = now_ms();
+        let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
+        manager
+            .send_message(service_id, body, timestamp)
+            .await
+            .map_err(send_error_of)?;
+        Ok(timestamp)
+    }
+
+    /// sendContact 群臂（窗D B11 同批）：官方名片群发同 DataMessage 通路，
+    /// dispatch_group MRM 主路径（poll 群臂同款——open_group_sender
+    /// terminated 硬拒 + announcements 闸 + sender-key 主路径 vendored
+    /// 逐收件人 failover）。群腿 outcomes 折叠（sendCallMessage 群臂同口径，
+    /// 应答恒 {timestamp}）。
+    pub(crate) async fn send_contact_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        payload: &SendContact,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
+        dispatch_group(self, &mut manager, group_id, body, timestamp)
+            .await
             .map(|_| ())?;
         Ok(timestamp)
     }
@@ -7534,6 +7798,87 @@ fn poll_vote_proto(
 fn poll_terminate_proto(target_sent_timestamp: u64) -> presage::proto::data_message::PollTerminate {
     presage::proto::data_message::PollTerminate {
         target_sent_timestamp: Some(target_sent_timestamp),
+    }
+}
+
+/// sendContact 名片 proto 构造（窗D B11，官方 SendMessage.preload.ts:418-492
+/// toProto contact 段同位）：DataMessage.contact 单条目投影。type 词→枚举
+/// 单点映射（词表闸在解析层，此处词表内词恒有落点；缺省投影 HOME——官方
+/// numberTo*Type(undefined)→HOME 默认同位；phone/email 两枚举同编号同词表
+/// 单点共用），address 三值词表同法；avatar 指针由服务层上行后注入（无
+/// 头像 = Avatar 位缺席——官方 avatar 位仅 contactEntry.avatar?.avatar 在
+/// 场时成 Avatar 同位；isProfile 恒 false = 引擎 wire 面无该键的官方默认
+/// 值）；organization 透传（解析层空串已归缺席）。
+fn contact_proto(
+    payload: &SendContact,
+    avatar: Option<presage::proto::AttachmentPointer>,
+) -> presage::proto::data_message::Contact {
+    use presage::proto::data_message::contact::{Avatar, Email, Name, Phone, PostalAddress};
+
+    let field_type = |word: Option<&str>| -> i32 {
+        use presage::proto::data_message::contact::phone::Type;
+        match word {
+            Some("MOBILE") => Type::Mobile as i32,
+            Some("WORK") => Type::Work as i32,
+            Some("CUSTOM") => Type::Custom as i32,
+            _ => Type::Home as i32, // HOME 或缺省
+        }
+    };
+    let address_type = |word: Option<&str>| -> i32 {
+        use presage::proto::data_message::contact::postal_address::Type;
+        match word {
+            Some("WORK") => Type::Work as i32,
+            Some("CUSTOM") => Type::Custom as i32,
+            _ => Type::Home as i32, // HOME 或缺省
+        }
+    };
+    presage::proto::data_message::Contact {
+        name: payload.name.as_ref().map(|name| Name {
+            given_name: name.given_name.clone(),
+            family_name: name.family_name.clone(),
+            prefix: name.prefix.clone(),
+            suffix: name.suffix.clone(),
+            middle_name: name.middle_name.clone(),
+            nickname: name.nickname.clone(),
+        }),
+        number: payload
+            .number
+            .iter()
+            .map(|field| Phone {
+                value: Some(field.value.clone()),
+                r#type: Some(field_type(field.r#type.as_deref())),
+                label: field.label.clone(),
+            })
+            .collect(),
+        email: payload
+            .email
+            .iter()
+            .map(|field| Email {
+                value: Some(field.value.clone()),
+                r#type: Some(field_type(field.r#type.as_deref())),
+                label: field.label.clone(),
+            })
+            .collect(),
+        address: payload
+            .address
+            .iter()
+            .map(|entry| PostalAddress {
+                r#type: Some(address_type(entry.r#type.as_deref())),
+                label: entry.label.clone(),
+                street: entry.street.clone(),
+                pobox: entry.pobox.clone(),
+                neighborhood: entry.neighborhood.clone(),
+                city: entry.city.clone(),
+                region: entry.region.clone(),
+                postcode: entry.postcode.clone(),
+                country: entry.country.clone(),
+            })
+            .collect(),
+        avatar: avatar.map(|pointer| Avatar {
+            avatar: Some(pointer),
+            is_profile: Some(false),
+        }),
+        organization: payload.organization.clone(),
     }
 }
 
@@ -14453,6 +14798,93 @@ mod tests {
 
         let terminate = poll_terminate_proto(99);
         assert_eq!(terminate.target_sent_timestamp, Some(99));
+    }
+
+    /// sendContact（窗D B11）proto 构造面：name 六子字段、number/email
+    /// type 词表→枚举映射（缺省投影 HOME——官方 numberTo*Type(undefined)
+    /// 默认同位；phone/email 同编号单点共用）、address 三值词表、
+    /// organization 透传、avatar 指针注入与缺席两态（isProfile 恒 false）。
+    #[test]
+    fn contact_proto_semantics() {
+        use presage::proto::data_message::contact::{email, phone, postal_address};
+
+        let payload = SendContact {
+            name: Some(SendContactName {
+                given_name: Some("Ada".to_owned()),
+                family_name: Some("Lovelace".to_owned()),
+                prefix: None,
+                suffix: None,
+                middle_name: Some("Augusta".to_owned()),
+                nickname: None,
+            }),
+            number: vec![
+                SendContactField {
+                    value: "+15551234567".to_owned(),
+                    r#type: Some("MOBILE".to_owned()),
+                    label: Some("cell".to_owned()),
+                },
+                SendContactField {
+                    value: "+15557654321".to_owned(),
+                    r#type: None,
+                    label: None,
+                },
+            ],
+            email: vec![SendContactField {
+                value: "ada@example.test".to_owned(),
+                r#type: Some("WORK".to_owned()),
+                label: None,
+            }],
+            address: vec![SendContactAddress {
+                r#type: Some("CUSTOM".to_owned()),
+                label: Some("lab".to_owned()),
+                street: Some("1 Analytical Way".to_owned()),
+                pobox: None,
+                neighborhood: None,
+                city: Some("London".to_owned()),
+                region: None,
+                postcode: None,
+                country: Some("UK".to_owned()),
+            }],
+            avatar: None,
+            organization: Some("Analytical Engines".to_owned()),
+        };
+
+        let contact = contact_proto(&payload, None);
+        let name = contact.name.expect("name projected");
+        assert_eq!(name.given_name.as_deref(), Some("Ada"));
+        assert_eq!(name.family_name.as_deref(), Some("Lovelace"));
+        assert_eq!(name.middle_name.as_deref(), Some("Augusta"));
+        assert_eq!(name.prefix, None);
+        assert_eq!(name.suffix, None);
+        assert_eq!(name.nickname, None);
+
+        assert_eq!(contact.number.len(), 2);
+        assert_eq!(contact.number[0].r#type, Some(phone::Type::Mobile as i32));
+        assert_eq!(contact.number[0].label.as_deref(), Some("cell"));
+        // type 缺省 → HOME（官方 numberToPhoneType(undefined) 同位）。
+        assert_eq!(contact.number[1].r#type, Some(phone::Type::Home as i32));
+
+        assert_eq!(contact.email.len(), 1);
+        assert_eq!(contact.email[0].r#type, Some(email::Type::Work as i32));
+        assert_eq!(contact.email[0].value.as_deref(), Some("ada@example.test"));
+
+        assert_eq!(contact.address.len(), 1);
+        assert_eq!(
+            contact.address[0].r#type,
+            Some(postal_address::Type::Custom as i32)
+        );
+        assert_eq!(contact.address[0].city.as_deref(), Some("London"));
+        assert_eq!(contact.address[0].pobox, None);
+
+        assert_eq!(contact.organization.as_deref(), Some("Analytical Engines"));
+        // 无头像 = Avatar 位缺席（官方 avatar 位仅在场才成 Avatar 同位）。
+        assert!(contact.avatar.is_none());
+
+        // 头像指针注入：pointer 原样进 Avatar.avatar，isProfile 恒 false。
+        let with_avatar = contact_proto(&payload, Some(Default::default()));
+        let avatar = with_avatar.avatar.expect("avatar projected");
+        assert!(avatar.avatar.is_some());
+        assert_eq!(avatar.is_profile, Some(false));
     }
 
     /// Q2/Q3/Q4 收投影：contact 卡片（键形与 backup contact_record 同族 +

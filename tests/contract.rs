@@ -3456,6 +3456,155 @@ fn call_message_fake_shape_and_param_fail_closed() {
     );
 }
 
+/// 名片发送臂（sendContact，窗D B11）：fake 形状成功 {"timestamp":u64}（直
+/// 聊/群两腿同口径）；参数面 fail-closed 逐形状（-32603）：contact 缺席/非
+/// 对象、name 非对象/子字段非字符串、number/email/address 非数组/条目非对
+/// 象/value 缺席·空串·非字符串/type 词表外（number/email 四值、address 三
+/// 值）/label/address 子字段非字符串、organization 非字符串、avatar 非字
+/// 符串；recipient/groupId 两腿恰一（同置/都缺/伪群 id）；协议上行面落调
+/// 度日志（contact 逐字保留）。
+#[test]
+fn send_contact_fake_shapes_and_param_fail_closed() {
+    let dir = temp_dir("send-contact");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 32 字节群 master key 的标准 base64（sendCallMessage group 同源口径）。
+    let group = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 成功面：直聊/群两腿；最简（单 number 条目）与全卡片（name/
+    // number/email/address/avatar/organization）同形。
+    let full_contact = json!({
+        "name": { "givenName": "Ada", "familyName": "Lovelace", "middleName": "Augusta" },
+        "number": [
+            { "value": "+15551234567", "type": "MOBILE", "label": "cell" },
+            { "value": "+15557654321" }
+        ],
+        "email": [ { "value": "ada@example.test", "type": "WORK" } ],
+        "address": [ {
+            "type": "CUSTOM", "label": "lab", "street": "1 Analytical Way",
+            "city": "London", "country": "UK"
+        } ],
+        "avatar": "data:image/png;base64,iVBORw0KGgo=",
+        "organization": "Analytical Engines"
+    });
+    for params in [
+        json!({ "account": number, "recipient": "+15555550101",
+                "contact": { "number": [{ "value": "+15550001111" }] } }),
+        json!({ "account": number, "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                "contact": full_contact }),
+        json!({ "account": number, "groupId": group, "contact": full_contact }),
+    ] {
+        let ok = engine.request("sendContact", params.clone());
+        assert!(
+            ok["result"]["timestamp"].is_u64(),
+            "fake sendContact ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状。
+    let contact = json!({ "number": [{ "value": "+15550001111" }] });
+    let rejects = [
+        json!({ "recipient": "+15555550101", "contact": contact }),
+        json!({ "account": number, "contact": contact }),
+        json!({ "account": number, "recipient": "+15555550101" }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": 42 }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": "card" }),
+        // name 面：非对象/子字段非字符串。
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "name": "Ada", "number": [{ "value": "1" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "name": { "givenName": 7 }, "number": [{ "value": "1" }] } }),
+        // number 面：非数组/条目非对象/value 缺席·空串·非字符串/type 词表
+        // 外·非字符串/label 非字符串。
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": "15550001111" } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": ["15550001111"] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "type": "MOBILE" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "value": "" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "value": 15550001111u64 }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "value": "1", "type": "CELL" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "value": "1", "type": 2 }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "number": [{ "value": "1", "label": 3 }] } }),
+        // email 同词表闸（与 number 共用四值，CELL 词表外）。
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "email": [{ "value": "a@b.test", "type": "CELL" }] } }),
+        // address 面：type 词表外（MOBILE 非 postal 词）、子字段非字符串。
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "address": [{ "type": "MOBILE" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "address": [{ "city": 4 }] } }),
+        // organization/avatar 面。
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "organization": 7, "number": [{ "value": "1" }] } }),
+        json!({ "account": number, "recipient": "+15555550101", "contact": { "avatar": 9, "number": [{ "value": "1" }] } }),
+        // 两腿恰一 + 群腿形状闸。
+        json!({ "account": number, "recipient": "+15555550101", "groupId": group, "contact": contact }),
+        json!({ "account": number, "groupId": "not-base64!!", "contact": contact }),
+        json!({ "account": number, "groupId": "QUJDREVG", "contact": contact }),
+        json!({ "account": number, "groupId": "", "contact": contact }),
+        json!({ "account": number, "groupId": 42, "contact": contact }),
+    ];
+    for params in &rejects {
+        let response = engine.request("sendContact", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendContact rejects {params}"
+        );
+    }
+
+    // 调度日志：contact 逐字保留（协议上行面纪律），群腿无 recipient 键。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendContact" && entry["params"].get("groupId").is_none())
+        .expect("direct sendContact logged");
+    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
+    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(
+        entry["params"]["contact"]["number"][0]["value"],
+        json!("+15550001111")
+    );
+    // avatar 载荷摘要化（调度零头像字节纪律），摘要保留量级——定位带
+    // avatar 的全卡片直聊记录断言。
+    let with_avatar = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "sendContact"
+                && entry["params"]["contact"].get("avatar").is_some()
+                && entry["params"].get("groupId").is_none()
+        })
+        .expect("avatar-bearing sendContact logged");
+    let avatar_digest = with_avatar["params"]["contact"]["avatar"]
+        .as_str()
+        .expect("avatar digest");
+    assert!(
+        avatar_digest.starts_with("[avatar data uri: ") && avatar_digest.ends_with(" bytes]"),
+        "avatar 摘要化: {avatar_digest}"
+    );
+    assert!(
+        !avatar_digest.contains("iVBORw0KGgo"),
+        "调度日志零头像字节: {avatar_digest}"
+    );
+    let group_entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendContact" && entry["params"].get("groupId").is_some())
+        .expect("group sendContact logged");
+    assert_eq!(group_entry["params"]["groupId"], json!(group));
+    assert!(
+        group_entry["params"].get("recipient").is_none(),
+        "群臂 wire 面无 recipient 键"
+    );
+}
+
 /// setExpirationTimer（消失消息 E 批）：fake 形状成功 {"timestamp":u64}
 /// （0=关闭同形）；参数面 fail-closed（-32603：account/recipient/
 /// expirationInSeconds 缺失、recipient 数组形状、timer 字符串/负数/小数/

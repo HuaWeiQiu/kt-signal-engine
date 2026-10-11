@@ -91,6 +91,7 @@ send message: Signal server unavailable.
 | `sendPollCreate` | `{account, groupId(32B 标准 base64 群 master key，参数层 decode_group_id 闸——fake 面同口径), question(非空 ≤200 字符 + 字节 ≤2048), options(2..=10 条字符串、每条非空 ≤100 字符 + 字节 ≤2048), allowMultiple?(布尔，缺省 false)}` | `{}` | 参数缺失/形状错（groupId 缺席·非 base64·≠32B、question 缺席·空·超 200 字符·超 2048 字节·非字符串、options 缺席·非数组·<2·>10·条目非字符串·空串·超 100 字符·超 2048 字节、allowMultiple 非布尔）/未注册账号 同 send 折叠；announcements-only/terminated 群 同群发送系（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A7，官方 poll 发送面对位）**：官方 `enqueuePollCreateForSend.dom.ts` → `DataMessage.pollCreate{question, allowMultiple, options}`（field 24，SendMessage.preload.ts toProto pollCreate 同构）走 dispatch_group MRM 主路径；官方仅群聊形态（1:1 走 isPollSend1to1Enabled feature flag，默认关——引擎按默认面无 1:1 形态，§5）；接收投影 `dataMessage.poll` 见 §3 receive 面；fake：成功 `{}`（落调度日志） |
 | `sendPollVote` | `{account, groupId(同 sendPollCreate 闸), targetAuthor(ACI/号码——被投 poll 的作者), targetTimestamp(正整数——被投 poll 原 sent timestamp), optionIndexes(u32 数组、每项 0..=9、≤10 条，空数组 = 清票动作合法), voteCount?(u32，缺省 1)}` | `{}` | 参数缺失/形状错（groupId 闸、targetAuthor/targetTimestamp 缺席·非正·非数字、optionIndexes 缺席·非数组·条目>9·条目非数值·>10 条、voteCount 超 u32·非数值）/未注册账号·群发送系闸 同 sendPollCreate | **2026-10-11 real（窗D A7 同批）**：官方 `enqueuePollVoteForSend.preload.ts` → `createDataMessageProtoForPollVote`（`DataMessage.pollVote{targetAuthorAciBinary, targetSentTimestamp, optionIndexes, voteCount}` field 26）走 sendToGroup 群腿同构（poll 只存在于群会话）；voteCount 官方语义 = 自身历史票 max+1（首票 1），由调用方（connector/desktop 持投票历史）计算传入，引擎缺省 1（§5 偏差）；optionIndexes 去重保首现序（发送幂等护栏，官方接收面 new Set 同构）；fake：成功 `{}`（落调度日志） |
 | `sendPollTerminate` | `{account, groupId(同 sendPollCreate 闸), targetTimestamp(正整数——被终止 poll 原 sent timestamp)}` | `{}` | 参数缺失/形状错（groupId 闸、targetTimestamp 缺席·非正·非数字）/未注册账号·群发送系闸 同 sendPollCreate | **2026-10-11 real（窗D A7 同批）**：官方 `enqueuePollTerminateForSend.preload.ts` → `createDataMessageProtoForPollTerminate`（`DataMessage.pollTerminate{targetSentTimestamp}` field 25）；官方拒 GroupV1（isGroupV1 refus）——引擎群腿形状闸只收 GV2 32B master key，GV1 天然不可达（零偏差）；poll 终止者资格（creator/admin）是官方 UI 层闸，wire 面不设；fake：成功 `{}`（落调度日志） |
+| `sendContact` | `{account, recipient(单号码/ACI)?\|groupId(32B 标准 base64 群 master key)?——寻址两腿恰一互斥, contact(名片对象，必填)}`（contact = 官方 EmbeddedContact/DataMessage.Contact 同构：`name?{givenName?, familyName?, prefix?, suffix?, middleName?, nickname?}`、`number?[{value(必填非空), type?("HOME"\|"MOBILE"\|"WORK"\|"CUSTOM"), label?}]`、`email?[同四值词表]`、`address?[{type?("HOME"\|"WORK"\|"CUSTOM"), label?, street?, pobox?, neighborhood?, city?, region?, postcode?, country?}]`、`avatar?(dataURI 单条)`、`organization?`——子键全可选但 contact 键本身必填；子键缺席/null 归缺席，organization 空串=官方 falsy 同位归缺席） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（contact 缺席·非对象、name 非对象/子字段非字符串、number/email/address 非数组/条目非对象/value 缺席·空串·非字符串/type 词表外·type 非字符串/label·address 子字段非字符串、organization/avatar 非字符串、两腿同置/都缺、groupId 非法 base64/≠32B/非字符串、recipient 空串）`-32603`；未注册账号/avatar 上行失败 同 send 折叠 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`、announcements-only 群非 admin `SEND_TARGET_ANNOUNCEMENTS_ONLY`（`-1` + message，群发送系同口径） | **2026-10-12 real（KT 扩展，窗D B11，官方名片发送面对位，engine-compat）**：官方 `sendMessage {contact: [EmbeddedContactWithUploadedAvatar]}` → `DataMessage.contact=9` repeated 单条目投影（SendMessage.preload.ts:418-492 toProto contact 段同位）走 1:1 `send_message`（P9 身份拒发闸在闸面）/群 dispatch_group MRM 主路径（poll 群臂同款）；type 词→枚举单点映射（phone/email 两枚举同编号同词表共用；缺省投影 HOME=官方 numberTo*Type(undefined) 同位；词表外官方静默归 HOME，引擎按 textStyle 先例拒绝——偏差 §5 记档）；avatar data URI 随批 CDN 上行取回指针进 Contact.Avatar（官方 EmbeddedContactWithUploadedAvatar 上传面同构，isProfile 恒 false=引擎 wire 面无该键的官方默认值）；调度日志 contact.avatar 摘要化（调度零头像字节纪律）、其余键逐字保留；接收投影 `dataMessage.contact` 卡片面已有（Q2）；详见 §5 窗D B11 块；fake：成功 `{"timestamp":u64}` 两腿同口径（落调度日志） |
 | `sendDeliveryReceipt` / `sendReadReceipt` / `sendViewedReceipt` | `{account, recipient(单作者), timestamps[]}` | `{}` | timestamps 空/缺/含非数字 `-32603` | **P2 real**：官方 ReceiptMessage type=delivery/read/viewed；逐作者直发（群组会话也直发原作者，官方不整组广播）；timestamps 按 CHUNK_SIZE=100 分帧 |
 | `sendViewOnceOpen` | `{account, senderAci(ACI/号码), timestamp(原消息 upstream 时间戳)}` | `{}` | 同 send；senderAci 不可解析/参数缺失或形状错 `-32603` | **P2 real（2026-10-04 阅后即焚扩面）**：官方 syncViewOnceOpen 同构——向自己 ACI 发 SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof viewOnceOpen=11，padded；多设备同步「该阅后即焚已被本机打开」），presage self-send 通路验证可行（§5，含钉定 rev 同内容二次转录重发怪癖）；与 sendViewedReceipt（作者面回执）双通道独立；fake：成功 `{}` |
 | `markRead` / `markViewed` | `{account, reads?\|viewed?: [{sender(ACI/号码), timestamp(原消息 upstream 时间戳)}]}`（markRead 用 `reads` 键、markViewed 用 `viewed` 键——官方 syncReadMessages/syncView 参数名同形；条目非空数组，列表缺席/空/非数组/条目缺 sender 或 timestamp/timestamp 非数字/sender 非字符串 `-32603`） | `{}` | sender 号码/UUID 不可解析（contacts 兜底后仍失败）`-32603`（整拒不发半批——发送面参数闸纪律）；未注册账号 `-32603` | **2026-10-11 real（KT 扩展，P14 组 6 自发多设备读态写面）**：官方 syncReadMessages/syncView 同构（SendMessage.preload.ts:2097/:2145）——向自己 ACI 发 SyncMessage.read=5/viewed=16（直接 repeated 字段，非 content oneof，多设备同步「这些消息已读/已看」）；ACI binary+string 双写（官方 isProtoBinaryEncodingEnabled 现行面/旧字符串面双兼容，viewOnceOpen 双写先例同构）；100 条/chunk 分信封（官方 syncHelpers.preload.ts:25 CHUNK_SIZE=100 同构）；padded sync message；与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执）双通道独立（官方 markConversationRead.preload.ts:252 注同位）；接收 echo 面 = §3 receive `syncMessage.read/viewed`（D2）；presage self-send 通路与 sendViewOnceOpen 同款；fake：成功 `{}`（落调度日志，reads/viewed 键逐字保留，协议上行面纪律） |
@@ -3973,6 +3974,51 @@ v1/devices/{id}）+ `Crypto.node.ts` decryptDeviceName（:142）+
 - **计数归真机回归**：服务器清单拉取/解绑结局需真机（fake 无服务器
   面），契约测试覆盖 fake 形状 + 参数闸逐形 + real 未注册折叠；单测钉
   设备名加解密往返（含 synthetic IV 篡改拒绝/裸 32B 无前缀拒绝）。
+
+
+### 窗D B11 名片发送臂 sendContact 批（2026-10-12，官方对齐 Signal-Desktop sendMessage contact 面，wire additive）
+
+缺口总登记 B11 的 engine 腿：新方法 `sendContact`（§3 一行）。官方锚：
+`ts/textsecure/SendMessage.preload.ts` toProto contact 段（:418-492）+
+`ts/types/EmbeddedContact.std.ts` numberToPhoneType/numberToEmailType/
+numberToAddressType（:108-156）+ `protos/SignalService.proto`
+DataMessage.Contact（:262-338，`DataMessage.contact`=9 repeated）。引擎
+此前名片面只有收投影（Q2 `projectContactCard`），无发送臂。
+
+- **proto 构造**：`DataMessage.contact` 单条目投影——name 六子字段、
+  number/email `{value,type,label}`、address 九子字段、organization
+  直投（官方 toProto 同位）；body/attachments 恒空（名片无正文位，官方
+  body=undefined 同位）；多条名片 = 调用方拆次调用（官方 API 面数组形
+  的单条目化，§5 记档）。
+- **type 词表面**：wire 词 number/email 四值 HOME|MOBILE|WORK|CUSTOM、
+  address 三值 HOME|WORK|CUSTOM（postal 枚举本无 MOBILE）；词→proto 枚
+  举单点映射，phone/email 两枚举同编号（HOME=1/MOBILE=2/WORK=3/
+  CUSTOM=4）共用一映射；type 缺省投影 HOME（官方 numberTo*Type(
+  undefined)→HOME 默认同位）。**偏差记档**：词表外官方静默归 HOME，引
+  擎按 textStyle 先例 fail-closed 拒绝（-32603）——静默改写调用方词比
+  拒绝更危险，§3 行同记。
+- **avatar 面**：单条 dataURI → `upload_attachments_for_send` 随批 CDN
+  上行取回 AttachmentPointer 进 Contact.Avatar（官方
+  EmbeddedContactWithUploadedAvatar 上传面同构；官方 avatar 位仅
+  contactEntry.avatar?.avatar 在场时成 Avatar，引擎无头像 = Avatar 位
+  缺席同位）；isProfile 恒 false（引擎 wire 面无该键——profile 头像
+  回填是桌面 UI 层职责，proto 缺席与 false 接收投影同值）；上行失败整
+  体 fail-closed（半发名片比拒绝更糟，send 附件面同纪律）。调度日志
+  contact.avatar 摘要化（「调度零头像字节」setProfile/updateGroup 同
+  纪律），contact 其余键逐字保留。
+- **通路**：直聊腿 = `send_message` + P9 身份拒发闸（名片同为内容面）；
+  群腿 = dispatch_group MRM 主路径（poll 群臂同款——open_group_sender
+  terminated 硬拒 + announcements 闸 + sender-key 主路径 vendored 逐收
+  件人 failover），群腿 outcomes 折叠（sendCallMessage 群臂同口径，应
+  答恒 `{timestamp}`）。
+- **记档**：桌面名片发送还带联系人间转发 UI 语义（联系人归属解析/
+  EmbeddedContact 组装归 connector/调用方，引擎收即所得）；官方
+  numberTo*Type 接受数字枚举面，引擎 wire 词面（textStyle 同构）。
+- **fake**：成功 `{"timestamp":u64}` 两腿同口径；参数闸（词表/形状/
+  两腿恰一）fake 同样生效（-32603 可契约测试）。
+- **计数归真机回归**：CDN 上行/对端投递需真机；契约测试覆盖 fake 形状
+  + 参数闸逐形 + 调度日志摘要化；单测钉 contact_proto 投影语义（词表
+  映射/缺省 HOME/avatar 两态/isProfile 恒 false）。
 
 
 ## 6. fake 服务模式（仅测试）

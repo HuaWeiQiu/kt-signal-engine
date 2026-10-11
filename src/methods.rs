@@ -14,10 +14,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    capabilities, parse_legacy_call_face, storage_sync, storage_write, DeleteForMeAuthor,
-    DeleteForMeConversation, DeleteForMeEntry, DeviceCapabilitiesError, LinkError,
-    MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange, SendSticker,
-    SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    capabilities, parse_legacy_call_face, parse_send_contact, storage_sync, storage_write,
+    DeleteForMeAuthor, DeleteForMeConversation, DeleteForMeEntry, DeviceCapabilitiesError,
+    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange,
+    SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -1179,6 +1179,91 @@ async fn dispatch(
                                 destination_device_id: None,
                             },
                         )
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
+        // sendContact（名片发送臂，窗D B11）：官方 DataMessage.contact=9
+        // repeated 单条目面（SendMessage.preload.ts:418-492 toProto contact
+        // 段 + EmbeddedContact.std.ts numberTo*Type 词表面同位）。协议上行
+        // 面落调度日志（send 系同纪律）；参数面 fail-closed（-32603）：
+        // recipient/groupId 两腿恰一（sendMessageRequestResponse 同款）、
+        // contact 缺席/非对象、name 在场非对象/子字段非字符串、
+        // number/email/address 在场非数组/条目非对象/value 缺席·非字符串·
+        // 空串/type 词表外（number/email 四值 HOME|MOBILE|WORK|CUSTOM、
+        // address 三值 HOME|WORK|CUSTOM——官方 numberTo*Type 词表外静默归
+        // HOME，引擎按 textStyle 先例拒绝，§5 偏差记档）/label·address 子
+        // 字段非字符串/organization 非字符串（空串=官方 falsy 同位归缺
+        // 席）/avatar 非字符串（data URI 形状归服务层上行闸，附件面同纪
+        // 律）。
+        "sendContact" => {
+            enum ContactTarget {
+                Recipient(String),
+                Group(String),
+            }
+            // 调度日志先落（send 系同款：被拒调用同样记录派发）；
+            // contact.avatar 键落盘前形状摘要化（头像 data URI 载荷零字
+            // 节进日志——setProfile/updateGroup「调度零头像字节」同纪律，
+            // 摘要以 URI 字符串长度记量级），contact 其余键逐字保留（名
+            // 片文本面是调用方自有数据，非 bulk 载荷）。
+            let mut logged_params = params.clone();
+            if let Some(Value::Object(contact)) = logged_params.get_mut("contact") {
+                if let Some(Value::String(uri)) = contact.get_mut("avatar") {
+                    let digest = format!("[avatar data uri: {} bytes]", uri.len());
+                    contact.insert("avatar".into(), json!(digest));
+                }
+            }
+            state.lock().await.append_dispatch(method, &logged_params);
+            let account = params.get("account").and_then(Value::as_str);
+            let contact = parse_send_contact(params.get("contact"));
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("groupId").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) if !text.is_empty() => Some(Some(text.clone())),
+                Some(_) => None,
+            };
+            let group = match params.get("groupId") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(|_| text.clone()))
+                }
+                Some(_) => None,
+            };
+            let target = match (recipient, group) {
+                (Some(Some(text)), None) => Some(ContactTarget::Recipient(text)),
+                (None, Some(Some(group_id))) => Some(ContactTarget::Group(group_id)),
+                _ => None,
+            };
+            match (account, target, contact) {
+                (Some(account), Some(ContactTarget::Recipient(recipient)), Some(payload)) => {
+                    match service.send_contact(account, &recipient, &payload).await {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                (Some(account), Some(ContactTarget::Group(group_id)), Some(payload)) => {
+                    match service
+                        .send_contact_group(account, &group_id, &payload)
                         .await
                     {
                         Ok(timestamp) => {
