@@ -2290,7 +2290,14 @@ async fn dispatch(
         // removeMembers：非空字符串数组（同解析；群态 members 面 →
         // delete_members、pending 面 → delete_members_pending_profile_key、
         // 两者皆非整拒 -32603——官方 buildDeleteMemberChange 不设防的 GUI
-        // 前置，API 面不静默）；全缺 = 无操作整拒 -32603（不静默 no-op），
+        // 前置，API 面不静默）；addFromInviteLinkAccess：词表字符串
+        // ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE（UNKNOWN 是读面兜底词不作
+        // 写意图、未知词/null/非字符串 -32603——官方
+        // buildAccessControlAddFromInviteLinkChange 枚举直通同位）；
+        // inviteLinkPassword：标准 base64 非空字符串（null/空串/坏 base64
+        // -32603；原始字节直入 modify_invite_link_password——官方
+        // buildInviteLinkPasswordChange `Bytes.fromBase64` 同位，长度服务器
+        // 裁决不本地硬闸）；全缺 = 无操作整拒 -32603（不静默 no-op），
         // 单项或组合在场均合法（同调合成单 change 一次 PATCH）；groupId/
         // account 纪律与 terminateGroup 同款；群头像上行链失败 → -1
         // GROUP_AVATAR_UPLOAD_FAILED + data {retryable:true, textSaved:false}
@@ -2366,6 +2373,34 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // 链接写面两臂（P13/任务2）：形状非法（null/未知词/非字符串/
+            // 空串/坏 base64）恒拒，与 title 键在场即闸同纪律。
+            let add_from_invite_link_access = match params.get("addFromInviteLinkAccess") {
+                None => None,
+                Some(Value::String(word)) => {
+                    use presage::libsignal_service::groups_v2::AccessRequired;
+                    let access = match word.as_str() {
+                        "ANY" => AccessRequired::Any,
+                        "MEMBER" => AccessRequired::Member,
+                        "ADMINISTRATOR" => AccessRequired::Administrator,
+                        "UNSATISFIABLE" => AccessRequired::Unsatisfiable,
+                        _ => return internal_error(id),
+                    };
+                    Some(access)
+                }
+                Some(_) => return internal_error(id),
+            };
+            let invite_link_password = match params.get("inviteLinkPassword") {
+                None => None,
+                Some(Value::String(text)) => {
+                    use base64::Engine as _;
+                    match base64::engine::general_purpose::STANDARD.decode(text) {
+                        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                        _ => return internal_error(id),
+                    }
+                }
+                Some(_) => return internal_error(id),
+            };
             // expiration 键在场但形状非法（null/字符串/负数/小数/超界）恒拒
             // ——与「合法缺席臂」（键不在场，avatar 在场时放行）区分。title
             // 键在场但 null/非字符串/空串恒拒（空串 = 官方 falsy no-op 语义
@@ -2377,12 +2412,14 @@ async fn dispatch(
                 return internal_error(id);
             }
             // 全缺 = 无操作整拒（不静默 no-op）：expiration/title/avatar/
-            // addMembers/removeMembers 至少一项在场。
+            // addMembers/removeMembers/链接两面至少一项在场。
             if expiration.is_none()
                 && title.is_none()
                 && avatar.is_none()
                 && add_members.is_empty()
                 && remove_members.is_empty()
+                && add_from_invite_link_access.is_none()
+                && invite_link_password.is_none()
             {
                 return internal_error(id);
             }
@@ -2395,6 +2432,8 @@ async fn dispatch(
                 avatar,
                 add_members,
                 remove_members,
+                add_from_invite_link_access,
+                invite_link_password,
             };
             match service
                 .update_group_change(account, master_key, write)

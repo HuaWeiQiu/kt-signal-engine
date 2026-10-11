@@ -1336,6 +1336,115 @@ fn update_group_remove_members_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// updateGroup 群链接写面（addFromInviteLinkAccess + inviteLinkPassword 参数
+/// 族，P13/任务2，官方 buildAccessControlAddFromInviteLinkChange/
+/// buildInviteLinkPasswordChange/buildNewGroupLinkChange 行为对齐）：fake
+/// 成功 `{status:"sent"}`（成员臂随桩成功同纪律，fake 无合成链）；双面同调
+/// 合法（同 version 单 change，官方 buildNewGroupLinkChange 同形）；参数面
+/// fail-closed（-32603：access 未知词/UNKNOWN/null/非字符串——UNKNOWN 是读
+/// 面兜底词不作写意图——password null/空串/坏 base64/非字符串）；调度日志
+/// 两键照旧逐字保留（链接密码非敏感载荷——20+ 调用方 wire 面本就明文携
+/// 密码，摘要有意不设）。
+#[test]
+fn update_group_group_link_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-group-link");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    // 16B 密码标准 base64（官方 GROUP_INVITE_LINK_PASSWORD_LENGTH = 16）。
+    let password_b64 = "qvUr2HnPjYWl3dBOYiF4mQ==";
+
+    // fake 合法面：access 单独在场 / password 单独在场 / 双面同调均成功
+    // {status:"sent"}。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "addFromInviteLinkAccess": "ANY"
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "inviteLinkPassword": password_b64
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "addFromInviteLinkAccess": "UNSATISFIABLE",
+                "inviteLinkPassword": password_b64
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状（access：未知词/UNKNOWN/小写词/null/非字符
+    // 串；password：null/空串/坏 base64/非字符串；groupId 闸照旧）。
+    let rejects = [
+        json!({ "account": "+15550000000", "groupId": group_id, "addFromInviteLinkAccess": "ANYBODY" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addFromInviteLinkAccess": "UNKNOWN" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addFromInviteLinkAccess": "any" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addFromInviteLinkAccess": null }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addFromInviteLinkAccess": 7 }),
+        json!({ "account": "+15550000000", "groupId": group_id, "inviteLinkPassword": null }),
+        json!({ "account": "+15550000000", "groupId": group_id, "inviteLinkPassword": "" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "inviteLinkPassword": "not base64!!" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "inviteLinkPassword": 42 }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "addFromInviteLinkAccess": "ANY" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：两键照旧逐字保留（成功 3 + 拒绝 10 = 13 行均落日志）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(entries.len(), 13, "成功三条 + 拒绝十条均落日志");
+    assert_eq!(
+        entries[0]["params"]["addFromInviteLinkAccess"],
+        json!("ANY")
+    );
+    assert_eq!(
+        entries[1]["params"]["inviteLinkPassword"],
+        json!(password_b64)
+    );
+
+    // real 模式未注册账号 + 链接两面在场：storage 上下文打不开折叠 -32603。
+    let real_dir = temp_dir("update-group-group-link-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({
+            "account": "+15559990000",
+            "groupId": group_id,
+            "addFromInviteLinkAccess": "ANY",
+            "inviteLinkPassword": password_b64
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// leaveGroup（群退出，KT 扩展方法，官方桌面 leaveGroupV2 行为对齐）：fake
 /// 成功 `{status:"left"}`（形状桩，不触网）；参数面 fail-closed（-32603：
 /// 缺 account / 缺 groupId / groupId 非 base64 / ≠32B）；调度日志 groupId

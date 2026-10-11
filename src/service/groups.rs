@@ -185,23 +185,31 @@ pub(crate) fn build_terminate_change(revision: u32) -> presage::proto::group_cha
     }
 }
 
-/// 群更新 change 合成核心（expiration/title/avatar 任意组合，至少一项在场
-/// 由调用方闸）：version = revision + 1（饱和不回卷），source_user_id/
-/// group_id 置空（terminate 面同纪律）；expiration 在场 =
-/// modify_disappearing_message_timer（加密 blob，官方
+/// 群更新 change 合成核心（expiration/title/avatar/link-access/link-password
+/// 任意组合，至少一项在场由调用方闸）：version = revision + 1（饱和不回
+/// 卷），source_user_id/group_id 置空（terminate 面同纪律）；expiration 在
+/// 场 = modify_disappearing_message_timer（加密 blob，官方
 /// buildDisappearingMessagesTimerChange 同构）；title 在场 = modify_title
 ///（加密 blob = GroupAttributeBlob{title}，官方 buildUpdateAttributesChange
 /// `if (title)` + buildGroupTitleBuffer 同构——空串 falsy no-op 语义在
 /// handler 面拒收，合成函数只认非空 title）；avatar_path 在场 =
 /// modify_avatar（Some(path) = 换新、Some("") = 移除，proto3 string 无
-/// presence——官方 `{avatar: null}` 线面空 message，服务器语义 = 清头像）。
-/// 一次调用单 Actions 多 action 单次 PATCH（§5 群头像上行面批合成裁定）。
+/// presence——官方 `{avatar: null}` 线面空 message，服务器语义 = 清头像）；
+/// link-access 在场 = modify_add_from_invite_link_access（proto 枚举直通，
+/// 官方 buildAccessControlAddFromInviteLinkChange/buildNewGroupLinkChange
+/// 同字段）；link-password 在场 = modify_invite_link_password（原始 16B，
+/// 官方 buildInviteLinkPasswordChange `Bytes.fromBase64` 同位——engine 面
+/// handler 已解 base64，此处不再编码）。一次调用单 Actions 多 action 单次
+/// PATCH（§5 群头像上行面批合成裁定；P13/任务2 链接两面顺延同口径）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_update_change(
     secret_params: &GroupSecretParams,
     revision: u32,
     expiration_secs: Option<u32>,
     title: Option<&str>,
     avatar_path: Option<String>,
+    add_from_invite_link_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    invite_link_password: Option<Vec<u8>>,
     randomness: [u8; 32],
 ) -> presage::proto::group_change::Actions {
     let mut actions = presage::proto::group_change::Actions {
@@ -240,6 +248,20 @@ pub(crate) fn build_update_change(
         actions.modify_avatar = Some(presage::proto::group_change::actions::ModifyAvatarAction {
             avatar: avatar_path,
         });
+    }
+    if let Some(access) = add_from_invite_link_access {
+        actions.modify_add_from_invite_link_access = Some(
+            presage::proto::group_change::actions::ModifyAddFromInviteLinkAccessControlAction {
+                add_from_invite_link_access: i32::from(access),
+            },
+        );
+    }
+    if let Some(password) = invite_link_password {
+        actions.modify_invite_link_password = Some(
+            presage::proto::group_change::actions::ModifyInviteLinkPasswordAction {
+                invite_link_password: password,
+            },
+        );
     }
     actions
 }
@@ -542,6 +564,12 @@ pub(crate) struct GroupUpdateWrite {
     pub(crate) avatar: Option<AvatarWrite>,
     pub(crate) add_members: Vec<String>,
     pub(crate) remove_members: Vec<String>,
+    /// 链接访问权写面（P13/任务2，词 ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE
+    /// 由 handler 解析；UNKNOWN 不作写意图词）。
+    pub(crate) add_from_invite_link_access:
+        Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    /// 链接密码写面（P13/任务2，标准 base64 由 handler 解码为原始 16B）。
+    pub(crate) invite_link_password: Option<Vec<u8>>,
 }
 
 /// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
@@ -641,6 +669,8 @@ pub(crate) async fn update_group_change(
         avatar,
         add_members,
         remove_members,
+        add_from_invite_link_access,
+        invite_link_password,
     } = write;
     let title = title.as_deref();
     use presage::libsignal_service::groups_v2::GroupMemberCandidate;
@@ -651,6 +681,8 @@ pub(crate) async fn update_group_change(
         && avatar.is_none()
         && add_members.is_empty()
         && remove_members.is_empty()
+        && add_from_invite_link_access.is_none()
+        && invite_link_password.is_none()
     {
         // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
         return Err(TerminateError::UnknownGroup);
@@ -758,6 +790,8 @@ pub(crate) async fn update_group_change(
         expiration_secs,
         title,
         avatar_path,
+        add_from_invite_link_access,
+        invite_link_password,
         randomness,
     );
     if !candidates.is_empty() {
@@ -1593,7 +1627,16 @@ mod tests {
         use rand::RngCore as _;
         rand::rng().fill_bytes(&mut randomness);
 
-        let actions = build_update_change(&secret_params, 41, Some(86_400), None, None, randomness);
+        let actions = build_update_change(
+            &secret_params,
+            41,
+            Some(86_400),
+            None,
+            None,
+            None,
+            None,
+            randomness,
+        );
         assert_eq!(actions.version, 42);
         let timer = actions
             .modify_disappearing_message_timer
@@ -1646,7 +1689,16 @@ mod tests {
         // 0 = 关闭：明文 duration 0 原样入 blob（不吞不转 None——线面
         // truth 在 duration 数值，关闭语义由消费方按 0 解读，官方
         // buildDisappearingMessagesTimerChange 对 expireTimer=0 同形状）。
-        let off = build_update_change(&secret_params, 3, Some(0), None, None, randomness);
+        let off = build_update_change(
+            &secret_params,
+            3,
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            randomness,
+        );
         let plaintext = secret_params
             .decrypt_blob_with_padding(
                 &off.modify_disappearing_message_timer
@@ -1664,11 +1716,31 @@ mod tests {
 
         // revision 0 → version 1；u32::MAX 饱和不回卷。
         assert_eq!(
-            build_update_change(&secret_params, 0, Some(60), None, None, randomness).version,
+            build_update_change(
+                &secret_params,
+                0,
+                Some(60),
+                None,
+                None,
+                None,
+                None,
+                randomness
+            )
+            .version,
             1
         );
         assert_eq!(
-            build_update_change(&secret_params, u32::MAX, Some(60), None, None, randomness).version,
+            build_update_change(
+                &secret_params,
+                u32::MAX,
+                Some(60),
+                None,
+                None,
+                None,
+                None,
+                randomness
+            )
+            .version,
             u32::MAX
         );
     }
@@ -1685,7 +1757,16 @@ mod tests {
         let master_key = [0x45u8; 32];
         let secret_params =
             GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
-        let actions = build_update_change(&secret_params, 7, Some(60), None, None, [0x77u8; 32]);
+        let actions = build_update_change(
+            &secret_params,
+            7,
+            Some(60),
+            None,
+            None,
+            None,
+            None,
+            [0x77u8; 32],
+        );
         assert_eq!(actions.version, 8);
         let bytes = actions.encode_to_vec();
         // version=8 varint: tag 0x10 (field 2, varint) + 0x08；
@@ -2253,6 +2334,8 @@ mod tests {
             None,
             None,
             Some("avatars/AbCdEf.g".to_owned()),
+            None,
+            None,
             [0u8; 32],
         );
         assert_eq!(replace.version, 42);
@@ -2277,7 +2360,16 @@ mod tests {
 
         // 移除：空串 = 空 message 在场（field 11 tag + len 0）——官方
         // {avatar: null} 线面。
-        let remove = build_update_change(&keyspace, 7, None, None, Some(String::new()), [0u8; 32]);
+        let remove = build_update_change(
+            &keyspace,
+            7,
+            None,
+            None,
+            Some(String::new()),
+            None,
+            None,
+            [0u8; 32],
+        );
         assert_eq!(remove.version, 8);
         assert_eq!(
             remove
@@ -2307,6 +2399,8 @@ mod tests {
                 None,
                 None,
                 Some("k".to_owned()),
+                None,
+                None,
                 [0u8; 32]
             )
             .version,
@@ -2330,6 +2424,8 @@ mod tests {
             Some(3_600),
             None,
             Some("avatars/Key1".to_owned()),
+            None,
+            None,
             [0x78u8; 32],
         );
         assert_eq!(actions.version, 6, "同 version 单 change");
@@ -2362,7 +2458,7 @@ mod tests {
 
         // 双缺 = 仅 version（零 action 空体；handler 面已闸，此处只钉
         // 合成函数不发明 action）。
-        let empty = build_update_change(&secret_params, 5, None, None, None, [0u8; 32]);
+        let empty = build_update_change(&secret_params, 5, None, None, None, None, None, [0u8; 32]);
         assert_eq!(empty.version, 6);
         assert!(empty.modify_disappearing_message_timer.is_none());
         assert!(empty.modify_avatar.is_none());
@@ -2380,8 +2476,16 @@ mod tests {
         let secret_params =
             GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
 
-        let actions =
-            build_update_change(&secret_params, 12, None, Some("新群名"), None, [0x79u8; 32]);
+        let actions = build_update_change(
+            &secret_params,
+            12,
+            None,
+            Some("新群名"),
+            None,
+            None,
+            None,
+            [0x79u8; 32],
+        );
         assert_eq!(actions.version, 13);
         let title = &actions
             .modify_title
@@ -2420,12 +2524,138 @@ mod tests {
         assert_eq!(blob_len, 44, "AES-GCM-SIV 填充密文定长（11B 明文面）");
 
         // title + expiration 组合：同 version 双 action（合成单 change 裁定）。
-        let combo =
-            build_update_change(&secret_params, 5, Some(60), Some("名"), None, [0x7au8; 32]);
+        let combo = build_update_change(
+            &secret_params,
+            5,
+            Some(60),
+            Some("名"),
+            None,
+            None,
+            None,
+            [0x7au8; 32],
+        );
         assert_eq!(combo.version, 6);
         assert!(combo.modify_disappearing_message_timer.is_some());
         assert!(combo.modify_title.is_some());
         assert!(combo.modify_avatar.is_none());
+    }
+
+    /// 合成 change（群链接写面两面，P13/任务2）：link-access 臂 =
+    /// modify_add_from_invite_link_access（proto 枚举直通，官方
+    /// buildAccessControlAddFromInviteLinkChange/buildNewGroupLinkChange 同
+    /// 字段同值域）；link-password 臂 = modify_invite_link_password（原始
+    /// 密码字节直入，官方 buildInviteLinkPasswordChange `Bytes.fromBase64`
+    /// 同位）；双面同 version 单 change；其余 action 全部缺席。wire 字节钉
+    /// 死字段编号（modify_add_from_invite_link_access = field 15 wire 2、
+    /// modify_invite_link_password = field 19 wire 2）。
+    #[test]
+    fn update_change_group_link_arms_wire_shape() {
+        use presage::libsignal_service::groups_v2::AccessRequired;
+        let master_key = [0x4bu8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+
+        // link-access 单臂：ANY 枚举直通（proto 值 1）。
+        let enable = build_update_change(
+            &secret_params,
+            7,
+            None,
+            None,
+            None,
+            Some(AccessRequired::Any),
+            None,
+            [0x7bu8; 32],
+        );
+        assert_eq!(enable.version, 8);
+        let access = enable
+            .modify_add_from_invite_link_access
+            .as_ref()
+            .expect("link access action 在场")
+            .add_from_invite_link_access;
+        assert_eq!(access, AccessRequired::Any as i32);
+        assert!(enable.modify_invite_link_password.is_none());
+        assert!(enable.modify_avatar.is_none());
+        assert!(enable.modify_title.is_none());
+        assert!(enable.source_user_id.is_empty());
+        assert!(enable.group_id.is_empty());
+
+        // wire 面：field 15 tag 0x7a + len + {field 1 tag 0x08 + varint 1}。
+        let bytes = enable.encode_to_vec();
+        assert_eq!(&bytes[0..2], &[0x10, 0x08], "version=8 字段头");
+        assert_eq!(
+            bytes[2], 0x7a,
+            "modify_add_from_invite_link_access tag (field 15, wire 2)"
+        );
+        assert_eq!(bytes[3], 2, "内层 (0x08, 0x01) 定长");
+        assert_eq!(&bytes[4..6], &[0x08, 0x01], "枚举子字段 tag + ANY 值");
+        assert_eq!(bytes.len(), 6, "无尾随字段");
+
+        // link-password 单臂：原始字节直入（不二次编码）。
+        let password = [0xa5u8; 16].to_vec();
+        let reset = build_update_change(
+            &secret_params,
+            3,
+            None,
+            None,
+            None,
+            None,
+            Some(password.clone()),
+            [0x7cu8; 32],
+        );
+        assert_eq!(reset.version, 4);
+        assert_eq!(
+            reset
+                .modify_invite_link_password
+                .as_ref()
+                .expect("link password action 在场")
+                .invite_link_password,
+            password,
+            "密码字节原样直入"
+        );
+
+        // wire 面：field 19 两字节 tag 0x9a 0x01 + len + {0x0a + len + 16B}。
+        let bytes = reset.encode_to_vec();
+        assert_eq!(&bytes[0..2], &[0x10, 0x04], "version=4 字段头");
+        assert_eq!(
+            &bytes[2..4],
+            &[0x9a, 0x01],
+            "modify_invite_link_password tag (field 19, wire 2)"
+        );
+        assert_eq!(bytes[4], 18, "内层 (0x0a, 16, 16B) 定长");
+        assert_eq!(bytes[5], 0x0a, "密码子字段 tag (field 1, wire 2)");
+        assert_eq!(bytes[6], 16, "密码长度");
+        assert_eq!(&bytes[7..23], &password[..], "密文字节收尾即消息尾");
+        assert_eq!(bytes.len(), 23, "无尾随字段");
+
+        // 双面组合：同 version 单 change（官方 buildNewGroupLinkChange 同形——
+        // 启用即同时旋转密码）。
+        let new_link = build_update_change(
+            &secret_params,
+            0,
+            None,
+            None,
+            None,
+            Some(AccessRequired::Unsatisfiable),
+            Some(vec![1, 2, 3, 4]),
+            [0x7du8; 32],
+        );
+        assert_eq!(new_link.version, 1);
+        assert_eq!(
+            new_link
+                .modify_add_from_invite_link_access
+                .as_ref()
+                .expect("access 在场")
+                .add_from_invite_link_access,
+            AccessRequired::Unsatisfiable as i32
+        );
+        assert_eq!(
+            new_link
+                .modify_invite_link_password
+                .as_ref()
+                .expect("password 在场")
+                .invite_link_password,
+            vec![1, 2, 3, 4]
+        );
     }
 
     /// addMembers change（群写面 P3 批）pending 臂：无凭据候选（PNI/无
