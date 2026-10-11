@@ -685,6 +685,42 @@ fn build_delete_for_me_conversation_sync(
     }
 }
 
+/// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
+/// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
+/// SyncMessage.content.Request{type}，padded sync message。
+fn build_sync_request(
+    r#type: presage::proto::sync_message::request::Type,
+) -> presage::proto::SyncMessage {
+    presage::proto::SyncMessage {
+        content: Some(presage::proto::sync_message::Content::Request(
+            presage::proto::sync_message::Request {
+                r#type: Some(r#type as i32),
+            },
+        )),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
+}
+
+/// 链接完成 sync 上行三请求（P15c 项4，官方 sendSyncRequests 同位，
+/// syncRequests.preload.ts:11-34 / afterEveryLinkedStartupOnNewVersion
+/// 触发）：新设备/链接启动向主设备要 contacts/configuration/block 三族
+/// 全量 sync（三封独立 SyncMessage.Request 上行，官方 singleProtoJobQueue
+/// × 3 同形态；contacts 腿 = presage 官方 request_contacts API）。引擎
+/// 既有 60s 一次性纪律保留（重连风暴不重复轰主设备），请求族由 contacts
+/// 一腿补齐为官方三腿；每腿独立 best-effort（官方 Promise.all 一损俱损，
+/// 引擎零 stderr 纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。
+async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) {
+    let _ = manager.request_contacts().await;
+    let own_aci = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
+    for r#type in [
+        presage::proto::sync_message::request::Type::Configuration,
+        presage::proto::sync_message::request::Type::Blocked,
+    ] {
+        let body = ContentBody::SynchronizeMessage(build_sync_request(r#type));
+        let _ = manager.send_message(own_aci, body, now_ms()).await;
+    }
+}
+
 /// E.164 形状闸（`+` 前缀 + 1..=15 位 ASCII 数字；deleteForMeConversation
 /// conversation/author E164 臂用——引擎无号码库语义，形状闸 fail-closed）。
 pub(crate) fn is_e164(text: &str) -> bool {
@@ -3977,12 +4013,12 @@ async fn serve_account_stream(
         Err(_) => return StreamOutcome::Recoverable,
     };
     // 存量联系人/会话补同步（欠账 §10-1，官方行为对齐：signal-cli/桌面
-    // 链接后同样向主设备要一轮 contacts sync）：链路建立 2s 沉降后
-    // request_contacts（presage 官方 API，SyncMessage.request=contacts），
-    // 主设备回传经接收流落 contacts 表 → connector listContacts 出骨架。
-    // warn-only（本层零 stderr，失败静默）；每账号 60s 一次性，watchdog
-    // 断连重开不重复。群组不在本面（presage 栈无 groups sync 消费路径，
-    // 首条群消息渐进落库=官方链接设备同款）。
+    // 链接后同样向主设备要一轮 sync）：链路建立 2s 沉降后上行官方
+    // sendSyncRequests 三请求（contacts/configuration/block，P15c 项4——
+    // 此前仅 contacts 一腿），主设备回传经接收流落 contacts/配置/拉黑
+    // 各面 → connector 消费。warn-only（本层零 stderr，失败静默）；每账号
+    // 60s 一次性，watchdog 断连重开不重复。群组不在本面（presage 栈无
+    // groups sync 消费路径，首条群消息渐进落库=官方链接设备同款）。
     let mut sync_pending = match *last_contacts_sync {
         Some(at) if at.elapsed() < Duration::from_secs(60) => None,
         _ => Some(tokio::time::Instant::now() + Duration::from_secs(2)),
@@ -4009,9 +4045,10 @@ async fn serve_account_stream(
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
-                    // 官方 request_contacts：成功/失败都不重试（一次性纪律，
-                    // 下次链路建立再补）。
-                    let _ = manager.request_contacts().await;
+                    // 链接完成 sync 上行三请求（P15c 项4）：官方
+                    // sendSyncRequests 同位——成功/失败都不重试（一次性
+                    // 纪律，下次链路建立再补）。
+                    send_initial_sync_requests(&mut manager).await;
                     *last_contacts_sync = Some(std::time::Instant::now());
                 }
             }, if sync_pending.is_some() => {
@@ -14118,6 +14155,28 @@ mod tests {
                     assert_eq!(context.revision, revision);
                 }
             }
+        }
+    }
+
+    /// P15c 项4 syncRequests 单请求构帧：SyncMessage.content.Request{type}
+    /// 枚举直通（CONFIGURATION=4/BLOCKED=3，官方
+    /// getRequestConfigurationSyncMessage/getRequestBlockSyncMessage 同位）。
+    #[test]
+    fn sync_request_frame_carries_type() {
+        for (word, value) in [
+            (
+                presage::proto::sync_message::request::Type::Configuration,
+                4,
+            ),
+            (presage::proto::sync_message::request::Type::Blocked, 3),
+        ] {
+            let sync = build_sync_request(word);
+            let presage::proto::sync_message::Content::Request(request) =
+                sync.content.as_ref().expect("content")
+            else {
+                panic!("request content");
+            };
+            assert_eq!(request.r#type, Some(value), "{value} 枚举直通");
         }
     }
 

@@ -3591,6 +3591,24 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   向自己 ACI 发 padded sync message（self-send 通路 E4 已验证同款）；
   协议上行面落调度日志。desktop 上行接线归后续批（connector/desktop
   消费缺口移交主线：桌面会话删除流现仅清自有库，多设备同步缺上行腿）。
+- **项4 syncRequests 上行三请求（链组一 N1，sendSyncRequests 同位，wire
+  additive 无新事件）**：求证结论：引擎链接完成流程（finish_link →
+  spawn_pipeline → serve_account_stream）已有链后 sync 上行步，但仅
+  contacts 一腿（presage `request_contacts`，60s 一次性 + 2s 沉降纪律，
+  欠账 §10-1 批遗留）——官方 sendSyncRequests（syncRequests.preload.ts:
+  11-34，afterEveryLinkedStartupOnNewVersion/auth socket 建流触发）是
+  contacts/configuration/block 三请求并发。落法：既有 sync_pending 臂扩为
+  `send_initial_sync_requests` 三腿（contacts 腿保持 presage 官方 API，
+  configuration/block 腿 = SyncMessage.content.Request{CONFIGURATION=4/
+  BLOCKED=3} 构帧上行——官方 getRequestConfigurationSyncMessage/
+  getRequestBlockSyncMessage 同位，padded sync message）；既有 60s 一次性
+  纪律保留（重连风暴不重复轰主设备，官方每次建流都发、引擎按欠账批既有
+  取舍收敛——偏差登记：短重连窗口内 configuration/block 可能比官方晚一拍
+  补发）；每腿独立 best-effort（官方 Promise.all 一损俱损，引擎零 stderr
+  纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。上行 sync
+  message 非投影，无新事件无新方法；主设备回传经接收流既有各面落库
+  （contacts → Received::Contacts 投影、configuration/block → 收包臂既有
+  投影）。单测 sync_request_frame_carries_type 钉枚举直通。
 
 
 ## 6. fake 服务模式（仅测试）
