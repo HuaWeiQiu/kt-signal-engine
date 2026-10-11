@@ -103,7 +103,8 @@ send message: Signal server unavailable.
 | `setConversationPinned` | `{account, conversationId, kind: contact\|group\|legacyGroup, pinned(bool)}` | `{pinned: [...]}`（写后全量，同 getPinnedConversations 形状） | 云引用解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次/写面冲突重放中失败 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/未知 kind/未注册账号 `-32603` | **P4 real**：官方 upload 语义（读改写 AccountRecord 仅动 pinned 字段、prost round-trip 保真其余字段、新 16B item id、version+1/source_device/record_ikm 透传）+ `PUT v1/storage/` + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；写面为 presage 上游缺口自建薄封装（上游补齐后替换）；fake：成功回 `{pinned: []}` |
 | `getStickerPackSyncs` | `{account}` | `{packs: [{packId(hex 32 小写), packKey(base64 32B)\|null, position, deletedAtTimestampMs}]}`（存储序 = manifest STICKER identifiers 首现序；坏条目跳过不炸面；墓碑 packKey=null、带 deletedAtTimestampMs） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real**：Storage Service manifest → 全部 type=6 STICKER identifier 批量读 → StickerPackRecord 投影（记录面为 presage 上游 proto 缺口本地定义 + 加解密 shim，§5）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；fake：恒 `{packs: []}` |
 | `setStickerPackSync` | `{account, packId(hex 32 小写), installed(bool), packKey?(base64 32B), position?}`（install 必带有效 packKey；uninstall 忽略 packKey 内容与 position，官方墓碑形态两字段皆不写） | `{packs: [...]}`（写后全量，同 getStickerPackSyncs 形状） | PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（packId 非小写 hex、install 缺/短/非字符串 packKey、packKey 非字符串、position 超 u32 或非数值）/未注册账号 `-32603` | **P5 real**：官方 toStickerPackRecord 语义（install 幂等：同 key 已装且未要求挪位→no-op；position 缺省=保持现位/无现位本地 MAX+1；uninstall 墓碑 deletedAtTimestampMs=引擎时钟，不物理删旧 record）+ 读改写仅动该 pack record + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；fake：成功回 `{packs: []}` |
-| `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?, storiesDisabled?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)/storiesDisabled(29)（2026-10-12 窗D B5 增，§5 块），读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
+| `getConfiguration` | `{account}` | `{readReceipts, typingIndicators, linkPreviews, unlistedPhoneNumber, storiesDisabled, phoneNumberSharingMode?: "everybody"\|"nobody"}`（五布尔键恒在——false = 位缺省；phoneNumberSharingMode 词表内才投，UNKNOWN(0)/词表外 = 键缺席——未设口径 + 读面宁缺勿错不发明第三词；六键 = setAccountConfiguration 可写面镜像） | account 缺席·非字符串/未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-12 real（KT 扩展，窗D B6 读腿，§5 块）**：真相源 = Storage Service AccountRecord 配置字段面（官方 mergeAccountRecord 配置段消费同点；P15c 项2「JSON 读面无消费方不补」的偏差就此解除——B6 三批写穿补链的 connector/desktop 消费方在途）；从未有 storage 状态（无 master key / manifest 404 / Account item 缺席）= 全缺省面（诚实缺省不报错，getConversationState 缺省桩同口径）；fake：恒全缺省面，不落调度日志（读面纪律） |
+| `setAccountConfiguration` | `{account, readReceipts?, typingIndicators?, phoneNumberSharingMode?: "everybody"\|"nobody", unlistedPhoneNumber?, storiesDisabled?, linkPreviews?}`（只写提供的字段；至少一项） | `{}` | 提供字段已全部满足 → 幂等无写成功；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失（含零可写字段）/形状错（布尔字段非布尔、phoneNumberSharingMode 非法值或非字符串）/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateConfiguration 等价）**：真相源 = AccountRecord 的 readReceipts(6)/typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)/storiesDisabled(29)（2026-10-12 窗D B5 增，§5 块）/linkPreviews(11)（2026-10-12 窗D B6 增，§5 块），读改写仅动提供字段（字段保真铁面同款链路），+ 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；枚举 everybody=1/nobody=2（桌面 v8.31/Android 现行一致，旧 CONTACTS_ONLY 已从官方 proto 移除不收）；真相源单点（AccountRecord），其他设备经 storage sync 收敛，无额外同步广播；fake：成功 `{}` |
 | `setProfile` | `{account, givenName, familyName?, about?, emoji?, avatar?}`（文字面全量写：givenName 必填非空，familyName/about/emoji 缺省=置空，官方 updateProfile 同口径；字节预算 UTF-8：given/family 各 ≤128B、about ≤512B、emoji ≤32B，超限 `-32603`；avatar 三态：缺省=保留现有、data URI=换新、null=移除） | `{"status":"saved"}` | 头像上行（profile PUT/CDN POST）失败 `-1 PROFILE_UPLOAD_FAILED`（data `{retryable:true, textSaved}`——textSaved=true 如实呈现文字面已提交的部分成功）；storage 链路同 `setAccountConfiguration` 四码；参数缺失/givenName 空、familyName/about/emoji 非字符串或超字节预算、avatar 非 image 族 data URI/非 base64/超 10MB/非字符串/未注册账号 `-32603` | **P5 real（2026-10-05 官方 updateProfile 等价）+ 对齐批②（2026-10-06 形状/错误/预算面，详见 §5）**：文字面走 presage `Manager::update_profile`（retain_avatar=true）；头像面为上游双层缺口自建薄封装（官方桌面 putProfile+uploadAvatar 行为对齐：`PUT /v1/profile` JSON `{version, name, about, aboutEmoji(加密 b64), avatar, sameAvatar:false, commitment(b64)}` → 响应上传属性 → 加密头像 multipart POST CDN0 根 → avatar path=响应 key，详见 §5）；写后 storage 面 AccountRecord.givenName/familyName/avatarUrlPath 同步；fake：成功 `{"status":"saved"}`，不落调度日志 |
 | `setUniversalExpireTimer` | `{account, expirationInSeconds}`（0=关闭） | `{}` | 同值幂等无写成功；PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`；参数缺失/形状错（timer 字符串/负数/小数/超 u32）/未注册账号 `-32603` | **P5 real（2026-10-05，E 批「不可达」结论勘误后落地）**：真相源 = AccountRecord.universalExpireTimer(17)（① vendored 官方 proto），读改写仅动该字段 + 409 响应体采纳重放；从未有 storage 状态 → master key 播种 + version 1 最小 AccountRecord（§5）；账户级默认值无广播（会话级计时器才广播 expiration-update），其他设备经 storage sync 收敛；fake：成功 `{}` |
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup, blockedAtTimestampMs?(u64 毫秒)}]}`（存储序；条目形状与置顶面同构 + blockedAtTimestampMs 透出（2026-10-12 窗D B7，wire additive）——contact/GV2 记录 blockedAtTimestamp>0 在场、0=官方「拉黑时刻未知」口径与无该位的 GV1 记录键缺席） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）+ 2026-10-12 窗D B7（blockedAt 透出，§5 块）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
@@ -3572,7 +3573,9 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
     proto 全字段保真）。官方桌面消费实锤（mergeAccountRecord 应用配置字
     段）。JSON-RPC 读面（getAccountConfiguration 形状）无消费方——按
     §4.50「不发明无消费方读面」纪律不补，connector/desktop 接线提出需求
-    再立项（偏差登记）。
+    再立项（偏差登记）。〔2026-10-12 窗D B6 批1 解除：读面
+    `getConfiguration` 随 B6 写穿补链落地（消费方 = connector/desktop
+    后续批），见 §5 窗D B6 块。〕
   - **UniversalTimer：官方桌面也不消费（族不存在于现行协议面），记档
     跳过**。现行官方 SignalStorage.proto ManifestRecord.Identifier.Type
     词表（UNKNOWN/CONTACT/GROUPV1/GROUPV2/ACCOUNT/STORY_DISTRIBUTION_LIST/
@@ -4178,6 +4181,44 @@ getGroupMigrationMembers → avatar 上行 → revision 0 + accessControl
   出现，且该窗内引擎按生成龄轮换重传，收敛到的服务器状态与官方一致。
   收编成本（vendored store confirmed 位 + 上传成功回写 + 读面切换）大
   于语义收益，维持现登记。
+
+
+### 窗D B6 linkPreviews 账号级写穿补链·批1（2026-10-12，官方对齐 Signal-Desktop storageRecordOps，wire additive）
+
+缺口总登记 B6 的 engine 腿（三批硬串行批1；批2 connector、批3 desktop
+不归本仓）：引擎 `AccountConfigurationUpdate` 此前只收 readReceipts(6)/
+typingIndicators(8)/phoneNumberSharingMode(12)/unlistedPhoneNumber(13)/
+storiesDisabled(29) 五位，linkPreviews(11) 无写通道（vendored 生成 proto
+既有该字段——`src/proto/storage.rs` AccountRecord.link_previews tag 11，
+round-trip 保真单测早已钉定，仅缺写面接线）。
+
+- **官方锚**：`protos/SignalStorage.proto` AccountRecord.linkPreviews
+  （field 11）+ `ts/services/storageRecordOps.preload.ts` 官方消费面
+  （:630 toAccountRecord 写面 = `getLinkPreviewSetting()` itemStorage
+  'linkPreviews' 镜像、:1786-1788 merge 读面 = typeof boolean 闸
+  itemStorage.put 回灌）。
+- **闭合方式**：`setAccountConfiguration` 增可选 `linkPreviews` 布尔位
+  （参数闸沿 optional_bool fail-closed 惯例，非布尔 -32603；零可写字段
+  闸同批并入）——该方法是引擎既有 AccountRecord 部分写面（官方
+  updateConfiguration 等价），linkPreviews 是同真相源的账号级开关，并入
+  即官方 toAccountRecord 同位写，不新开写方法。
+- **读腿（新方法 getConfiguration）**：AccountRecord 配置字段面 →
+  setAccountConfiguration 可写六位镜像 JSON 投影（五布尔键恒在，
+  phoneNumberSharingMode 词表内才投——UNKNOWN(0)/词表外 = 键缺席，读面
+  宁缺勿错不发明第三词；官方 merge 对未知值回落缺省是端上消费面，引擎
+  如实缺席）。真相源 = Storage Service（多设备经 storage sync 收敛）；
+  从未有 storage 状态 = 全缺省面（诚实缺省不报错）。**P15c 项2「JSON
+  读面无消费方不补」的偏差就此解除**——B6 三批写穿补链的 connector/
+  desktop 消费方在途，消费需求成立故立项（§4.50 纪律不受损）。
+- **未知键静默忽略纪律不破坏（批1 ④）**：params 解析 = 白名单取键
+  （params.get），未知键不参与闸、不炸面；契约测试钉「合法位 + 未知键
+  同场照常生效」。
+- **fake**：setAccountConfiguration 成功 `{}` 不变（写面纪律）；
+  getConfiguration 恒全缺省面（五布尔键 + sharing mode 缺席）；写后回
+  显链（写面产出记录 → 读投影回显写后值）由 bin 单测
+  `account_configuration_face_projects_record_and_write_echo` 钉形
+  （fake 无 storage 态不回显）；契约测试补 linkPreviews 单写成功形状 +
+  非布尔拒绝 + getConfiguration 形状/参数面。
 
 
 ## 6. fake 服务模式（仅测试）

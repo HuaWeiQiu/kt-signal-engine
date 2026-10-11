@@ -2180,6 +2180,9 @@ pub(crate) struct AccountConfigurationUpdate {
     /// storiesDisabled(29)（窗D B5，官方 toAccountRecord itemStorage
     /// 'hasStoriesDisabled' 同位——Stories 面跨设备收敛写位）。
     pub(crate) stories_disabled: Option<bool>,
+    /// linkPreviews(11)（窗D B6，官方 toAccountRecord getLinkPreviewSetting
+    /// 同位 = itemStorage 'linkPreviews' 镜像——链接预览面跨设备收敛写位）。
+    pub(crate) link_previews: Option<bool>,
 }
 
 /// AccountRecord 读-改-写保真核心（设置面）：只覆写提供的字段，其余字段
@@ -2195,6 +2198,7 @@ pub(crate) fn account_record_with_configuration(
         phone_number_sharing_mode,
         unlisted_phone_number,
         stories_disabled,
+        link_previews,
     } = update;
     let mut updated = record.clone();
     let mut changed = false;
@@ -2217,6 +2221,10 @@ pub(crate) fn account_record_with_configuration(
     if let Some(value) = stories_disabled {
         changed |= updated.stories_disabled != *value;
         updated.stories_disabled = *value;
+    }
+    if let Some(value) = link_previews {
+        changed |= updated.link_previews != *value;
+        updated.link_previews = *value;
     }
     changed.then_some(updated)
 }
@@ -2294,8 +2302,8 @@ pub(crate) async fn write_universal_expire_timer(
 /// 骨架 + 设置面 mutate。官方 updateConfiguration 等价——真相源 =
 /// AccountRecord 的 readReceipts(6)/typingIndicators(8)/
 /// phoneNumberSharingMode(12)/unlistedPhoneNumber(13)/storiesDisabled(29)
-///（窗D B5），读改写仅动提供的字段，其余账号设置原样（字段保真铁面同
-/// 款链路）。
+///（窗D B5）/linkPreviews(11)（窗D B6），读改写仅动提供的字段，其余账号
+/// 设置原样（字段保真铁面同款链路）。
 pub(crate) async fn write_account_configuration(
     context: &StorageContext,
     update: AccountConfigurationUpdate,
@@ -2305,6 +2313,44 @@ pub(crate) async fn write_account_configuration(
     })
     .await
     .map(|_| ())
+}
+
+/// 账号级设置读投影（getConfiguration，窗D B6）：AccountRecord 配置字段
+/// 面 → setAccountConfiguration 可写六位镜像（真相源同点，读改写同族）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct AccountConfigurationFace {
+    pub(crate) read_receipts: bool,
+    pub(crate) typing_indicators: bool,
+    pub(crate) link_previews: bool,
+    /// PhoneNumberSharingMode API 词（"everybody"/"nobody"）；UNKNOWN(0)/
+    /// 词表外数值 = None（wire 键缺席：未设口径 + 读面宁缺勿错，不发明
+    /// 第三词——官方 merge 对未知值回落缺省是端上消费面，引擎如实缺席）。
+    pub(crate) phone_number_sharing_mode: Option<&'static str>,
+    pub(crate) unlisted_phone_number: bool,
+    pub(crate) stories_disabled: bool,
+}
+
+/// PhoneNumberSharingMode 数值 → API 词（everybody=1/nobody=2；UNKNOWN(0)
+/// 与词表外数值 = None）。
+fn phone_number_sharing_mode_word(raw: i32) -> Option<&'static str> {
+    match account_record::PhoneNumberSharingMode::try_from(raw) {
+        Ok(account_record::PhoneNumberSharingMode::Everybody) => Some("everybody"),
+        Ok(account_record::PhoneNumberSharingMode::Nobody) => Some("nobody"),
+        _ => None,
+    }
+}
+
+/// AccountRecord → 账号级设置读投影（getConfiguration 真相源入口；记录
+/// 缺席调用方以 `AccountRecord::default()` 进 = 全缺省面）。
+pub(crate) fn account_configuration_of_record(record: &AccountRecord) -> AccountConfigurationFace {
+    AccountConfigurationFace {
+        read_receipts: record.read_receipts,
+        typing_indicators: record.typing_indicators,
+        link_previews: record.link_previews,
+        phone_number_sharing_mode: phone_number_sharing_mode_word(record.phone_number_sharing_mode),
+        unlisted_phone_number: record.unlisted_phone_number,
+        stories_disabled: record.stories_disabled,
+    }
 }
 
 /// contact 会话 → (ServiceId, e164?)（ACI 优先）：UUID 形状直通 → 本机号
@@ -3445,6 +3491,17 @@ mod tests {
         assert_eq!(updated.phone_number_sharing_mode, everybody);
         assert_eq!(updated.username, "kt.01");
 
+        // linkPreviews（窗D B6）：写位生效，其余字段原样。
+        let update = AccountConfigurationUpdate {
+            link_previews: Some(true),
+            ..AccountConfigurationUpdate::default()
+        };
+        let updated = account_record_with_configuration(&base, &update).expect("changes");
+        assert!(updated.link_previews);
+        assert!(!updated.stories_disabled);
+        assert_eq!(updated.phone_number_sharing_mode, everybody);
+        assert_eq!(updated.username, "kt.01");
+
         // 幂等：提供字段与现状全等 → None（无写面）。
         let same = AccountConfigurationUpdate {
             read_receipts: Some(false),
@@ -3452,6 +3509,7 @@ mod tests {
             phone_number_sharing_mode: Some(everybody),
             unlisted_phone_number: Some(false),
             stories_disabled: Some(false),
+            link_previews: Some(false),
         };
         assert!(account_record_with_configuration(&base, &same).is_none());
 
@@ -3460,6 +3518,80 @@ mod tests {
         assert_eq!(phone_number_sharing_mode_of("nobody"), Some(nobody));
         assert_eq!(phone_number_sharing_mode_of("contactsOnly"), None);
         assert_eq!(phone_number_sharing_mode_of(""), None);
+    }
+
+    /// 账号级设置读投影（getConfiguration，窗D B6）：写面产出记录 → 读
+    /// 投影回显（写后回显+读投影同链钉形）；UNKNOWN(0)/词表外 sharing
+    /// mode = None（wire 键缺席口径）；缺省记录 = 全缺省面。
+    #[test]
+    fn account_configuration_face_projects_record_and_write_echo() {
+        use crate::proto::storage::account_record as off_account;
+        use crate::proto::storage::AccountRecord as Official;
+
+        let everybody = off_account::PhoneNumberSharingMode::Everybody as i32;
+        let base = Official {
+            read_receipts: true,
+            typing_indicators: false,
+            link_previews: true,
+            phone_number_sharing_mode: everybody,
+            unlisted_phone_number: true,
+            stories_disabled: true,
+            ..Official::default()
+        };
+        let face = account_configuration_of_record(&base);
+        assert!(face.read_receipts);
+        assert!(!face.typing_indicators);
+        assert!(face.link_previews);
+        assert_eq!(face.phone_number_sharing_mode, Some("everybody"));
+        assert!(face.unlisted_phone_number);
+        assert!(face.stories_disabled);
+
+        // 写后回显：写面改 link_previews/reading 面 → 新记录投影出写后值。
+        let updated = account_record_with_configuration(
+            &base,
+            &AccountConfigurationUpdate {
+                link_previews: Some(false),
+                typing_indicators: Some(true),
+                ..AccountConfigurationUpdate::default()
+            },
+        )
+        .expect("changes");
+        let echoed = account_configuration_of_record(&updated);
+        assert!(!echoed.link_previews);
+        assert!(echoed.typing_indicators);
+        assert!(echoed.read_receipts);
+
+        // sharing mode：nobody 词、UNKNOWN(0)/词表外数值 → None（键缺席）。
+        let nobody = Official {
+            phone_number_sharing_mode: off_account::PhoneNumberSharingMode::Nobody as i32,
+            ..Official::default()
+        };
+        assert_eq!(
+            account_configuration_of_record(&nobody).phone_number_sharing_mode,
+            Some("nobody")
+        );
+        let unknown = Official {
+            phone_number_sharing_mode: off_account::PhoneNumberSharingMode::Unknown as i32,
+            ..Official::default()
+        };
+        assert_eq!(
+            account_configuration_of_record(&unknown).phone_number_sharing_mode,
+            None
+        );
+        let out_of_vocab = Official {
+            phone_number_sharing_mode: 7,
+            ..Official::default()
+        };
+        assert_eq!(
+            account_configuration_of_record(&out_of_vocab).phone_number_sharing_mode,
+            None
+        );
+
+        // 缺省记录 = 全缺省面（从未有 storage 状态投影，与 Default 面一致）。
+        assert_eq!(
+            account_configuration_of_record(&Official::default()),
+            AccountConfigurationFace::default()
+        );
     }
 
     /// universal timer mutate（setUniversalExpireTimer）：只覆写

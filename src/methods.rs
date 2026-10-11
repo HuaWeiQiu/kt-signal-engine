@@ -2077,6 +2077,22 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // 账号级设置读投影（getConfiguration，窗D B6 KT 扩展方法）：
+        // setAccountConfiguration 可写六位镜像读面——真相源 = Storage
+        // Service AccountRecord（官方 mergeAccountRecord 配置段消费同点，
+        // B6 写穿补链批1 的读腿，消费方 = connector/desktop 后续批）；
+        // 从未有 storage 状态 = 全缺省面（诚实缺省不报错，getConversation
+        // State 缺省桩同口径）；参数面白名单取键，未知键静默忽略纪律照旧。
+        "getConfiguration" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.get_configuration(account).await {
+                Ok(face) => jsonrpc::success_response(id, account_configuration_payload(&face)),
+                Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
+                Err(error) => storage_error(id, &error),
+            }
+        }
         // 账号级设置（官方 updateConfiguration 等价，Storage Service 真相源，
         // 带 account 参数，风格对齐置顶/贴纸面）：只写提供的字段；形状错
         // fail-closed -32603（置顶面参数处理先例，不占用结构化码）。
@@ -2113,12 +2129,20 @@ async fn dispatch(
                 Some(value) => value,
                 None => return internal_error(id),
             };
+            // linkPreviews（窗D B6）：AccountRecord.linkPreviews(11) 写位，
+            // 官方 toAccountRecord getLinkPreviewSetting 同位（itemStorage
+            // 'linkPreviews' 镜像）——链接预览面跨设备收敛。
+            let link_previews = match optional_bool(params.get("linkPreviews")) {
+                Some(value) => value,
+                None => return internal_error(id),
+            };
             // 零可写字段 = 无意图调用，fail-closed（不静默 no-op）。
             if read_receipts.is_none()
                 && typing_indicators.is_none()
                 && phone_number_sharing_mode.is_none()
                 && unlisted_phone_number.is_none()
                 && stories_disabled.is_none()
+                && link_previews.is_none()
             {
                 return internal_error(id);
             }
@@ -2131,6 +2155,7 @@ async fn dispatch(
                         phone_number_sharing_mode,
                         unlisted_phone_number,
                         stories_disabled,
+                        link_previews,
                     },
                 )
                 .await
@@ -3813,6 +3838,24 @@ fn conversation_state_payload(state: &storage_sync::ConversationState) -> Value 
         "archived": state.archived,
         "markedUnread": state.marked_unread,
     })
+}
+
+/// 账号级设置读投影 → wire（getConfiguration 应答形状；五布尔键恒在
+/// ——false = 位缺省，与 Storage record 位读出面一致；phoneNumberSharing
+/// Mode 词表内才投——UNKNOWN/词表外 = 键缺席，未设口径宁缺勿错；六键 =
+/// setAccountConfiguration 可写面镜像）。
+fn account_configuration_payload(face: &storage_sync::AccountConfigurationFace) -> Value {
+    let mut payload = json!({
+        "readReceipts": face.read_receipts,
+        "typingIndicators": face.typing_indicators,
+        "linkPreviews": face.link_previews,
+        "unlistedPhoneNumber": face.unlisted_phone_number,
+        "storiesDisabled": face.stories_disabled,
+    });
+    if let Some(word) = face.phone_number_sharing_mode {
+        payload["phoneNumberSharingMode"] = json!(word);
+    }
+    payload
 }
 
 /// 贴纸包同步返回体（getStickerPackSyncs / setStickerPackSync 共用形状）：

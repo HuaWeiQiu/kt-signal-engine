@@ -3497,6 +3497,26 @@ impl Service {
         storage_sync::write_account_configuration(&context, update).await
     }
 
+    /// getConfiguration（账号级设置读投影，窗D B6 KT 扩展方法）：
+    /// AccountRecord 配置字段面 → setAccountConfiguration 可写六位镜像；
+    /// 真相源 = Storage Service（多设备经 storage sync 收敛）。从未有
+    /// storage 状态（无 master key / manifest 404 / 记录缺席）= 全缺省面
+    /// （诚实缺省，不报错）。fake 模式缺省桩。
+    pub(crate) async fn get_configuration(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<storage_sync::AccountConfigurationFace, storage_sync::StorageSyncError> {
+        if !self.real {
+            return Ok(storage_sync::AccountConfigurationFace::default());
+        }
+        let context = storage_context(self, account).await?;
+        match storage_sync::read_own_account_record(&context).await? {
+            Some(record) => Ok(storage_sync::account_configuration_of_record(&record)),
+            // 记录缺席 = 全缺省面（空记录投影与 Default 面逐位等价，单测钉形）。
+            None => Ok(storage_sync::AccountConfigurationFace::default()),
+        }
+    }
+
     /// setProfile（P5 扩面，官方 updateProfile 等价）：名字/关于/emoji +
     /// 头像（缺省保留/data URI 换新/null 移除）server 面写 + storage 面
     /// AccountRecord 名字与头像 path 同步。

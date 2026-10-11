@@ -3805,9 +3805,10 @@ fn set_expiration_timer_fake_shape_and_param_fail_closed() {
 }
 
 /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：fake
-/// 形状成功 `{}`（只写提供字段的三形态）+ 参数面 fail-closed 逐形状
-/// （-32603：缺 account、布尔字段非布尔、phoneNumberSharingMode 非法/
-/// 非字符串、零可写字段——不触网）。
+/// 形状成功 `{}`（只写提供字段的多形态，含 storiesDisabled B5/linkPreviews
+/// B6 单写位 + 未知键静默忽略）+ 参数面 fail-closed 逐形状（-32603：缺
+/// account、布尔字段非布尔、phoneNumberSharingMode 非法/非字符串、零可写
+/// 字段——不触网）。
 #[test]
 fn set_account_configuration_fake_shapes_and_param_fail_closed() {
     let dir = temp_dir("account-config");
@@ -3855,6 +3856,23 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
         )["result"],
         json!({})
     );
+    // linkPreviews 单写（窗D B6：AccountRecord.linkPreviews(11)）。
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "linkPreviews": true }),
+        )["result"],
+        json!({})
+    );
+    // 未知参数键静默忽略纪律（窗D B6 ④）：合法位 + 未知键同场 = 合法位
+    // 照常生效、未知键不炸面。
+    assert_eq!(
+        engine.request(
+            "setAccountConfiguration",
+            json!({ "account": number, "linkPreviews": false, "unknownFutureKey": 1 }),
+        )["result"],
+        json!({})
+    );
 
     // 参数面 fail-closed 逐形状。
     let rejects = [
@@ -3863,6 +3881,7 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
         json!({ "account": number, "typingIndicators": 1 }),
         json!({ "account": number, "unlistedPhoneNumber": "false" }),
         json!({ "account": number, "storiesDisabled": "yes" }),
+        json!({ "account": number, "linkPreviews": "yes" }),
         json!({ "account": number, "phoneNumberSharingMode": "contactsOnly" }),
         json!({ "account": number, "phoneNumberSharingMode": "" }),
         json!({ "account": number, "phoneNumberSharingMode": 1 }),
@@ -3876,6 +3895,46 @@ fn set_account_configuration_fake_shapes_and_param_fail_closed() {
             "setAccountConfiguration rejects {params}"
         );
     }
+}
+
+/// getConfiguration（账号级设置读投影，窗D B6）：fake 模式恒全缺省面
+///（五布尔键恒在 + phoneNumberSharingMode 键缺席——UNKNOWN=未设口径）；
+/// 参数面 fail-closed -32603（account 缺席/非字符串）。写后回显链（写面
+/// 产出记录 → 读投影回显）由 bin 单测 account_configuration_face_projects_
+/// record_and_write_echo 钉形（fake 无 storage 态不回显）。
+#[test]
+fn get_configuration_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("get-account-config");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake 读：全缺省面（六位镜像形状钉定）。
+    assert_eq!(
+        engine.request("getConfiguration", json!({ "account": number }))["result"],
+        json!({
+            "readReceipts": false,
+            "typingIndicators": false,
+            "linkPreviews": false,
+            "unlistedPhoneNumber": false,
+            "storiesDisabled": false,
+        })
+    );
+
+    // 参数面 fail-closed：account 缺席/非字符串 → -32603。
+    let (code, _) = engine.error_of("getConfiguration", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getConfiguration", json!({ "account": 1 }));
+    assert_eq!(code, -32603);
 }
 
 /// setProfile（个人资料写面，官方 updateProfile 等价）：fake 形状成功
