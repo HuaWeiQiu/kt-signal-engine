@@ -2103,22 +2103,27 @@ async fn dispatch(
             }
         }
         // 群更新写面（updateGroup，KT 扩展方法）：expiration + title + avatar
-        // 参数族，协议上行面，落调度日志（terminateGroup 同纪律；avatar 键落
-        // 盘前形状摘要化——data URI/base64 载荷零字节进日志，setProfile 头像
-        // 纪律；title 明文短标签照旧逐字保留，群名非敏感载荷）。expiration：
-        // 0 = 关闭，u32 形状（null/字符串/负数/小数/超界 fail-closed）；title：
-        // 非空 string（null/非字符串/空串 fail-closed -32603——官方 `if
-        // (title)` 对空串 falsy no-op 的语义本引擎不静默收，双缺整拒同纪律）；
-        // avatar 三态镜像 setProfile（缺省=保留、data:image/*;base64, 规范
-        // base64=换新、null=移除；非 image 族/非规范 base64/解码超 10MiB/
-        // 非字符串 -32603）；全缺 = 无操作整拒 -32603（不静默 no-op），单项
-        // 或组合在场均合法；groupId/account 纪律与 terminateGroup 同款；群头
-        // 像上行链失败 → -1 GROUP_AVATAR_UPLOAD_FAILED + data {retryable:
-        // true, textSaved:false}（合成单 change 语义下伴生面未提交，§5）；
-        // 服务器拒绝 → -1 GROUP_UPDATE_FAILED + data.status 诚实透传；网络面
-        // → -1 STORAGE_UNAVAILABLE；fake 两臂：缺省/null 臂成功
-        // {status:"sent"}、data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED
-        //（§5 fake 两臂纪律）。
+        // + addMembers 参数族，协议上行面，落调度日志（terminateGroup 同纪
+        // 律；avatar 键落盘前形状摘要化——data URI/base64 载荷零字节进日志，
+        // setProfile 头像纪律；title/members 短标签照旧逐字保留）。
+        // expiration：0 = 关闭，u32 形状（null/字符串/负数/小数/超界
+        // fail-closed）；title：非空 string（null/非字符串/空串 fail-closed
+        // -32603——官方 `if (title)` 对空串 falsy no-op 的语义本引擎不静默
+        // 收，全缺整拒同纪律）；avatar 三态镜像 setProfile（缺省=保留、
+        // data:image/*;base64, 规范 base64=换新、null=移除；非 image 族/
+        // 非规范 base64/解码超 10MiB/非字符串 -32603）；addMembers：非空字
+        // 符串数组（service-id 串/联系人号码，缺联系成员解析同 createGroup
+        // ——不可解析整拒 -32603，官方桌面静默跳过是 GUI 语义；self 静默剔
+        // 除——self 入 change 服务器必 400；有凭据 = 全成员、凭据失败/无
+        // key/PNI = pending 邀请，官方 buildAddMembersChange 分流同构）；
+        // 全缺 = 无操作整拒 -32603（不静默 no-op），单项或组合在场均合法
+        //（同调合成单 change 一次 PATCH）；groupId/account 纪律与
+        // terminateGroup 同款；群头像上行链失败 → -1 GROUP_AVATAR_UPLOAD_
+        // FAILED + data {retryable:true, textSaved:false}（合成单 change 语
+        // 义下伴生面未提交，§5）；服务器拒绝 → -1 GROUP_UPDATE_FAILED +
+        // data.status 诚实透传；网络面 → -1 STORAGE_UNAVAILABLE；fake 两臂：
+        // 缺省/null 臂成功 {status:"sent"}、data URI 臂失败
+        // GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
         "updateGroup" => {
             // 调度日志先落（mutating 面同款：被拒调用同样记录派发）；
             // avatar 键落盘前形状摘要化（头像 data URI/base64 载荷零字节
@@ -2140,6 +2145,23 @@ async fn dispatch(
                 .and_then(Value::as_u64)
                 .and_then(|seconds| u32::try_from(seconds).ok());
             let title = params.get("title").and_then(Value::as_str);
+            let add_members = match params.get("addMembers") {
+                None => Vec::new(),
+                Some(Value::Array(entries)) => {
+                    if entries.is_empty() {
+                        return internal_error(id);
+                    }
+                    let mut parsed = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(text) => parsed.push(text.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    parsed
+                }
+                Some(_) => return internal_error(id),
+            };
             let avatar = match params.get("avatar") {
                 None => None,
                 Some(Value::Null) => Some(crate::service::groups::AvatarWrite::Remove),
@@ -2163,14 +2185,15 @@ async fn dispatch(
             if params.get("title").is_some() && title.map(str::is_empty).unwrap_or(true) {
                 return internal_error(id);
             }
-            if expiration.is_none() && title.is_none() && avatar.is_none() {
+            if expiration.is_none() && title.is_none() && avatar.is_none() && add_members.is_empty()
+            {
                 return internal_error(id);
             }
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
             match service
-                .update_group_change(account, master_key, expiration, title, avatar)
+                .update_group_change(account, master_key, expiration, title, avatar, &add_members)
                 .await
             {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),

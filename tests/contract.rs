@@ -1182,6 +1182,90 @@ fn update_group_title_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// updateGroup 加成员写面（addMembers 参数族，官方 buildAddMembersChange
+/// 行为对齐）：fake 成功 `{status:"sent"}`（fake 无解析链，形状桩）；与
+/// title 同调组合合法（合成单 change 语义）；参数面 fail-closed（-32603：
+/// addMembers 非数组/空数组/条目非字符串，成员不可解析整拒——官方桌面缺
+/// 本地联系人静默跳过是 GUI 语义，API 面不静默，addMembers 在场时
+/// groupId/account 形状照旧闸）；调度日志 addMembers 键照旧逐字保留。
+#[test]
+fn update_group_add_members_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-add-members");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：addMembers 单独在场 / 与 title 同调均成功 {status:"sent"}。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "addMembers": ["+15550000001", "11111111-2222-4333-8444-555555555555"]
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "addMembers": ["+15550000002"],
+                "title": "扩员"
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状（非数组/空数组/条目非字符串；groupId/account
+    // 闸照旧）。
+    let rejects = [
+        json!({ "account": "+15550000000", "groupId": group_id, "addMembers": "+15550000001" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addMembers": [] }),
+        json!({ "account": "+15550000000", "groupId": group_id, "addMembers": [7] }),
+        json!({ "account": "+15550000000", "groupId": "not-base64!!", "addMembers": ["+15550000001"] }),
+        json!({ "groupId": group_id, "addMembers": ["+15550000001"] }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：addMembers 键照旧逐字保留（成功 2 + 拒绝 5 = 7 行均落日志）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(entries.len(), 7, "成功两条 + 拒绝五条均落日志");
+    assert_eq!(
+        entries[0]["params"]["addMembers"],
+        json!(["+15550000001", "11111111-2222-4333-8444-555555555555"])
+    );
+    assert_eq!(entries[1]["params"]["title"], json!("扩员"));
+
+    // real 模式未注册账号 + addMembers 在场：storage 上下文打不开折叠
+    // -32603。
+    let real_dir = temp_dir("update-group-add-members-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({
+            "account": "+15559990000",
+            "groupId": group_id,
+            "addMembers": ["+15550000001"]
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// call-link 凭据材料面（calls.* 五方法，KT 扩展，P4c 切一）：fake 模式形状
 /// 桩（桩字节非有效 zk 材料，仅钉契约形状）+ 参数闸 fail-closed（-32603：
 /// rootKey 非 base64/非 16·21B、roomId 非 base64/≠32B、groupId 同

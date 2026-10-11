@@ -241,6 +241,52 @@ pub(crate) fn build_update_change(
     actions
 }
 
+/// addMembers change 合成核心（官方 buildAddMembersChange 行为对齐，群写面
+/// P3 批）：version = revision + 1（饱和不回卷）；有凭据候选 = add_members
+///（zkgroup presentation，vendored `build_add_member_action_with_credential`
+///，Role Default——官方 MemberRole.DEFAULT 同位）；无凭据候选 =
+/// add_members_pending_profile_key（vendored `build_add_pending_member_
+/// action`，added_by = own ACI 加密；timestamp/joined_at_version 0 = 服务
+/// 器回填，vendored 原语语义——官方桌面客户端侧填 now/newGroupVersion 的
+/// 位在服务器回填语义下等价，登记偏差）。与 update_group_change 属性臂合
+/// 成单 Actions（同 version 多 action）单次 PATCH（§5 合成裁定顺延）。
+pub(crate) fn build_add_members_change(
+    secret_params: &GroupSecretParams,
+    revision: u32,
+    candidates: &[presage::libsignal_service::groups_v2::GroupMemberCandidate],
+    own_aci: presage::libsignal_service::protocol::Aci,
+) -> Result<presage::proto::group_change::Actions, TerminateError> {
+    use presage::libsignal_service::groups_v2::GroupOperations;
+    use presage::libsignal_service::groups_v2::Role;
+    let operations = GroupOperations::new(*secret_params);
+    let server_public_params = super::zkgroup_consts::legacy_server_public_params();
+    let mut actions = presage::proto::group_change::Actions {
+        source_user_id: Vec::new(),
+        group_id: Vec::new(),
+        version: revision.saturating_add(1),
+        ..presage::proto::group_change::Actions::default()
+    };
+    for candidate in candidates {
+        match &candidate.credential {
+            Some(credential) => {
+                actions
+                    .add_members
+                    .push(operations.build_add_member_action_with_credential(
+                        credential,
+                        Role::Default,
+                        &server_public_params,
+                    ))
+            }
+            None => actions.add_members_pending_profile_key.push(
+                operations
+                    .build_add_pending_member_action(candidate.service_id, own_aci, Role::Default)
+                    .map_err(|_| TerminateError::Failed { status: None })?,
+            ),
+        }
+    }
+    Ok(actions)
+}
+
 /// `PATCH v2/groups` 群 change 上传（上游缺口单点，官方 modifyGroup 同形状）：
 /// storage 服务 host、body = Actions protobuf、群凭据 basic auth；2xx = 成功
 ///（响应 GroupChangeResponse 不消费——终止后本机群态以登记表 + 服务器读面
@@ -442,23 +488,69 @@ async fn upload_group_avatar(
         .map_err(|_| TerminateError::AvatarUpload)
 }
 
-/// updateGroup 合成编排（expiration/title/avatar 任意组合，至少一项在场由
-/// 调用方闸）：群态读面取 revision（Unavailable 退化 0，expiration 批同口
+/// updateGroup 合成编排（expiration/title/avatar/addMembers 任意组合，至
+/// 少一项在场由调用方闸）：成员解析分流先行（不可解析整拒 UnknownGroup，
+/// §5 P3 登记偏差；self 静默剔除——self 入 change 服务器必 400，createGroup
+/// 同纪律）→ 群态读面取 revision（Unavailable 退化 0，expiration 批同口
 /// 径）→ avatar Replace 臂先走上行链（官方 buildUpdateAttributesChange 同
 /// 序：uploadAvatar 在 change 上送之前）→ 群凭据 → 单 Actions（同 version
-/// 多 action）单次 PATCH。avatar 链失败 = AvatarUpload（伴生 expiration/
-/// title 面未提交，GROUP_AVATAR_UPLOAD_FAILED data.textSaved=false 诚实呈
-/// 现）；PATCH 面失败维持 Failed/Unavailable 四码。
+/// 多 action：属性臂 + add_members/pending 臂）单次 PATCH。avatar 链失败 =
+/// AvatarUpload（伴生 expiration/title/成员面未提交，GROUP_AVATAR_UPLOAD_
+/// FAILED data.textSaved=false 诚实呈现）；PATCH 面失败维持 Failed/
+/// Unavailable 四码。写后本地群态刷新（best-effort，P3 批起 updateGroup
+/// 全路径生效——addMembers 改变本机 listGroups 投影的成员面）。
 pub(crate) async fn update_group_change(
     context: &StorageContext,
     master_key: &[u8],
     expiration_secs: Option<u32>,
     title: Option<&str>,
     avatar: Option<AvatarWrite>,
+    add_members: &[String],
 ) -> Result<(), TerminateError> {
-    if expiration_secs.is_none() && title.is_none() && avatar.is_none() {
+    use presage::libsignal_service::groups_v2::GroupMemberCandidate;
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+    use presage::store::ContentsStore as _;
+    if expiration_secs.is_none() && title.is_none() && avatar.is_none() && add_members.is_empty() {
         // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
         return Err(TerminateError::UnknownGroup);
+    }
+    let own_aci = Aci::from(context.aci_uuid);
+    let mut candidates: Vec<GroupMemberCandidate> = Vec::new();
+    for entry in add_members {
+        let service_id = resolve_group_member(&context.store, entry)
+            .await
+            .ok_or(TerminateError::UnknownGroup)?;
+        if candidates
+            .iter()
+            .any(|candidate| candidate.service_id == service_id)
+        {
+            continue;
+        }
+        match service_id {
+            ServiceId::Aci(aci) => {
+                if aci == own_aci {
+                    continue;
+                }
+                let profile_key = context
+                    .store
+                    .profile_key(&ServiceId::Aci(aci))
+                    .await
+                    .ok()
+                    .flatten();
+                let credential = match profile_key {
+                    Some(profile_key) => fetch_profile_key_credential(aci, profile_key).await,
+                    None => None,
+                };
+                candidates.push(GroupMemberCandidate {
+                    service_id: service_id.to_owned(),
+                    credential,
+                });
+            }
+            ServiceId::Pni(_) => candidates.push(GroupMemberCandidate {
+                service_id: service_id.to_owned(),
+                credential: None,
+            }),
+        }
     }
     use rand::RngCore as _;
     let revision = match fetch_group_state(context, master_key).await {
@@ -481,19 +573,23 @@ pub(crate) async fn update_group_change(
             .map_err(|_| TerminateError::UnknownGroup)?,
     ));
     let authorization = group_authorization(context, master_key).await?;
-    patch_group(
-        &context.push,
-        authorization,
-        &build_update_change(
-            &secret_params,
-            revision,
-            expiration_secs,
-            title,
-            avatar_path,
-            randomness,
-        ),
-    )
-    .await
+    let mut actions = build_update_change(
+        &secret_params,
+        revision,
+        expiration_secs,
+        title,
+        avatar_path,
+        randomness,
+    );
+    if !candidates.is_empty() {
+        let member_actions =
+            build_add_members_change(&secret_params, revision, &candidates, own_aci)?;
+        actions.add_members = member_actions.add_members;
+        actions.add_members_pending_profile_key = member_actions.add_members_pending_profile_key;
+    }
+    patch_group(&context.push, authorization, &actions).await?;
+    refresh_local_group_state(context, master_key).await;
+    Ok(())
 }
 
 /// receive 投影面：群更新消息内携带 terminated change → `group_terminated`
@@ -1997,6 +2093,157 @@ mod tests {
         assert!(combo.modify_disappearing_message_timer.is_some());
         assert!(combo.modify_title.is_some());
         assert!(combo.modify_avatar.is_none());
+    }
+
+    /// addMembers change（群写面 P3 批）pending 臂：无凭据候选（PNI/无
+    /// profile key ACI）= add_members_pending_profile_key（vendored
+    /// build_add_pending_member_action，Role Default）；user_id/
+    /// added_by_user_id zkgroup 加密可回读（secret params
+    /// decrypt_service_id 对账）；timestamp/joined_at_version = 0（服务器
+    /// 回填，vendored 原语语义，§5 登记偏差）；其余 action 全部缺席。
+    #[test]
+    fn add_members_change_pending_arm_shape() {
+        use presage::libsignal_service::groups_v2::GroupMemberCandidate;
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        let master_key = [0x4au8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let own_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let invitee_aci = Aci::from(uuid::Uuid::from_u128(
+            0xaaaa_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let invitee_pni =
+            ServiceId::parse_from_service_id_string("PNI:bbbb2222-3333-4444-5555-666677778888")
+                .expect("PNI parses");
+        let candidates = vec![
+            GroupMemberCandidate {
+                service_id: ServiceId::Aci(invitee_aci),
+                credential: None,
+            },
+            GroupMemberCandidate {
+                service_id: invitee_pni,
+                credential: None,
+            },
+        ];
+        let actions =
+            build_add_members_change(&secret_params, 9, &candidates, own_aci).expect("builds");
+        assert_eq!(actions.version, 10);
+        assert!(
+            actions.add_members.is_empty(),
+            "无凭据臂不产生全成员 action"
+        );
+        assert_eq!(actions.add_members_pending_profile_key.len(), 2);
+        for (pending, want) in actions
+            .add_members_pending_profile_key
+            .iter()
+            .zip([ServiceId::Aci(invitee_aci), invitee_pni])
+        {
+            let added = pending.added.as_ref().expect("added 在场");
+            let member = added.member.as_ref().expect("member 在场");
+            assert_eq!(
+                secret_params
+                    .decrypt_service_id(zkgroup::deserialize(&member.user_id).expect("ciphertext"))
+                    .expect("decrypts"),
+                want,
+                "user_id 加密回读对账"
+            );
+            assert_eq!(
+                member.role,
+                presage::proto::member::Role::Default as i32,
+                "官方 MemberRole.DEFAULT 同位"
+            );
+            assert_eq!(added.timestamp, 0, "服务器回填位");
+            assert_eq!(member.joined_at_version, 0, "服务器回填位");
+        }
+        let first = actions.add_members_pending_profile_key[0]
+            .added
+            .as_ref()
+            .expect("added 在场");
+        assert_eq!(
+            secret_params
+                .decrypt_service_id(
+                    zkgroup::deserialize(&first.added_by_user_id).expect("ciphertext")
+                )
+                .expect("decrypts"),
+            ServiceId::Aci(own_aci),
+            "added_by = 邀请者 own ACI 加密"
+        );
+        assert!(actions.terminate_group.is_none());
+        assert!(actions.modify_title.is_none());
+        assert!(actions.modify_avatar.is_none());
+        assert!(actions.modify_disappearing_message_timer.is_none());
+        assert!(actions.delete_members.is_empty());
+    }
+
+    /// addMembers change 全成员臂：zkgroup 凭据 issuance 全链自模拟（客户
+    /// 端 request context → 服务器 secret params 签发 → 客户端 receive，
+    /// 单元面零网络、全官方原语）= add_members（presentation 在场，user_id/
+    /// profile_key 空位 = 服务器从 presentation 提取，vendored
+    /// build_add_member_action_with_credential 语义）。
+    #[test]
+    fn add_members_change_credential_arm_full_member() {
+        use presage::libsignal_service::groups_v2::GroupMemberCandidate;
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        use zkgroup::api::server_params::ServerSecretParams;
+        use zkgroup::profiles::ProfileKey;
+        let master_key = [0x4bu8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let own_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let invitee = Aci::from(uuid::Uuid::from_u128(
+            0xcccc_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let profile_key = ProfileKey::create([0x55u8; 32]);
+        let server_secret = ServerSecretParams::generate([0x66u8; 32]);
+        let server_public = server_secret.get_public_params();
+        let context = server_public.create_profile_key_credential_request_context(
+            [0x77u8; 32],
+            invitee,
+            profile_key,
+        );
+        let today = now_epoch_seconds();
+        let expiration = (today / 86_400 + 3) * 86_400;
+        let response = server_secret
+            .issue_expiring_profile_key_credential(
+                [0x88u8; 32],
+                &context.get_request(),
+                invitee,
+                profile_key.get_commitment(invitee),
+                zkgroup::Timestamp::from_epoch_seconds(expiration),
+            )
+            .expect("server issues");
+        let credential = server_public
+            .receive_expiring_profile_key_credential(
+                &context,
+                &response,
+                zkgroup::Timestamp::from_epoch_seconds(today),
+            )
+            .expect("client receives");
+        let candidates = vec![GroupMemberCandidate {
+            service_id: ServiceId::Aci(invitee),
+            credential: Some(credential),
+        }];
+        let actions =
+            build_add_members_change(&secret_params, 4, &candidates, own_aci).expect("builds");
+        assert_eq!(actions.version, 5);
+        assert_eq!(actions.add_members.len(), 1, "有凭据 = 全成员 action");
+        assert!(actions.add_members_pending_profile_key.is_empty());
+        let added = actions.add_members[0].added.as_ref().expect("added 在场");
+        assert!(!added.presentation.is_empty(), "zkgroup presentation 在场");
+        assert!(
+            added.user_id.is_empty(),
+            "user_id 服务器从 presentation 提取"
+        );
+        assert!(
+            added.profile_key.is_empty(),
+            "profile_key 服务器从 presentation 提取"
+        );
+        assert_eq!(added.role, presage::proto::member::Role::Default as i32);
+        assert!(!actions.add_members[0].join_from_invite_link);
     }
 
     /// 群头像 CDN 载荷加密面（upload_group_avatar 内联链的纯函数钉定）：
