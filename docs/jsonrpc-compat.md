@@ -3510,6 +3510,25 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   refuse 流按 §4.53 走 updateGroup 共享数组，无第二消费方，按 §4.50「
   不发明无消费方写面」纪律收口。
 
+### P15c 批（2026-10-11，链组审计落地窗 B，wire additive / 记档）
+
+- **项1 多设备编辑 echo 正文求证（链组一，审计过时记档，wire 零变化）**：
+  审计原文「本机从手机端编辑消息后，编辑 echo 同步回桌面时正文丢失」——
+  求证结论：**审计过时**。引擎 Sent echo 臂的 editMessage 投影已由六问批
+  Q1（commit c20a310，2026-10-11 13:18，先于链组审计落地窗）全量落地：
+  `syncMessage.sentMessage.editMessage{targetSentTimestamp,
+  dataMessage{message(正文)/timestamp/groupInfo?/quote?/...}}`——正文经
+  project_data_message 单点投影（`message` 键），编辑目标/时间戳双键齐备
+  （sentMessage.editMessage.dataMessage.timestamp），单测
+  `sent_sync_projects_edit_and_story_echoes` 钉形。对照官方编辑 echo 消费
+  面（MessageReceiver.preload.ts #handleSentEditMessage → SentEvent →
+  background.preload.ts:2886 Edits.onEdit → handleEditMessage.preload.ts）
+  逐键核对：正文=editMessage.dataMessage.body ✓、编辑目标=
+  targetSentTimestamp ✓、时间戳=dataMessage.timestamp ✓、quote/preview/
+  bodyRanges ✓ 均随 project_data_message 投影；官方 handleEditMessage 另需
+  serverTimestamp（48h 编辑窗 isTooOldToEditMessage 判据）——该键由本批
+  项5 信封 serverTimestamp 投影补齐，编辑消费面由此完整。零代码改动。
+
 
 ## 6. fake 服务模式（仅测试）
 
