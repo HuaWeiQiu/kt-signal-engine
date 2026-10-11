@@ -3448,6 +3448,18 @@ async fn serve_account_stream(
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
     let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
+    // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
+    // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
+    // 收敛到 30min/200 信封。refresh_pre_keys 自带服务器计数闸（≥10 零上
+    // 传），触发频繁也只多一次 GET /v2/keys；本地面重连即重置（水位权威
+    // 在服务器计数，短重连风暴靠闸挡）。
+    let mut quick_at = Some(
+        tokio::time::Instant::now() + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
+    );
+    // 毫秒书签与 Instant 计时器并行：拍到时 quick_check_due 二次裁定
+    // （maintenance_tick 书签判到期同纪律），量触发刷新书签让时间窗重开。
+    let mut quick_last_ms: Option<u64> = None;
+    let mut quick_seen: u64 = 0;
     loop {
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
@@ -3475,6 +3487,24 @@ async fn serve_account_stream(
                         + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
                 );
             }
+            // prekey 快速巡检时间臂（P12/R4）：30min 一拍，与量触发共用
+            // quick_check 面；拍后计时器重置。
+            _ = async {
+                if let Some(at) = quick_at {
+                    tokio::time::sleep_until(at).await;
+                }
+            }, if quick_at.is_some() => {
+                let now = prekey::now_ms();
+                if prekey::quick_check_due(quick_last_ms, now) {
+                    prekey::quick_check(&mut manager).await;
+                }
+                quick_last_ms = Some(now);
+                quick_seen = 0;
+                quick_at = Some(
+                    tokio::time::Instant::now()
+                        + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
+                );
+            }
             // D1 自动 delivery receipt 批量窗：到期即取批直发（官方
             // deliveryReceiptBatcher wait=500ms 语义）。发送 spawn_local
             // 承载，臂内即刻返回不阻塞收流。
@@ -3487,13 +3517,15 @@ async fn serve_account_stream(
                     delivery_receipt::spawn_delivery_receipt_flush(service, number, batch);
                 }
             }
-            item = stream.next() => match item {
+            item = stream.next() => {
+                match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
                 // messagepipe 层已就地 ack）。
                 Some(Received::QueueEmpty) => {}
                 // contacts 由 presage 自动入库（号码/名字面随之可用），
                 // 源信封处理完成 → 补 ack。
                 Some(Received::Contacts(ack)) => {
+                    quick_seen += 1;
                     ack.ack();
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
@@ -3510,10 +3542,12 @@ async fn serve_account_stream(
                     if let Some(failure) = failure {
                         derm_handle(&mut manager, sender, failure, derm_guard).await;
                     }
+                    quick_seen += 1;
                     ack.ack();
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
                 Some(Received::Duplicate(ack)) => {
+                    quick_seen += 1;
                     ack.ack();
                 }
                 // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
@@ -3544,6 +3578,7 @@ async fn serve_account_stream(
                     {
                         let _ = service.outbound.send(notification);
                     }
+                    quick_seen += 1;
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
@@ -3582,9 +3617,22 @@ async fn serve_account_stream(
                             );
                         }
                     }
+                    quick_seen += 1;
                     ack.ack();
                 }
-                None => return StreamOutcome::Connected,
+                    None => return StreamOutcome::Connected,
+                }
+                // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
+                // 一次，计数与时间臂计时器同复位（含解密失败/重复投递——
+                // 服务器侧取信封同样消耗一次性 prekey）。
+                if prekey::quick_check_volume_due(std::mem::replace(&mut quick_seen, 0)) {
+                    prekey::quick_check(&mut manager).await;
+                    quick_last_ms = Some(prekey::now_ms());
+                    quick_at = Some(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
+                    );
+                }
             }
         }
     }
