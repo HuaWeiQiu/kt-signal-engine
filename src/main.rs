@@ -142,19 +142,16 @@ async fn amain() -> ExitCode {
         Err(_) => return ExitCode::from(1),
     };
 
-    // stdout writer：响应与 receive 通知的唯一出口（行序 = 队列序）。
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
-    let writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
-        use tokio::io::AsyncWriteExt;
-        while let Some(value) = outbound_rx.recv().await {
-            let mut text = serde_json::to_string(&value).expect("line serializes");
-            text.push('\n');
-            if stdout.write_all(text.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    // stdout writer：响应与 receive 通知的唯一出口（行序 = 队列序）。Notice
+    // 逐条写+flush；Flush 是背压栅栏（此前全部 Notice 已写进 stdout 并 flush
+    // ——连接器至少收到字节——才解决 oneshot）。receive 管线 ack 前等栅栏
+    // （时序审计 G1：ack 晚于「连接器可读」，连接器死亡窗口内引擎崩溃也不
+    // 丢已投影消息——服务器队列未耗，重启重放）。
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundFrame>();
+    let writer = tokio::spawn(run_outbound_writer(
+        outbound_rx,
+        tokio::io::BufWriter::new(tokio::io::stdout()),
+    ));
 
     // stdin 有界读（阻塞线程；P1a 逻辑原样）→ 桥进 tokio。
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Inbound>();
@@ -198,7 +195,7 @@ async fn amain() -> ExitCode {
                 let outbound = outbound_tx.clone();
                 tokio::task::spawn_local(async move {
                     let response = methods::respond(&inbound, state, service).await;
-                    let _ = outbound.send(response);
+                    let _ = outbound.send(OutboundFrame::Notice(response));
                 });
             }
         })
@@ -214,6 +211,50 @@ enum ReadOutcome {
     Line,
     Eof,
     Overlong,
+}
+
+/// stdout 出站帧。`Notice` 是一行 JSON（响应或 receive 通知）；`Flush` 是
+/// 时序审计 G1 的背压栅栏——writer 在此前全部 Notice 已写并 flush 后解决
+/// oneshot，消费方（receive 管线 ack）据此把「连接器至少收到」变成显式
+/// 等待点。
+pub(crate) enum OutboundFrame {
+    Notice(Value),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// writer 主循环：Notice 逐条 write+flush（任一步失败即退出，栅栏 oneshot
+/// 随帧弃置自然落在等待方 false）；Flush 就地解决（FIFO 保证此前 Notice
+/// 已 flush）。
+async fn run_outbound_writer<W>(mut rx: mpsc::UnboundedReceiver<OutboundFrame>, mut out: W)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            OutboundFrame::Notice(value) => {
+                let mut text = serde_json::to_string(&value).expect("line serializes");
+                text.push('\n');
+                if out.write_all(text.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                    break;
+                }
+            }
+            OutboundFrame::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// flush 栅栏的通道侧实现（`Service::flush_barrier` 委托；自由函数便于
+/// 单测直打协议面）。出口关闭立即 false；writer 已死则栅栏 oneshot 随
+/// 接收端弃置，等待落 false。
+pub(crate) async fn outbound_flush_barrier(tx: &mpsc::UnboundedSender<OutboundFrame>) -> bool {
+    let (done, wait) = tokio::sync::oneshot::channel();
+    if tx.send(OutboundFrame::Flush(done)).is_err() {
+        return false;
+    }
+    wait.await.is_ok()
 }
 
 /// 有界按行读：不预分配无界缓冲；超限行吞到行尾后报 Overlong。
@@ -264,6 +305,9 @@ fn read_bounded_line(stdin: &std::io::Stdin, buf: &mut Vec<u8>) -> ReadOutcome {
 #[cfg(test)]
 mod tests {
     use super::socks_proxy_url;
+    use super::{outbound_flush_barrier, run_outbound_writer, OutboundFrame};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     #[test]
     fn socks_proxy_url_accepts_host_port() {
@@ -286,5 +330,99 @@ mod tests {
         assert!(socks_proxy_url(":7890").is_err());
         assert!(socks_proxy_url("host with space:7890").is_err());
         assert!(socks_proxy_url("socks5://host:7890").is_err());
+    }
+
+    /// G1 ack 时序面：栅栏在先入 Notice 落盘（write+flush）之后才解决——
+    /// writer 逐条 flush，FIFO 队列序下 Flush 帧被弹出即代表此前全部通知
+    /// 已出进程。栅栏等待方拿到 true 且字节已在 sink。
+    #[tokio::test]
+    async fn flush_barrier_resolves_only_after_prior_notices_flushed() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer_sink = std::sync::Arc::clone(&sink);
+        let writer = tokio::spawn(async move {
+            // Vec<u8> 直写无法断言中间态，包一层把 write 缓冲在 flush 时
+            // 才并入共享 sink 的探针（flush 语义可断言）。
+            struct Probe(std::sync::Arc<std::sync::Mutex<Vec<u8>>>, Vec<u8>);
+            impl tokio::io::AsyncWrite for Probe {
+                fn poll_write(
+                    mut self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<std::io::Result<usize>> {
+                    self.1.extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+                fn poll_flush(
+                    mut self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<std::io::Result<()>> {
+                    let inner = std::mem::take(&mut self.1);
+                    self.0.lock().unwrap().extend(inner);
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<std::io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            run_outbound_writer(rx, Probe(writer_sink, Vec::new())).await
+        });
+        tx.send(OutboundFrame::Notice(serde_json::json!({"m": 1})))
+            .unwrap();
+        assert!(outbound_flush_barrier(&tx).await);
+        let written = sink.lock().unwrap().clone();
+        assert_eq!(written, b"{\"m\":1}\n".to_vec());
+        drop(tx);
+        let _ = writer.await;
+    }
+
+    /// G1 ack 时序面：出口死亡（writer 因写失败退出 / 通道关闭）→ 栅栏
+    /// 落 false——receive 管线据此放弃 ack，信封留服务器队列待重启重放。
+    #[tokio::test]
+    async fn flush_barrier_fails_when_outbound_dead() {
+        // 通道关闭臂：接收端已弃。
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        drop(rx);
+        assert!(!outbound_flush_barrier(&tx).await);
+
+        // writer 死亡臂：sink 写失败 → writer 退出 → 在途栅栏 oneshot 弃置。
+        struct BrokenSink;
+        impl tokio::io::AsyncWrite for BrokenSink {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::other("sink broken")))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        tokio::spawn(run_outbound_writer(rx, BrokenSink));
+        tx.send(OutboundFrame::Notice(serde_json::json!({"m": 1})))
+            .unwrap();
+        let mut died = false;
+        for _ in 0..100 {
+            if !outbound_flush_barrier(&tx).await {
+                died = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(died, "barrier must fail once the writer has died");
     }
 }

@@ -762,7 +762,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<Value>();
+        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         // idle 面：无任务、无工件、无快照。
@@ -846,7 +846,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<Value>();
+        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         // 注册数据 + AEP 落 store（serde 数据面 = 官方 store 落库格式，

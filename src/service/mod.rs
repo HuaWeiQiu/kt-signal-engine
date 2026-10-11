@@ -657,8 +657,9 @@ pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
     state: Arc<AsyncMutex<EngineState>>,
-    /// receive 通知出口（与 JSON-RPC 响应同一 stdout writer 队列）。
-    outbound: mpsc::UnboundedSender<Value>,
+    /// receive 通知出口（与 JSON-RPC 响应同一 stdout writer 队列；帧协议
+    /// 见 main::OutboundFrame——Notice 直通，Flush 背压栅栏）。
+    outbound: mpsc::UnboundedSender<crate::OutboundFrame>,
     inner: AsyncMutex<Inner>,
     /// 运行中的接收管线（账号 → 停机旗），delete 时通知退出。
     pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
@@ -706,7 +707,7 @@ impl Service {
     pub(crate) fn new(
         data_dir: PathBuf,
         state: Arc<AsyncMutex<EngineState>>,
-        outbound: mpsc::UnboundedSender<Value>,
+        outbound: mpsc::UnboundedSender<crate::OutboundFrame>,
     ) -> Arc<Self> {
         let real = !mode_from_env();
         Arc::new(Self {
@@ -729,6 +730,19 @@ impl Service {
             send_managers: AsyncMutex::new(HashMap::new()),
             mrm_chat: AsyncMutex::new(None),
         })
+    }
+
+    /// stdout 通知入队（fire-and-forget；行序 = 队列序，writer 死亡静默）。
+    pub(crate) fn notify(&self, value: Value) {
+        let _ = self.outbound.send(crate::OutboundFrame::Notice(value));
+    }
+
+    /// flush 背压栅栏（时序审计 G1）：resolve = 此前全部已入队通知已写进
+    /// stdout 并 flush（连接器至少收到字节）；`false` = 出口已死（writer
+    /// 退出/通道关闭）——调用方据此放弃 ack，让服务器队列保留信封待重启
+    /// 重放，连接器侧永不缺投影。
+    pub(crate) async fn flush_barrier(&self) -> bool {
+        crate::outbound_flush_barrier(&self.outbound).await
     }
 
     /// 启动时为每个真实账号拉起接收管线（`--receive-mode on-start` 语义）。
@@ -3307,6 +3321,9 @@ enum StreamOutcome {
     Connected,
     Recoverable,
     Unbound,
+    /// 时序审计 G1：stdout 出口死亡（flush 栅栏不可解）。停环等连接器
+    /// 重启引擎，不退避重连（重连 = 重投信封被 Duplicate 就地 ack 吞）。
+    StdioDead,
 }
 
 // ---------------------------------------------------------------------------
@@ -3504,7 +3521,13 @@ async fn receive_pipeline(
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
         // 不退避重连；结构化上抛一次（wire additive，compat §5）。
         if outcome == StreamOutcome::Unbound {
-            let _ = service.outbound.send(account_unbound_notification(&number));
+            service.notify(account_unbound_notification(&number));
+            return;
+        }
+        // StdioDead（时序审计 G1）：stdout 已死（连接器侧断开/半开管道），
+        // 投影永不可达。停管线不退避——重连只会把重投信封喂进 Duplicate
+        // 就地 ack 吞掉；信封留服务器队列，连接器重启引擎后全量重放补投影。
+        if outcome == StreamOutcome::StdioDead {
             return;
         }
         // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
@@ -3737,12 +3760,15 @@ async fn serve_account_stream(
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
                 // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
                 // ContactSync 载体，fork 登记 vendor/README.md），投影 receive
-                // 事件供 connector upsert 自有库（官方 contactSync 消费同位），
-                // 完成后补 ack。
+                // 事件供 connector upsert 自有库（官方 contactSync 消费同位）。
+                // G1：ack 前等 flush 栅栏（投影可达连接器才耗服务器队列）。
                 Some(Received::Contacts(sync, ack)) => {
                     quick_seen += 1;
                     for notification in project_contacts_sync(number, &sync) {
-                        let _ = service.outbound.send(notification);
+                        service.notify(notification);
+                    }
+                    if !service.flush_barrier().await {
+                        return StreamOutcome::StdioDead;
                     }
                     ack.ack();
                 }
@@ -3754,9 +3780,10 @@ async fn serve_account_stream(
                 // 请求 → 按原始时间戳找回已发消息重发，找不到/超龄/超限 →
                 // clear_sessions 触发会话重建。全链路失败静默，绝不影响 ack。
                 Some(Received::DecryptionError(sender, timestamp, failure, ack)) => {
-                    let _ = service
-                        .outbound
-                        .send(decryption_error_notification(number, &sender, timestamp));
+                    service.notify(decryption_error_notification(number, &sender, timestamp));
+                    if !service.flush_barrier().await {
+                        return StreamOutcome::StdioDead;
+                    }
                     if let Some(failure) = failure {
                         derm_handle(&mut manager, sender, failure, derm_guard).await;
                     }
@@ -3780,7 +3807,7 @@ async fn serve_account_stream(
                 Some(Received::IdentityChange(sender, content, ack)) => {
                     let sid_string = sender.service_id_string();
                     let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
-                    let _ = service.outbound.send(identity_changed_notification(
+                    service.notify(identity_changed_notification(
                         number,
                         &sender,
                         content.metadata.client_timestamp.timestamp_millis().max(0) as u64,
@@ -3794,7 +3821,11 @@ async fn serve_account_stream(
                         )
                         .await
                     {
-                        let _ = service.outbound.send(notification);
+                        service.notify(notification);
+                    }
+                    // G1：ack 前等 flush 栅栏（同 Content 臂）。
+                    if !service.flush_barrier().await {
+                        return StreamOutcome::StdioDead;
                     }
                     quick_seen += 1;
                     ack.ack();
@@ -3806,12 +3837,21 @@ async fn serve_account_stream(
                     if let Some(notification) =
                         project_verified_sync(number, manager.store(), &content, dir).await
                     {
-                        let _ = service.outbound.send(notification);
+                        service.notify(notification);
                     }
                     // 官方契约：解密+落库+投影完成后才 ack（Android
                     // IncomingMessageObserver.kt 事务提交后逐条 ack；
                     // SignalWebSocket.kt「处理成功后由你 ack」）。两条路
                     // （投影成功/失败）都必达 ack，防服务器队列堆积。
+                    // G1 时序收口：ack 再晚于「投影已写进 stdout 并 flush」
+                    // ——此前投影 fire-and-forget 入无界 mpsc 即 ack，引擎在
+                    // presage 已落库、连接器未收到的窗口内死亡（watchdog/
+                    // 链式重启/OOM）时，服务器队列已耗、连接器永不收到，且
+                    // 重启重放被 (sender, client_timestamp) 重放闸吞成
+                    // Duplicate——消息永久丢失。栅栏把 ack 顶到「连接器至少
+                    // 收到字节」之后（engine 内闭环，天然背压上收）；栅栏
+                    // 不可解（出口死）→ 不 ack + 停管线，信封留服务器队列
+                    // 待重启重放。
                     for notification in
                         project_content(
                             number,
@@ -3821,7 +3861,10 @@ async fn serve_account_stream(
                         )
                         .await
                     {
-                        let _ = service.outbound.send(notification);
+                        service.notify(notification);
+                    }
+                    if !service.flush_barrier().await {
+                        return StreamOutcome::StdioDead;
                     }
                     // D1 自动 delivery receipt 排队闸（官方 handleDataMessage
                     // / handleEditMessage 条件面，见 delivery_receipt 模块注）。
