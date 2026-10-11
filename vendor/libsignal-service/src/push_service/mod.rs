@@ -9,7 +9,7 @@ use crate::{
 
 use libsignal_core::DeviceId;
 use protobuf::ProtobufResponseExt;
-use reqwest::{Method, RequestBuilder};
+use reqwest::{Method, RequestBuilder, StatusCode};
 use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
 use tracing::{debug_span, Instrument};
@@ -170,13 +170,9 @@ impl PushService {
                 builder.basic_auth(credentials.login(), credentials.password);
         }
 
-        let ws = builder
-            .upgrade()
-            .send()
-            .await?
-            .into_websocket()
-            .instrument(span.clone())
-            .await?;
+        let response = builder.upgrade().send().await?;
+        classify_upgrade_response(response.status())?;
+        let ws = response.into_websocket().instrument(span.clone()).await?;
 
         let unidentified_push_service = PushService {
             servers: self.servers,
@@ -213,6 +209,16 @@ impl PushService {
         .await?
         .protobuf()
         .await
+    }
+}
+
+/// 401/403 on the WS upgrade are credential rejection, not transport failure.
+fn classify_upgrade_response(status: StatusCode) -> Result<(), ServiceError> {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Err(ServiceError::Unauthorized)
+        },
+        _ => Ok(()),
     }
 }
 
@@ -316,5 +322,35 @@ mod keepalive_timeout_tests {
             KEEPALIVE_TIMEOUT_SECONDS,
             std::time::Duration::from_secs(30)
         );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_classify_tests {
+    use super::classify_upgrade_response;
+    use crate::push_service::ServiceError;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn credential_rejection_stays_unauthorized() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(matches!(
+                classify_upgrade_response(status),
+                Err(ServiceError::Unauthorized)
+            ));
+        }
+    }
+
+    #[test]
+    fn other_statuses_are_left_to_into_websocket() {
+        for status in [
+            StatusCode::SWITCHING_PROTOCOLS,
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(classify_upgrade_response(status).is_ok());
+        }
     }
 }

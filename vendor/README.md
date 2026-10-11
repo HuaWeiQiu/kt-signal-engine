@@ -74,6 +74,11 @@ git 源。story 协议面的最小叠加随本批后续 commit 落地，届时�
 - `src/account_manager.rs`、`src/content.rs`、`src/sender.rs`、
   `src/push_service/mod.rs`（同批 `cargo fmt` 收口）— 稳定通道 rustfmt
   子集重排，语义零变化。
+- `src/push_service/mod.rs`（2026-10-11 ws 升级 401 归型批）— `ws()` 升级
+  响应 401/403 经纯函数 `classify_upgrade_response` 保留为
+  `ServiceError::Unauthorized`（此前 `.into_websocket()` 把非 101 升级
+  失败整体折叠 `WsError`，升级状态码丢弃，凭据死亡被黑盒化）；
+  `upgrade_classify_tests` 单测。
 
 `vendor/presage/`（rev 33dd149）：
 

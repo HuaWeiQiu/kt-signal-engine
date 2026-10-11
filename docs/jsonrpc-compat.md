@@ -2378,6 +2378,11 @@ response.rs：401/403 同归型）。此前 send 链把 presage 错误一律折�
 - **单测**：归型两面包 + 反例（404/NoMessagesToSend/UnknownGroup 不误
   报）钉 `send_error_of`；sendError 解绑臂形状（-32603 + 原文 + 分类器
   锚词 AuthorizationFailedException/Authorization failed）钉 methods 面。
+- **ws 升级层（vendored，2026-10-11 批）**：`ws()` 升级响应 401/403 现保留
+  为 `ServiceError::Unauthorized`（vendored `classify_upgrade_response`
+  单点）——此前升级失败经 `into_websocket` 整体折叠 `WsError`、状态码
+  丢弃，建流遇凭据死亡只走退避重连不停环；修复后 `receive_stream_unbound`
+  停环归型在升级层真正可达。wire 零变化不 bump 契约。
 
 ### 发送链错误码结构化三分类（RateLimited/ProofRequired/ServerUnavailable，2026-10-11 批，官方对齐 P8）
 
