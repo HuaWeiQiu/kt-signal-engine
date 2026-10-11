@@ -3466,6 +3466,32 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   the upstream」），引擎侧无消费方，按 §4.50「不发明无消费方的读面」纪
   律收口。过滤判定抽纯函数 `group_key_passes_filter` 单测钉形；fake 面
   参数闸同口径（契约测试钉定）。
+- **项8 时钟偏移闸 + keepalive stale（审计项8，wire additive）**：两个
+  子项求证与落法——
+  - **keepalive stale 检测（websocket 假活）**：vendored websocket 已实
+    现（libsignal-service src/websocket/mod.rs `run()`：30s
+    keepalive 节律（`KEEPALIVE_TIMEOUT_SECONDS`，官方 Android
+    HealthMonitor 30s 同值）发出后未在下一拍前收到应答（`outgoing_keep_
+    alive_set` 非空）→ `Websocket will be closed due to failed keepalives`
+    → close + 管道结束 → 引擎重连退避循环接管）——官方 Signal-Android
+    SignalWebSocketHealthMonitor onKeepAliveResponse/keepalive sender 状
+    态机同位。零改动，如实记档。
+  - **时钟偏移闸**：官方 Signal-Android `ClockSkewDetector` 行为对齐（
+    不抄码）——服务器时间源 = 每信封 `metadata.server_timestamp`（官方
+    从 ws 消息/remote config 取，engine 信封面同源同权威）；skew 式 =
+    `|本地 − 服务器|`；阈值 = 官方 remote config
+    `client.maxAllowedClockSkewSeconds` 默认 24h（engine 无 remote config
+    面，取同默认编译期常量）。落法：`receive.clockskew` per-account
+    additive 通知 `{account, skewMs（带符号 = 本地−服务器，正 = 本地快）,
+    serverTimestamp}`，**边缘触发**（首越阈告警一次 → 持续越阈静默 → 回
+    阈内重臂 → 再越阈重新告警；官方 detected 态 in-memory 自愈清除同语
+    义；per-信封重复告警无增量信息故不逐条投）；状态 per-接收管线一份
+    （跨重连存活）。**拒绝面不做**（偏差登记）：本地钟错不该丢真消息，
+    官方超阈动作是「停保活 + 阻断屏」GUI 语义（有用户可修钟）；sidecar
+    无用户可介入，停车/拒收即自 DoS——保守策略 = 只报态，连接器/desktop
+    消费自定（日志/告警/运维通知）。观测面在 Received::Content 与
+    IdentityChange 两臂（二者同携 server_timestamp；DecryptionError 携
+    sender client 时钟非服务器权威，不入观测）。
 - **项6 群审批 deny 原语（审计项6，wire 语义扩展无新键）**：审计「审批
   deny 原语 + ban 写面」求证：ban 写面 = GroupV2Record.blocked 位，由
   `setConversationBlocked`（2026-10-06 批）已覆盖，无缺口；deny 原语真

@@ -3353,6 +3353,82 @@ fn queue_emptied_notification(account: &str) -> Value {
     })
 }
 
+/// 时钟偏移闸阈值（时序审计 G-时钟，P15b 项8）：官方 Signal-Android
+/// ClockSkewDetector 阈值 = remote config `client.maxAllowedClockSkewSeconds`
+/// 默认 24h（RemoteConfig.kt defaultValue = 24.hours）。引擎无 remote
+/// config 面，取同默认值为编译期常量。
+const CLOCK_SKEW_THRESHOLD_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// 偏移判定纯函数：`|本地 - 服务器| > 阈值` → Some(skew_ms)，符号 = 本地
+/// − 服务器（正 = 本地钟快）；阈内 → None（官方 ClockSkewDetector.skewFrom
+/// 同式：abs(local − server)）。
+fn clock_skew_over_threshold(server_ts_ms: i64, now_ms: i64) -> Option<i64> {
+    let skew = now_ms - server_ts_ms;
+    (skew.abs() > CLOCK_SKEW_THRESHOLD_MS).then_some(skew)
+}
+
+/// 偏移状态机单步（边缘触发，防 per-信封告警风暴）：
+/// - 未告警 + 越阈 → `Alert(skew)`：上抛一次告警；
+/// - 已告警 + 仍越阈 → `Sustained`：静默（每信封重复告警无增量信息）；
+/// - 阈内 → `Rearm`：清告警态（官方 detected 态 in-memory 自愈清除同
+///   语义——时钟修好后下次越阈重新告警）。
+enum SkewTransition {
+    Alert(i64),
+    Sustained,
+    Rearm,
+}
+
+fn skew_transition(alerted: bool, server_ts_ms: i64, now_ms: i64) -> SkewTransition {
+    match clock_skew_over_threshold(server_ts_ms, now_ms) {
+        Some(skew) if !alerted => SkewTransition::Alert(skew),
+        Some(_) => SkewTransition::Sustained,
+        None => SkewTransition::Rearm,
+    }
+}
+
+/// per-管线时钟偏移闸（跨重连存活：接收管线生命周期持一份）。偏移观测
+/// 只做告警上抛，不拒信封不停车：本地钟错不该丢真消息（拒绝面不做，§5
+/// 偏差登记）；官方 Android 超阈「停保活 + 阻断屏」是 GUI 语义（有用户
+/// 可修钟），sidecar 无用户可介入，停车即自 DoS——保守策略 = 报态给
+/// 消费方自定。
+struct ClockSkewGate {
+    alerted: bool,
+}
+
+impl ClockSkewGate {
+    fn observe(&mut self, service: &Arc<Service>, number: &str, server_ts_ms: i64) {
+        match skew_transition(self.alerted, server_ts_ms, now_ms() as i64) {
+            SkewTransition::Alert(skew) => {
+                self.alerted = true;
+                service.notify(clock_skew_notification(
+                    number,
+                    skew,
+                    server_ts_ms.max(0) as u64,
+                ));
+            }
+            SkewTransition::Sustained => {}
+            SkewTransition::Rearm => self.alerted = false,
+        }
+    }
+}
+
+/// 偏移告警通知（wire additive，`receive.clockskew`，receive.emptied 同款
+/// 独立方法名非 envelope 载体——偏移是流态观测无信封可挂）。params：
+/// account / skewMs（带符号 = 本地 − 服务器，正 = 本地快）/ serverTimestamp
+///（观测源信封服务器毫秒）。引擎只报态；连接器/desktop 消费自定（日志/
+/// 告警/运维通知）。
+fn clock_skew_notification(account: &str, skew_ms: i64, server_timestamp_ms: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive.clockskew",
+        "params": {
+            "account": account,
+            "skewMs": skew_ms,
+            "serverTimestamp": server_timestamp_ms,
+        },
+    })
+}
+
 fn identity_changed_notification(account: &str, sender: &ServiceId, timestamp: u64) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -3564,6 +3640,9 @@ async fn receive_pipeline(
     // D5 设备面能力注册：每管线运行成功一次即止（官方 afterEveryLinked
     // Startup 每次链接启动同位，不随重连重发）；失败随建流重试。
     let mut capabilities_registered = false;
+    // P15b 项8 时钟偏移闸：跨重连存活（管线生命周期一份），边缘触发
+    // 上抛 receive.clockskew。
+    let mut skew_gate = ClockSkewGate { alerted: false };
     // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
@@ -3599,6 +3678,7 @@ async fn receive_pipeline(
                 &mut derm_guard,
                 &mut receipts,
                 &mut capabilities_registered,
+                &mut skew_gate,
             ) => outcome,
         };
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
@@ -3728,6 +3808,7 @@ async fn serve_account_stream(
     derm_guard: &mut DermRetryGuard,
     receipts: &mut delivery_receipt::AutoDeliveryReceipts,
     capabilities_registered: &mut bool,
+    skew_gate: &mut ClockSkewGate,
 ) -> StreamOutcome {
     let Ok(store) = open_store(dir).await else {
         return StreamOutcome::Recoverable;
@@ -3894,6 +3975,12 @@ async fn serve_account_stream(
                 Some(Received::IdentityChange(sender, content, ack)) => {
                     let sid_string = sender.service_id_string();
                     let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
+                    // P15b 项8：偏移观测（IdentityChange 臂同 Content 臂）。
+                    skew_gate.observe(
+                        service,
+                        number,
+                        content.metadata.server_timestamp.timestamp_millis(),
+                    );
                     service.notify(identity_changed_notification(
                         number,
                         &sender,
@@ -3918,6 +4005,13 @@ async fn serve_account_stream(
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
+                    // P15b 项8 时钟偏移闸：服务器时间戳 vs 本地钟（边缘触发
+                    // 告警上抛，不拒信封不停车，§5 偏差登记）。
+                    skew_gate.observe(
+                        service,
+                        number,
+                        content.metadata.server_timestamp.timestamp_millis(),
+                    );
                     // B4 身份事件面：verified 同步下行（多设备信任态收敛）
                     // ——sidecar 权威突变 + receive 事件投影，先于普通投影
                     // 面（该体在 project_content 恒空投影，零冲突）。
@@ -12887,6 +12981,80 @@ mod tests {
         assert_eq!(notification["jsonrpc"], json!("2.0"));
         assert_eq!(notification["method"], json!("receive.emptied"));
         assert_eq!(notification["params"]["account"], json!("acct"));
+        assert!(notification["params"].get("envelope").is_none());
+    }
+
+    /// P15b 项8 时钟偏移闸判定：阈内 None；越阈 Some(skew)（符号 = 本地 −
+    /// 服务器）；阈值 = 官方 ClockSkewDetector 默认 24h。
+    #[test]
+    fn clock_skew_threshold_matches_official_24h_default() {
+        let day: i64 = 24 * 60 * 60 * 1_000;
+        assert_eq!(CLOCK_SKEW_THRESHOLD_MS, day);
+        assert_eq!(clock_skew_over_threshold(1_000_000, 1_000_000), None);
+        assert_eq!(
+            clock_skew_over_threshold(1_000_000, 1_000_000 + day),
+            None,
+            "恰在阈值不告警"
+        );
+        assert_eq!(
+            clock_skew_over_threshold(1_000_000, 1_000_000 + day + 1),
+            Some(day + 1),
+            "本地钟快超阈，skew 为正"
+        );
+        assert_eq!(
+            clock_skew_over_threshold(1_000_000 + day + 5_000, 1_000_000),
+            Some(-(day + 5_000)),
+            "本地钟慢超阈，skew 为负"
+        );
+    }
+
+    /// P15b 项8 偏移状态机（边缘触发）：首越阈 Alert → 持续 Sustained →
+    /// 回阈内 Rearm → 再越阈重新 Alert。
+    #[test]
+    fn skew_transition_edge_triggers_once_per_episode() {
+        let day: i64 = 24 * 60 * 60 * 1_000;
+        let t0 = 1_000_000_i64;
+        // 未告警 + 阈内 = Rearm（幂等无害）。
+        assert!(matches!(
+            skew_transition(false, t0, t0),
+            SkewTransition::Rearm
+        ));
+        // 首越阈 = Alert（带符号 skew）。
+        assert!(matches!(
+            skew_transition(false, t0, t0 + day + 60_000),
+            SkewTransition::Alert(s) if s == day + 60_000
+        ));
+        // 已告警 + 仍越阈 = Sustained（不重复告警）。
+        assert!(matches!(
+            skew_transition(true, t0, t0 + day + 120_000),
+            SkewTransition::Sustained
+        ));
+        // 已告警 + 回阈内 = Rearm。
+        assert!(matches!(
+            skew_transition(true, t0, t0),
+            SkewTransition::Rearm
+        ));
+        // 重臂后再越阈 = 重新 Alert。
+        assert!(matches!(
+            skew_transition(false, t0, t0 - day - 1),
+            SkewTransition::Alert(s) if s == -(day + 1)
+        ));
+    }
+
+    /// P15b 项8 偏移告警通知形状面：`receive.clockskew` 独立方法（非
+    /// envelope 载体同 emptied 纪律），params 三键（account/skewMs/
+    /// serverTimestamp）。
+    #[test]
+    fn clock_skew_notification_shape_is_additive_stream_face() {
+        let notification = clock_skew_notification("acct", -86_500_000, 1_700_000_000_000);
+        assert_eq!(notification["jsonrpc"], json!("2.0"));
+        assert_eq!(notification["method"], json!("receive.clockskew"));
+        assert_eq!(notification["params"]["account"], json!("acct"));
+        assert_eq!(notification["params"]["skewMs"], json!(-86_500_000));
+        assert_eq!(
+            notification["params"]["serverTimestamp"],
+            json!(1_700_000_000_000_u64)
+        );
         assert!(notification["params"].get("envelope").is_none());
     }
 
