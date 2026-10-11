@@ -14,9 +14,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
-    capabilities, parse_legacy_call_face, storage_sync, storage_write, DeviceCapabilitiesError,
-    LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange,
-    SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    capabilities, parse_legacy_call_face, storage_sync, storage_write, DeleteForMeAuthor,
+    DeleteForMeConversation, DeleteForMeEntry, DeviceCapabilitiesError, LinkError,
+    MessageRequestTarget, SendMention, SendPreview, SendQuote, SendQuoteBodyRange, SendSticker,
+    SendStoryContext, SendTextStyle, Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -1313,6 +1314,105 @@ async fn dispatch(
                     }
                 }
                 _ => internal_error(id),
+            }
+        }
+        // deleteForMeConversation（P15c 项3，官方 deleteConversation 发送面
+        // 同位，compat §3 行 + §5 P15c 块）：会话级「为我删除」上行。kind
+        // 词表 contact/group（legacyGroup 官方不支持——getConversation
+        // Identifier 非 GV2 群 throw 同拒）；contact = service-id 串或 E164
+        // （toConversationIdentifier aci/e164 双形态），group = 32B 标准
+        // base64 master key（decode_group_id 闸）。localOnly 缺省 false =
+        // 全量清空臂（mostRecentMessages 必填非空 ≤5 条目——官方 slice(0,5)
+        // 上限镜像，超出 fail-closed 不静默截断破坏性意图；
+        // mostRecentNonExpiringMessages 可选 ≤5）；true = 仅本地臂
+        // （mostRecent* 必须缺席——官方 local-only 分支无消息位）。条目
+        // {author, timestamp}：author = service-id 串或 E164 直通
+        // （toAddressableMessage 形态，引擎不做号码↔service id 二次变换），
+        // timestamp 正整数；任一条目形状错整拒 -32603 不发半批。协议上行
+        // 面落调度日志（send 系同纪律）。
+        "deleteForMeConversation" => {
+            state.lock().await.append_dispatch(method, params);
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let local_only = match params.get("localOnly") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return internal_error(id),
+            };
+            let conversation = match (
+                params.get("kind").and_then(Value::as_str),
+                params.get("conversationId").and_then(Value::as_str),
+            ) {
+                (Some("contact"), Some(text)) if !text.is_empty() => {
+                    if let Some(sid) =
+                        presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(text)
+                    {
+                        DeleteForMeConversation::Contact(sid)
+                    } else if crate::service::is_e164(text) {
+                        DeleteForMeConversation::Phone(text.to_owned())
+                    } else {
+                        return internal_error(id);
+                    }
+                }
+                (Some("group"), Some(text)) => match crate::service::decode_group_id(text) {
+                    Some(master_key) => DeleteForMeConversation::Group(master_key),
+                    None => return internal_error(id),
+                },
+                _ => return internal_error(id),
+            };
+            let parse_entries = |value: Option<&Value>| match value {
+                None | Some(Value::Null) => Some(Vec::new()),
+                Some(Value::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let author = item.get("author").and_then(Value::as_str)?;
+                        let author =
+                                if let Some(sid) = presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(author) {
+                                    DeleteForMeAuthor::ServiceId(sid)
+                                } else if crate::service::is_e164(author) {
+                                    DeleteForMeAuthor::Phone(author.to_owned())
+                                } else {
+                                    return None;
+                                };
+                        let timestamp = item.get("timestamp").and_then(Value::as_u64)?;
+                        if timestamp == 0 {
+                            return None;
+                        }
+                        out.push(DeleteForMeEntry { author, timestamp });
+                    }
+                    Some(out)
+                }
+                Some(_) => None,
+            };
+            let (Some(most_recent), Some(most_recent_non_expiring)) = (
+                parse_entries(params.get("mostRecentMessages")),
+                parse_entries(params.get("mostRecentNonExpiringMessages")),
+            ) else {
+                return internal_error(id);
+            };
+            if local_only {
+                if !most_recent.is_empty() || !most_recent_non_expiring.is_empty() {
+                    return internal_error(id);
+                }
+            } else if most_recent.is_empty()
+                || most_recent.len() > 5
+                || most_recent_non_expiring.len() > 5
+            {
+                return internal_error(id);
+            }
+            match service
+                .send_delete_for_me_conversation(
+                    account,
+                    conversation,
+                    local_only,
+                    most_recent,
+                    most_recent_non_expiring,
+                )
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
+                Err(error) => send_error(id, error),
             }
         }
         // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头）；

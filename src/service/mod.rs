@@ -591,6 +591,111 @@ fn build_message_request_response_sync(
     }
 }
 
+/// deleteForMeConversation 会话标识（官方 toConversationIdentifier 三形态，
+/// SendMessage.preload.ts:2915）：service id（ACI/PNI）直写
+/// threadServiceIdBinary 现行 binary 面；E164 直写 threadE164；GV2 群 =
+/// 32B master key 原样 bytes。非 GV2 群官方不支持（getConversationIdentifier
+/// isGroup&&!isGroupV2 throw，syncIdentifiers.preload.ts:148-150），API 面
+/// 同拒 legacyGroup。
+pub(crate) enum DeleteForMeConversation {
+    Contact(ServiceId),
+    Phone(String),
+    Group(Vec<u8>),
+}
+
+/// deleteForMeConversation mostRecentMessages 条目（官方 toAddressableMessage
+/// 同构：author ACI/PNI/E164 三形态 + sentTimestamp；SendMessage.preload.ts
+/// :2871）。作者 = 调用方消息行的身份直通（ACI/E164，官方
+/// getAddressableMessage 同源取材），引擎不做号码↔service id 二次变换。
+pub(crate) struct DeleteForMeEntry {
+    pub(crate) author: DeleteForMeAuthor,
+    pub(crate) timestamp: u64,
+}
+
+pub(crate) enum DeleteForMeAuthor {
+    ServiceId(ServiceId),
+    Phone(String),
+}
+
+/// DeleteForMe 会话级构帧（官方 getDeleteForMeSyncMessage delete-conversation
+/// / delete-local-conversation 两变体同位，SendMessage.preload.ts:1840/
+/// conversations.preload.ts:5640-5663）：全量清空臂 = conversationDeletes[0]
+/// {conversation, isFullDelete: true, mostRecentMessages,
+/// mostRecentNonExpiringMessages?}；仅本地臂 = localOnlyConversationDeletes[0]
+/// {conversation}（官方 mostRecentMessages 空批 else 分支同语义）。padded
+/// sync message。
+fn build_delete_for_me_conversation_sync(
+    conversation: &DeleteForMeConversation,
+    local_only: bool,
+    most_recent: &[DeleteForMeEntry],
+    most_recent_non_expiring: &[DeleteForMeEntry],
+) -> presage::proto::SyncMessage {
+    use presage::proto::addressable_message::Author;
+    use presage::proto::conversation_identifier::Identifier;
+
+    let identifier = match conversation {
+        DeleteForMeConversation::Contact(sid) => {
+            Identifier::ThreadServiceIdBinary(sid.service_id_binary())
+        }
+        DeleteForMeConversation::Phone(e164) => Identifier::ThreadE164(e164.clone()),
+        DeleteForMeConversation::Group(master_key) => Identifier::ThreadGroupId(master_key.clone()),
+    };
+    let entry_of = |entry: &DeleteForMeEntry| presage::proto::AddressableMessage {
+        author: Some(match &entry.author {
+            DeleteForMeAuthor::ServiceId(sid) => {
+                Author::AuthorServiceIdBinary(sid.service_id_binary())
+            }
+            DeleteForMeAuthor::Phone(e164) => Author::AuthorE164(e164.clone()),
+        }),
+        sent_timestamp: Some(entry.timestamp),
+    };
+    let conversation_identifier = presage::proto::ConversationIdentifier {
+        identifier: Some(identifier),
+    };
+    let delete_for_me = if local_only {
+        presage::proto::sync_message::DeleteForMe {
+            local_only_conversation_deletes: vec![
+                presage::proto::sync_message::delete_for_me::LocalOnlyConversationDelete {
+                    conversation: Some(conversation_identifier),
+                },
+            ],
+            ..presage::proto::sync_message::DeleteForMe::default()
+        }
+    } else {
+        presage::proto::sync_message::DeleteForMe {
+            conversation_deletes: vec![
+                presage::proto::sync_message::delete_for_me::ConversationDelete {
+                    conversation: Some(conversation_identifier),
+                    is_full_delete: Some(true),
+                    most_recent_messages: most_recent.iter().map(entry_of).collect(),
+                    most_recent_non_expiring_messages: most_recent_non_expiring
+                        .iter()
+                        .map(entry_of)
+                        .collect(),
+                },
+            ],
+            ..presage::proto::sync_message::DeleteForMe::default()
+        }
+    };
+    presage::proto::SyncMessage {
+        content: Some(presage::proto::sync_message::Content::DeleteForMe(
+            delete_for_me,
+        )),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
+}
+
+/// E.164 形状闸（`+` 前缀 + 1..=15 位 ASCII 数字；deleteForMeConversation
+/// conversation/author E164 臂用——引擎无号码库语义，形状闸 fail-closed）。
+pub(crate) fn is_e164(text: &str) -> bool {
+    match text.strip_prefix('+') {
+        Some(digits) => {
+            !digits.is_empty() && digits.len() <= 15 && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum UserStatusError {
     /// 账号在服务器侧已解绑（401）：connector 1.21 靠错误原文识别解绑态。
@@ -1629,6 +1734,45 @@ impl Service {
         );
         let body =
             ContentBody::SynchronizeMessage(build_message_request_response_sync(&target, r#type));
+        let envelope_ts = now_ms();
+        manager
+            .send_message(own_aci, body, envelope_ts)
+            .await
+            .map_err(send_error_of)?;
+        Ok(())
+    }
+
+    /// deleteForMeConversation（P15c 项3，官方桌面 conversations.preload.ts
+    /// deleteConversation 发送面同构）：会话级「为我删除」上行——全量清空臂
+    /// （delete-conversation：mostRecentMessages 全量清空语义 +
+    /// isFullDelete:true）/ 仅本地臂（delete-local-conversation）双变体，
+    /// 向自己 ACI 发 SyncMessage.deleteForMe（content oneof deleteForMe=22，
+    /// padded sync message；构帧单点 build_delete_for_me_conversation_sync）。
+    /// desktop 上行接线归后续批。
+    pub(crate) async fn send_delete_for_me_conversation(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: DeleteForMeConversation,
+        local_only: bool,
+        most_recent: Vec<DeleteForMeEntry>,
+        most_recent_non_expiring: Vec<DeleteForMeEntry>,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        let body = ContentBody::SynchronizeMessage(build_delete_for_me_conversation_sync(
+            &conversation,
+            local_only,
+            &most_recent,
+            &most_recent_non_expiring,
+        ));
         let envelope_ts = now_ms();
         manager
             .send_message(own_aci, body, envelope_ts)
@@ -13974,6 +14118,141 @@ mod tests {
                     assert_eq!(context.revision, revision);
                 }
             }
+        }
+    }
+
+    /// P15c 项3 DeleteForMe 会话级构帧：全量清空臂（conversationDeletes[0]
+    /// isFullDelete + mostRecent 双数组）/ 仅本地臂（localOnlyConversation
+    /// Deletes[0]）三形态会话标识（service-id binary/E164/group master key）
+    /// 含条目 author binary 面——官方 getDeleteForMeSyncMessage 同位字节
+    /// 钉形（encode→decode 回读对账，群审批 deny 原语单测同纪律）。
+    #[test]
+    fn delete_for_me_conversation_sync_shapes() {
+        let aci = ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+            .expect("aci");
+        let entries = |count: usize| {
+            (0..count)
+                .map(|i| DeleteForMeEntry {
+                    author: DeleteForMeAuthor::ServiceId(aci),
+                    timestamp: 1_700_000_000_000 + i as u64,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 全量清空臂（直聊 ACI）：conversationDeletes 恰一条、isFullDelete
+        // 真、mostRecent 双数组进位；localOnly 臂空。
+        let sync = build_delete_for_me_conversation_sync(
+            &DeleteForMeConversation::Contact(aci),
+            false,
+            &entries(2),
+            &entries(1),
+        );
+        let presage::proto::sync_message::Content::DeleteForMe(delete) =
+            sync.content.as_ref().expect("content")
+        else {
+            panic!("deleteForMe content");
+        };
+        assert!(delete.message_deletes.is_empty());
+        assert!(delete.local_only_conversation_deletes.is_empty());
+        let [group] = delete.conversation_deletes.as_slice() else {
+            panic!("one conversation delete");
+        };
+        assert_eq!(group.is_full_delete, Some(true));
+        assert_eq!(group.most_recent_messages.len(), 2);
+        assert_eq!(group.most_recent_non_expiring_messages.len(), 1);
+        let identifier = group
+            .conversation
+            .as_ref()
+            .expect("conversation")
+            .identifier
+            .as_ref()
+            .expect("identifier");
+        match identifier {
+            presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes) => {
+                assert_eq!(bytes, &aci.service_id_binary(), "service id binary 面");
+            }
+            other => panic!("thread service id binary, got {other:?}"),
+        }
+        let entry = &group.most_recent_messages[0];
+        assert_eq!(entry.sent_timestamp, Some(1_700_000_000_000));
+        match entry.author.as_ref().expect("author") {
+            presage::proto::addressable_message::Author::AuthorServiceIdBinary(bytes) => {
+                assert_eq!(bytes, &aci.service_id_binary());
+            }
+            other => panic!("author binary, got {other:?}"),
+        }
+
+        // 仅本地臂（群 master key）：localOnlyConversationDeletes 恰一条、
+        // conversationDeletes 空。
+        let sync = build_delete_for_me_conversation_sync(
+            &DeleteForMeConversation::Group(vec![9u8; 32]),
+            true,
+            &[],
+            &[],
+        );
+        let presage::proto::sync_message::Content::DeleteForMe(delete) =
+            sync.content.as_ref().expect("content")
+        else {
+            panic!("deleteForMe content");
+        };
+        assert!(delete.conversation_deletes.is_empty());
+        let [local] = delete.local_only_conversation_deletes.as_slice() else {
+            panic!("one local-only delete");
+        };
+        match local
+            .conversation
+            .as_ref()
+            .expect("conversation")
+            .identifier
+            .as_ref()
+            .expect("identifier")
+        {
+            presage::proto::conversation_identifier::Identifier::ThreadGroupId(bytes) => {
+                assert_eq!(bytes, &[9u8; 32], "group master key 原样");
+            }
+            other => panic!("thread group id, got {other:?}"),
+        }
+
+        // E164 会话 + E164 作者（官方 e164 臂直通形态）。
+        let sync = build_delete_for_me_conversation_sync(
+            &DeleteForMeConversation::Phone("+15551234567".to_owned()),
+            false,
+            &[DeleteForMeEntry {
+                author: DeleteForMeAuthor::Phone("+15550009999".to_owned()),
+                timestamp: 42,
+            }],
+            &[],
+        );
+        let presage::proto::sync_message::Content::DeleteForMe(delete) =
+            sync.content.as_ref().expect("content")
+        else {
+            panic!("deleteForMe content");
+        };
+        let [group] = delete.conversation_deletes.as_slice() else {
+            panic!("one conversation delete");
+        };
+        match group
+            .conversation
+            .as_ref()
+            .expect("conversation")
+            .identifier
+            .as_ref()
+            .expect("identifier")
+        {
+            presage::proto::conversation_identifier::Identifier::ThreadE164(e164) => {
+                assert_eq!(e164, "+15551234567");
+            }
+            other => panic!("thread e164, got {other:?}"),
+        }
+        match group.most_recent_messages[0]
+            .author
+            .as_ref()
+            .expect("author")
+        {
+            presage::proto::addressable_message::Author::AuthorE164(e164) => {
+                assert_eq!(e164, "+15550009999");
+            }
+            other => panic!("author e164, got {other:?}"),
         }
     }
 

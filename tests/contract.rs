@@ -4863,3 +4863,150 @@ fn send_quote_type_and_body_ranges_param_faces_and_dispatch_log() {
         "quoteBodyRanges array verbatim"
     );
 }
+
+/// deleteForMeConversation（P15c 项3，官方 deleteConversation 发送面同位）：
+/// fake 模式两臂成功形状桩 `{status: "sent"}`；参数面 fail-closed -32603：
+/// kind 词表（contact/group，legacyGroup 官方非 GV2 群不支持同拒）、contact
+/// 标识 service-id/E164 双形态闸、group 32B master key 闸、localOnly 非布尔、
+/// 全量清空臂 mostRecentMessages 必填非空 ≤5、仅本地臂 mostRecent* 必须缺席、
+/// 条目 author/timestamp 形状闸。协议上行面落调度日志（send 系同纪律）。
+#[test]
+fn delete_for_me_conversation_faces_and_param_fail_closed() {
+    let dir = temp_dir("delete-for-me-conversation");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let account = "+15550000000";
+    let aci = "11111111-2222-4333-8444-555555555555";
+
+    // 全量清空臂（contact service-id）：成功形状桩。
+    assert_eq!(
+        engine.request(
+            "deleteForMeConversation",
+            json!({ "account": account, "kind": "contact", "conversationId": aci,
+                    "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // E164 会话 + E164 作者 + nonExpiring 伴随数组。
+    assert_eq!(
+        engine.request(
+            "deleteForMeConversation",
+            json!({ "account": account, "kind": "contact", "conversationId": "+15555550101",
+                    "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 42 }],
+                    "mostRecentNonExpiringMessages": [{ "author": aci, "timestamp": 43 }] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // 群形态（32B master key）。
+    let group_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    assert_eq!(
+        engine.request(
+            "deleteForMeConversation",
+            json!({ "account": account, "kind": "group", "conversationId": group_id,
+                    "mostRecentMessages": [
+                        { "author": aci, "timestamp": 42 },
+                        { "author": aci, "timestamp": 43 }
+                    ] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // 仅本地臂：mostRecent* 缺席成功。
+    assert_eq!(
+        engine.request(
+            "deleteForMeConversation",
+            json!({ "account": account, "kind": "contact", "conversationId": aci,
+                    "localOnly": true }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    let rejects = [
+        // 缺 account / kind / conversationId。
+        json!({ "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact",
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        // kind 词表外 / legacyGroup（官方非 GV2 群不支持）。
+        json!({ "account": account, "kind": "bogus", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "legacyGroup", "conversationId": "abc",
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        // contact 标识既非 service-id 也非 E164。
+        json!({ "account": account, "kind": "contact", "conversationId": "not-an-id",
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        // group 非 base64 / ≠32B。
+        json!({ "account": account, "kind": "group", "conversationId": "%%%",
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "group", "conversationId": "AAA=",
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        // localOnly 非布尔。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "localOnly": "yes" }),
+        // 全量清空臂：mostRecentMessages 缺席/空批/非数组/超 5 条。
+        json!({ "account": account, "kind": "contact", "conversationId": aci }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": "x" }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": (0..6).map(|i| json!({ "author": aci, "timestamp": i + 1 })).collect::<Vec<_>>() }),
+        // 全量清空臂：mostRecentNonExpiringMessages 超 5 条。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }],
+                "mostRecentNonExpiringMessages": (0..6).map(|i| json!({ "author": aci, "timestamp": i + 1 })).collect::<Vec<_>>() }),
+        // 条目形状：author 不可解析（非 service-id 非 E164）/缺失、timestamp
+        // 缺失/0/负数/非整数、条目非对象、数组非对象形状。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": "whoami", "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 0 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": -1 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 1.5 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": [42] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "mostRecentMessages": { "author": aci } }),
+        // 仅本地臂：mostRecent* 必须缺席（官方 local-only 分支无消息位）。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "localOnly": true,
+                "mostRecentMessages": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "localOnly": true,
+                "mostRecentNonExpiringMessages": [{ "author": aci, "timestamp": 42 }] }),
+    ];
+    for params in &rejects {
+        assert_eq!(
+            engine.error_of("deleteForMeConversation", params.clone()).0,
+            -32603,
+            "deleteForMeConversation reject {params}"
+        );
+    }
+
+    // 调度日志：协议上行面逐字保留（send 系同纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let logged = entries
+        .iter()
+        .find(|entry| entry["method"] == "deleteForMeConversation")
+        .expect("deleteForMeConversation logged");
+    assert_eq!(logged["params"]["kind"], json!("contact"));
+    let logged_local = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "deleteForMeConversation"
+                && entry["params"]["localOnly"] == json!(true)
+        })
+        .expect("localOnly arm logged");
+    assert_eq!(logged_local["params"]["localOnly"], json!(true));
+}

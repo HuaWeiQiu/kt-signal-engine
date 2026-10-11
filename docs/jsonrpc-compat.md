@@ -150,6 +150,7 @@ send message: Signal server unavailable.
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
 | `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
+| `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
 
 `receive` 通知：`{jsonrpc, method:"receive", params:{account, envelope}}`；
 P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal-cli
@@ -3562,6 +3563,34 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
     Timer 面 = AccountRecord.universalExpireTimer(17) 字段写面（非独立
     record 族），桌面 `pendingUniversalTimer` 字样属消息级计时器通知
     （cleanup 面），与 Storage record 族无涉。零代码改动。
+- **项3 DeleteForMe 发送面（链组一 N1 发腿，deleteForMeConversation，
+  wire additive）**：会话级「为我删除」此前只有收包投影（P15a 项1，
+  conversationDeletes/localOnlyConversationDeletes 两臂投影给 connector
+  删自有库行），上行发送面缺口——本机桌面删会话时向手机同步「把这些消息
+  也删掉」。落法：新增 JSON-RPC `deleteForMeConversation`（§3 行），
+  官方 conversations.preload.ts:5640-5663 deleteConversation 发送面 +
+  SendMessage.preload.ts:1840 getDeleteForMeSyncMessage 构帧同位——
+  - 全量清空臂（官方 delete-conversation）：`localOnly` 缺省/false +
+    `mostRecentMessages`（必填非空 ≤5 条目——官方
+    getMostRecentAddressableMessages().slice(0, 5) 上限镜像，超出
+    fail-closed 不静默截断破坏性意图）+ 可选 `mostRecentNonExpiringMessages`
+    （官方 areAnyDisappearing 伴随面 ≤5）→ SyncMessage.deleteForMe.
+    conversationDeletes[0]{conversation, isFullDelete: true, ...}（手机端
+    按 mostRecent 定位消息行执行服务器删除 + 全设备清空语义）；
+  - 仅本地臂（官方 delete-local-conversation）：`localOnly: true`，
+    mostRecent* 必须缺席 → localOnlyConversationDeletes[0]{conversation}
+    （其他设备仅清本地行，无服务器删除；官方 mostRecentMessages 空批
+    else 分支同语义）；
+  - 会话标识三形态 binary-first（threadServiceIdBinary/threadE164/
+    threadGroupId = 32B master key bytes，官方 toConversationIdentifier
+    isProtoBinaryEncodingEnabled 现行面同位；legacyGroup 拒——官方
+    getConversationIdentifier 非 GV2 群 throw 同构）；条目 author 直通
+    （service-id/E164，官方 toAddressableMessage 形态，引擎不做号码↔
+    service id 二次变换——作者身份须与手机端消息行逐字匹配，store 侧
+    猜测映射会破坏 (author, sentTimestamp) 定位）。
+  向自己 ACI 发 padded sync message（self-send 通路 E4 已验证同款）；
+  协议上行面落调度日志。desktop 上行接线归后续批（connector/desktop
+  消费缺口移交主线：桌面会话删除流现仅清自有库，多设备同步缺上行腿）。
 
 
 ## 6. fake 服务模式（仅测试）
