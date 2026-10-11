@@ -3913,6 +3913,28 @@ pub(crate) struct StorageContext {
     pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
 }
 
+/// 凭据构造共用面（storage_context 上下文与 prekey remote config 读面同
+/// 源单点）：注册数据 → 手工凭据 PushService（link_flow 先例同构）。
+/// password 为 pub(crate)：经 serde 数据面读回（ADR 0005 §S2 唯一外部
+/// 构造路径，JSON 形态 = presage 官方 store 落库格式）；phonenumber 字段
+/// 要 E164（与 link_flow / presage credentials() 同构）。
+pub(crate) fn push_service_from_registration(data: &RegistrationData) -> Option<PushService> {
+    let raw = serde_json::to_value(data).ok()?;
+    let password = raw["password"].as_str()?.to_string();
+    use presage::libsignal_service::utils::TryIntoE164;
+    Some(PushService::new(
+        SignalServers::Production,
+        Some(ServiceCredentials {
+            aci: Some(data.service_ids.aci),
+            pni: Some(data.service_ids.pni),
+            phonenumber: data.phone_number.clone().try_into_e164().ok()?,
+            password: Some(password),
+            device_id: data.device_id.and_then(|id| id.try_into().ok()),
+        }),
+        USER_AGENT,
+    ))
+}
+
 /// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。
 async fn storage_context(
     service: &Service,
@@ -3933,30 +3955,8 @@ async fn storage_context(
         .await
         .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?
         .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
-    // password 为 pub(crate)：经 serde 数据面读回（ADR 0005 §S2 唯一外部
-    // 构造路径，JSON 形态 = presage 官方 store 落库格式）。
-    let raw =
-        serde_json::to_value(&data).map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?;
-    let password = raw["password"]
-        .as_str()
-        .ok_or(storage_sync::StorageSyncError::UnknownAccount)?
-        .to_string();
-    // phonenumber 字段要 E164（与 link_flow / presage credentials() 同构）。
-    use presage::libsignal_service::utils::TryIntoE164;
-    let push = PushService::new(
-        SignalServers::Production,
-        Some(ServiceCredentials {
-            aci: Some(data.service_ids.aci),
-            pni: Some(data.service_ids.pni),
-            phonenumber: data
-                .phone_number
-                .try_into_e164()
-                .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?,
-            password: Some(password),
-            device_id: data.device_id.and_then(|id| id.try_into().ok()),
-        }),
-        USER_AGENT,
-    );
+    let push = push_service_from_registration(&data)
+        .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
     Ok(StorageContext {
         store,
         push,

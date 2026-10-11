@@ -3712,13 +3712,16 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   `save_pre_key` 写入（宏改运行时 query，`.sqlx/` 缓存不动）+
   `SqliteProtocolStore` 六个 `kt_` 方法（one-time/signed/kyber 清单 + 三
   族批量删除，kyber 可删 last-resort 行由调用方裁定）；engine
-  `prekey.rs::cleanup_tick` 四族保留窗扫删（200/90d、5/30d、5/90d 常规
-  kyber、5/30d last-resort），挂 maintenance_tick（轮换后跑，纯本地零网
-  络），`sweep_candidates` 纯函数判删（窗外且够老双条件，窗内/窗外年轻
-  恒活——在役 signed/last-resort 按构造必在窗内）。偏差登记：30d 窗取
-  官方缺省（我方无 remoteConfig 读面）。单测 sweep_candidates_keep_
-  newest_and_age_gate（engine）+ kt_pre_key_inventory_and_bulk_removal
-  （store 级，时间戳/旗标/批量删除钉形）。
+  `prekey.rs::cleanup_tick` 四族保留窗扫删（200/90d、5/{messageQueueTime
+  窗}、5/90d 常规 kyber、5/{messageQueueTime 窗} last-resort），挂
+  maintenance_tick（轮换后跑），`sweep_candidates` 纯函数判删（窗外且够
+  老双条件，窗内/窗外年轻恒活——在役 signed/last-resort 按构造必在窗
+  内）。原偏差「30d 窗取官方缺省（无 remoteConfig 读面）」已于 2026-10-12
+  stretch 批收编（见下「窗C stretch 收编批」）。单测
+  sweep_candidates_keep_newest_and_age_gate +
+  signed_family_delete_age_ms_matches_official_max_floor（engine）+
+  kt_pre_key_inventory_and_bulk_removal（store 级，时间戳/旗标/批量删除
+  钉形）。
 - **项4 DERM 档二兜底细化（E4）**：审计原文「失败路径一律 clear_sessions
   全设备删除，过重且超限也清，与官方不符」。求证结论：官方 onRetryRequest
   闸序（handleRetry.preload.ts:129-261）= 防环超限（RETRY_LIMIT=5）**早
@@ -4129,6 +4132,52 @@ getGroupMigrationMembers → avatar 上行 → revision 0 + accessControl
   closed` 钉成功形状/参数闸逐形/日志摘要化/real 未注册账号折叠；单测
   `derive_master_key_from_group_v1_is_deterministic_and_length_agnostic`
   钉派生稳定性（无官方向量，回归锚）。
+
+### 窗C stretch 收编批（2026-10-12，官方对齐 Signal-Desktop RemoteConfig；三项一收编两维持）
+
+窗C 时序审计批遗留的三项 stretch 偏差逐项求证与处置：
+
+- **项3 30d 窗 remoteConfig——收编**。官方 `getMessageQueueTime()`
+  （ts/util/getMessageQueueTime.dom.ts）= `max(RemoteConfig.getValue(
+  'global.messageQueueTimeInSeconds'), MONTH/SECOND)`，MONTH 下限 = 30
+  天；prekey 本地保留窗（_cleanSignedPreKeys/_cleanKyberPreKeys）消费
+  同值。落法：`prekey.rs` 增 remote config 读面
+  `fetch_message_queue_time_seconds`（官方 WebAPI getConfig 行为对齐：
+  chatService host `GET v2/config`、账号 basic auth
+  （`HttpAuthOverride::NoOverride` = 注册凭据）、body =
+  `{config: {name: value}}` JSON map，取
+  `config["global.messageQueueTimeInSeconds"]` 字符串秒）；窗龄纯函数
+  `signed_family_delete_age_ms` = `max(remote 秒值, 30 天 floor)`（与
+  官方同式，floor 恒压过服务器调小）；`cleanup_tick` 挂读面（maintenance
+  2 天一拍只多一次 GET，官方 desktop 有本地缓存 + ETag 增量拉，headless
+  引擎拍频低无需同构）；读面任何失败（非 2xx/坏 JSON/键缺席/非数）=
+  None 落 floor——官方 parseIntWithFallback 缺省同 fail-open 语义，行为
+  与收编前完全一致。凭据构造抽 `push_service_from_registration` 共用面
+  （storage_context 同源单点）。偏差原登记行作废。单测
+  signed_family_delete_age_ms_matches_official_max_floor（缺席/低于/等于
+  /高于 floor 四态）。
+- **项4 SKDM 重发臂——维持记档，未收编**。官方兜底群臂（
+  handleRetry.preload.ts:370-440 + conversationJobQueue
+  sendSenderKeyDistribution）语义：群 id 来自**密封层 USMC 的
+  groupContext**（MessageReceiver.preload.ts:1388
+  `messageContent.groupId()`——envelope.groupId 出自 USMC.groupContext，
+  非 Content 本体），向**请求者单独** 1:1 重发同 distributionId 的 SKDM
+  （不要求 didArchive；NullMessage 才要求）。求证结论：vendored Rust 链
+  两处断层——proto `Content` 无 group context 字段（对照官方
+  SignalService.proto Content 同样无，群上下文只在 USMC 层）、vendored
+  USMC 解密链不透出 groupContext——收编需跨三层 vendored 改造（cipher
+  返回型 → presage 事件 → 引擎管线），波及面超出 stretch 语境。引擎
+  现兜底「归档过发 NullMessage（新会话敲对端促重建），否则不做」正确性
+  安全（SKDM 臂只加速群 sender key 重分发，NullMessage 路径同样触发对
+  端重建）；后续立项 = vendored USMC groupContext 透出面 + 兜底群臂。
+- **项2 confirmed 位——维持记档，未收编**。官方 signed prekey 轮换龄
+  判据 = 最近 confirmed 键 lastUpdate；引擎视 stored = confirmed（记录
+  内嵌时间戳即生成时刻）。求证结论：引擎 `update_pre_key_bundle` 单一
+  漏斗 = 生成即上传（轮换 PUT 同携新 signed + 新 last-resort），生成到
+  上传间隔为秒级同拍，两判据在正常路径等价；差异只在持续上传失败窗内
+  出现，且该窗内引擎按生成龄轮换重传，收敛到的服务器状态与官方一致。
+  收编成本（vendored store confirmed 位 + 上传成功回写 + 读面切换）大
+  于语义收益，维持现登记。
 
 
 ## 6. fake 服务模式（仅测试）

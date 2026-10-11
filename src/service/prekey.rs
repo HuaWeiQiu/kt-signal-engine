@@ -55,10 +55,10 @@ pub(crate) const PRE_KEY_ARCHIVE_AGE_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 /// signed/last-resort 族保留 newest（官方 SIGNED_PRE_KEY_MINIMUM = 5 :143、
 /// LAST_RESORT_KEY_MINIMUM = 5 :116）。
 pub(crate) const SIGNED_FAMILY_KEEP_NEWEST: usize = 5;
-/// signed/last-resort 族窗龄（官方 getMessageQueueTime() 缺省 30 天）。
-/// 偏差登记：官方取 max(remoteConfig, 30d)，我方无 remote config 读面，
-/// 取缺省下限 30d。
-pub(crate) const SIGNED_FAMILY_DELETE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+/// signed/last-resort 族窗龄 floor（官方 getMessageQueueTime
+/// `max(remoteConfig, MONTH/SECOND)` 的 MONTH 下限，30 天；remote config
+/// 读面见 `fetch_message_queue_time_seconds`，失败落本值）。
+pub(crate) const MESSAGE_QUEUE_TIME_FLOOR_SECONDS: u64 = 30 * 24 * 60 * 60;
 /// 巡检书签 kv 键（per-account store.db，跨重启生效）。
 const KV_LAST_RUN_MS: &str = "kt_prekey_maintenance_last_run_ms";
 
@@ -218,11 +218,65 @@ pub(crate) fn sweep_candidates(
         .collect()
 }
 
+/// signed/last-resort 族窗龄（官方 getMessageQueueTime 同式，纯函数）：
+/// `max(remoteConfig 秒值, 30 天 floor)`；config 缺席 = floor（官方
+/// parseIntWithFallback 缺省 MONTH/SECOND 同 fail-open 语义）。
+pub(crate) fn signed_family_delete_age_ms(message_queue_time_seconds: Option<u64>) -> u64 {
+    let seconds = message_queue_time_seconds
+        .unwrap_or(MESSAGE_QUEUE_TIME_FLOOR_SECONDS)
+        .max(MESSAGE_QUEUE_TIME_FLOOR_SECONDS);
+    seconds.saturating_mul(1_000)
+}
+
+/// remote config 读面（官方 WebAPI getConfig 行为对齐：chatService host
+/// `GET v2/config`、账号 basic auth、body = `{config: {name: value}}`
+/// JSON map；`HttpAuthOverride::NoOverride` = 注册凭据 basic auth）。
+/// 取 `config["global.messageQueueTimeInSeconds"]`（字符串秒，官方
+/// RemoteConfig 值形态）。任何失败（非 2xx/坏 JSON/键缺席/非数）= None，
+/// 调用方落 floor——不缓存不重试（maintenance 2 天一拍，下拍再取；官方
+/// desktop 有本地 config 缓存 + ETag 增量拉，headless 引擎拍频低无需
+/// 同构）。
+async fn fetch_message_queue_time_seconds(
+    push: &presage::libsignal_service::prelude::PushService,
+) -> Option<u64> {
+    use presage::libsignal_service::configuration::Endpoint;
+    use presage::libsignal_service::push_service::HttpAuthOverride;
+    let response = push
+        .request(
+            reqwest::Method::GET,
+            Endpoint::service("v2/config"),
+            HttpAuthOverride::NoOverride,
+        )
+        .ok()?
+        .send()
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    body.get("config")?
+        .get("global.messageQueueTimeInSeconds")?
+        .as_str()?
+        .parse::<u64>()
+        .ok()
+}
+
 /// 本地清理执行面（maintenance_tick 挂点）：四族按官方保留窗扫删——
-/// 一次性 200/90d、signed 5/30d、常规 kyber 200/90d、last-resort 5/30d。
-/// 纯本地面零网络；删除名单之外的键（含当前在役 signed/last-resort）恒
-/// 存活。全链路 best-effort：读/删失败静默，下轮节律再扫。
+/// 一次性 200/90d、signed 5/{messageQueueTime 窗}、常规 kyber 200/90d、
+/// last-resort 5/{messageQueueTime 窗}。signed/last-resort 窗龄取 remote
+/// config `global.messageQueueTimeInSeconds`（官方 getMessageQueueTime
+/// 同源；读面失败落 30 天 floor，2 天一拍只多一次 GET）。删除名单之外
+/// 的键（含当前在役 signed/last-resort）恒存活。全链路 best-effort：
+/// 读/删失败静默，下轮节律再扫。
 pub(crate) async fn cleanup_tick(manager: &mut Manager<SqliteStore, Registered>) {
+    let message_queue_time =
+        match super::push_service_from_registration(manager.registration_data()) {
+            Some(push) => fetch_message_queue_time_seconds(&push).await,
+            None => None,
+        };
+    let signed_family_delete_age_ms = signed_family_delete_age_ms(message_queue_time);
     let now = now_ms();
     let store = manager.store();
     for protocol_store in [store.aci_protocol_store(), store.pni_protocol_store()] {
@@ -244,7 +298,7 @@ pub(crate) async fn cleanup_tick(manager: &mut Manager<SqliteStore, Registered>)
             Ok(entries) => sweep_candidates(
                 entries,
                 SIGNED_FAMILY_KEEP_NEWEST,
-                SIGNED_FAMILY_DELETE_AGE_MS,
+                signed_family_delete_age_ms,
                 now,
             ),
             Err(_) => continue,
@@ -271,7 +325,7 @@ pub(crate) async fn cleanup_tick(manager: &mut Manager<SqliteStore, Registered>)
         let last_resort = sweep_candidates(
             last_resort,
             SIGNED_FAMILY_KEEP_NEWEST,
-            SIGNED_FAMILY_DELETE_AGE_MS,
+            signed_family_delete_age_ms,
             now,
         );
         let _ = protocol_store.kt_remove_kyber_pre_keys(&last_resort).await;
@@ -397,6 +451,27 @@ mod tests {
         // created_at=0（migration 前旧行）= 最旧：窗外即删（90 天必然超过）。
         let entries = vec![(7u32, 0), (8, now - day)];
         assert_eq!(sweep_candidates(entries, 1, 90 * day, now), vec![7]);
+    }
+
+    /// signed/last-resort 族窗龄（官方 getMessageQueueTime 同式回归锚）：
+    /// config 缺席/低于 floor = 30 天 floor；等于 floor 原值；高于 floor
+    /// 取 remote 值（官方 max(parsed, MONTH/SECOND) 同式）。
+    #[test]
+    fn signed_family_delete_age_ms_matches_official_max_floor() {
+        let day_ms: u64 = 24 * 60 * 60 * 1_000;
+        let floor = 30 * 24 * 60 * 60;
+        // 缺席 = floor。
+        assert_eq!(signed_family_delete_age_ms(None), 30 * day_ms);
+        // 低于 floor（服务器调小也压不过下限）= floor。
+        assert_eq!(signed_family_delete_age_ms(Some(3600)), 30 * day_ms);
+        assert_eq!(signed_family_delete_age_ms(Some(floor - 1)), 30 * day_ms);
+        // 恰 floor。
+        assert_eq!(signed_family_delete_age_ms(Some(floor)), 30 * day_ms);
+        // 高于 floor = remote 值。
+        assert_eq!(
+            signed_family_delete_age_ms(Some(floor + 86_400)),
+            31 * day_ms
+        );
     }
 
     /// 快速巡检时间触发（30min）：无书签未到期（首拍归 2 天巡检面）；窗口
