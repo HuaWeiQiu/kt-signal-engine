@@ -337,6 +337,18 @@
   记录内嵌时间戳[, is_last_resort])`、三族按 id 批量 remove（kyber 可删
   last-resort 行，保留窗由调用方裁定）；③`kt_pre_key_inventory_and_bulk_
   removal` 单测（时间戳/旗标/批量删除钉形）。
+- `src/protocol.rs`（2026-10-12 save_identity 误报修复批）—
+  `save_identity` 的 ReplacedExisting 判定从 UPDATE `rows_affected`
+  改为先 SELECT 比对钥匙字节：无档 INSERT、同钥不写库直返
+  `NewOrUnchanged`（无变更事件）、异钥才 UPDATE + archive + 变更
+  日志——补全 P9 批只把比对用在 archive 决策、返回值/变更日志仍吃
+  `rows_affected` 的缺口（上游 main 96f5e925，2026-10-12 fetch 仍把
+  「行存在」当「钥变」，值得向上游提 PR）。同钥重存（会话重建/第二封
+  PreKey 消息）曾误报换钥 → 引擎 identity 臂置 pending → 发送闸全拒，
+  即生产验收期「所有发送被安全号码闸拒绝」根因。两条宏查询改运行时
+  query（save_pre_key 先例，`.sqlx/` 离线缓存不动）；新增
+  `save_identity_same_key_not_reported_as_replacement` 回归单测（同钥
+  两存 NewOrUnchanged+单行+零事件、异钥 ReplacedExisting+行更新+单事件）。
 
 ## 更新纪律
 

@@ -709,59 +709,68 @@ impl IdentityKeyStore for SqliteProtocolStore {
         // sessions when the key actually CHANGED
         // (ts/SignalProtocolStore.preload.ts:2140-2192,
         // archiveSiblingSessions :2188-2192). Upstream's
-        // UPDATE-affected-rows check below conflates "row existed" with
-        // "key changed" — a same-key re-save must not wipe sessions — so
-        // the change decision is taken from the stored identity before it
-        // is overwritten.
+        // UPDATE-affected-rows check conflates "row existed" with
+        // "key changed", so the change decision is taken from the stored
+        // identity before it is overwritten.
         let previous = self.get_identity(address).await?;
+
+        // KT (false-replacement fix, P9 completion): replaced means a
+        // stored identity exists AND the key bytes differ — decided here
+        // by comparison, not by UPDATE rows_affected (upstream main
+        // 96f5e925 still conflates them; a same-key re-save — session
+        // rebuild / second PreKey message — was misreported as a key
+        // change, pending-flagging the peer identity and refusing every
+        // send). Same-key re-save: no write, no change event,
+        // NewOrUnchanged.
+        let is_replaced = previous.is_some() && previous.as_ref() != Some(identity);
+        if !is_replaced && previous.is_some() {
+            return Ok(IdentityChange::NewOrUnchanged);
+        }
 
         let address = address.name();
         let bytes = identity.serialize();
 
         let mut tx = self.store.db.begin().await.into_protocol_error()?;
 
-        // Note: It is faster to do the update in a separate query and only insert the record if
-        // the update did not do anything.
-        let is_replaced = query!(
-            "UPDATE identities SET record = ?3
-            WHERE address = ?1 AND identity = ?2",
-            address,
-            self.identity,
-            bytes,
-        )
-        .execute(&mut *tx)
-        .await
-        .into_protocol_error()?
-        .rows_affected()
-            != 0;
-
-        if !is_replaced {
-            query!(
-                "INSERT INTO identities (address, identity, record)
-                VALUES (?1, ?2, ?3)",
-                address,
-                self.identity,
-                bytes,
+        // Runtime queries (not macros) so this KT-patched block can move
+        // without touching the offline .sqlx cache (save_pre_key
+        // precedent).
+        if is_replaced {
+            sqlx::query(
+                "UPDATE identities SET record = ?3
+                WHERE address = ?1 AND identity = ?2",
             )
+            .bind(address)
+            .bind(self.identity)
+            .bind(&bytes)
             .execute(&mut *tx)
             .await
             .into_protocol_error()?;
-        }
 
-        // KT: the key actually changed → archive the sessions built under
-        // the old key (official archiveSiblingSessions face), same
-        // transaction as the identity overwrite. The next send/receive
-        // rebuilds from the new identity (DERM/MRM self-heal covers the
-        // far end). Outbound group sender-key reset is NOT done (no
-        // group-member face in the engine; deviation logged,
-        // docs/jsonrpc-compat.md §5).
-        if is_replaced && previous.as_ref() != Some(identity) {
+            // KT: the key actually changed → archive the sessions built
+            // under the old key (official archiveSiblingSessions face),
+            // same transaction as the identity overwrite. The next
+            // send/receive rebuilds from the new identity (DERM/MRM
+            // self-heal covers the far end). Outbound group sender-key
+            // reset is NOT done (no group-member face in the engine;
+            // deviation logged, docs/jsonrpc-compat.md §5).
             sqlx::query("DELETE FROM sessions WHERE address = ? AND identity = ?")
                 .bind(address)
                 .bind(self.identity)
                 .execute(&mut *tx)
                 .await
                 .into_protocol_error()?;
+        } else {
+            sqlx::query(
+                "INSERT INTO identities (address, identity, record)
+                VALUES (?1, ?2, ?3)",
+            )
+            .bind(address)
+            .bind(self.identity)
+            .bind(&bytes)
+            .execute(&mut *tx)
+            .await
+            .into_protocol_error()?;
         }
 
         tx.commit().await.into_protocol_error()?;
@@ -1074,6 +1083,79 @@ mod test {
         // the new identity.
         protocol_store.save_identity(&address, &new_key).await?;
         assert!(protocol_store.load_session(&address).await?.is_none());
+
+        Ok(())
+    }
+
+    // KT (false-replacement fix): a same-key re-save (session rebuild /
+    // second PreKey message) must report NewOrUnchanged — no write, no
+    // replacement event, row count stable; only a genuinely different key
+    // reports ReplacedExisting, updates the stored bytes and logs one
+    // change event.
+    #[tokio::test]
+    async fn save_identity_same_key_not_reported_as_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use presage::store::Store;
+
+        async fn identities_row_count(
+            store: &SqliteProtocolStore,
+            address: &ProtocolAddress,
+        ) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM identities WHERE address = ?1 AND identity = ?2",
+            )
+            .bind(address.name())
+            .bind(store.identity)
+            .fetch_one(&store.store.db)
+            .await
+            .expect("count identities")
+        }
+
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        let device = DeviceId::new(1)?;
+        let address =
+            ProtocolAddress::new("10000000-0000-0000-0000-000000000004".to_owned(), device);
+        let key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let other_key = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        assert_ne!(key, other_key);
+
+        // New identity: NewOrUnchanged, exactly one row.
+        assert_eq!(
+            protocol_store.save_identity(&address, &key).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(identities_row_count(&protocol_store, &address).await, 1);
+
+        // Same-key re-save: NewOrUnchanged again, still one row, stored
+        // key kept, no change event logged.
+        assert_eq!(
+            protocol_store.save_identity(&address, &key).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(identities_row_count(&protocol_store, &address).await, 1);
+        assert_eq!(protocol_store.get_identity(&address).await?, Some(key));
+        assert!(protocol_store.store.take_identity_changes().is_empty());
+
+        // Genuinely different key: ReplacedExisting, one row updated to
+        // the new key, one change event logged.
+        assert_eq!(
+            protocol_store.save_identity(&address, &other_key).await?,
+            IdentityChange::ReplacedExisting
+        );
+        assert_eq!(identities_row_count(&protocol_store, &address).await, 1);
+        assert_eq!(
+            protocol_store.get_identity(&address).await?,
+            Some(other_key)
+        );
+        assert_eq!(
+            protocol_store.store.take_identity_changes(),
+            vec![address.name().to_owned()]
+        );
 
         Ok(())
     }
