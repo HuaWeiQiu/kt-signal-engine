@@ -335,7 +335,9 @@ pub(crate) struct TrustOutcome {
 
 /// `listIdentities` 读投影（单引用窄读；对端 identity 未知 → 空表 =
 /// SafetyNumberNotReady 态非错误）。首读建档：sidecar 缺条目以 `default`
-/// 态 + now 建（addedTimestamp 语义见模块注释）。
+/// 态 + now 建（addedTimestamp 语义见模块注释）；`pending` 挂起位直投
+/// （[sidecar_pending] 单点，wire additive——trustLevel 词表三值不变，
+/// 首联系人换钥挂起只由该键诚实表达）。
 pub(crate) async fn identity_records<K: IdentityKeyStore>(
     store: &K,
     own_aci: &ServiceId,
@@ -362,6 +364,7 @@ pub(crate) async fn identity_records<K: IdentityKeyStore>(
     };
 
     let sid = peer.service_id_string();
+    let pending = sidecar_pending(account_dir, &sid);
     let (sidecar_state, added_at) = match sidecar_entry(account_dir, &sid) {
         Some((word, added)) => (Some(word), added),
         None => {
@@ -402,6 +405,11 @@ pub(crate) async fn identity_records<K: IdentityKeyStore>(
         serde_json::Value::String(trust_level_word(sidecar_state.as_deref()).to_string()),
     );
     object.insert("addedTimestamp".into(), serde_json::json!(added_at));
+    // pending 挂起位直投（P9 读面补链，wire additive）：与 `send` 行身份
+    // 拒发闸同源单点 [`sidecar_pending`]——存量条目键缺席/无条目 = false，
+    // 换钥未确认 = true（首联系人挂起时 trustLevel 仍是 TRUSTED_UNVERIFIED，
+    // 该键是唯一诚实信号；connector §4.61 additive 透传）。
+    object.insert("pending".into(), serde_json::Value::Bool(pending));
     vec![serde_json::Value::Object(object)]
 }
 
@@ -952,6 +960,90 @@ mod tests {
         assert_eq!(record["trustLevel"], "TRUSTED_VERIFIED");
         assert_eq!(record["addedTimestamp"], 5000, "addedAt 跨读保留");
         assert!(record.get("number").is_none(), "无号码形态 number 键不在");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P9 读面补链：投影 pending 两态（false = 无条目/建档/确认钩子清标，
+    // true = 换钥挂起含首联系人）；首联系人挂起时 trustLevel 仍
+    // TRUSTED_UNVERIFIED（词表三值不变），additive pending 是唯一诚实信号。
+    #[test]
+    fn identity_records_projects_pending_two_states() {
+        let own = service_id(TEST_OWN_UUID);
+        let peer = service_id(TEST_PEER_UUID);
+        let dir = temp_dir("records-pending");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = inmem_store(
+            ALICE_IDENTITY_HEX,
+            &peer.service_id_string(),
+            BOB_IDENTITY_HEX,
+        );
+
+        // 态一（false）：首读建档（无条目）——挂起位恒 false。
+        let records =
+            futures::executor::block_on(identity_records(&store, &own, peer, None, &dir, 1000));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["pending"], serde_json::Value::Bool(false));
+
+        // 态二（true）：首联系人换钥挂起——mark_identity_replaced 以
+        // default 建档置位，trustLevel 仍 TRUSTED_UNVERIFIED（横幅漏报
+        // 根因的引擎面：词表无信号，pending 键是唯一诚实信号）。
+        assert!(mark_identity_replaced(
+            &dir,
+            &peer.service_id_string(),
+            2000
+        ));
+        let records =
+            futures::executor::block_on(identity_records(&store, &own, peer, None, &dir, 3000));
+        assert_eq!(records[0]["pending"], serde_json::Value::Bool(true));
+        assert_eq!(
+            records[0]["trustLevel"], "TRUSTED_UNVERIFIED",
+            "首联系人挂起词表不变"
+        );
+        assert_eq!(
+            records[0]["addedTimestamp"], 1000,
+            "addedAt 跨换钥保留（首读建档时刻）"
+        );
+        // 显式 unverified 写入（用户显式不信任）挂起保持。
+        assert!(save_trust_state(
+            &dir,
+            &peer.service_id_string(),
+            TrustState::Unverified,
+            2000,
+            4000
+        ));
+        let records =
+            futures::executor::block_on(identity_records(&store, &own, peer, None, &dir, 5000));
+        assert_eq!(records[0]["pending"], serde_json::Value::Bool(true));
+
+        // 态三（false）：trust 确认钩子（verified 写）清标放行。
+        assert!(save_trust_state(
+            &dir,
+            &peer.service_id_string(),
+            TrustState::Verified,
+            2000,
+            6000
+        ));
+        let records =
+            futures::executor::block_on(identity_records(&store, &own, peer, None, &dir, 7000));
+        assert_eq!(records[0]["pending"], serde_json::Value::Bool(false));
+        assert_eq!(records[0]["trustLevel"], "TRUSTED_VERIFIED");
+        // default 写（官方 send-anyway 同位钩子）同样清标。
+        assert!(mark_identity_replaced(
+            &dir,
+            &peer.service_id_string(),
+            8000
+        ));
+        assert!(save_trust_state(
+            &dir,
+            &peer.service_id_string(),
+            TrustState::Default,
+            2000,
+            9000
+        ));
+        let records =
+            futures::executor::block_on(identity_records(&store, &own, peer, None, &dir, 10000));
+        assert_eq!(records[0]["pending"], serde_json::Value::Bool(false));
+        assert_eq!(records[0]["trustLevel"], "TRUSTED_UNVERIFIED");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
