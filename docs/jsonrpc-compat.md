@@ -20,12 +20,6 @@ fixture 同款）：
 
 环境变量（可选）：
 
-- `KT_SIGNAL_SOCKS_PROXY=host:port`：connector 注入的出口代理（与 signal-cli
-  JVM 形态同一变量）。引擎在校验后映射为 `ALL_PROXY=socks5://host:port`，
-  由 libsignal-service 的 reqwest 传输面（HTTP + WebSocket 共用同一 client，
-  缺省读系统/环境代理）统一走 SOCKS5；要求依赖图含 reqwest `socks` feature
-  （本仓显式声明）。非法值启动即 exit 2；空值视为未配置（直连）。
-
 - `--data-dir`：引擎全部本地状态根（真实引擎为 presage SqliteStore 目录，
   `accounts/lk-<hex>/` 每账号一库 + `engine-state.json` 注册表；注册表里不落
   除号码/目录名以外的任何内容）。
@@ -36,12 +30,54 @@ fixture 同款）：
   在 P2 附件阶段生效，P1a 仅接受参数。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
-- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 保持安静
-  （connector watchdog 以 stderr ERROR 行判死活——引擎不得误发该形状日志；
-  任何日志纪律：不落消息正文/号码/URI/密钥，P1a 直接零日志）。
+- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除两处启动期输出外
+  保持安静：网络路径 INFO 行（`kt-signal-engine: INFO network path:
+  <direct|explicit-env|std-env|system-http|system-socks> <地址或说明>`，恰
+  一条）与 `KT_SIGNAL_SOCKS_PROXY` 非法时的错误行（exit 2 前打印）。connector
+  watchdog 只把「websocketioexception 或 websocket+失败关键词」形状的行判为
+  接收面死活信号，INFO 行刻意避开该形状；除此之外引擎不得再写 stderr。
+  日志纪律：不落消息正文/号码/URI/密钥（代理 host:port 属网络配置，允许）。
 - 退出码：stdin EOF（含宿主粗暴断开）= 干净退出 0；无法解析的致命状态
   非零。未知参数/缺 `jsonRpc` 子命令 = 非零快速失败（与上游对未知参数
   fail-closed 同口径）。
+
+### 1.1 出口代理解析顺序
+
+引擎启动同步段（任何 libsignal-service reqwest client 构建之前）按以下优先级
+解析出口代理，**首个命中生效**，并在 stderr 打一条网络路径 INFO 行（见 stdio
+条目）说明最终路径与具体地址，供排障对账：
+
+1. **显式环境** `KT_SIGNAL_SOCKS_PROXY=host:port`：connector 注入的出口代理
+   （与 signal-cli JVM 形态同一变量）。校验通过映射为
+   `ALL_PROXY=socks5h://host:port`（socks5h = 域名在代理侧远端解析，防本地
+   DNS 污染把 CONNECT 指到假 IP；早期文档误写 `socks5://`，以本条为准）。
+   **覆写关系**：该变量命中时无条件覆写已存在的 `ALL_PROXY`（显式配置优先）。
+   非空且非法启动即 exit 2（fail-closed，与上游对未知参数同口径）；空值视为
+   未配置，落到下一级。日志标记 `explicit-env`。
+2. **标准环境** `ALL_PROXY`（大写优先）否则 `all_proxy`：scheme 白名单
+   `socks5://`、`socks5h://`、`http://`（scheme 大小写不敏感），命中即生效。
+   引擎**不改写**该变量——reqwest 传输面原生读取同一变量、同一语义，日志
+   标记 `std-env` 并回显原值。白名单外 scheme（`https://`/`socks4://` 等）或
+   含空白的值不被本链采纳，引擎不采纳也不清除（reqwest 原生层对它的处理不受
+   本链约束，日志按链决策输出）。
+3. **系统代理**（仅 macOS；其他平台跳过此步）：spawn `scutil --proxy` 解析
+   系统配置——`HTTPEnable=1` 且 `HTTPProxy`/`HTTPPort` 合法 → 映射为
+   `ALL_PROXY=http://host:port`（日志 `system-http`）；否则 `SOCKSEnable=1`
+   且 `SOCKSProxy`/`SOCKSPort` 合法 → 映射为 `ALL_PROXY=socks5h://host:port`
+   （日志 `system-socks`）。HTTP 与 SOCKS 同时启用时优先 HTTP（http 代理可经
+   CONNECT 覆盖 https/wss 流量）；某路使能但字段缺失/畸形（host 空·含空白·
+   含 `:`·超 253 字节，端口非数值或 0）→ 该路跳过落到另一路，两路皆废 →
+   降级下一级。scutil 进程失败（spawn 失败/超时 2s 被杀/非零退出/输出非
+   UTF-8）整体降级下一级，**不 panic、不 exit**。与官方桌面一致：系统代理
+   开关由用户在系统设置里拨，引擎零配置跟随。
+4. **直连**：以上皆未命中（日志 `direct`）。
+
+被选中的显式/系统代理统一经 `ALL_PROXY` 生效：libsignal-service 的 reqwest
+传输面（HTTP + WebSocket 共用同一 client，缺省读环境代理面）统一走该出口；
+要求依赖图含 reqwest `socks` feature（本仓显式声明）。reqwest 原生还会读取
+`HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`（逐 scheme 优先级高于 `ALL_PROXY`，
+`REQUEST_METHOD` 在环境时整体禁用 env 代理——hyper-util 语义，现状保持，
+引擎不改写不拦截这些变量）。
 
 ## 2. 分帧（framing）
 
