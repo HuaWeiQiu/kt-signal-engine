@@ -8,9 +8,10 @@ use crate::{
     websocket::registration::DeviceActivationRequest,
 };
 
-use super::{
-    response::ReqwestExt, HttpAuth, HttpAuthOverride, PushService, ServiceError,
+use super::response::{
+    device_limit_reached, error_mapper, SignalServiceResponse,
 };
+use super::{HttpAuth, HttpAuthOverride, PushService, ServiceError};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +66,18 @@ pub struct LinkRequest {
     pub device_activation_request: DeviceActivationRequest,
 }
 
+// Signal-Server: controllers/DeviceController.java:231
+// (PUT /v1/devices/link)
+error_mapper! {
+    link_device_errors:
+        // 403: invalid device verification code, DeviceController.java:238
+        FORBIDDEN => InvalidDeviceVerificationCode,
+        // 409: device capability downgrade, DeviceController.java:267
+        CONFLICT => DeviceCapabilityDowngrade,
+        // 411: device limit reached, DeviceController.java:260
+        LENGTH_REQUIRED => fn device_limit_reached,
+}
+
 impl PushService {
     pub async fn link_device(
         &mut self,
@@ -79,7 +92,7 @@ impl PushService {
         .json(&link_request)
         .send()
         .await?
-        .service_error_for_status()
+        .service_error_for_status_with(link_device_errors)
         .await?
         .json()
         .await

@@ -279,7 +279,7 @@ mod tests {
         // 复核（vendor 构造点扫描单测同闸）——这正是自证面存在的意义。
         assert_eq!(
             env!("KT_ENGINE_PRESAGE_REV"),
-            "33dd1491130793390e356e15a5711f1e6ca14fdb"
+            "96f5e925c45b2d7a1c09afd0aee44733a2c3e671"
         );
         assert_eq!(env!("KT_ENGINE_LIBSIGNAL_VERSION"), "0.99.0");
         assert_eq!(

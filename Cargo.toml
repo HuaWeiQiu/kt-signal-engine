@@ -13,8 +13,8 @@ serde_json = "1"
 # presage 全家桶按 rev 钉定（ADR 0003：服务层 = presage + libsignal-service，
 # 传递钉 libsignal tag v0.99.0）。许可：两者均 AGPL-3.0-only，与本仓一致。
 # default-features=false：不引 cdsi（联系方式发现）与 sqlcipher 捆绑构建。
-presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", default-features = false }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false }
 
 # 接收管线（Stream 组合）与异步运行时；io-std/io-util 供 stdout writer。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }

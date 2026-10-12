@@ -7,8 +7,8 @@
 
 | 目录 | 上游 | 钉定 rev | 许可 |
 |---|---|---|---|
-| `libsignal-service/` | github.com/whisperfish/libsignal-service-rs | `9e6c08b8e6d413391831dc49065e5b05490d6c82` | AGPL-3.0-only（LICENSE.md 随目录） |
-| `presage/presage` | github.com/whisperfish/presage | `33dd1491130793390e356e15a5711f1e6ca14fdb` | AGPL-3.0-only（LICENSE.md 随目录） |
+| `libsignal-service/` | github.com/whisperfish/libsignal-service-rs | `7aa49095efc0627aa7a59c34ef9d98042c35731b` | AGPL-3.0-only（LICENSE.md 随目录） |
+| `presage/presage` | github.com/whisperfish/presage | `96f5e925c45b2d7a1c09afd0aee44733a2c3e671` | AGPL-3.0-only（LICENSE.md 随目录） |
 | `presage/presage-store-sqlite` | 同上 | 同上 | AGPL-3.0-only（fork 叠加见下方清单） |
 
 为什么 vendor：上游（含 presage 传递钉定的 libsignal-service）没有 story
@@ -131,6 +131,20 @@
 - `src/websocket/registration.rs`（2026-10-11 时序审计组四 E1-E4 收口批）
   — ACI/PNI 两 `replenish_pre_keys` 调用点补 `force_new_last_resort=false`
   位（pre_keys E1 签名扩参的编译面，注册链行为不变）。
+- 上游升级（2026-10-12 presage 升 rev 批）— 随 presage 33dd149→96f5e92
+  传递钉定 9e6c08b→7aa49095 重新 vendor + fork 清单重放（11 提交：
+  错误处理解码面函数化重构 response.rs、`ServiceError` 新增约 20 个
+  细化变体（additive）、发送路径 404 匹配改 `UnregisteredRecipient`
+  （`NotFoundError` 变体保留）、DME 面 `UnidentifiedAccess` 改按引用、
+  新增 `send_decryption_error_message`/`send_sender_key_decryption_
+  error_message`；传递 libsignal 仍钉 tag v0.99.0，Cargo.lock 全图
+  零漂移）。fork 清单 14 文件中 12 个逐字干净重放，两个融合点：
+  - `src/sender.rs` — 上游新增 `send_sender_key_decryption_error_
+    message` 内的 `try_send_message` 调用点（第 7 处）与 `send_message`
+    内部调用点（新上游形状）补 story `None` 位（story 参数融合面）。
+  - `src/websocket/sender.rs` — `send_messages_unidentified_story` 内部
+    改走上游新 `request_json_with(request, put_messages_errors)`（原
+    `request_json` 方法被上游移除，story 查询参/无 UAK 头语义不变）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -249,6 +263,22 @@
   `DeviceCapabilities` 字面量补 `versioned_expiration_timer: false`/
   `optional_phone_number: false` 两位（D5 字段新增的编译面，链接注册
   声明位恒无）。
+- 上游升级（2026-10-12 presage 升 rev 批）— 钉定 rev 33dd149→96f5e92
+  （main HEAD；tag 0.7.0 落后于原钉 rev 不适用，最新发布点仍为 33dd149
+  之后的 main。5 提交：AGENTS.md 纯文档、传递 libsignal-service bump、
+  PNI 接收修复、profile 解密 unwrap→`?`、群 master key 长度异常
+  panic→`ThreadError::InvalidGroupMasterKey`；传递 libsignal 仍钉
+  tag v0.99.0）。fork 清单逐文件重放：`store.rs`/`Cargo.toml`/
+  presage-store-sqlite 全部 9 文件逐字干净重放（store-sqlite 上游零
+  触碰，重放后与原 fork 逐字节一致）；一个融合点：
+  - `presage/src/manager/registered.rs` — 接收 unfold 批化区（P12/R2
+    大改区）整体移植到新基线；PNI sealed-sender 判定跟进上游新 API
+    形状（`envelope.source_service_id` 字段访问 → `parse_source_
+    service_id()`，字段已标 deprecated，语义同值）；`send_message`
+    主体的 `unidentified_access.as_ref()` 为上游自带的 lss 新签名
+    适配（非 fork 叠加）。上游 5 提交中 messagepipe/envelope/协议
+    存储面零触碰，QueueEmpty 时序/ack 契约/identity 事件三行为锚
+    上游面零变化。
 
 `vendor/presage/presage-store-sqlite/`：
 

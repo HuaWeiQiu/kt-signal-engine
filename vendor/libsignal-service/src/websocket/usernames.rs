@@ -5,8 +5,18 @@ use reqwest::Method;
 use serde::Serialize;
 
 use crate::content::ServiceError;
+use crate::push_service::response::error_mapper;
+use crate::push_service::response::SignalServiceResponse;
 
 use super::{Identified, SignalWebSocket, Unidentified};
+
+// Signal-Server: controllers/AccountController.java:415
+// (PUT /v1/accounts/username_link)
+error_mapper! {
+    put_username_link_errors:
+        // 409: username hash not set, AccountController.java:427
+        CONFLICT => UsernameHashNotSet,
+}
 
 impl SignalWebSocket<Unidentified> {
     pub async fn look_up_username(
@@ -229,7 +239,7 @@ impl SignalWebSocket<Identified> {
                 keep_link_handle,
             })
             .await?
-            .service_error_for_status()
+            .service_error_for_status_with(put_username_link_errors)
             .await?;
 
         let result: UsernameLinkHandleResponse = response.json().await?;

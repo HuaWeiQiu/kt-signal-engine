@@ -9,6 +9,10 @@ use super::ServiceError;
 use crate::{
     pre_keys::{KyberPreKeyEntity, PreKeysStore, SignedPreKeyEntity},
     provisioning::ProvisioningError,
+    push_service::response::{
+        error_mapper, json_or_unhandled, parse_retry_after,
+        SignalServiceResponse,
+    },
     utils::{serde_base64, TryIntoE164},
     websocket::{self, account::AccountAttributes, SignalWebSocket},
 };
@@ -139,6 +143,89 @@ impl RegistrationSessionMetadataResponse {
     }
 }
 
+// 429: specialised through the response's `retry-after` header plus the
+// session metadata body; see VerificationSessionRateLimited.
+async fn session_rate_limited<R>(response: R) -> ServiceError
+where
+    R: SignalServiceResponse,
+    ServiceError: From<<R as SignalServiceResponse>::Error>,
+{
+    let retry_after =
+        response.header("retry-after").and_then(parse_retry_after);
+    match json_or_unhandled::<R, RegistrationSessionMetadataResponse>(response)
+        .await
+    {
+        Ok(session) => ServiceError::VerificationSessionRateLimited {
+            session,
+            retry_after,
+        },
+        Err(error) => error,
+    }
+}
+
+// Signal-Server: controllers/VerificationController.java:196
+// (POST /v1/verification/session)
+error_mapper! {
+    create_verification_session_errors:
+        // 429: session rate limited, VerificationController.java:795
+        TOO_MANY_REQUESTS => fn session_rate_limited,
+}
+
+// Signal-Server: controllers/VerificationController.java:275
+// (PATCH /v1/verification/session/{sessionId})
+error_mapper! {
+    patch_verification_session_errors:
+        // 403: token not accepted, VerificationController.java:315
+        FORBIDDEN => TokenNotAccepted(RegistrationSessionMetadataResponse),
+        // 404: no such session, VerificationController.java:820
+        NOT_FOUND => NoSuchSession,
+        // 422: invalid session id, VerificationController.java:815
+        UNPROCESSABLE_ENTITY => InvalidVerificationSessionId,
+        // 429: session rate limited, VerificationController.java:309
+        TOO_MANY_REQUESTS => fn session_rate_limited,
+}
+
+// Signal-Server: controllers/VerificationController.java:576
+// (POST /v1/verification/session/{sessionId}/code)
+error_mapper! {
+    request_verification_code_errors:
+        // 404: no such session, VerificationController.java:654
+        NOT_FOUND => NoSuchSession,
+        // 409: session conflict, VerificationController.java:598
+        CONFLICT => RegistrationSessionConflict(RegistrationSessionMetadataResponse),
+        // 418: transport not allowed, VerificationController.java:649
+        IM_A_TEAPOT => InvalidTransportMode(RegistrationSessionMetadataResponse),
+        // 422: invalid session id, VerificationController.java:815
+        UNPROCESSABLE_ENTITY => InvalidVerificationSessionId,
+        // 429: session rate limited, VerificationController.java:641
+        TOO_MANY_REQUESTS => fn session_rate_limited,
+        // 440: remote service rejected code delivery, VerificationController.java:568
+        // (RegistrationServiceSenderExceptionMapper.java:15)
+        440 => VerificationDeliveryFailed(crate::push_service::VerificationDeliveryFailure),
+}
+
+// Signal-Server: controllers/VerificationController.java:714
+// (PUT /v1/verification/session/{sessionId}/code)
+error_mapper! {
+    submit_verification_code_errors:
+        // 404: no such session, VerificationController.java:743
+        NOT_FOUND => NoSuchSession,
+        // 409: session conflict, VerificationController.java:726
+        CONFLICT => RegistrationSessionConflict(RegistrationSessionMetadataResponse),
+        // 422: invalid session id, VerificationController.java:815
+        UNPROCESSABLE_ENTITY => InvalidVerificationSessionId,
+        // 429: session rate limited, VerificationController.java:735
+        TOO_MANY_REQUESTS => fn session_rate_limited,
+}
+
+// Signal-Server: controllers/RegistrationController.java:114
+// (PUT /v1/registration)
+error_mapper! {
+    post_registration_errors:
+        // 409: device transfer available, RegistrationController.java:161
+        CONFLICT => DeviceTransferAvailable,
+}
+
 impl SignalWebSocket<websocket::Unidentified> {
     // Equivalent of Java's
     // RegistrationSessionMetadataResponse createVerificationSession(@Nullable String pushToken, @Nullable String mcc, @Nullable String mnc)
@@ -168,7 +255,7 @@ impl SignalWebSocket<websocket::Unidentified> {
                 mnc,
             })
             .await?
-            .service_error_for_status()
+            .service_error_for_status_with(create_verification_session_errors)
             .await?
             .json()
             .await
@@ -207,7 +294,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             push_challenge,
         })
         .await?
-        .service_error_for_status()
+        .service_error_for_status_with(patch_verification_session_errors)
         .await?
         .json()
         .await
@@ -245,7 +332,7 @@ impl SignalWebSocket<websocket::Unidentified> {
         )?
         .send_json(&VerificationCodeRequest { transport, client })
         .await?
-        .service_error_for_status()
+        .service_error_for_status_with(request_verification_code_errors)
         .await?
         .json()
         .await
@@ -303,7 +390,7 @@ impl SignalWebSocket<websocket::Unidentified> {
                 require_atomic: true, // XXX default = true but what does this signify?
             })
             .await?
-            .service_error_for_status()
+            .service_error_for_status_with(post_registration_errors)
             .await?
             .json()
             .await
@@ -327,7 +414,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             code: verification_code,
         })
         .await?
-        .service_error_for_status()
+        .service_error_for_status_with(submit_verification_code_errors)
         .await?
         .json()
         .await
