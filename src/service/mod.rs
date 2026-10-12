@@ -4172,7 +4172,8 @@ const CLOCK_SKEW_THRESHOLD_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// 偏移判定纯函数：`|本地 - 服务器| > 阈值` → Some(skew_ms)，符号 = 本地
 /// − 服务器（正 = 本地钟快）；阈内 → None（官方 ClockSkewDetector.skewFrom
-/// 同式：abs(local − server)）。
+/// 同式：abs(local − server)；喂闸锚位与官方 WS 层锚的差异及等价设计见
+/// ClockSkewGate）。
 fn clock_skew_over_threshold(server_ts_ms: i64, now_ms: i64) -> Option<i64> {
     let skew = now_ms - server_ts_ms;
     (skew.abs() > CLOCK_SKEW_THRESHOLD_MS).then_some(skew)
@@ -4197,28 +4198,72 @@ fn skew_transition(alerted: bool, server_ts_ms: i64, now_ms: i64) -> SkewTransit
     }
 }
 
-/// per-管线时钟偏移闸（跨重连存活：接收管线生命周期持一份）。偏移观测
-/// 只做告警上抛，不拒信封不停车：本地钟错不该丢真消息（拒绝面不做，§5
-/// 偏差登记）；官方 Android 超阈「停保活 + 阻断屏」是 GUI 语义（有用户
-/// 可修钟），sidecar 无用户可介入，停车即自 DoS——保守策略 = 报态给
-/// 消费方自定。
+/// per-管线时钟偏移闸。锚位（行为对齐，非抄码，2026-10-12 逐行核实）：
+/// 官方 skew 判定锚在 **WebSocket 层服务器时间**——Signal-Desktop
+/// （pinned abe80d3）ts/textsecure/SocketManager.preload.ts
+/// #handleServerTimestamp（:928）由 connectAuthenticated 的
+/// onServerTimestamp 回调喂（WS 响应级服务器时间，恒新鲜，与积压信封
+/// 无关），#getSkew（:914）+ 阈值 remote config
+/// `client.maxAllowedClockSkewSeconds`（兜底 24h、下限 1h）；官方
+/// Signal-Android（pinned 92f5ccd）ClockSkewDetector.onServerTimeReceived
+/// 同位（ChatConnectionListener.onServerTimestamp 经
+/// SignalWebSocketHealthMonitor + remote config fetch）。官方从不拿信封
+/// 内层 metadata.server_timestamp 喂判定。sidecar 等价设计（积压免疫）：
+/// presage receive_stream 暴露不了 WS 层服务器时间，改用武装闸——每条
+/// 新流入口先解除武装（新流 = 服务器历史队列可能未排空，积压信封
+/// server_timestamp 是入队时刻），排空标记 `Received::QueueEmpty` 到达
+/// 再武装（服务器侧 = RedisDynamoDbMessagePublisher「initial queue drain
+/// complete signal」：零存量建连恒产出、websocket 通道每流恰一次，
+/// vendored presage 无条件透传不丢弃）；武装后信封为实时相，喂闸锚恒
+/// 新鲜，等价官方 WS 层锚。`alerted` 跨重连存活（边缘触发纪律不变），
+/// `armed` 随每条新流重置。偏移观测只做告警上抛，不拒信封不停车：本地
+/// 钟错不该丢真消息（拒绝面不做，§5 偏差登记）；官方 Android 超阈「停
+/// 保活 + 阻断屏」是 GUI 语义（有用户可修钟），sidecar 无用户可介入，
+/// 停车即自 DoS——保守策略 = 报态给消费方自定。
 struct ClockSkewGate {
     alerted: bool,
+    armed: bool,
 }
 
 impl ClockSkewGate {
-    fn observe(&mut self, service: &Arc<Service>, number: &str, server_ts_ms: i64) {
-        match skew_transition(self.alerted, server_ts_ms, now_ms() as i64) {
+    /// 新流入口解除武装：排水完成前的信封可能出自服务器历史队列，
+    /// observe 一律 no-op（不告警、不变更 alerted、不重臂）。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// 排空标记（`Received::QueueEmpty`）到达：武装，此后实时相信封喂闸。
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// 单步推进闸状态（纯状态机，可测）：未武装 no-op 返回 None；武装后
+    /// 按 skew_transition 推进并同步 alerted，返回本步转移。
+    fn step(&mut self, server_ts_ms: i64, now_ms: i64) -> Option<SkewTransition> {
+        if !self.armed {
+            return None;
+        }
+        let transition = skew_transition(self.alerted, server_ts_ms, now_ms);
+        match transition {
             SkewTransition::Alert(skew) => {
                 self.alerted = true;
-                service.notify(clock_skew_notification(
-                    number,
-                    skew,
-                    server_ts_ms.max(0) as u64,
-                ));
+                Some(SkewTransition::Alert(skew))
             }
-            SkewTransition::Sustained => {}
-            SkewTransition::Rearm => self.alerted = false,
+            SkewTransition::Sustained => Some(SkewTransition::Sustained),
+            SkewTransition::Rearm => {
+                self.alerted = false;
+                Some(SkewTransition::Rearm)
+            }
+        }
+    }
+
+    fn observe(&mut self, service: &Arc<Service>, number: &str, server_ts_ms: i64) {
+        if let Some(SkewTransition::Alert(skew)) = self.step(server_ts_ms, now_ms() as i64) {
+            service.notify(clock_skew_notification(
+                number,
+                skew,
+                server_ts_ms.max(0) as u64,
+            ));
         }
     }
 }
@@ -4226,7 +4271,8 @@ impl ClockSkewGate {
 /// 偏移告警通知（wire additive，`receive.clockskew`，receive.emptied 同款
 /// 独立方法名非 envelope 载体——偏移是流态观测无信封可挂）。params：
 /// account / skewMs（带符号 = 本地 − 服务器，正 = 本地快）/ serverTimestamp
-///（观测源信封服务器毫秒）。引擎只报态；连接器/desktop 消费自定（日志/
+///（观测源信封服务器毫秒；积压免疫下仅排空完成后的实时相信封可达告警，
+/// 见 ClockSkewGate）。引擎只报态；连接器/desktop 消费自定（日志/
 /// 告警/运维通知）。
 fn clock_skew_notification(account: &str, skew_ms: i64, server_timestamp_ms: u64) -> Value {
     json!({
@@ -4572,9 +4618,13 @@ async fn receive_pipeline(
     // D5 设备面能力注册：每管线运行成功一次即止（官方 afterEveryLinked
     // Startup 每次链接启动同位，不随重连重发）；失败随建流重试。
     let mut capabilities_registered = false;
-    // P15b 项8 时钟偏移闸：跨重连存活（管线生命周期一份），边缘触发
-    // 上抛 receive.clockskew。
-    let mut skew_gate = ClockSkewGate { alerted: false };
+    // P15b 项8 时钟偏移闸：alerted 跨重连存活（管线生命周期一份，边缘
+    // 触发上抛 receive.clockskew）；armed 随每条新流重置（积压免疫，
+    // serve_account_stream 入口 disarm / QueueEmpty 臂 arm）。
+    let mut skew_gate = ClockSkewGate {
+        alerted: false,
+        armed: false,
+    };
     // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
@@ -4751,6 +4801,12 @@ async fn serve_account_stream(
     capabilities_registered: &mut bool,
     skew_gate: &mut ClockSkewGate,
 ) -> StreamOutcome {
+    // 时钟偏移闸积压免疫：每条新流 = 服务器历史队列可能未排空（刚链接
+    // 设备的队列排水、断线重连补投），排水完成前的信封 server_timestamp
+    // 是入队时刻而非观测时刻，喂闸必出「本机钟快数天」假告警——入口先
+    // 解除武装（observe no-op），排空标记 Received::QueueEmpty 到达后
+    // 重新武装（服务器零存量建连也恒发排空标记，武装必达）。
+    skew_gate.disarm();
     let Ok(store) = open_store(dir).await else {
         return StreamOutcome::Recoverable;
     };
@@ -4876,6 +4932,12 @@ async fn serve_account_stream(
                 // 器/desktop 消费自定）。
                 Some(Received::QueueEmpty) => {
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_QUEUE_EMPTY, 1);
+                    // 时钟偏移闸武装锚：排空标记到达 = 实时相开始，此后
+                    // 信封才允许喂闸（服务器侧 RedisDynamoDbMessagePublisher
+                    // 「initial queue drain complete signal」——零存量建连
+                    // 也恒产出、每流恰一次，vendored presage 无条件透传
+                    // 不丢弃，武装必达）。
+                    skew_gate.arm();
                     service.notify(queue_emptied_notification(number));
                 }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
@@ -4944,7 +5006,8 @@ async fn serve_account_stream(
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_IDENTITY_CHANGE, 1);
                     let sid_string = sender.service_id_string();
                     let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
-                    // P15b 项8：偏移观测（IdentityChange 臂同 Content 臂）。
+                    // P15b 项8：偏移观测（IdentityChange 臂同 Content 臂；
+                    // 积压免疫武装前置——disarmed 时 no-op）。
                     skew_gate.observe(
                         service,
                         number,
@@ -4981,7 +5044,8 @@ async fn serve_account_stream(
                     // S2a 打点：Content 臂信封计数。
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTENT, 1);
                     // P15b 项8 时钟偏移闸：服务器时间戳 vs 本地钟（边缘触发
-                    // 告警上抛，不拒信封不停车，§5 偏差登记）。
+                    // 告警上抛，不拒信封不停车，§5 偏差登记；积压免疫武装
+                    // 前置——排水完成前的信封不喂闸，见 ClockSkewGate）。
                     skew_gate.observe(
                         service,
                         number,
@@ -14270,6 +14334,129 @@ mod tests {
             json!(1_700_000_000_000_u64)
         );
         assert!(notification["params"].get("envelope").is_none());
+    }
+
+    /// P15b 项8 时钟偏移闸积压免疫（时序修复批）武装态机：官方锚在 WS 层
+    /// 恒新鲜服务器时间，sidecar 等价 = 排空前不喂闸——①新流解除武装后
+    /// observe 单步 no-op（不上抛、不变 alerted、不清既有告警态）；②排空
+    /// 标记（QueueEmpty→arm）后旧时间戳（入队时刻的积压信封）首越阈恰一
+    /// 次 Alert，持续越阈 Sustained 静默；③新流再 disarm 后旧时间戳仍
+    /// no-op 且 alerted 跨流保持；④重新武装后新鲜时间戳照常 Rearm、再越
+    /// 阈重新 Alert（边缘触发纪律不变）。
+    #[test]
+    fn clock_skew_gate_backlog_immunity_armed_state_machine() {
+        let day: i64 = 24 * 60 * 60 * 1_000;
+        let t0 = 1_000_000_i64;
+        let stale = t0 - day - 60_000;
+
+        // ① 未武装（新流排水未完成）：no-op，不上抛不改态。
+        let mut gate = ClockSkewGate {
+            alerted: false,
+            armed: false,
+        };
+        assert!(gate.step(stale, t0).is_none(), "disarmed 不产生转移");
+        assert!(!gate.alerted, "disarmed 不变更 alerted");
+        assert!(!gate.armed);
+
+        // 排空标记到达（QueueEmpty 臂）→ arm；积压后的旧时间戳首越阈 =
+        // Alert（恰一次），持续越阈 = Sustained。
+        let mut gate = ClockSkewGate {
+            alerted: false,
+            armed: false,
+        };
+        gate.arm();
+        assert!(matches!(
+            gate.step(stale, t0),
+            Some(SkewTransition::Alert(s)) if s == t0 - stale
+        ));
+        assert!(gate.alerted);
+        assert!(matches!(
+            gate.step(stale, t0),
+            Some(SkewTransition::Sustained)
+        ));
+        assert!(gate.alerted, "Sustained 不重复告警不清态");
+
+        // ③ 新流入口 disarm：旧时间戳重新 no-op，alerted 保持（跨重连存
+        // 活），不清态不重臂。
+        gate.disarm();
+        assert!(gate.step(stale, t0).is_none());
+        assert!(gate.alerted, "disarmed observe 不变更 alerted");
+
+        // ④ 重新武装 + 新鲜时间戳（阈内）→ Rearm 清告警态；再越阈照旧重
+        // 新 Alert（边缘触发纪律与修复前一致）。
+        gate.arm();
+        assert!(matches!(gate.step(t0, t0), Some(SkewTransition::Rearm)));
+        assert!(!gate.alerted);
+        assert!(matches!(
+            gate.step(stale, t0),
+            Some(SkewTransition::Alert(_))
+        ));
+        assert!(gate.alerted);
+    }
+
+    /// P15b 项8 偏移闸 observe 边界（真 Service 出口钉形）：积压免疫下
+    /// disarmed observe 零通知上抛；armed 后旧时间戳恰一条
+    /// `receive.clockskew`（skewMs 带符号 = 本地 − 服务器；积压信封入队
+    /// 时刻在过去 → 正值，即「本机钟快」假告警形状——修复前必现）。
+    #[tokio::test]
+    async fn clock_skew_gate_disarmed_observe_emits_no_notice() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-skew-gate-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir, Arc::clone(&state), tx);
+
+        let now = now_ms() as i64;
+        let stale = now - 25 * 60 * 60 * 1_000; // 数天前入队的积压信封
+        let clockskew_notices = |rx: &mut mpsc::UnboundedReceiver<crate::OutboundFrame>| {
+            let mut notices = Vec::new();
+            while let Ok(crate::OutboundFrame::Notice(value)) = rx.try_recv() {
+                if value["method"] == json!("receive.clockskew") {
+                    notices.push(value);
+                }
+            }
+            notices
+        };
+
+        // ① disarmed（新流排水未完成）：喂积压旧时间戳零上抛。
+        let mut gate = ClockSkewGate {
+            alerted: false,
+            armed: false,
+        };
+        gate.observe(&service, "acct", stale);
+        assert!(
+            clockskew_notices(&mut rx).is_empty(),
+            "disarmed observe 不上抛"
+        );
+
+        // ② QueueEmpty 排空标记后（arm）：同一旧时间戳恰一条告警。
+        gate.arm();
+        gate.observe(&service, "acct", stale);
+        let notices = clockskew_notices(&mut rx);
+        assert_eq!(notices.len(), 1, "armed 首越阈恰一条 receive.clockskew");
+        assert_eq!(notices[0]["params"]["account"], json!("acct"));
+        assert!(
+            notices[0]["params"]["skewMs"].as_i64().unwrap() > 24 * 60 * 60 * 1_000,
+            "skew = 本地 − 服务器，积压信封入队时刻在过去 → 本地「快」为正（假告警形状）"
+        );
+        // 持续越阈静默：同态再喂零新通知。
+        gate.observe(&service, "acct", stale);
+        assert!(clockskew_notices(&mut rx).is_empty());
+
+        // ③ 新流 disarm 后喂旧时间戳：零上抛且 alerted 保持；重新武装 +
+        // 新鲜时间戳 Rearm 后再越阈照旧重新上抛（边缘触发不变）。
+        gate.disarm();
+        gate.observe(&service, "acct", stale);
+        assert!(clockskew_notices(&mut rx).is_empty());
+        gate.arm();
+        gate.observe(&service, "acct", now);
+        assert!(clockskew_notices(&mut rx).is_empty(), "回阈内 Rearm 无告警");
+        gate.observe(&service, "acct", stale);
+        assert_eq!(clockskew_notices(&mut rx).len(), 1, "重臂后再越阈重新告警");
     }
 
     /// F 链路引擎腿接线（storage_watch × Service 出口）：入站观测批过

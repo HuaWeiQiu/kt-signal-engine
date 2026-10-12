@@ -425,7 +425,11 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
 - `receive.clockskew {account, skewMs, serverTimestamp}`（P15b 项8）：本地
   −服务器时钟偏移越阈（官方 ClockSkewDetector 24h 默认阈值）边缘触发
   告警一次，skewMs 带符号（正 = 本地快）、serverTimestamp = 观测源信封
-  服务器毫秒；拒绝面不做（偏差登记），消费自定；§5 P15b 项8。
+  服务器毫秒；**积压免疫**（时序修复批，2026-10-12）：闸每流武装——
+  新流入口解除武装、`receive.emptied` 排空标记到达后武装，武装前信封
+  （可能出自服务器历史队列，server_timestamp 是入队时刻）一律不喂闸，
+  对齐官方 WS 层恒新鲜服务器时间锚（官方从不逐信封喂判定，见 §5 项8
+  修正）；拒绝面不做（偏差登记），消费自定；§5 P15b 项8。
 
 Storage 合并共生通知（F 链路引擎腿，**非 envelope 载体**——存储态事件
 无信封可挂；wire additive，词表第五词）：
@@ -3548,21 +3552,38 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
     SignalWebSocketHealthMonitor onKeepAliveResponse/keepalive sender 状
     态机同位。零改动，如实记档。
   - **时钟偏移闸**：官方 Signal-Android `ClockSkewDetector` 行为对齐（
-    不抄码）——服务器时间源 = 每信封 `metadata.server_timestamp`（官方
-    从 ws 消息/remote config 取，engine 信封面同源同权威）；skew 式 =
-    `|本地 − 服务器|`；阈值 = 官方 remote config
-    `client.maxAllowedClockSkewSeconds` 默认 24h（engine 无 remote config
-    面，取同默认编译期常量）。落法：`receive.clockskew` per-account
+    不抄码）——锚位逐行核实修正（2026-10-12 时序修复批）：官方 skew 判
+    定锚在 **WebSocket 层服务器时间**，Signal-Desktop（pinned abe80d3）
+    ts/textsecure/SocketManager.preload.ts #handleServerTimestamp（:928）
+    由 connectAuthenticated 的 onServerTimestamp 回调喂（WS 响应级服务
+    器时间，恒新鲜，与积压信封无关）、#getSkew（:914）+ 阈值 remote
+    config `client.maxAllowedClockSkewSeconds`（兜底 24h、下限 1h）；
+    Signal-Android（pinned 92f5ccd）ClockSkewDetector.onServerTimeReceived
+    同位（ChatConnectionListener.onServerTimestamp 经
+    SignalWebSocketHealthMonitor + remote config fetch）。**官方从不拿
+    信封内层 metadata.server_timestamp 喂判定**——初版落法（逐信封喂闸）
+    与官方锚位不同，刚链接设备的积压信封携入队时刻时间戳必出「本机钟快
+    数天」假告警，本批修正。skew 式 = `|本地 − 服务器|`；阈值 = 官方
+    remote config `client.maxAllowedClockSkewSeconds` 默认 24h（engine 无
+    remote config 面，取同默认编译期常量）。sidecar 等价设计（**积压免
+    疫**）：presage receive_stream 暴露不了 WS 层服务器时间，改用武装闸
+    ——每条新流入口先解除武装（observe no-op），排空标记
+    `Received::QueueEmpty` 到达后武装（服务器侧
+    RedisDynamoDbMessagePublisher「initial queue drain complete signal」
+    ——初始态即假定两存储有消息，零存量建连也恒产出、每流恰一次，
+    vendored presage 无条件透传不丢弃，武装必达）；武装后信封为实时相、
+    喂闸锚恒新鲜，等价官方 WS 层锚；`alerted` 跨重连存活（边缘触发纪律
+    不变）、`armed` 随每条新流重置。落法：`receive.clockskew` per-account
     additive 通知 `{account, skewMs（带符号 = 本地−服务器，正 = 本地快）,
     serverTimestamp}`，**边缘触发**（首越阈告警一次 → 持续越阈静默 → 回
     阈内重臂 → 再越阈重新告警；官方 detected 态 in-memory 自愈清除同语
-    义；per-信封重复告警无增量信息故不逐条投）；状态 per-接收管线一份
-    （跨重连存活）。**拒绝面不做**（偏差登记）：本地钟错不该丢真消息，
-    官方超阈动作是「停保活 + 阻断屏」GUI 语义（有用户可修钟）；sidecar
-    无用户可介入，停车/拒收即自 DoS——保守策略 = 只报态，连接器/desktop
-    消费自定（日志/告警/运维通知）。观测面在 Received::Content 与
-    IdentityChange 两臂（二者同携 server_timestamp；DecryptionError 携
-    sender client 时钟非服务器权威，不入观测）。
+    义；per-信封重复告警无增量信息故不逐条投）。**拒绝面不做**（偏差登
+    记）：本地钟错不该丢真消息，官方超阈动作是「停保活 + 阻断屏」GUI
+    语义（有用户可修钟）；sidecar 无用户可介入，停车/拒收即自 DoS——
+    保守策略 = 只报态，连接器/desktop 消费自定（日志/告警/运维通知）。
+    观测面在 Received::Content 与 IdentityChange 两臂（二者同携
+    server_timestamp；DecryptionError 携 sender client 时钟非服务器权威，
+    不入观测），武装前置闸统一在 observe 入口（disarmed 一律 no-op）。
 - **项6 群审批 deny 原语（审计项6，wire 语义扩展无新键）**：审计「审批
   deny 原语 + ban 写面」求证：ban 写面 = GroupV2Record.blocked 位，由
   `setConversationBlocked`（2026-10-06 批）已覆盖，无缺口；deny 原语真
