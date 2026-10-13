@@ -110,8 +110,8 @@ send message: Signal server unavailable.
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…`） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩 |
-| `finishLink` | `{deviceLinkUri, deviceName}` | `{number}` | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
-| `listAccounts` | `{}` | `[{"number": …}]`；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
+| `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
+| `listAccounts` | `{}` | `[{"number", "aci"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
 | `listGroups` | `{account, groupId?: [32B 标准 base64 群 master key…]（可选过滤，P15b 审计项5 单群读投影：数组非空、条目 decode_group_id 闸；坏形状——非数组/空数组/条目非字符串·坏 base64·≠32B——fail-closed `-32603`（fake 面同口径）；well-formed 但 store 不在 → 掉出结果不报错（结果可空，connector fold 侧 `first()` → 空集诚实降级）；缺席/null = 全表旧行为）}` | `[{id(base64), name, revision, description?(Some 时在场), announcementsOnly, expireTimerSeconds(0 = 关), isMember(计算值：own ACI ∈ members), members:[{number, role}], pendingMembers:[{number, addedBy, timestamp}], requestingMembers:[{number, timestamp}], bannedMembers:[{number, timestamp}], accessControl?{attributes, members, addFromInviteLink, memberLabel}(词表 UNKNOWN/ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE，Some 时在场), terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现）；**2026-10-11 real（群写面 P5 投影批，§5 块）**：投影族扩展（description/announcementsOnly/expireTimerSeconds/revision/members[].role/pending/requesting/banned 三成员面/accessControl 四族——vendored presage `Group` 补 `banned_members` 位，README fork 清单登记）；**isMember 诚实化修正**：改计算值（own ACI ∈ members）——早期「入库即成员恒 true」口径废止，被移出群的本地残留投影即 false（§5 登记偏差）；单群投影抽纯函数 `project_group_list_entry` 单测钉形；**2026-10-11 real（P15b 审计项5，§5 块）**：可选 `groupId` 过滤（单群读投影）——connector §4.53/§4.57/§4.62 三处 fold 读已派发 `listGroups {account, groupId: [id]}` 数组形并取 `first()` 当目标群，引擎此前忽略该参数返回全表，多群账号下 `first()` 读到任意群（requesting/pending 集合错群危害）；过滤判定抽纯函数 `group_key_passes_filter` 单测钉形 |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
@@ -4566,6 +4566,33 @@ b719997（T-2/T-9 批）落地后的两个信号缺口之第 1 缺的事件面�
   「零通知出站」断言由结果事件契约取代（每拉恰一条 storagePull + 观测批空
   conversationState 零帧）。既有事件通道测试不动（receive.emptied/clockskew/
   conversationState 形状面原样）。
+
+### finishLink/listAccounts 账号自有 ACI 透出批（2026-10-13，connector 契约 1.142 消费面，wire additive）
+
+桌面呼叫链（call.self 帧源，桌面 F3）需要账号自有 ACI（self-UUID），引擎两
+代 jsonRpc 面此前都不暴露——`finishLink` 只答 `{number}`、`listAccounts` 只答
+`[{number}]`。connector 契约 1.142 已先行钉定消费面：解析两脸 number 旁可选
+`aci` 键，canonical 归一梯（dashed 8-4-4-4-12 或裸 32hex、任意大小写 → dashed
+lowercase；错长/错位/非 hex 一律非 ACI）在 connector 侧。本批闭合引擎供给腿。
+
+- **真值源与形状**：presage 注册数据 `service_ids.aci`（`ServiceIds` serde
+  flatten，store 落盘键名 `uuid`）**原生序列化形直投**——`Uuid` 的 serde
+  落盘形与 Display 同为 dashed lowercase，引擎不二次变换、不重复归一（归一
+  梯由 connector 1.142 消费侧承担）。真值来源恒为类型化 `Uuid`：键类型恒
+  string，无垃圾态。
+- **缺席语义（整键缺席，不出 null）**：store 不可读/注册数据缺席/并发幂等
+  臂（finishLink 重试收口时首臂已收走会话槽，ACI 不为此回查 store）= 键
+  不在场，重试消费方按可选键语义退回旧行为；fake 账号（dir=None）/fake
+  模式恒无键。additive 位 best-effort（`account_aci` 单点）：宁缺勿炸，不
+  连坐链接与列表主结局。
+- **两脸**：`finishLink` result `{number, aci?}`；`listAccounts` 条目
+  `{number, aci?}`——多账号各带各的（逐 store 读注册数据，注册表快照后放
+  锁做盘 IO，锁纪律见 `list_accounts`）；finishLink 收口臂在既有设备名写
+  臂后追加读取，链接主结局零回归。
+- **fake**：成功形状 `{number}` / `[{number}]` 原样（无 store 即无 aci），
+  契约测试锁整键缺席防回归。
+- **计数归真机回归**：real 链接端到端需真机；单测钉 ACI 真值 dashed
+  lowercase 直投、空 store/悬挂目录缺席、listAccounts 多账号各带各的。
 
 ## 6. fake 服务模式（仅测试）
 

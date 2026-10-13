@@ -211,6 +211,12 @@ fn start_and_finish_link_lifecycle() {
         .expect("number string")
         .to_owned();
     assert_e164_number(&number);
+    // fake 账号无 store：aci additive 键整键缺席（connector 契约 1.142
+    // 可选键语义；不出 aci:null，§5 账号自有 ACI 批）。
+    assert!(
+        finished["result"].get("aci").is_none(),
+        "fake finishLink 无 aci 键"
+    );
 
     let accounts = engine.request("listAccounts", json!({}))["result"]
         .as_array()
@@ -218,6 +224,10 @@ fn start_and_finish_link_lifecycle() {
         .clone();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["number"], json!(number));
+    assert!(
+        accounts[0].get("aci").is_none(),
+        "fake listAccounts 无 aci 键"
+    );
 
     assert_eq!(
         engine.request("deleteLocalAccountData", json!({ "account": number }))["result"],

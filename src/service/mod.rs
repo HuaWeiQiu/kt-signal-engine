@@ -39,7 +39,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 
-use crate::state::EngineState;
+use crate::state::{AccountEntry, EngineState};
 
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
@@ -600,6 +600,14 @@ pub(crate) enum LinkError {
     UnknownUri,
     /// 内部失败（-32603，细节不外泄）。
     Internal,
+}
+
+/// finishLink 成功应答投影：号码 + 账号自有 ACI（wire additive，connector
+/// 契约 1.142 消费面）。`aci` 是可选键的取值位：None = wire 整键缺席（不
+/// 出 null）——fake 面、并发幂等臂、store 不可读均诚实落 None。
+pub(crate) struct LinkedAccount {
+    pub(crate) number: String,
+    pub(crate) aci: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1357,7 +1365,7 @@ impl Service {
         self: &Arc<Self>,
         uri: &str,
         device_name: &str,
-    ) -> Result<String, LinkError> {
+    ) -> Result<LinkedAccount, LinkError> {
         if !self.real {
             let mut inner = self.inner.lock().await;
             let matches = inner
@@ -1373,7 +1381,8 @@ impl Service {
             state
                 .add_account(number.clone(), None)
                 .map_err(|_| LinkError::Internal)?;
-            return Ok(number);
+            // fake 账号无 store：aci 整键缺席（LinkedAccount::aci = None）。
+            return Ok(LinkedAccount { number, aci: None });
         }
 
         // 锁内只做会话查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
@@ -1397,8 +1406,10 @@ impl Service {
             .as_ref()
             .is_none_or(|pending| pending.uri != uri)
         {
-            // 并发重试已完成收口：幂等返回同一号码。
-            return Ok(number);
+            // 并发重试已完成收口：幂等返回同一号码。ACI 不为此回查 store
+            //（会话槽已收走，锁结构不为一枚 additive 键复杂化）——键缺席
+            // 无害，重试消费方按可选键语义退回旧行为。
+            return Ok(LinkedAccount { number, aci: None });
         }
         let pending = inner.pending.take().expect("checked");
         if !device_name.is_empty() {
@@ -1430,8 +1441,34 @@ impl Service {
             .map_err(|_| LinkError::Internal)?;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
+        // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
+        // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
+        let aci = account_aci(&pending.store_dir).await;
         self.spawn_pipeline(number.clone(), pending.store_dir).await;
-        Ok(number)
+        Ok(LinkedAccount { number, aci })
+    }
+
+    /// listAccounts 读投影（wire additive `aci` 键，connector 契约 1.142
+    /// 消费面）：注册表快照后放锁，逐账号 best-effort 读注册数据——sqlite
+    /// 打开是盘 IO，不持引擎状态锁做。fake 账号（dir=None）恒无 aci；
+    /// 条目整键缺席语义见 account_aci。
+    pub(crate) async fn list_accounts(&self) -> Vec<Value> {
+        let accounts: Vec<AccountEntry> = {
+            let state = self.state.lock().await;
+            state.accounts().to_vec()
+        };
+        let mut rows = Vec::with_capacity(accounts.len());
+        for entry in accounts {
+            let mut row = serde_json::Map::with_capacity(2);
+            row.insert("number".to_owned(), json!(entry.number));
+            if let Some(rel) = &entry.dir {
+                if let Some(aci) = account_aci(&self.data_dir.join(rel)).await {
+                    row.insert("aci".to_owned(), json!(aci));
+                }
+            }
+            rows.push(Value::Object(row));
+        }
+        rows
     }
 
     /// transfer_archive 下载进度查询（契约 1.53 §4.38 扩展，connector 的
@@ -9011,6 +9048,23 @@ async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
         })
 }
 
+/// 账号自有 ACI（wire additive：finishLink/listAccounts 的 `aci` 键真值源，
+/// connector 契约 1.142 消费面）：presage 注册数据 `service_ids.aci` 的原生
+/// 序列化形直投——`Uuid` 的 serde 落盘形与 Display 同为 dashed lowercase
+///（store 里 `ServiceIds` serde flatten 后 aci 键即此形），不二次变换。
+/// best-effort：store 不可读/注册数据缺席 = None（wire 键缺席诚实退化），
+/// additive 位不连坐链接与列表主结局；消费方的 canonical 归一梯由 connector
+/// 契约 1.142 承担，引擎不出垃圾态（来源恒为类型化 `Uuid`）。
+async fn account_aci(store_dir: &Path) -> Option<String> {
+    let store = open_store(store_dir).await.ok()?;
+    store
+        .load_registration_data()
+        .await
+        .ok()
+        .flatten()
+        .map(|data| data.service_ids.aci.to_string())
+}
+
 /// 发送路径取用账号常驻管理器共享句柄（C 批提速单一漏斗）：缓存命中即复用
 /// （presage Manager 内部 websocket 常驻，closed 自愈重建）；未命中惰性建
 /// 连（open store + load_registered）入缓存。同账号取用互斥串行（`lock_
@@ -11722,6 +11776,147 @@ mod tests {
             serde_json::from_str(&round.to_string()).expect("re-deserializes");
         let round2: Value = serde_json::to_value(&data2).expect("re-serializes");
         assert_eq!(round2, value);
+    }
+
+    /// 测试夹具：向 store 写一份合法注册数据（官方落库 JSON 形，ACI 直给；
+    /// 其余键值与往返测试同款合法值），返回 store 目录。store 连接随返回
+    /// drop（sqlx WAL 多连接安全，被测面 account_aci/list_accounts 自行
+    /// 重开，生产路径 open_registered 同模式）。
+    async fn seed_store_with_aci(data_dir: &Path, rel: &str, aci: &str) -> PathBuf {
+        use presage::libsignal_service::utils::TryIntoE164;
+
+        let store_dir = data_dir.join(rel);
+        let e164 = "+15551234567".try_into_e164().expect("e164");
+        let phone_number = presage::libsignal_service::utils::phonenumber_from_signal(&e164);
+        let data: RegistrationData = serde_json::from_str(
+            &json!({
+                "signal_servers": "Production",
+                "device_name": "KT Signal Engine",
+                "phone_number": serde_json::to_value(&phone_number).expect("phone serializes"),
+                "uuid": aci,
+                "pni": "7b3dc19e-11f2-4c5a-9d0e-2f6a8b4c1d3e",
+                "password": "abcdefghijklmnopqrstuvwx",
+                "device_id": Some(2u32),
+                "registration_id": 1234u32,
+                "pni_registration_id": Some(5678u32),
+                "profile_key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            })
+            .to_string(),
+        )
+        .expect("registration data deserializes");
+        let mut store = open_store(&store_dir).await.expect("store opens");
+        store
+            .save_registration_data(&data)
+            .await
+            .expect("registration data saves");
+        store_dir
+    }
+
+    /// wire additive `aci` 键真值面（connector 契约 1.142 消费面）：注册
+    /// 数据 `service_ids.aci` 原生序列化形直投——dashed lowercase 原样，
+    /// 引擎零二次变换。
+    #[tokio::test]
+    async fn account_aci_projects_registration_uuid_dashed_lowercase() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-aci-truth-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = seed_store_with_aci(
+            &data_dir,
+            "accounts/test-aci",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        assert_eq!(
+            account_aci(&store_dir).await,
+            Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned())
+        );
+    }
+
+    /// 缺席面一：store 在、注册数据缺席（链接半途/未注册 store）= None
+    ///（wire 整键缺席，不出 null、不出垃圾态）。
+    #[tokio::test]
+    async fn account_aci_absent_without_registration_data() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-aci-empty-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/test-empty");
+        open_store(&store_dir).await.expect("store opens");
+        assert_eq!(account_aci(&store_dir).await, None);
+    }
+
+    /// 缺席面二：注册表悬挂引用（store 目录不存在）= None 同缺席口径。
+    #[tokio::test]
+    async fn account_aci_absent_for_hanging_store_dir() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-aci-hang-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        assert_eq!(
+            account_aci(&data_dir.join("accounts/never-created")).await,
+            None
+        );
+    }
+
+    /// listAccounts 多账号投影：各账号各带各的 aci（逐 store 读注册数
+    /// 据），fake 账号（dir=None）整键缺席。
+    #[tokio::test]
+    async fn list_account_rows_carry_per_account_aci() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-aci-rows-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/test-a",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/test-b",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        {
+            let mut state = state.lock().await;
+            state
+                .add_account(
+                    "+15550001111".to_owned(),
+                    Some("accounts/test-a".to_owned()),
+                )
+                .expect("add a");
+            state
+                .add_account(
+                    "+15550002222".to_owned(),
+                    Some("accounts/test-b".to_owned()),
+                )
+                .expect("add b");
+            state
+                .add_account("+15550003333".to_owned(), None)
+                .expect("add fake");
+        }
+
+        let rows = service.list_accounts().await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            json!({"number": "+15550001111", "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"})
+        );
+        assert_eq!(
+            rows[1],
+            json!({"number": "+15550002222", "aci": "11111111-2222-4333-8444-555555555555"})
+        );
+        // fake 账号：整键缺席（不出 aci:null）。
+        assert_eq!(rows[2], json!({"number": "+15550003333"}));
+        assert!(rows[2].get("aci").is_none());
     }
 
     /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid

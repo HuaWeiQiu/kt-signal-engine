@@ -94,7 +94,16 @@ async fn dispatch(
             let name = params.get("deviceName").and_then(Value::as_str);
             match (uri, name) {
                 (Some(uri), Some(name)) => match service.finish_link(uri, name).await {
-                    Ok(number) => jsonrpc::success_response(id, json!({ "number": number })),
+                    Ok(linked) => {
+                        // aci additive（connector 契约 1.142）：缺席 = 整键
+                        // 不出（LinkedAccount::aci = None），不出 null。
+                        let mut row = serde_json::Map::with_capacity(2);
+                        row.insert("number".to_owned(), json!(linked.number));
+                        if let Some(aci) = linked.aci {
+                            row.insert("aci".to_owned(), json!(aci));
+                        }
+                        jsonrpc::success_response(id, Value::Object(row))
+                    }
                     Err(LinkError::UnknownUri) => {
                         jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI))
                     }
@@ -105,17 +114,9 @@ async fn dispatch(
             }
         }
         "listAccounts" => {
-            let state = state.lock().await;
-            jsonrpc::success_response(
-                id,
-                Value::Array(
-                    state
-                        .accounts()
-                        .iter()
-                        .map(|entry| json!({ "number": entry.number }))
-                        .collect(),
-                ),
-            )
+            // 投影收口在 service 层（注册表快照后放锁读 store，锁纪律见
+            // list_accounts 注释）。
+            jsonrpc::success_response(id, Value::Array(service.list_accounts().await))
         }
         // listContacts/listGroups：store 投影（fake 模式回空表）；未注册
         // 账号 -32603（细节不外泄）。listGroups 可选 groupId 过滤（P15b
