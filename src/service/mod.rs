@@ -899,6 +899,108 @@ fn build_delete_for_me_conversation_sync(
     }
 }
 
+/// 登录期 sync/自动拉 60s 一次性窗（毫秒）：watchdog 断连重开风暴内不重复
+/// 轰主设备/Storage Service（P15c 项4 既有纪律，T-9 manifest 自动拉同门）。
+const INITIAL_SYNC_WINDOW_MS: u64 = 60_000;
+
+/// 登录期 sync 时机裁定（60s 一次性纪律单点；P15c 项4 既有语义抽纯函数，
+/// T-9 manifest 自动拉同门共闸）：上次记录缺席（首流/进程重启后）或超窗
+/// → true（本次建流安排 +2s 沉降）；窗内（重连风暴）→ false 恰跳过。
+fn initial_sync_due(last_elapsed_ms: Option<u64>) -> bool {
+    match last_elapsed_ms {
+        Some(elapsed) => elapsed >= INITIAL_SYNC_WINDOW_MS,
+        None => true,
+    }
+}
+
+/// FetchLatest STORAGE_MANIFEST 触发判别（T-9 消费臂入口纯函数面）：官方
+/// 「实时」= 改了 manifest 的设备发普通 E2E 信封 SyncMessage.fetchLatest
+/// {STORAGE_MANIFEST}，收方 HTTP 重拉（服务器 websocket 只推 E2E 信封 +
+/// 队列排空，storage 无 live 推送——ADR 0007 / compat §5 本批块结论）。
+/// 仅 STORAGE_MANIFEST 触发；LOCAL_PROFILE/SUBSCRIPTION_STATUS/UNKNOWN/
+/// type 缺席（缺席照投空对象的信号面语义不变）一律不触发。
+fn storage_manifest_fetch_requested(
+    content: &presage::libsignal_service::content::Content,
+) -> bool {
+    let presage::libsignal_service::content::ContentBody::SynchronizeMessage(sync) = &content.body
+    else {
+        return false;
+    };
+    matches!(
+        sync.content.as_ref(),
+        Some(presage::proto::sync_message::Content::FetchLatest(fetch))
+            if fetch.r#type
+                == Some(presage::proto::sync_message::fetch_latest::Type::StorageManifest as i32)
+    )
+}
+
+/// FetchLatest STORAGE_MANIFEST 消费臂防抖器（官方 sync job debounce 500ms
+/// 同款）：trailing 沿——每封把窗沿推后 500ms，防抖窗内多封合并为恰一次
+/// 拉取；take_due 到期裁定恰一次清位。毫秒簿记纯函数面（now 注入可测），
+/// 收流 select 臂按簿记桥接 sleep。
+#[derive(Default)]
+struct ManifestPullDebounce {
+    deadline: Option<u64>,
+}
+
+impl ManifestPullDebounce {
+    /// 防抖窗（官方 storage sync job debounce 同款 500ms）。
+    const WINDOW_MS: u64 = 500;
+
+    /// 一封触发信封到达：窗沿推后（trailing debounce；墙钟毫秒簿记，NTP
+    /// 回拨至多延迟一次拉取，前跳至多提前——拉取幂等，两向无害）。
+    fn on_fetch(&mut self, now: u64) {
+        self.deadline = Some(now.saturating_add(Self::WINDOW_MS));
+    }
+
+    /// 窗沿裁定：到期 → 清位 + true（本窗恰一次）；未到期/无窗 → false
+    /// （簿记不动——select 假醒重睡，拉取不丢不重）。
+    fn take_due(&mut self, now: u64) -> bool {
+        match self.deadline {
+            Some(at) if now >= at => {
+                self.deadline = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn pending_deadline(&self) -> Option<u64> {
+        self.deadline
+    }
+}
+
+/// manifest 自动拉单次结果（两腿各自汇总/错误）：触发方 best-effort 不看
+/// ，测试钉定分发面（UnknownAccount 只能出自两腿本体）+ 打点外观测面。
+type ManifestPullOutcome = (
+    Result<storage_merge::MergeOutcome, storage_sync::StorageSyncError>,
+    Result<storage_merge::GroupImportOutcome, storage_sync::StorageSyncError>,
+);
+
+/// manifest 自动拉单次（T-9 两触发面共用单点）：storage.mergeContacts 与
+/// storage.importGroups 同一内部函数面（一处权威两链共用——消费臂、登录
+/// 期自动拉、connector 显式 RPC 三链同走这两个 Service 方法），manifest
+/// 重读 → Contact 全量 merge → GROUPV2 导入 → 既有 storage_watch 观测簿
+/// 差分出口自然出 `receive.conversationState` 翻转通知。逐腿 best-effort
+/// （零 stderr 纪律，失败走打点；读面幂等，靠下次触发/下次链路建立重补）
+/// 。
+async fn pull_storage_manifest(
+    service: &Arc<Service>,
+    account: &str,
+    trigger: &'static str,
+) -> ManifestPullOutcome {
+    perf_metrics::add(trigger, 1);
+    let contacts = service.merge_storage_contacts(account).await;
+    if contacts.is_err() {
+        perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
+    }
+    let groups = service.import_storage_groups(account).await;
+    if groups.is_err() {
+        perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
+    }
+    (contacts, groups)
+}
+
 /// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
 /// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
 /// SyncMessage.content.Request{type}，padded sync message。
@@ -4834,12 +4936,19 @@ async fn serve_account_stream(
     // sendSyncRequests 三请求（contacts/configuration/block，P15c 项4——
     // 此前仅 contacts 一腿），主设备回传经接收流落 contacts/配置/拉黑
     // 各面 → connector 消费。warn-only（本层零 stderr，失败静默）；每账号
-    // 60s 一次性，watchdog 断连重开不重复。群组不在本面（presage 栈无
-    // groups sync 消费路径，首条群消息渐进落库=官方链接设备同款）。
-    let mut sync_pending = match *last_contacts_sync {
-        Some(at) if at.elapsed() < Duration::from_secs(60) => None,
-        _ => Some(tokio::time::Instant::now() + Duration::from_secs(2)),
-    };
+    // 60s 一次性（initial_sync_due 单点闸），watchdog 断连重开不重复。
+    // 群组不在本面（presage 栈无 groups sync 消费路径，首条群消息渐进落
+    // 库=官方链接设备同款）；群会话完整性由本批登录期 manifest 自动拉补
+    // （同一时机带，见 sync 臂体）。
+    let mut sync_pending =
+        if initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)) {
+            Some(tokio::time::Instant::now() + Duration::from_secs(2))
+        } else {
+            None
+        };
+    // T-9 fetchLatest 消费臂防抖簿（触发位在 Received::Content 臂；
+    // 500ms trailing 窗沿毫秒簿记，窗沿 select 臂执行拉取）。
+    let mut manifest_debounce = ManifestPullDebounce::default();
     // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
@@ -4872,10 +4981,48 @@ async fn serve_account_stream(
                         perf_metrics::keys::INITIAL_SYNC_REQUESTS,
                         sync_started.elapsed().as_micros() as u64,
                     );
+                    // T-9 登录期 manifest 自动拉（官方 afterFirstAuthSocket
+                    // Connect 同位——首连授权 socket 建立即重读 manifest；
+                    // 会话列表完整性含无消息群会话依赖它，正是「群会话登录
+                    // 后不显示」的主根因补口）：与三 sync 请求同一沉降时机
+                    // 带，走 pull_storage_manifest 单点（merge 两族权威函数
+                    // 面 + storage_watch 观测出口）。connector 登录期显式
+                    // merge 保留（读面幂等 + 簿防回声，双链无叠加效应）。
+                    // 60s 一次性随 sync_pending 继承，重连风暴不重复轰。
+                    let _ = pull_storage_manifest(
+                        service,
+                        number,
+                        perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
+                    )
+                    .await;
                     *last_contacts_sync = Some(std::time::Instant::now());
                 }
             }, if sync_pending.is_some() => {
                 sync_pending = None;
+            }
+            // T-9 fetchLatest STORAGE_MANIFEST 消费臂窗沿：到期 → manifest
+            // 重读 + merge（pull_storage_manifest 单点）→ 观测簿差分通知
+            // 自然出口。take_due 恰一次清位（假醒重睡不丢不重）；窗内新封
+            // 在 Content 臂推后沿（官方 sync job debounce 同款），多封合并
+            // 一次拉。拉取期间收流循环串行等待（单任务 select，无并发信封
+            // 处理）——读面幂等，与 connector 驱动的显式 merge 并发安全见
+            // ADR 0007 / compat §5 互斥结论。
+            _ = async {
+                if let Some(at) = manifest_debounce.pending_deadline() {
+                    tokio::time::sleep(Duration::from_millis(
+                        at.saturating_sub(now_ms()),
+                    ))
+                    .await;
+                }
+            }, if manifest_debounce.pending_deadline().is_some() => {
+                if manifest_debounce.take_due(now_ms()) {
+                    let _ = pull_storage_manifest(
+                        service,
+                        number,
+                        perf_metrics::keys::STORAGE_MANIFEST_PULL,
+                    )
+                    .await;
+                }
             }
             _ = async {
                 if let Some(at) = maint_at {
@@ -5097,6 +5244,15 @@ async fn serve_account_stream(
                                 service, number, batch,
                             );
                         }
+                    }
+                    // T-9 fetchLatest 消费臂触发位：STORAGE_MANIFEST 信封 →
+                    // 防抖窗沿推后（拉取在独立 select 臂执行，不在信封咽喉
+                    // 内阻塞 ack 时序）；非 STORAGE_MANIFEST type 不触发
+                    // （LOCAL_PROFILE/SUBSCRIPTION_STATUS/UNKNOWN/type 缺席，
+                    // 信号面投影照旧）。IdentityChange 臂不触发：自发 sync
+                    // 信封换钥解密路径现实中不可达，消费臂单点收口。
+                    if storage_manifest_fetch_requested(&content) {
+                        manifest_debounce.on_fetch(now_ms());
                     }
                     quick_seen += 1;
                     perf_metrics::record_us(
@@ -14535,6 +14691,176 @@ mod tests {
         service.delete_account("acct").await.expect("delete");
         service.publish_conversation_state_observations("acct", vec![(contact, flags(16))]);
         assert!(rx.try_recv().is_err(), "摘簿后重观测 = 种子静默");
+    }
+
+    /// T-9 fetchLatest 消费臂触发判别面：仅 STORAGE_MANIFEST 触发；
+    /// LOCAL_PROFILE/SUBSCRIPTION_STATUS/UNKNOWN/type 缺席/未知 raw 值一律
+    /// 不触发；非 FetchLatest sync 体（sent）与 DataMessage 体不触发。
+    /// 信号面投影不受本判别影响（投影臂照旧，零 wire 变化）。
+    #[test]
+    fn storage_manifest_fetch_trigger_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::sync_message;
+
+        fn sync_content(sync: presage::proto::SyncMessage) -> Content {
+            Content::from_body(ContentBody::SynchronizeMessage(sync), envelope_metadata())
+        }
+        fn fetch_latest(raw_type: Option<i32>) -> Content {
+            sync_content(presage::proto::SyncMessage {
+                content: Some(sync_message::Content::FetchLatest(
+                    sync_message::FetchLatest { r#type: raw_type },
+                )),
+                ..presage::proto::SyncMessage::with_padding(&mut rng())
+            })
+        }
+
+        let storage_manifest =
+            presage::proto::sync_message::fetch_latest::Type::StorageManifest as i32;
+        assert!(storage_manifest_fetch_requested(&fetch_latest(Some(
+            storage_manifest
+        ))));
+        let local_profile = presage::proto::sync_message::fetch_latest::Type::LocalProfile as i32;
+        assert!(
+            !storage_manifest_fetch_requested(&fetch_latest(Some(local_profile))),
+            "LOCAL_PROFILE 不触发"
+        );
+        let subscription =
+            presage::proto::sync_message::fetch_latest::Type::SubscriptionStatus as i32;
+        assert!(
+            !storage_manifest_fetch_requested(&fetch_latest(Some(subscription))),
+            "SUBSCRIPTION_STATUS 不触发"
+        );
+        let unknown = presage::proto::sync_message::fetch_latest::Type::Unknown as i32;
+        assert!(!storage_manifest_fetch_requested(&fetch_latest(Some(
+            unknown
+        ))));
+        assert!(
+            !storage_manifest_fetch_requested(&fetch_latest(Some(99))),
+            "未知 raw 值不触发"
+        );
+        assert!(
+            !storage_manifest_fetch_requested(&fetch_latest(None)),
+            "type 缺席不触发（信号面照投空对象语义不变）"
+        );
+
+        // 非 FetchLatest 体不触发。
+        let sent = sync_content(presage::proto::SyncMessage {
+            content: Some(sync_message::Content::Sent(sync_message::Sent::default())),
+            ..presage::proto::SyncMessage::with_padding(&mut rng())
+        });
+        assert!(!storage_manifest_fetch_requested(&sent));
+        let data = Content::from_body(
+            ContentBody::DataMessage(presage::proto::DataMessage::default()),
+            envelope_metadata(),
+        );
+        assert!(!storage_manifest_fetch_requested(&data));
+    }
+
+    /// T-9 消费臂防抖器（官方 sync job debounce 500ms 同款，trailing 沿）：
+    /// 防抖窗内多封合并为恰一次拉取——窗沿随每封推后、旧沿作废、静默期满
+    /// 恰一拉、同窗 take_due 不重复；火后新封开新窗。
+    #[test]
+    fn manifest_pull_debounce_coalesces_burst_into_single_fire() {
+        let mut debounce = ManifestPullDebounce::default();
+        assert_eq!(debounce.pending_deadline(), None);
+        assert!(!debounce.take_due(1_000), "无窗不拉");
+
+        // 首封开窗（+500ms）；窗内不拉。
+        debounce.on_fetch(1_000);
+        assert_eq!(debounce.pending_deadline(), Some(1_500));
+        assert!(!debounce.take_due(1_499), "窗沿未到不拉");
+
+        // 窗内第二封：窗沿推后（trailing），旧沿作废。
+        debounce.on_fetch(1_400);
+        assert_eq!(debounce.pending_deadline(), Some(1_900));
+        assert!(!debounce.take_due(1_500), "旧窗沿已作废");
+
+        // 三封 burst（1_000/1_400/1_850）→ 窗沿随末封推至 2_350，静默期满
+        // 恰一拉。
+        debounce.on_fetch(1_850);
+        assert!(!debounce.take_due(2_349));
+        assert!(debounce.take_due(2_350), "静默期满恰一次");
+        assert_eq!(debounce.pending_deadline(), None);
+        assert!(!debounce.take_due(2_351), "同窗不重复拉");
+
+        // 火后新封 → 新窗（后续信封照常触发下一轮）。
+        debounce.on_fetch(2_000);
+        assert_eq!(debounce.pending_deadline(), Some(2_500));
+        assert!(debounce.take_due(2_500));
+        assert_eq!(debounce.pending_deadline(), None);
+    }
+
+    /// T-9 登录期 sync/自动拉共闸（60s 一次性，P15c 项4 既有语义抽纯函数
+    /// ——「登录期建流后自动拉恰一次」的闸腿：首流/重启后 true，重连风暴
+    /// 窗内恰跳过，超窗重臂；臂体一次性消费 + 拉取随臂体恰一调为结构保证
+    /// ——单任务 select 循环，臂体串行无重入）。
+    #[test]
+    fn initial_sync_gate_window_faces() {
+        assert!(initial_sync_due(None), "首流/重启后必安排");
+        assert!(
+            !initial_sync_due(Some(INITIAL_SYNC_WINDOW_MS - 1)),
+            "窗内（重连风暴）恰跳过"
+        );
+        assert!(initial_sync_due(Some(INITIAL_SYNC_WINDOW_MS)), "超窗重臂");
+    }
+
+    /// T-9 manifest 自动拉分发面（单点两腿恰各一调 + 幂等入口）：未注册
+    /// 账号 real 模式两腿都在 account 解析处报 UnknownAccount（分发证据
+    /// ——该错误只能来自 merge_storage_contacts/import_storage_groups 本体
+    /// ，错误逐腿上浮不连坐）；重复拉同形再现，无 panic 无状态残留；零
+    /// 通知出站（观测批空，storage_watch 出口零翻转）。fake 模式两腿零
+    /// 汇总早退（Ok(Default)，与 storage.mergeContacts/importGroups RPC
+    /// fake 面同纪律）。通知抑制的幂等语义（重复拉同值零帧）由
+    /// conversation_state_watch_publish_and_echo_suppression 钉定（同一
+    /// publish 单点）。
+    #[tokio::test]
+    async fn manifest_pull_dispatches_both_merge_legs_idempotently() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-manifest-pull-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir, Arc::clone(&state), tx);
+
+        let expect_legs = |outcome: &ManifestPullOutcome| {
+            let (contacts, groups) = outcome;
+            if mode_from_env() {
+                assert!(contacts.is_ok(), "fake 两腿零汇总早退");
+                assert!(groups.is_ok(), "fake 两腿零汇总早退");
+            } else {
+                assert!(
+                    matches!(
+                        contacts,
+                        Err(storage_sync::StorageSyncError::UnknownAccount)
+                    ),
+                    "mergeContacts 腿被调（UnknownAccount 上浮）"
+                );
+                assert!(
+                    matches!(groups, Err(storage_sync::StorageSyncError::UnknownAccount)),
+                    "importGroups 腿被调（UnknownAccount 上浮）"
+                );
+            }
+        };
+
+        let outcome = pull_storage_manifest(
+            &service,
+            "+15550000000",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL,
+        )
+        .await;
+        expect_legs(&outcome);
+        // 幂等入口：重复拉同形再现。
+        let outcome = pull_storage_manifest(
+            &service,
+            "+15550000000",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL,
+        )
+        .await;
+        expect_legs(&outcome);
+        assert!(rx.try_recv().is_err(), "未注册账号零观测零通知");
     }
 
     /// F 链路回声抑制预观测（storage.write 面）：三类会话记录 INSERT/

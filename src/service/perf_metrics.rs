@@ -57,6 +57,15 @@ pub(crate) mod keys {
     pub const INITIAL_SYNC_REQUESTS: &str = "initial_sync_requests";
 
     // —— 计数器 ——
+    /// T-9 manifest 自动拉（消费臂触发源：FetchLatest STORAGE_MANIFEST 防抖
+    /// 窗沿到期一次一计）。
+    pub const STORAGE_MANIFEST_PULL: &str = "storage_manifest_pull";
+    /// T-9 manifest 自动拉（登录期触发源：建流 +2s 沉降时机带，60s 闸内
+    /// 恰一次）。
+    pub const STORAGE_MANIFEST_PULL_LOGIN: &str = "storage_manifest_pull_login";
+    /// T-9 manifest 自动拉逐腿失败计（mergeContacts/importGroups 各自计；
+    /// 读面幂等，失败靠下次触发/下次链路建立重补）。
+    pub const STORAGE_MANIFEST_PULL_ERR: &str = "storage_manifest_pull_err";
     pub const RECEIVE_KIND_CONTENT: &str = "receive_kind_content";
     pub const RECEIVE_KIND_IDENTITY_CHANGE: &str = "receive_kind_identity_change";
     pub const RECEIVE_KIND_DECRYPTION_ERROR: &str = "receive_kind_decryption_error";
@@ -92,6 +101,9 @@ const KNOWN_KEYS: &[&str] = &[
     keys::PREKEY_CLEANUP,
     keys::RECONNECT_BACKOFF,
     keys::INITIAL_SYNC_REQUESTS,
+    keys::STORAGE_MANIFEST_PULL,
+    keys::STORAGE_MANIFEST_PULL_LOGIN,
+    keys::STORAGE_MANIFEST_PULL_ERR,
     keys::RECEIVE_KIND_CONTENT,
     keys::RECEIVE_KIND_IDENTITY_CHANGE,
     keys::RECEIVE_KIND_DECRYPTION_ERROR,

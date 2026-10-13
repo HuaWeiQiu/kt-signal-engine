@@ -4465,6 +4465,54 @@ connector/desktop（反方向本机 setConversationState 云写穿是通的）�
   合并 outgoing 行为幂等兜底。在案「同内容二次转录重发」怪癖（§5，sync-to-self
   信封尾部重发一次）由同一幂等性吸收，本批不动。
 
+### T-2/T-9 storage manifest 拉取腿批（2026-10-13，官方 fetchLatest 消费 + 登录自动拉，engine 内闭环零 wire 新增【engine-compat】）
+
+storage 腿合并实施（「加强版拉取」定案，ADR 0007 为决策记录，本条为契约登记）。
+官方勘核结论先行：**官方没有 storage live 推送**——服务器 websocket 对链接设备只
+推 E2E 信封 + 队列排空标记；官方「实时」= 改了 manifest 的设备发普通 E2E 信封
+`SyncMessage.fetchLatest{STORAGE_MANIFEST}`，收方 HTTP 重拉。本批把「触发信号到站
+即弃」改为「到站即拉」：
+
+- **fetchLatest 消费臂（engine 内闭环，wire 零新增）**：receive pipeline
+  `Received::Content` 臂收到 FetchLatest 且 type=STORAGE_MANIFEST → 防抖窗沿推后
+  （500ms，官方 sync job debounce 同款、trailing 沿——防抖窗内多封合并恰一次拉取
+  ；窗沿到期在收流 select 独立臂执行，不阻塞信封投影/ack 时序）→ manifest 重读 +
+  merge 走 `pull_storage_manifest` 单点。合并面 = `storage.mergeContacts` /
+  `storage.importGroups` **同一内部函数面**（一处权威：消费臂/登录自动拉/connector
+  显式 RPC 三链共用，不造第三条 merge 路径）；翻转通知走既有 storage_watch 观测簿
+  → `receive.conversationState`（词表第五词，无新词）。非 STORAGE_MANIFEST type
+  （LOCAL_PROFILE/SUBSCRIPTION_STATUS/UNKNOWN/type 缺席）不触发；信号面投影
+  （§5 P14 组5）照旧，投影与消费正交。IdentityChange 臂不触发（自发 sync 信封换
+  钥解密路径现实不可达，消费单点收口）。
+- **登录期自动拉（官方 afterFirstAuthSocketConnect 同位）**：建流成功 +2s 沉降发
+  三 sync 请求（P15c 项4）同一时机带追加一次，60s 一次性闸同门（重连风暴不重复
+  轰）；connector 登录期显式 merge 保留——读面幂等双链无叠加。会话列表完整性
+  （无消息群会话登录后显示）依赖此步把 GV2 masterKey 灌 presage store——「群会话
+  登录后不显示」主根因的引擎腿补口。
+- **并发互斥结论（记档，不新造锁）**：自动拉为纯读面（manifest/items GET + 本地
+  写）。引擎单线程 LocalSet 装配（dispatch 与收流管线同线程 await 点交错，无并行
+  数据竞争面）；与 connector 驱动的显式 merge/写**交错**时：本地面 SQLite 库级串
+  行 + 逐写幂等（同钥 save_identity no-op / profile_key 缺才写 / contact 缺才建 /
+  group 命中零网络跳过），交错重复写收敛同值；服务器写面不经此路径（merge 不产
+  WriteOperation），storage.write/置顶/拉黑/三 flag 写已有 409 版本闸 +
+  conflictBackOff 重放；通知出口 = storage_watch 簿 StdMutex 单点差分，交错两份
+  相同观测恰一次翻转。
+- **24h 例行拉取不做（记档）**：官方桌面没有 background 周期性 manifest 拉取；
+  收敛靠「每次建流登录拉 + fetchLatest 触发信封」两面，断链窗口修订由服务器队列
+  重连补投信封触发，登录拉兜底。
+- **失败语义**：逐腿 best-effort，打点 `storage_manifest_pull`（消费臂触发源）/
+  `storage_manifest_pull_login`（登录触发源）/ `storage_manifest_pull_err`（逐腿
+  失败计）——零 stderr 纪律下打点即日志；不重试不停车，下次触发/下次链路建立重补
+  （读面幂等）。
+- **单测（+4）**：触发判别面（STORAGE_MANIFEST 唯一触发；LOCAL_PROFILE/
+  SUBSCRIPTION_STATUS/UNKNOWN/缺席/未知 raw/非 FetchLatest 体全不触发）、防抖器
+  （burst 三封合并恰一拉、窗沿 trailing 推后旧沿作废、同窗不重复、火后新窗）、
+  登录 60s 闸（首流 true/窗内跳过/超窗重臂——「自动拉恰一次」的闸腿；臂体一次性
+  消费为结构保证）、分发面（未注册账号两腿 UnknownAccount 上浮 = 两权威方法恰各
+  一调的分发证据；重复拉幂等；零通知出站）。重复拉不重复翻转通知由既有
+  storage_watch/Service 出口测试钉定（同一 publish 单点）。契约测试不动（fake 面
+  无 storage 触发链）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
