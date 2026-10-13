@@ -4430,6 +4430,41 @@ connector/desktop（反方向本机 setConversationState 云写穿是通的）�
   归 None）。契约测试不动（fake 面无观测）——68 基线原样。
 
 
+### 批次 T 发送侧 sync 副本批（2026-10-13，官方对齐 wrapWithSyncMessageSend，wire additive / 记档【engine-compat】）
+
+自发 `SyncMessage.Sent` 转录面收口（审计 T-1/T-8，ADR 0006 为决策记录，本条为
+契约登记）：
+
+- **事实基线（审计前提订正）**：直聊内容发送（send 文本/附件/贴纸/quote/预览/
+  阅后即焚、editMessage、remoteDelete、sendReaction、pin/unpin、sendContact、
+  timer update、note-to-self）**本就经 vendored `MessageSender::send_message`
+  尾部咽喉自动产自发 sent 副本**（`create_multi_device_sent_transcript_content`：
+  destination string+binary 双写、timestamp、message/editMessage、
+  expirationStartTimestamp 按 expire_timer 在场、UDS 逐收件人）；引擎恒为链接
+  设备（is_multi_device 恒真），机制恒在武装。直聊 timer update 副本与直聊消息
+  副本 expirationStartTimestamp=发送时刻（官方 direct=发送即起算同语义，T-8）
+  由同一构造器承载，本批零改码。
+- **best-effort 化（vendored fork，vendor/README.md 登记）**：转录上行失败原样
+  `?` 连坐主发送结局——收件人已达但副本失败时整发报错，connector 重试队列
+  （§4.123）会对已送达收件人重复投递。改为失败记 warn 日志、主发送结局保留；
+  note-to-self 包裹腿（sync 即消息本体）不在列，错误仍上抛。本条为发送 RPC
+  结局语义变化（行为面，响应形状零变化）。
+- **MRM 群转录补两位（wire additive）**：`build_group_sent_transcript` 纯函数
+  收口群转录构造——`expirationStartTimestamp`（expire_timer 在场 → 发送时刻；
+  timer 关闭/无 timer 群缺席）与 `unidentifiedStatus`（逐成功收件人 string+binary
+  双写、unidentified 恒 true——MRM 全程 sealed sender、PNI identity key 恒无，
+  官方 proto「Only set for PNI destinations」同位）；destination 双形态恒无
+  （群线程身份由 message.groupV2 携带，官方群转录同位）；转录失败记 stderr
+  不连坐群发送结局。消费方为其他链接设备（手机/官方桌面）send-state/计时显示。
+  单测：`group_sent_transcript_pins_official_fields`/
+  `group_sent_transcript_gates_expiration_start_and_uds`。
+- **回声环结论（T-1 强制核查项，记档）**：无回声环——`create_encrypted_messages`
+  剔除发送设备自身（服务器只向请求内设备投递，自发 sync 只扇出其他链接设备）；
+  引擎收到的 sent 转录只可能来自其他自有设备，收侧镜像消费在 connector 已就绪，
+  转录永不被引擎再转发；connector sent 镜像按 (destination, sent timestamp) 键
+  合并 outgoing 行为幂等兜底。在案「同内容二次转录重发」怪癖（§5，sync-to-self
+  信封尾部重发一次）由同一幂等性吸收，本批不动。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

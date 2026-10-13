@@ -469,13 +469,13 @@ pub(crate) async fn dispatch_group_message(
 
     // —— 发后落库 + 自同步 transcript（官方 sendToGroup 收尾同构）——
     save_outgoing_group_message(manager, &thread, &body, timestamp).await?;
-    let sent = sync_message::Sent {
-        destination_service_id: None,
-        timestamp: Some(timestamp),
-        message: Some(body),
-        ..sync_message::Sent::default()
-    };
-    let _ = manager
+    let succeeded: Vec<ServiceId> = outcomes
+        .iter()
+        .filter(|(_, error)| error.is_none())
+        .map(|(service_id, _)| *service_id)
+        .collect();
+    let sent = build_group_sent_transcript(body, timestamp, &succeeded);
+    if let Err(error) = manager
         .send_message(
             own_aci,
             ContentBody::SynchronizeMessage(SyncMessage {
@@ -484,9 +484,49 @@ pub(crate) async fn dispatch_group_message(
             }),
             timestamp,
         )
-        .await;
+        .await
+    {
+        // best-effort：群成员已达，副本失败不连坐主发送结局（官方
+        // wrapWithSyncMessageSend 同语义），记 stderr（connector 转发通道）。
+        eprintln!("kt-signal-engine: group sent transcript failed: {error}");
+    }
 
     Ok(outcomes)
+}
+
+/// 群发 Sent 转录构造（官方 sendToGroup → wrapWithSyncMessageSend 收尾同构，
+/// wire additive 批次 T）：destination 双形态恒无——群线程身份由 message
+/// groupV2 携带，官方群转录同位；expirationStartTimestamp 按 expire_timer
+/// 在场钉发送时刻（直聊面 vendored create_multi_device_sent_transcript_content
+/// 同一规则；timer 关闭/无 timer 群 = 缺席）；UDS 逐成功收件人 string+binary
+/// 双写、unidentified 恒 true（MRM 全程 sealed sender）、PNI identity key
+/// 恒无（官方 SignalService.proto「Only set for PNI destinations」）。
+fn build_group_sent_transcript(
+    body: DataMessage,
+    timestamp: u64,
+    succeeded: &[ServiceId],
+) -> sync_message::Sent {
+    let expiration_start_timestamp = body.expire_timer.map(|_| timestamp);
+    sync_message::Sent {
+        destination_service_id: None,
+        destination_service_id_binary: None,
+        destination_e164: None,
+        timestamp: Some(timestamp),
+        message: Some(body),
+        expiration_start_timestamp,
+        unidentified_status: succeeded
+            .iter()
+            .map(
+                |service_id| sync_message::sent::UnidentifiedDeliveryStatus {
+                    destination_service_id: Some(service_id.service_id_string()),
+                    destination_service_id_binary: Some(service_id.service_id_binary()),
+                    unidentified: Some(true),
+                    destination_pni_identity_key: None,
+                },
+            )
+            .collect(),
+        ..sync_message::Sent::default()
+    }
 }
 
 /// vendored 逐收件人 failover（官方 fallback；body 已带 group_v2，接收方
@@ -721,6 +761,58 @@ mod tests {
         let back: SenderKeyInfo = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.distribution_id, info.distribution_id);
         assert_eq!(back.created_at_ms, info.created_at_ms);
+    }
+
+    /// 群 Sent 转录字段钉面（批次 T，官方 sendToGroup → wrapWithSyncMessageSend
+    /// 同构）：destination 双形态恒无、timestamp/message 原样、
+    /// expirationStartTimestamp 按 expire_timer 在场、UDS 逐成功收件人
+    /// string+binary 双写 + unidentified=true + 无 PNI key。
+    #[test]
+    fn group_sent_transcript_pins_official_fields() {
+        let body = DataMessage {
+            timestamp: Some(1_000),
+            body: Some("hello".into()),
+            expire_timer: Some(60),
+            expire_timer_version: Some(1),
+            ..DataMessage::default()
+        };
+        let succeeded = vec![
+            ServiceId::from(Aci::from(Uuid::from_u128(0xA1))),
+            ServiceId::from(Aci::from(Uuid::from_u128(0xB2))),
+        ];
+        let sent = build_group_sent_transcript(body.clone(), 1_700_000_000_000, &succeeded);
+        assert_eq!(sent.destination_service_id, None);
+        assert_eq!(sent.destination_service_id_binary, None);
+        assert_eq!(sent.destination_e164, None);
+        assert_eq!(sent.timestamp, Some(1_700_000_000_000));
+        assert_eq!(sent.message, Some(body));
+        assert_eq!(sent.expiration_start_timestamp, Some(1_700_000_000_000));
+        assert_eq!(sent.unidentified_status.len(), succeeded.len());
+        for (status, id) in sent.unidentified_status.iter().zip(&succeeded) {
+            assert_eq!(
+                status.destination_service_id.as_deref(),
+                Some(id.service_id_string().as_str())
+            );
+            assert_eq!(
+                status.destination_service_id_binary.as_deref(),
+                Some(id.service_id_binary().as_slice())
+            );
+            assert_eq!(status.unidentified, Some(true));
+            assert_eq!(status.destination_pni_identity_key, None);
+        }
+    }
+
+    /// 无 timer 群 = expirationStartTimestamp 缺席；无成功收件人 = UDS 空表。
+    #[test]
+    fn group_sent_transcript_gates_expiration_start_and_uds() {
+        let body = DataMessage {
+            timestamp: Some(5),
+            ..DataMessage::default()
+        };
+        let sent = build_group_sent_transcript(body, 42, &[]);
+        assert_eq!(sent.expiration_start_timestamp, None);
+        assert!(sent.unidentified_status.is_empty());
+        assert_eq!(sent.timestamp, Some(42));
     }
 
     /// GSE 全链往返（本地造证）：issue → 字节 deserialize → receive（含
