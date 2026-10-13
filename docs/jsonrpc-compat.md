@@ -4513,6 +4513,60 @@ storage 腿合并实施（「加强版拉取」定案，ADR 0007 为决策记录
   storage_watch/Service 出口测试钉定（同一 publish 单点）。契约测试不动（fake 面
   无 storage 触发链）。
 
+### T-9b storage manifest 拉取结果事件批（2026-10-13，`engine.storagePull`，wire additive【engine-compat】）
+
+b719997（T-2/T-9 批）落地后的两个信号缺口之第 1 缺的事件面补口：拉取失败此前只有
+内部打点 `storage_manifest_pull_err`（进程内指标，桌面不可观测）；成功信号走
+`receive.conversationState` 差分出口（本块 T-2/T-9 批），manifest 无变化时零通知——
+桌面收件箱 gate 无法区分「拉取完成」与「拉取没发生」、更拿不到失败面。本批在
+`pull_storage_manifest` 单点（两触发臂共用）解析后恒发一条结果事件：
+
+- **事件形状**（契约 1.141 由 connector 侧登记，形状以本块为权威）：
+
+  ```json
+  {
+    "jsonrpc": "2.0",
+    "method": "engine.storagePull",
+    "params": {
+      "account": "+1555…",
+      "trigger": "login" | "fetchLatest",
+      "contactsOk": <bool>,
+      "groupsOk": <bool>
+    }
+  }
+  ```
+
+  `account` 为通知通道惯例域（receive.emptied/receive.clockskew 同款，多账号归属
+  必需）；`trigger` 与 T-9 打点触发键单射（`storage_manifest_pull_login` →
+  `login`、`storage_manifest_pull` → `fetchLatest`）；`contactsOk`/`groupsOk` 两腿
+  逐腿如实布尔（`false` = 该腿 Err，含未注册账号 UnknownAccount——失败如实上报
+  正是本批目的）。规格三字段 `trigger/contactsOk/groupsOk` 逐字不动。
+- **触发面恰两臂**：登录期自动拉（60s 闸臂体）与 fetchLatest 消费臂窗沿，都走
+  `pull_storage_manifest` 单点 → 每拉恰一条，不重不漏。connector 显式 RPC 链
+  （storage.mergeContacts/storage.importGroups 直调 Service 方法）不经本单点，
+  **不产生本事件**（消费方勿把本事件当 RPC 应答面）。
+- **与 conversationState 正交**：成功位不替代三 flag 差分通知（词表第五词照旧）
+  ——本事件只答「拉取发生 + 两腿结局」，不携任何记录内容；manifest 无变化时
+  conversationState 零帧但本事件照发，「完成」与「没发生」从此可分。
+- **best-effort 纪律不变**：notify fire-and-forget（receive.emptied 同款），发射
+  失败不连坐拉取结果、不重试；零 stderr 照旧（打点 + 事件即全部观测面）。
+- **contacts 腿结论（记档，不实现对称事件）**：勘核结论 = contacts sync **有**
+  干净的完成可签名点，且**已存在并已投影**——`Received::Contacts` 臂投影的
+  `receive` 信封 `syncMessage.contacts.complete` 旗标（官方 handleContacts →
+  contactSync:complete 同位；空记录照投、complete 旗标即信号，P15a 项3 既有
+  语义），connector/desktop 以「complete=true 的 contacts 信封到达」为完成信号
+  即可，`engine.contactsSync {ok:true}` 与之冗余不加。失败半边无廉价对称面：
+  presage 栈内 blob parse 失败上游静默丢（filter_map）、store save 失败 break 后
+  不产错误事件、主设备不回传在引擎层无超时建模（造 `ok:false` 需新加定时器/状态
+  机，非「廉价对称面」）——contacts 半边失败由桌面 gate 自身超时兜底，引擎不硬造。
+- **单测（+2，改 1）**：两触发臂各发恰一条 + trigger 单射映射 + 腿位如实
+  （storage_pull_result_event_fires_per_trigger_with_truthy_legs）、通知帧消费方
+  替身严格解析恰四键验型 + 词表外整拒
+  （storage_pull_notification_shape_pins_wire_contract）；分发面测试改写——原
+  「零通知出站」断言由结果事件契约取代（每拉恰一条 storagePull + 观测批空
+  conversationState 零帧）。既有事件通道测试不动（receive.emptied/clockskew/
+  conversationState 形状面原样）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

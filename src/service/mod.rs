@@ -982,8 +982,9 @@ type ManifestPullOutcome = (
 /// 期自动拉、connector 显式 RPC 三链同走这两个 Service 方法），manifest
 /// 重读 → Contact 全量 merge → GROUPV2 导入 → 既有 storage_watch 观测簿
 /// 差分出口自然出 `receive.conversationState` 翻转通知。逐腿 best-effort
-/// （零 stderr 纪律，失败走打点；读面幂等，靠下次触发/下次链路建立重补）
-/// 。
+/// （零 stderr 纪律，失败走打点 + `engine.storagePull` 逐腿如实位；读面
+/// 幂等，靠下次触发/下次链路建立重补）。两臂解析后经既有通知通道恒发
+/// 一条 `engine.storagePull` 结果事件（T-9b，storage_pull_notification）。
 async fn pull_storage_manifest(
     service: &Arc<Service>,
     account: &str,
@@ -998,7 +999,47 @@ async fn pull_storage_manifest(
     if groups.is_err() {
         perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
     }
+    service.notify(storage_pull_notification(
+        account,
+        trigger,
+        contacts.is_ok(),
+        groups.is_ok(),
+    ));
     (contacts, groups)
+}
+
+/// manifest 拉取结果通知（T-9b，wire additive，`engine.storagePull`，
+/// compat §5 契约 1.141 由 connector 侧登记、形状以本仓为权威）：两触发
+/// 臂解析后恒发恰一条。params = account（通道惯例域，receive.emptied 同
+/// 款）/ trigger（login | fetchLatest，perf 触发键单射映射）/ contactsOk
+/// / groupsOk——两腿逐腿如实布尔（false = 该腿 Err，含未注册账号
+/// UnknownAccount），成功面与 conversationState 差分正交（manifest 无
+/// 变化零翻转也有本事件可等）。补 b719997 双信号缺口之第 1 缺：失败此前
+/// 只有内部打点（storage_manifest_pull_err），桌面不可观测。best-effort：
+/// notify fire-and-forget（receive.emptied/receive.clockskew 同款），发射
+/// 不连坐拉取结果、不重试；connector 显式 RPC 链（storage.mergeContacts
+/// /storage.importGroups 直调）不经本单点，零新增通知。
+fn storage_pull_notification(
+    account: &str,
+    trigger: &str,
+    contacts_ok: bool,
+    groups_ok: bool,
+) -> Value {
+    let trigger_name = if trigger == perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN {
+        "login"
+    } else {
+        "fetchLatest"
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "method": "engine.storagePull",
+        "params": {
+            "account": account,
+            "trigger": trigger_name,
+            "contactsOk": contacts_ok,
+            "groupsOk": groups_ok,
+        },
+    })
 }
 
 /// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
@@ -14804,15 +14845,38 @@ mod tests {
         assert!(initial_sync_due(Some(INITIAL_SYNC_WINDOW_MS)), "超窗重臂");
     }
 
+    /// T-9b 结果事件消费方测试替身：通道恰一帧且为 `engine.storagePull`
+    /// 通知，方法名/jsonrpc/account/trigger/双腿位逐键验型（形状钉定）。
+    fn expect_storage_pull_notice(
+        rx: &mut mpsc::UnboundedReceiver<crate::OutboundFrame>,
+        account: &str,
+        trigger_wire: &str,
+        contacts_ok: bool,
+        groups_ok: bool,
+    ) {
+        let frame = rx.try_recv().expect("结果事件恰一帧");
+        let crate::OutboundFrame::Notice(value) = frame else {
+            panic!("出站帧应为通知帧");
+        };
+        assert_eq!(value["method"], json!("engine.storagePull"));
+        assert_eq!(value["jsonrpc"], json!("2.0"));
+        assert_eq!(value["params"]["account"], json!(account));
+        assert_eq!(value["params"]["trigger"], json!(trigger_wire));
+        assert_eq!(value["params"]["contactsOk"], json!(contacts_ok));
+        assert_eq!(value["params"]["groupsOk"], json!(groups_ok));
+    }
+
     /// T-9 manifest 自动拉分发面（单点两腿恰各一调 + 幂等入口）：未注册
     /// 账号 real 模式两腿都在 account 解析处报 UnknownAccount（分发证据
     /// ——该错误只能来自 merge_storage_contacts/import_storage_groups 本体
-    /// ，错误逐腿上浮不连坐）；重复拉同形再现，无 panic 无状态残留；零
-    /// 通知出站（观测批空，storage_watch 出口零翻转）。fake 模式两腿零
-    /// 汇总早退（Ok(Default)，与 storage.mergeContacts/importGroups RPC
-    /// fake 面同纪律）。通知抑制的幂等语义（重复拉同值零帧）由
-    /// conversation_state_watch_publish_and_echo_suppression 钉定（同一
-    /// publish 单点）。
+    /// ，错误逐腿上浮不连坐）；重复拉同形再现，无 panic 无状态残留。
+    /// fake 模式两腿零汇总早退（Ok(Default)，与 storage.mergeContacts/
+    /// importGroups RPC fake 面同纪律）。T-9b 起两臂解析后各恒发一条
+    /// `engine.storagePull` 结果事件（失败如实位——此前「零通知」断言由
+    /// 本契约取代），storage_watch 观测出口照旧零翻转（观测批空，无
+    /// conversationState 噪声帧）。通知抑制的幂等语义（重复拉同值零帧）
+    /// 由 conversation_state_watch_publish_and_echo_suppression 钉定（同
+    /// 一 publish 单点）。
     #[tokio::test]
     async fn manifest_pull_dispatches_both_merge_legs_idempotently() {
         let data_dir = std::env::temp_dir().join(format!(
@@ -14824,25 +14888,27 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
         let service = Service::new(data_dir, Arc::clone(&state), tx);
-
-        let expect_legs = |outcome: &ManifestPullOutcome| {
-            let (contacts, groups) = outcome;
-            if mode_from_env() {
-                assert!(contacts.is_ok(), "fake 两腿零汇总早退");
-                assert!(groups.is_ok(), "fake 两腿零汇总早退");
-            } else {
-                assert!(
-                    matches!(
-                        contacts,
-                        Err(storage_sync::StorageSyncError::UnknownAccount)
-                    ),
-                    "mergeContacts 腿被调（UnknownAccount 上浮）"
-                );
-                assert!(
-                    matches!(groups, Err(storage_sync::StorageSyncError::UnknownAccount)),
-                    "importGroups 腿被调（UnknownAccount 上浮）"
-                );
-            }
+        let (legs_ok, expect_legs) = {
+            let expect_legs = |outcome: &ManifestPullOutcome| {
+                let (contacts, groups) = outcome;
+                if mode_from_env() {
+                    assert!(contacts.is_ok(), "fake 两腿零汇总早退");
+                    assert!(groups.is_ok(), "fake 两腿零汇总早退");
+                } else {
+                    assert!(
+                        matches!(
+                            contacts,
+                            Err(storage_sync::StorageSyncError::UnknownAccount)
+                        ),
+                        "mergeContacts 腿被调（UnknownAccount 上浮）"
+                    );
+                    assert!(
+                        matches!(groups, Err(storage_sync::StorageSyncError::UnknownAccount)),
+                        "importGroups 腿被调（UnknownAccount 上浮）"
+                    );
+                }
+            };
+            (mode_from_env(), expect_legs)
         };
 
         let outcome = pull_storage_manifest(
@@ -14852,7 +14918,9 @@ mod tests {
         )
         .await;
         expect_legs(&outcome);
-        // 幂等入口：重复拉同形再现。
+        expect_storage_pull_notice(&mut rx, "+15550000000", "fetchLatest", legs_ok, legs_ok);
+        assert!(rx.try_recv().is_err(), "观测批空，conversationState 零帧");
+        // 幂等入口：重复拉同形再现（结果事件随行各一帧）。
         let outcome = pull_storage_manifest(
             &service,
             "+15550000000",
@@ -14860,7 +14928,87 @@ mod tests {
         )
         .await;
         expect_legs(&outcome);
-        assert!(rx.try_recv().is_err(), "未注册账号零观测零通知");
+        expect_storage_pull_notice(&mut rx, "+15550000000", "fetchLatest", legs_ok, legs_ok);
+        assert!(rx.try_recv().is_err(), "无其他帧");
+    }
+
+    /// T-9b 结果事件面（契约 1.141 引擎腿）：两触发臂各发恰一条，trigger
+    /// wire 名与 perf 触发键单射（storage_manifest_pull → fetchLatest、
+    /// storage_manifest_pull_login → login），腿位如实，通道无残余帧。
+    #[tokio::test]
+    async fn storage_pull_result_event_fires_per_trigger_with_truthy_legs() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-pull-event-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir, Arc::clone(&state), tx);
+        let legs_ok = mode_from_env();
+
+        let _ = pull_storage_manifest(
+            &service,
+            "+15550000001",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
+        )
+        .await;
+        expect_storage_pull_notice(&mut rx, "+15550000001", "login", legs_ok, legs_ok);
+
+        let _ = pull_storage_manifest(
+            &service,
+            "+15550000001",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL,
+        )
+        .await;
+        expect_storage_pull_notice(&mut rx, "+15550000001", "fetchLatest", legs_ok, legs_ok);
+
+        assert!(rx.try_recv().is_err(), "每拉恰一帧，无其他通知");
+    }
+
+    /// `engine.storagePull` 通知帧消费方测试替身（词表注册验收面）：方法名
+    /// 入词表、params 恰四键逐键验型，坏形状整拒。
+    #[test]
+    fn storage_pull_notification_shape_pins_wire_contract() {
+        fn strict_parse(value: &Value) -> Option<(String, String, bool, bool)> {
+            if value["method"] != "engine.storagePull" || value["jsonrpc"] != "2.0" {
+                return None;
+            }
+            let params = value["params"].as_object()?;
+            if params.len() != 4 {
+                return None;
+            }
+            Some((
+                params["account"].as_str()?.to_owned(),
+                params["trigger"].as_str()?.to_owned(),
+                params["contactsOk"].as_bool()?,
+                params["groupsOk"].as_bool()?,
+            ))
+        }
+
+        let login = storage_pull_notification(
+            "acct",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
+            true,
+            false,
+        );
+        assert_eq!(
+            strict_parse(&login),
+            Some(("acct".to_owned(), "login".to_owned(), true, false))
+        );
+        let fetch = storage_pull_notification(
+            "acct",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL,
+            false,
+            true,
+        );
+        assert_eq!(
+            strict_parse(&fetch),
+            Some(("acct".to_owned(), "fetchLatest".to_owned(), false, true))
+        );
+        // 词表外方法名整拒（consumer 侧 default 臂语义）。
+        assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
     }
 
     /// F 链路回声抑制预观测（storage.write 面）：三类会话记录 INSERT/

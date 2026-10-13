@@ -64,3 +64,21 @@ storage.importGroups 等）才发生 manifest 重读，引擎自身从不主动�
 - 「群会话登录后不显示」主根因补口：登录拉把 GV2 masterKey 导入 presage store，
   connector listGroups/open_group_sender 面即刻可用；无消息群会话不再依赖首条消息
   才现身。
+
+## 补遗（2026-10-13，批次 T-9b：拉取结果事件面）
+
+同日桌面 gate 对齐批勘核出两个信号缺口，本补遗修订本 ADR 两条决策面：
+
+1. **「wire 零新增」修订为 additive 一词**：`pull_storage_manifest` 两触发臂解析
+   后经既有通知通道恒发一条 `engine.storagePull`（params = account / trigger
+   （login|fetchLatest）/ contactsOk / groupsOk，契约 1.141 由 connector 侧登记，
+   compat §5 T-9b 块为形状权威）。拉取「完成」与「没发生」从此可分（成功位与
+   `receive.conversationState` 差分正交——manifest 无变化零翻转也有本事件可等）。
+2. **「失败走打点」升级为「打点 + 事件位如实」**：失败此前只有进程内打点
+   `storage_manifest_pull_err`，桌面不可观测；本事件两腿逐腿如实布尔补上失败面。
+
+不变项：best-effort 纪律（发射 fire-and-forget，不连坐拉取结果、不重试）；单点两
+臂结构（登录自动拉 + fetchLatest 消费臂窗沿）；connector 显式 RPC 链不经
+`pull_storage_manifest` 单点、零新增通知；零 stderr。contacts sync 腿勘核结论
+（完成点已存在于 `Received::Contacts` 投影 `complete` 旗标、失败无廉价对称面）
+记档于 compat §5 T-9b 块，不做对称事件。
