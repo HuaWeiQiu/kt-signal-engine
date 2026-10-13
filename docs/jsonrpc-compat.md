@@ -162,6 +162,7 @@ send message: Signal server unavailable.
 | `calls.groupProof` | `{account, groupId(32B 标准 base64 群 master key，listGroups/terminateGroup 的 groupId 同源)}` | `{proof(token 字符串 = ExternalGroupCredential.token 原样透出；RingRTC setMembershipProof 消费其 UTF-8 字节)}` | 参数缺失/groupId 非 base64·≠32B/未注册账号 `-32603`；服务器拒绝（凭据无效/非群成员）·响应 proto 解码失败·当日凭据缺席 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 fetchMembershipProof 同链（groups.preload.ts:1782-1806 → WebAPI getExternalGroupCredential:4566-4586）——双族缓存取当日 AuthCredentialWithPni → present(group) → `GET v2/groups/token`（storageService host，basic auth = `hex(GroupPublicParams):hex(presentation)`，generateGroupAuth:4533-4540 同构）→ `ExternalGroupCredential{token=1}`（Groups.proto:285-287，presage::proto 生成面复用）解 token 透出；fake：参数闸后形状桩 `{proof}` |
 | `calls.groupMembers` | `{account, groupId(同 calls.groupProof)}` | `{members: [{uuid(ACI 字符串), userIdCipherText(标准 base64 = UuidCiphertext bincode 序列化)}]}`（服务器群态成员序；RingRTC GroupMemberInfo{userId, userIdCipherText} 材料面） | 参数缺失/groupId 形状错/未注册账号 `-32603`；群态拉取被拒/解密失败 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 getMembershipList 同语义（groups.preload.ts:7611-7632：群成员逐一 encryptServiceId）——`GET v1/groups/` + decrypt_group（fetch_group_state 既有面复用）→ 每成员 `GroupSecretParams::encrypt_service_id(ACI)` → UuidCiphertext 序列化；uuid = ACI 字符串（relay-api-v2 §2 帧面对位）；fake：参数闸后 `{members: []}` |
 | `calls.endorsementsPublicKey` | `{}`（常量派生面，无 account——getStickerPackManifest 匿名面同纪律） | `{endorsementPublicKey(标准 base64 = EndorsementPublicKey bincode 序列化)}` | 无（常量派生不触网，fake 同码路真实答） | **2026-10-09 real（同批）**：legacy ServerPublicParams 派生 `get_endorsement_public_key()`（zkgroup pin 树 server_params.rs:347；官方 `serverPublicParams.getEndorsementPublicKey()` 同位，消费位 calling.preload.ts:1134/:2018 = RingRTC getCallLinkCall 的 endorsementPublicKey 槽）；共享常量模块 `zkgroup_consts` 单一真相源（云备份面同源不重复嵌） |
+| `calls.relays` | `{account}` | `{account, relays: [{username, password, urls?, urlsWithIps?, hostname?, ttl?}], fetchedAtMs?, expiresAtMs?, stale, lastError?}`（relays 条目 = 官方 IceServerGroupType 逐字段透传，未知字段丢弃不发明；`fetchedAtMs`/`expiresAtMs` 为 epoch 毫秒，无缓存空态整键缺席不出 null；条目内可选字段 None 整键缺席；`stale` = 无缓存恒 true，有条目 = now ≥ expiresAtMs；`lastError` = 最近一次重拉失败诚实原因） | 未知/未注册账号 `-32603`（折叠惯例）；账号凭据失效（服务器 401/403）`-32603` + getUserStatus 解绑原文同款（缓存不动）；网络/应答形状失败**不是错误应答**——空态或旧值 + `lastError` 如实成功应答（错误不连坐，§5 块） | **2026-10-13 real（KT 扩展，批次 G 第一腿，wire additive，【engine-compat】，§5 块）**：官方 getIceServers 同端点（WebAPI.preload.ts:796 路径 + :3064 调用，chatService identified 账号 Basic Auth——presage 链接账号凭据同类用法，代理随进程 ALL_PROXY 自动生效）；缓存 + TTL 官方 calling.preload.ts #getIceServers 同口径（TTL = relays[].ttl 最小秒值、任一缺失/0 不缓存、TTL 内零网络、空应答不覆盖旧缓存、失败诚实保旧 + lastError、401/403 归解绑）；进程内存 per-account 缓存不落盘（delete_account 摘除）；fake 面 = 空态（`{account, relays: [], stale: true}`）；**connector 消费面后续批次登记**（connector 仓另有 agent 在写，本批不动） |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `backup.importSnapshot` | `{account, snapshotDir}`（官方桌面本地备份快照目录，官方布局 `signal-backup-<ts>/{metadata, main, files/}`；connector 传入的同机路径，引擎不持久化） | `{"status": "started"}`（后台任务已启动，进度走 `backup.importSnapshotStatus`） | 未注册/fake 账号/AEP 缺失 `-32603`；该账号导入任务在跑 `BACKUP_IMPORT_ALREADY_RUNNING`；目录或 metadata/main 缺 `BACKUP_SNAPSHOT_MISSING`；metadata decode 失败/version≠1/形状不合规 `BACKUP_SNAPSHOT_METADATA_INVALID`；backupId 比对不等（非本账号备份）`BACKUP_SNAPSHOT_KEY_MISMATCH`——结构化码均 `-1` + message 码位（备份导出契约 §11.4，connector 1.78 白名单） | **B2 批 real（2026-10-08，快照导入收向）**：官方 `importLocalBackup`/`verifyLocalBackupMetadata` 行为对齐（AGPL 只读参照零拷贝）——metadata 校验（官方 strict assert 面：version==1、iv 12B、encryptedId 16B、CTR 解密 backupId 逐字节比对）前移为 start 同步闸，main 全链（官方 FramesReader 解密+HMAC+分帧）后台 `spawn_local`（帧导出 future 非 Send），逐帧投影复用 `history::export_frames_loop` 落 `<账号目录>/history-import.ndjson`（connector §4.38 通路同一落点，临时名+rename 原子替换，失败删半成品既有 NDJSON 不动）；密钥边界 §10.5 延续（任务 future 内即用即弃）；fake 模式账号无 store，按未注册 `-32603`；不落调度日志零 stderr |
@@ -4593,6 +4594,58 @@ lowercase；错长/错位/非 hex 一律非 ACI）在 connector 侧。本批闭�
   契约测试锁整键缺席防回归。
 - **计数归真机回归**：real 链接端到端需真机；单测钉 ACI 真值 dashed
   lowercase 直投、空 store/悬挂目录缺席、listAccounts 多账号各带各的。
+
+### 通话中继配置面（calls.relays，2026-10-13 批，批次 G 第一腿，wire additive）
+
+jsonRpc 面新增 `calls.relays {account}`（KT 扩展方法，命名随仓内 `calls.`
+通话域前缀——任务书举例 `calling.relays`，仓内既有域名为准，偏差登记）：
+认证 GET `/v2/calling/relays`（官方 getIceServers 同端点）拉取 ICE/TURN
+配置，缓存 + TTL + 新鲜度如实暴露。官方桌面 ICE/TURN 不写死本地
+（WebAPI.preload.ts:796 路径 + :3064 调用）；引擎握 presage 链接账号凭据，
+同一 API 同类用法。
+
+- **勘察结论（可行性，官方姿态）**：
+  - 鉴权类 = chatService identified 账号 Basic Auth（`_ajax` outerParams
+    默认 `user: username, password: password`，getIceServers 调用不带
+    `unauthenticated`/`accessKey` 位，WebAPI.preload.ts:1856-1870/:3064）；
+    引擎侧对应 `PushService::request(GET, Endpoint::service, NoOverride)`
+    ——NoOverride 挂 presage 注册数据账号凭据，同一鉴权族。
+  - 刷新节奏 = 按需（起呼 `#handleStartCall` → `#getIceServers`），无定时
+    轮询；缓存 TTL = 应答 `relays[].ttl` 最小秒值，任一条目 ttl 缺失或 0
+    → 0 = 不缓存（`reduce min(ttl ?? 0)`）；TTL 内零网络。
+  - 失败姿态 = 缓存未过期不打网络；过期重拉失败错误上抛（起呼失败）；
+    空应答（relays 缺席/空数组 → 转换列表空）不覆盖既有缓存（「列表非空
+    才写缓存」）；官方应答校验 zodSchema = z.unknown() 未校验
+    （TODO DESKTOP-8719）。
+  - 应答形状 = `{relays?: [{username, password, urls?, urlsWithIps?,
+    hostname?, ttl?}]}`（GetIceServersResultType/IceServerGroupType，
+    WebAPI.preload.ts:1000-1013）。
+- **与官方的取舍差异（登记）**：网络拉取失败时官方上抛、起呼失败；本引擎
+  是后台缓存服务面，失败诚实保留旧缓存（`lastError` 如实记因）+ 新鲜度
+  （`stale`/`fetchedAtMs`/`expiresAtMs`）暴露，无缓存则空态——错误不连坐
+  其他链路（任务口径）。401/403 例外归解绑诚实错误面（凭据死了旧缓存同死，
+  engine.deviceCapabilities 同款），缓存不动。
+- **引擎侧落点**：`PushService` reqwest 客户端未禁代理，进程启动面把
+  `KT_SIGNAL_SOCKS_PROXY` 覆写 `ALL_PROXY`（compat §1.1 解析顺序）→ 代理
+  自动生效，零新增机制。缓存 per-account 进程内存（group_credentials 同款
+  纪律），不落盘不跨重启，delete_account 摘除；并发过期重拉无防抖（幂等
+  GET，last-write-wins）。
+- **应答面**：`{account, relays: [...], fetchedAtMs?, expiresAtMs?, stale,
+  lastError?}`——relays 条目官方形状逐字段透传（serde 未知字段丢弃不发明；
+  可选字段 None 整键缺席不出 null）；无缓存空态 relays = `[]` 且
+  fetchedAtMs/expiresAtMs 整键缺席；`stale` = 无缓存恒 true / 有条目
+  now ≥ expiresAtMs（ttl 0 条目当拍即 stale）。
+- **fake**：空态应答 `{account, relays: [], stale: true}`（无网络不伪装
+  账号面，进程真实态 = 无缓存）。
+- **connector 消费面后续批次登记**：connector 仓另有 agent 在写（批次 G
+  第二腿），本批 engine 侧 additive，不动 connector/桌面/sidecar。
+- **单测（+11）**：解析器钉官方应答形状（全字段/relays 缺席/空数组/未知
+  字段丢弃/序列化整键缺席/形状违约 fail-closed）；TTL 语义（最小值/任一
+  缺失归零/新鲜边界）；advance 矩阵（非空覆盖带 TTL/ttl0 当拍 stale/空
+  应答保旧/失败保旧记因/成功清错因/无缓存失败维持空态）；face 三态投影
+  （fresh/stale/空态 + lastError 穿透）。TTL 内不重拉/到期重拉由
+  cache_fresh 纯函数 + 服务层直读臂承载（fresh 命中零网络）。契约测试：
+  fake 空态形状、real 未注册 `-32603`。
 
 ## 6. fake 服务模式（仅测试）
 

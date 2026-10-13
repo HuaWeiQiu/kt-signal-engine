@@ -15,10 +15,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
 use crate::service::{
     capabilities, parse_legacy_call_face, parse_send_contact, perf_metrics, storage_sync,
-    storage_write, DeleteForMeAuthor, DeleteForMeConversation, DeleteForMeEntry,
-    DeviceCapabilitiesError, LinkError, MessageRequestTarget, SendMention, SendPreview, SendQuote,
-    SendQuoteBodyRange, SendSticker, SendStoryContext, SendTextStyle, Service, UserStatusError,
-    MAX_SEND_TEXT_STYLES,
+    storage_write, CallingRelaysError, DeleteForMeAuthor, DeleteForMeConversation,
+    DeleteForMeEntry, DeviceCapabilitiesError, LinkError, MessageRequestTarget, SendMention,
+    SendPreview, SendQuote, SendQuoteBodyRange, SendSticker, SendStoryContext, SendTextStyle,
+    Service, UserStatusError, MAX_SEND_TEXT_STYLES,
 };
 use crate::state::EngineState;
 
@@ -3816,6 +3816,42 @@ async fn dispatch(
                     jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
                 }
                 Err(DeviceCapabilitiesError::Internal) => internal_error(id),
+            }
+        }
+        // calls.relays（通话中继配置，KT 扩展方法）：认证 GET
+        // /v2/calling/relays（官方 getIceServers 同端点，chatService
+        // identified 账号凭据）缓存 + TTL 读面（compat §3 行 + §5 块）。
+        // 读面不落调度日志（engine.deviceCapabilities 触网读面同纪律）；
+        // fake 面 = 空态（进程真实态，无网络不伪装账号）；未知/未注册账号
+        // -32603（惯例折叠）；401/403 解绑 USER_UNBOUND_MESSAGE 同款；
+        // 网络/形状失败不连坐——空态或旧值 + lastError 如实应答（新鲜度
+        // stale/fetchedAtMs/expiresAtMs 诚实呈现，键缺席纪律不出 null）。
+        "calls.relays" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match service.calling_relays(account).await {
+                Ok(face) => {
+                    let mut row = serde_json::Map::new();
+                    row.insert("account".to_owned(), json!(account));
+                    row.insert("relays".to_owned(), json!(face.relays));
+                    if let Some(fetched) = face.fetched_at_ms {
+                        row.insert("fetchedAtMs".to_owned(), json!(fetched));
+                    }
+                    if let Some(expires) = face.expires_at_ms {
+                        row.insert("expiresAtMs".to_owned(), json!(expires));
+                    }
+                    row.insert("stale".to_owned(), json!(face.stale));
+                    if let Some(error) = face.last_error {
+                        row.insert("lastError".to_owned(), json!(error));
+                    }
+                    jsonrpc::success_response(id, Value::Object(row))
+                }
+                Err(CallingRelaysError::UnknownAccount) => internal_error(id),
+                Err(CallingRelaysError::Unbound) => {
+                    jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+                }
             }
         }
         _ => jsonrpc::error_response(

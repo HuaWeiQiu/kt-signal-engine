@@ -44,6 +44,9 @@ use crate::state::{AccountEntry, EngineState};
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
+/// 通话中继配置（calls.relays）：认证 GET /v2/calling/relays + 官方同口径
+/// TTL 缓存（模块头注载形状/纪律）。
+pub(crate) mod calling_relays;
 pub(crate) mod capabilities;
 pub(crate) mod cdn_upload;
 pub(crate) mod delivery_receipt;
@@ -1112,6 +1115,14 @@ pub(crate) enum DeviceCapabilitiesError {
     Internal,
 }
 
+/// calls.relays 错误面：未知/未注册账号（惯例 -32603 折叠）与账号凭据
+/// 失效（解绑原文）。网络/形状失败不进本枚举——按模块纪律保旧缓存/空态
+/// 如实应答，错误不连坐。
+pub(crate) enum CallingRelaysError {
+    UnknownAccount,
+    Unbound,
+}
+
 /// 链接结果共享槽：finishLink 可被连接器超时重试（connector service.rs 语义），
 /// 多个等待者共享同一次结果。
 struct LinkResultSlot {
@@ -1196,6 +1207,10 @@ pub(crate) struct Service {
     /// 建连 + 空闲保留，不逐消息冷启动。同账号取用互斥串行（Manager 方法
     /// 需 &mut 且跨 await 持有），跨账号互不阻塞；delete/relink 摘除。
     send_managers: AsyncMutex<SendManagerCache>,
+    /// calls.relays 应答缓存（进程内存 per-account，不落盘不跨重启；
+    /// 官方 #iceServersCache 对位件 per-account 分桶版，calling_relays
+    /// 模块头注载 TTL/失败保旧纪律）。delete_account 摘除。
+    calling_relays_cache: AsyncMutex<HashMap<String, calling_relays::CacheEntry>>,
     /// 群发 MRM 单请求面（C 批提速）：进程级未鉴权 chat WS 连接单槽缓存
     /// （PUT /v1/messages/multi_recipient 不带账号凭据，跨账号共用）；
     /// 传输失败摘除重连一次（group_mrm::send_mrm），惰性建连。
@@ -1239,6 +1254,7 @@ impl Service {
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
             conversation_state_books: StdMutex::new(HashMap::new()),
             send_managers: AsyncMutex::new(HashMap::new()),
+            calling_relays_cache: AsyncMutex::new(HashMap::new()),
             mrm_chat: AsyncMutex::new(None),
         })
     }
@@ -1506,6 +1522,8 @@ impl Service {
             .lock()
             .expect("conversation state books lock")
             .remove(account);
+        // calls.relays 缓存摘除（账号面随注册表生命周期）。
+        self.calling_relays_cache.lock().await.remove(account);
         Ok(had_dir || !self.real)
     }
 
@@ -3209,6 +3227,58 @@ impl Service {
             )) => Err(DeviceCapabilitiesError::Unbound),
             Err(_) => Err(DeviceCapabilitiesError::Internal),
         }
+    }
+
+    /// calls.relays 服务腿：TTL 内缓存直读（零网络，官方 TTL 语义），过期
+    /// /缺席触发认证重拉（成功非空覆盖 / 空应答保旧 / 失败保旧 + 记因，
+    /// calling_relays::advance_cache 单点），401/403 归解绑诚实错误面，
+    /// 网络失败不连坐（空态或旧值 + lastError 如实应答）。
+    pub(crate) async fn calling_relays(
+        self: &Arc<Self>,
+        account: &str,
+    ) -> Result<calling_relays::RelaysFace, CallingRelaysError> {
+        let now = now_ms();
+        if !self.real {
+            // fake：无网络无账号面，进程真实态 = 空态（空 relays + stale），
+            // 形状与 real 空态同构，契约测试可钉。
+            return Ok(calling_relays::face_from_cache(None, now, None));
+        }
+        {
+            let cache = self.calling_relays_cache.lock().await;
+            if let Some(entry) = cache.get(account) {
+                if calling_relays::cache_fresh(entry, now) {
+                    return Ok(calling_relays::face_from_cache(Some(entry), now, None));
+                }
+            }
+        }
+        let context = storage_context(self, account)
+            .await
+            .map_err(|_| CallingRelaysError::UnknownAccount)?;
+        let outcome = match calling_relays::fetch_relays(&context.push).await {
+            Ok(doc) => calling_relays::RefreshOutcome::Fetched(doc),
+            Err(calling_relays::RelaysError::Unauthorized) => {
+                return Err(CallingRelaysError::Unbound)
+            }
+            Err(error) => calling_relays::RefreshOutcome::Failed(error.to_string()),
+        };
+        let mut cache = self.calling_relays_cache.lock().await;
+        let entry = calling_relays::advance_cache(cache.get(account).cloned(), &outcome, now);
+        let empty_error = match &outcome {
+            calling_relays::RefreshOutcome::Failed(reason) if entry.is_none() => {
+                Some(reason.clone())
+            }
+            _ => None,
+        };
+        let face = calling_relays::face_from_cache(entry.as_ref(), now, empty_error);
+        match entry {
+            Some(entry) => {
+                cache.insert(account.to_owned(), entry);
+            }
+            None => {
+                cache.remove(account);
+            }
+        }
+        Ok(face)
     }
 
     /// updateContact：P1b 仅在本地 store 命中该号码时改名（uuid 归属需要

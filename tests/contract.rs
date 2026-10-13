@@ -334,10 +334,50 @@ fn real_mode_no_network_error_paths() {
     );
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
+    // 未注册账号的 calls.relays：storage 上下文打不开 → 内部失败折叠
+    //（不触网；通话中继配置批）。
+    let (code, message) = engine.error_of("calls.relays", json!({ "account": "+15559990000" }));
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+
     assert_eq!(
         engine.request("listAccounts", json!({}))["result"],
         json!([])
     );
+}
+
+/// calls.relays（通话中继配置，KT 扩展方法，compat §3 行 + §5 块）：fake
+/// 面 = 空态（`{account, relays: [], stale: true}`，无网络不伪装账号），
+/// 空态键缺席纪律（fetchedAtMs/expiresAtMs/lastError 整键不出），读面不落
+/// 调度日志。real 模式未注册折叠见 real_mode_no_network_error_paths；
+/// 网络拉取/缓存 TTL 矩阵在 src/service/calling_relays.rs 单测（决策腿
+/// 纯函数化，不触网）。
+#[test]
+fn calls_relays_fake_empty_state_and_no_dispatch_log() {
+    let dir = temp_dir("calls-relays-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    let result =
+        engine.request("calls.relays", json!({ "account": "+15550001111" }))["result"].clone();
+    assert_eq!(result["account"], json!("+15550001111"));
+    assert_eq!(result["relays"], json!([]));
+    assert_eq!(result["stale"], json!(true));
+    assert!(result.get("fetchedAtMs").is_none(), "空态无 fetchedAtMs 键");
+    assert!(result.get("expiresAtMs").is_none(), "空态无 expiresAtMs 键");
+    assert!(result.get("lastError").is_none(), "空态成功无 lastError 键");
+
+    // 读面不落调度日志（engine.deviceCapabilities 触网读面同纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let has_entry = std::fs::read_to_string(&log_path)
+        .ok()
+        .map(|log| {
+            log.lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map(|entry| entry["method"] == "calls.relays")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(!has_entry, "calls.relays 读面不落调度日志");
 }
 
 /// 贴纸包浏览（compat §4.32）：参数面 fail-closed 逐码位 + fake 模式网络面
