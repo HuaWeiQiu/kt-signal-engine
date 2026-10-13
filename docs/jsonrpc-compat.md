@@ -109,6 +109,7 @@ send message: Signal server unavailable.
 
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
+| `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version}`（双字符串键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答 |
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…`） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number", "aci"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
@@ -4646,6 +4647,42 @@ jsonRpc 面新增 `calls.relays {account}`（KT 扩展方法，命名随仓内 `
   （fresh/stale/空态 + lastError 穿透）。TTL 内不重拉/到期重拉由
   cache_fresh 纯函数 + 服务层直读臂承载（fresh 命中零网络）。契约测试：
   fake 空态形状、real 未注册 `-32603`。
+
+### version 元方法白名单补齐批（2026-10-14，上游 signal-cli JSON-RPC 元方法，wire additive【engine-compat】）
+
+KT 桌面真机验收发现：connector `runtime.doctor`（connector implementation-plan
+§4.79，契约 1.96/1.101/1.133）对引擎做三只读探针（`version` /
+`engine.protocolCapabilities` / `engine.perfMetrics`）时，`version` 探针回错误
+——引擎白名单缺这个上游 signal-cli JSON-RPC 元方法，未知方法 `-32601` 上抛；
+doctor 把「携带版本面的引擎不该缺」的该方法错误按**上游错误类**降级为
+`present:false`，固定理由文案「the engine answered an error for the version
+method (an engine that does not carry it surfaces the upstream class)」经
+connector 原样冒上桌面。本批闭合引擎供给腿（connector/桌面零改动）。
+
+- **契约结论（connector 侧只读调查，本批实现依据）**：
+  - 方法名 `version`（裸名，上游 signal-cli JSON-RPC 白名单动词，非 KT 扩展
+    命名空间）；调用点 `connector/src/doctor.rs::probe_engine_method`——空参
+    `{}`、`CallClass::ReadOnly`、3 秒诊断预算（`DOCTOR_ENGINE_CALL_TIMEOUT`）。
+  - 应答消费 = **原样透传**：doctor 把 result 装进 `EngineMethodFace.face`
+    逐字上桌面（不 re-key、不归一、不重推导）；doctor-contract.md 对该
+    face 的机器判据只有「是 JSON 对象」，字段级形状以上游 signal-cli
+    `version` 应答为准 = `{name, version}` 双字符串键。
+  - 错误语义 = 错误类降级：timeout/not-running/exited/backpressure 答
+    「stopped answering mid-probe」，其余错误（含本批修的 `-32601`）答上游
+    错误类固定理由——present:false + reason，诊断整体不失败。
+- **实现面**：dispatch 常量面臂 `version`（零参数 params 忽略——wire 宽容，
+  generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答；
+  fake/real 同码路真实答——常量面无模式分叉，calls.endorsementsPublicKey
+  同款）；读面不落调度日志零 stderr（engine.protocolCapabilities 同纪律）。
+  应答 `{name: "kt-signal-engine", version: CARGO_PKG_VERSION}`——身份诚实
+  自报引擎本名与本仓版本，不冒充上游名（doctor 原样呈现，冒名将制造
+  「signal-cli 0.1.0」式误读，自证面「如实自报」同纪律）；libsignal 基线
+  **不在本面**（`engine.protocolCapabilities.baseline` 的
+  libsignalVersion/presageRev/libsignalCommit 所有），不自造字段、白名单
+  其他方法零改动。
+- **测试（+2）**：payload 形状单测（恰双键 + 本名钉定 + 版本非空）；契约
+  测试 real/fake 双模式形状、doctor 同形空参 + 多余参数宽容臂、读面不落
+  调度日志断言。未知方法 `-32601` 既有闸不动（词空间外动词仍拒）。
 
 ## 6. fake 服务模式（仅测试）
 

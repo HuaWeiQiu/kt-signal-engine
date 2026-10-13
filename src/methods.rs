@@ -3771,6 +3771,15 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // version（上游 signal-cli JSON-RPC 元方法，白名单补齐批 2026-10-14）：
+        // connector runtime.doctor（implementation-plan §4.79）的版本探针
+        // 引擎腿——doctor 以空参 `{}`、只读车道、3s 诊断预算调用，应答原样
+        // 透传给桌面呈现；缺该方法的引擎被 doctor 按「上游错误类」降级
+        // （present:false + 固定理由文案），携带版本面的引擎不该缺。零参数
+        // 方法 params 忽略（wire 宽容，generateInviteLinkPassword 同口径）、
+        // 账号无关、无业务错误面；fake/real 同码路真实答；读面不落调度日志
+        // 零 stderr（engine.protocolCapabilities 同纪律）。
+        "version" => jsonrpc::success_response(id, version_payload()),
         // ---- 引擎自证面（KT 扩展方法，compat §3 引擎自证块）----
         // engine.protocolCapabilities：只读、零网络、账号无关（无 account
         // 参数，未绑定账号照常应答）——引擎向服务器声明的协议能力位 +
@@ -3859,6 +3868,18 @@ async fn dispatch(
             &RpcError::new(jsonrpc::METHOD_NOT_FOUND, "Method not found"),
         ),
     }
+}
+
+/// version 元方法应答体：上游 signal-cli JSON-RPC 的 `{name, version}`
+/// 双字符串键形状（connector 原样透传，键集即契约，不自造字段——libsignal
+/// 基线是 `engine.protocolCapabilities.baseline` 的面，不混装）。身份诚实
+/// 自报引擎本名与本仓版本，不冒充上游名——doctor 面向桌面呈现的就是这份
+/// 原文，冒名将制造「signal-cli 版本 0.1.0」式误读。
+fn version_payload() -> Value {
+    json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 /// 置顶返回体（getPinnedConversations / setConversationPinned 共用形状）：
@@ -4363,6 +4384,27 @@ mod tests {
             assert_eq!(face.get("code").and_then(Value::as_i64), Some(code));
             assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
         }
+    }
+
+    /// version 元方法应答体形状面：恰 `{name, version}` 双字符串键（上游
+    /// signal-cli JSON-RPC 形状，connector runtime.doctor 原样透传——键集
+    /// 即契约，改动即断）；name = 引擎本名（诚实自报，不冒充上游），
+    /// version = 本仓版本非空。
+    #[test]
+    fn version_payload_shape() {
+        let payload = version_payload();
+        let obj = payload.as_object().expect("payload object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>().as_slice(),
+            ["name", "version"]
+        );
+        assert_eq!(obj["name"], json!(env!("CARGO_PKG_NAME")));
+        assert_eq!(obj["name"], json!("kt-signal-engine"));
+        assert_eq!(obj["version"], json!(env!("CARGO_PKG_VERSION")));
+        assert!(
+            !obj["version"].as_str().expect("version string").is_empty(),
+            "version 非空"
+        );
     }
 
     /// 发送链结构化三面（限流/人机验证/服务端不可用）wire 形状：均

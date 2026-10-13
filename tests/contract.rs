@@ -5253,6 +5253,52 @@ fn engine_protocol_capabilities_self_report_shape() {
     assert_shape(&fake_engine.request("engine.protocolCapabilities", json!({}))["result"]);
 }
 
+/// version（上游 signal-cli JSON-RPC 元方法，白名单补齐批）：connector
+/// runtime.doctor（implementation-plan §4.79）的版本探针引擎腿——doctor
+/// 以空参 `{}`、只读车道调用，应答原样透传（doctor-contract.md：face 为
+/// 引擎应答 verbatim）；缺该方法的引擎被按「上游错误类」降级并冒固定
+/// 理由文案上桌面（真机验收发现的根因面）。零参数、账号无关、只读常量
+/// 面：未绑定账号（全新数据目录，real 模式零账号）照常应答；fake/real
+/// 同码路真实答（常量面，calls.endorsementsPublicKey 同款）；读面不落
+/// 调度日志（engine-send-log.jsonl 不出现）。响应形状 = 上游
+/// `{name, version}` 双字符串键，引擎诚实自报本名本版本（不冒充上游名，
+/// 自证面同纪律）；libsignal 基线不在本面——engine.protocolCapabilities
+/// .baseline 所有，不自造字段。
+#[test]
+fn version_self_report_shape() {
+    let assert_shape = |result: &Value| {
+        let obj = result.as_object().expect("result object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>().as_slice(),
+            ["name", "version"]
+        );
+        assert_eq!(obj["name"], json!("kt-signal-engine"));
+        let version = obj["version"].as_str().expect("version string");
+        assert!(!version.is_empty(), "engine version present");
+        assert!(
+            version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "version is semver-ish (digit-leading)"
+        );
+    };
+
+    // real 模式 + 全新数据目录：doctor 探针同形空参应答；零参数方法多余
+    // 参数不设闸（wire 宽容，generateInviteLinkPassword 同口径）。
+    let real_dir = temp_dir("version-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_shape(&real_engine.request("version", json!({}))["result"]);
+    assert_shape(&real_engine.request("version", json!({ "extra": 1 }))["result"]);
+    drop(real_engine);
+    assert!(
+        !real_dir.join("engine-send-log.jsonl").exists(),
+        "read-only face must not write the dispatch log"
+    );
+
+    // fake 模式：同码路真实答（形状逐键一致）。
+    let fake_dir = temp_dir("version-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    assert_shape(&fake_engine.request("version", json!({}))["result"]);
+}
+
 /// engine.perfMetrics（S2a 性能基线打点层，KT 扩展方法）：进程内指标快照
 /// 只读投影——零参数、账号无关、零网络；`{uptimeMs, timings, counters,
 /// unknownKeyDropped}` 四键恒在；`rpc_dispatch` 计时随请求数单调（respond
