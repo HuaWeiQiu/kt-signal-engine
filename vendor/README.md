@@ -145,6 +145,13 @@
   - `src/websocket/sender.rs` — `send_messages_unidentified_story` 内部
     改走上游新 `request_json_with(request, put_messages_errors)`（原
     `request_json` 方法被上游移除，story 查询参/无 UAK 头语义不变）。
+- `src/sender.rs`（2026-10-13 批次 T 发送侧 sync 副本批）— `send_message`
+  尾部多设备转录上行改 best-effort：转录 `try_send_message` 失败降级为
+  `warn!` 日志、主发送结局保留（上游原样 `?` 连坐——收件人已达但副本失败
+  时整发报错，连接器重试队列会对已送达收件人重复投递；官方
+  wrapWithSyncMessageSend.preload.ts / Android SignalServiceMessageSender
+  均为副本失败不连坐主发送）。note-to-self 包裹腿（sync 即消息本体）不
+  在此列，错误仍上抛。
 
 `vendor/presage/`（rev 33dd149）：
 

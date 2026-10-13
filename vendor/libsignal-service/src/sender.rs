@@ -435,16 +435,24 @@ where
             };
             if let Some(body) = sync_body {
                 debug!("sending multi-device sync message");
-                self.try_send_message(
-                    self.local_aci.into(),
-                    None,
-                    None,
-                    &body,
-                    timestamp,
-                    false,
-                    false,
-                )
-                .await?;
+                // KT (best-effort transcript): official wrapWithSyncMessageSend /
+                // Android SignalServiceMessageSender keep the main send result
+                // when the multi-device copy fails; a transcript error must not
+                // turn an already-delivered message into a send failure.
+                if let Err(error) = self
+                    .try_send_message(
+                        self.local_aci.into(),
+                        None,
+                        None,
+                        &body,
+                        timestamp,
+                        false,
+                        false,
+                    )
+                    .await
+                {
+                    warn!(%error, "multi-device sync transcript failed; keeping main send result");
+                }
             }
         }
 
