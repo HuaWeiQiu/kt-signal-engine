@@ -153,6 +153,14 @@ pub(crate) struct SendTextStyle {
 /// receive cap 的发送侧镜像，契约 1.69 §4.62——超出整拒，不静默截断）。
 pub(crate) const MAX_SEND_TEXT_STYLES: usize = 64;
 
+/// 媒体 story caption 字节上限（2026-10-15 批）：官方 story composer
+/// caption 输入帽 `MAX_BODY_ATTACHMENT_BYTE_LENGTH = 64 * KIBIBYTE`
+///（Signal-Desktop ts/util/longAttachment.std.ts:8，CompositionInput.dom.tsx
+/// :686-692 `Buffer.byteLength(text) > 64 KiB` 裁决同源）——字节面非字符面
+///（Rust `str.len()` 即 UTF-8 字节，previewTitle ≤1024 字节纪律同构），
+/// 超出整拒不静默截断。
+pub(crate) const STORY_CAPTION_MAX_BYTES: usize = 64 * 1024;
+
 /// P14 组 4：story 回复发送面（compat §3 send 行 storyReplyAuthor/
 /// storyReplyTimestamp 扩面，官方 Desktop sendMessage storyContext 同位
 /// SendMessage.preload.ts:565-577）。author 为被回复 story 作者 ACI
@@ -650,6 +658,23 @@ fn apply_outgoing_voice_metadata(
 ) {
     pointer.audio_waveform = Some(metadata.waveform.clone());
     pointer.audio_duration_seconds = Some(metadata.duration_seconds);
+}
+
+/// 出向 caption 置位单点（2026-10-15 媒体 story caption 批）：caption 走
+/// presage spec 上行面直通——vendored `AttachmentSpec.caption`（官方
+/// `MAX_BODY_ATTACHMENT_BYTE_LENGTH` 帽闸在 methods 参数面）由
+/// `upload_attachment` 原样落返回指针 `AttachmentPointer.caption`
+///（vendored sender.rs spec.caption 直通；官方 uploadAttachment
+/// `caption || null` 进指针同构，uploadAttachment.preload.ts:99/:134），
+/// 零 vendor/fork 改动。仅 story 媒体腿传 Some（entries 恒单条，置位
+/// 首条正文附件），send/preview 面传 None 零变化；空 parsed 批 = 编排面
+/// 不会发生（媒体腿恒单条先行置位前已非空闸）。
+fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>) {
+    if let Some(text) = caption {
+        if let Some(first) = parsed.first_mut() {
+            first.spec.caption = Some(text.to_owned());
+        }
+    }
 }
 
 /// send 附件条目解析：data URI 唯一形状 = connector 上游形状
@@ -1741,11 +1766,13 @@ impl Service {
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
         let whitelist = profile_sharing_whitelist(self, account).await;
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
-        // 同样多收件人共享指针。
+        // 同样多收件人共享指针。caption 位 = story 媒体腿专属（send 面无
+        // caption 参数，None 零变化）。
         let (pointers, preview_image) = upload_attachments_for_send(
             &manager,
             attachments,
             preview.and_then(|item| item.image.as_deref()),
+            None,
         )
         .await?;
         let sticker_pointer = match sticker {
@@ -1895,6 +1922,7 @@ impl Service {
         text_style: Option<i32>,
         body_ranges: &[SendTextStyle],
         attachment: Option<&str>,
+        caption: Option<&str>,
         preview_image: Option<&str>,
         preview_url: Option<String>,
         preview_title: Option<String>,
@@ -1916,6 +1944,7 @@ impl Service {
                 text_style,
                 body_ranges,
                 attachment,
+                caption,
                 preview_image,
                 preview_url.clone(),
                 preview_title.clone(),
@@ -1941,6 +1970,7 @@ impl Service {
                     text_style,
                     body_ranges,
                     attachment,
+                    caption,
                     preview_image,
                     preview_url,
                     preview_title,
@@ -2841,7 +2871,7 @@ impl Service {
         let avatar = match payload.avatar.as_deref() {
             Some(uri) => {
                 let (pointers, _) =
-                    upload_attachments_for_send(manager, &[uri.to_owned()], None).await?;
+                    upload_attachments_for_send(manager, &[uri.to_owned()], None, None).await?;
                 Some(pointers.into_iter().next().ok_or(SendError::Internal)?)
             }
             None => None,
@@ -3137,6 +3167,7 @@ impl Service {
             &manager,
             attachments,
             preview.and_then(|item| item.image.as_deref()),
+            None,
         )
         .await?;
         let body = match sticker {
@@ -9225,10 +9256,17 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
 /// 生成 audioWaveform/audioDurationSeconds，见 apply_outgoing_voice_
 /// metadata）；贴纸图走 upload_sticker_image 单条面不经此处（官方贴纸
 /// 指针无 GIF 位、无语音元数据）。
+///
+/// `caption`（2026-10-15 媒体 story caption 批）：story 媒体腿 caption 走
+/// spec 上行面直通（apply_outgoing_caption 置位首条正文附件 spec，vendored
+/// `upload_attachment` 原样落返回指针 `AttachmentPointer.caption`，官方
+/// uploadAttachment `caption || null` 进指针同构）——仅 story 媒体腿传
+/// Some（entries 恒单条），send/preview 调用面传 None 零变化。
 async fn upload_attachments_for_send(
     manager: &Manager<SqliteStore, Registered>,
     entries: &[String],
     preview_image: Option<&str>,
+    caption: Option<&str>,
 ) -> Result<
     (
         Vec<presage::proto::AttachmentPointer>,
@@ -9254,6 +9292,7 @@ async fn upload_attachments_for_send(
     if parsed.is_empty() {
         return Ok((Vec::new(), None));
     }
+    apply_outgoing_caption(&mut parsed, caption);
     let mut outgoing_faces = Vec::with_capacity(parsed.len());
     let mut batch = Vec::with_capacity(parsed.len());
     for item in parsed {
@@ -10123,6 +10162,37 @@ mod tests {
         let both = parsed("data:video/mp4;voice=true;gif=true;base64,aGVsbG8=");
         assert_eq!(both.spec.voice_note, Some(true));
         assert!(both.is_gif);
+    }
+
+    #[test]
+    fn apply_outgoing_caption_spec_face() {
+        // 媒体 story caption 置位单点（2026-10-15 批）：Some = 首条正文附件
+        // spec 载 caption（vendored upload_attachment spec.caption 直通返回
+        // 指针 AttachmentPointer.caption，官方 uploadAttachment caption 进
+        // 指针同构）；None = 零变化不覆盖；空 parsed 批（preview 单条面）
+        // 不 panic 不置位。
+        let uri = "data:image/jpeg;base64,aGVsbG8=";
+        let mut parsed = vec![parse_attachment_data_uri(uri).expect("parses")];
+        assert_eq!(parsed[0].spec.caption, None, "解析面 caption 恒缺席");
+        apply_outgoing_caption(&mut parsed, Some("story caption"));
+        assert_eq!(parsed[0].spec.caption.as_deref(), Some("story caption"));
+
+        let mut parsed = vec![parse_attachment_data_uri(uri).expect("parses")];
+        apply_outgoing_caption(&mut parsed, None);
+        assert_eq!(parsed[0].spec.caption, None, "None = 零变化");
+
+        // 正文附件 + 预览图同批形态：置位首条（正文），预览图不受染。
+        let mut batch = vec![
+            parse_attachment_data_uri(uri).expect("parses"),
+            parse_attachment_data_uri("data:image/png;base64,aGVsbG8=").expect("parses"),
+        ];
+        apply_outgoing_caption(&mut batch, Some("story caption"));
+        assert_eq!(batch[0].spec.caption.as_deref(), Some("story caption"));
+        assert_eq!(batch[1].spec.caption, None, "preview 位不受染");
+
+        let mut bare: Vec<ParsedAttachment> = Vec::new();
+        apply_outgoing_caption(&mut bare, Some("no-op"));
+        assert!(bare.is_empty());
     }
 
     #[test]

@@ -60,6 +60,18 @@
 //! recipients）；群 story 成员解析 = 引擎群态（sendTextGroup 同源）；
 //! 24h 过期纯客户端语义不在引擎面。
 //!
+//! 媒体 story caption（2026-10-15 批，官方对齐 Signal-Desktop abe80d3，
+//! wire additive）：`caption` 可选参数扩媒体腿——官方 caption 进
+//! `AttachmentPointer.caption = 11`（protos/SignalService.proto:940，
+//! uploadAttachment.preload.ts:99/:134 `caption || null` 随上传返回指针同
+//! 载），媒体编辑面输入帽 `MAX_BODY_ATTACHMENT_BYTE_LENGTH = 64 KiB`
+//!（longAttachment.std.ts:8，CompositionInput.dom.tsx:686-692 字节面裁
+//! 决）。caption 媒体腿专属（官方 textAttachment 无 caption 位）；上行
+//! 路径 = presage `AttachmentSpec.caption` 上行面直通返回指针（vendored
+//! sender.rs spec.caption→pointer.caption，零 vendor/fork 改动）——
+//! S6a 桌面媒体 story 批记档「引擎 media 腿无 caption 键」边界就此翻案
+//!（compat §5 媒体 story caption 批）。
+//!
 //! 纪律（compat §1）：本层不产生任何 stderr 输出。
 
 use std::collections::HashSet;
@@ -269,6 +281,10 @@ fn dedup_resolved(recipients: Vec<(ServiceId, String)>) -> Vec<(ServiceId, Strin
 /// data URI 走既有 transit CDN 上行链（entries 单条、无预览图），上传返回
 /// 指针进 `StoryMessage.fileAttachment`（官方 sendStory.preload.ts:186-190
 /// 同构）；缺席 = text story 现状零变化。两腿互斥闸在 methods 参数面。
+/// `caption`（媒体 story caption 批，2026-10-15）：媒体腿专属——随正文
+/// 附件 spec 上行直通返回指针（apply_outgoing_caption，官方
+/// uploadAttachment caption 进指针同构），text 腿恒 None（官方
+/// textAttachment 无 caption 位）。
 /// 本函数 = 名单受众腿（2026-10-15 批拆分）：群受众腿独立编排于
 /// `send_story_group`（混合受众官方 = 两 job 两 sync，sendStoryMessage
 /// .preload.ts:327-332 名单 job / :337-378 群 job 各自带收尾 sync——引擎
@@ -285,6 +301,7 @@ pub(crate) async fn send_story(
     text_style: Option<i32>,
     body_ranges: &[SendTextStyle],
     attachment: Option<&str>,
+    caption: Option<&str>,
     preview_image: Option<&str>,
     preview_url: Option<String>,
     preview_title: Option<String>,
@@ -305,13 +322,13 @@ pub(crate) async fn send_story(
     let story = match attachment {
         Some(uri) => {
             let (pointers, _) =
-                upload_attachments_for_send(&manager, &[uri.to_owned()], None).await?;
+                upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
             build_media_story_message(allows_replies, body_ranges, file_pointer, None)?
         }
         None => {
             let (_, preview_pointer) = match preview_image {
-                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri)).await?,
+                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri), None).await?,
                 None => (Vec::new(), None),
             };
             build_story_message(
@@ -411,6 +428,9 @@ pub(crate) async fn send_story(
 ///   任一成员失败整体 `-32603`（sendStory 既有纪律）。
 /// - **allowsReplies**：群腿线上恒 true（官方 sendStory.preload.ts:199
 ///   硬编码 + :352-354 `isGroupV2 ||` 短路；RPC allowsReplies 只辖名单腿）。
+/// - `caption`（媒体 story caption 批，2026-10-15）：媒体腿专属，随正文
+///   附件 spec 上行直通返回指针（名单腿同构；官方群 story media 臂同源
+///   getStoryMessage），text 腿恒 None。
 /// - **自同步**（官方群 story sync 形状，恰好一次）：≥1 成员发送成功才发
 ///   `SyncMessage.Sent{timestamp, story_message（载 group）,
 ///   story_message_recipients = group_story_sync_recipients（空名单位 +
@@ -432,6 +452,7 @@ pub(crate) async fn send_story_group(
     text_style: Option<i32>,
     body_ranges: &[SendTextStyle],
     attachment: Option<&str>,
+    caption: Option<&str>,
     preview_image: Option<&str>,
     preview_url: Option<String>,
     preview_title: Option<String>,
@@ -500,7 +521,7 @@ pub(crate) async fn send_story_group(
     let story = match attachment {
         Some(uri) => {
             let (pointers, _) =
-                upload_attachments_for_send(&manager, &[uri.to_owned()], None).await?;
+                upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
             build_media_story_message(
                 true,
@@ -511,7 +532,7 @@ pub(crate) async fn send_story_group(
         }
         None => {
             let (_, preview_pointer) = match preview_image {
-                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri)).await?,
+                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri), None).await?,
                 None => (Vec::new(), None),
             };
             build_story_message(
@@ -1080,5 +1101,77 @@ mod tests {
         );
         assert_eq!(entries[1].distribution_list_ids, Vec::<String>::new());
         assert_eq!(entries[1].is_allowed_to_reply, Some(true));
+    }
+
+    /// 媒体 story caption 构造钉形（2026-10-15 批，compat §5 媒体 story
+    /// caption 批）：caption 属上传面元数据——带 caption 的上传返回指针原样
+    /// 进 StoryMessage.fileAttachment（官方 uploadAttachment `caption || null`
+    /// 进指针同构 uploadAttachment.preload.ts:99/:134，getStoryMessage
+    /// `attachment = { fileAttachment }` 恰一 SendMessage.preload.ts:
+    /// 1043-1044）；接收投影 caption 位原样读回（收发互逆，E2 既有面）；
+    /// prost encode/decode 往返（sealed-sender 载荷与 sync echo 同值面）
+    /// caption 保持。
+    #[test]
+    fn media_story_caption_pointer_shape_and_roundtrip() {
+        use prost::Message as _;
+        let captioned = presage::proto::AttachmentPointer {
+            cdn_number: Some(3),
+            content_type: Some("image/jpeg".to_owned()),
+            caption: Some("a caption".to_owned()),
+            ..Default::default()
+        };
+        let story = build_media_story_message(true, &[], captioned.clone(), None).expect("shape");
+        match &story.attachment {
+            Some(story_message::Attachment::FileAttachment(pointer)) => {
+                assert_eq!(
+                    pointer.caption.as_deref(),
+                    Some("a caption"),
+                    "指针 caption 原样透传（构造面不补键不剥离）"
+                );
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
+        // 接收投影（E2 既有面）caption 位读回——收发互逆半边。
+        let out = crate::service::project_story_message(&story, &std::collections::HashMap::new())
+            .expect("story projection");
+        assert_eq!(out["fileAttachment"]["caption"], json!("a caption"));
+        // prost 往返（sync echo / sealed-sender 同值面）caption 保持。
+        let mut buf = Vec::new();
+        story.encode(&mut buf).expect("encode");
+        let echoed = StoryMessage::decode(buf.as_slice()).expect("decode");
+        assert_eq!(
+            echoed.attachment,
+            Some(story_message::Attachment::FileAttachment(captioned))
+        );
+
+        // 缺席面（pre-caption 帧同形）：无 caption 指针 → fileAttachment
+        // caption 缺席（proto 字段 11 不在线上）→ 投影无 caption 键 →
+        // encode/decode 往返保持缺席。
+        let bare = presage::proto::AttachmentPointer {
+            cdn_number: Some(3),
+            ..Default::default()
+        };
+        let story = build_media_story_message(false, &[], bare, None).expect("shape");
+        match &story.attachment {
+            Some(story_message::Attachment::FileAttachment(pointer)) => {
+                assert_eq!(pointer.caption, None, "缺席 = proto 字段缺席");
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
+        let out = crate::service::project_story_message(&story, &std::collections::HashMap::new())
+            .expect("story projection");
+        assert!(
+            out["fileAttachment"].get("caption").is_none(),
+            "缺席键不在（pre-caption 帧零漂移）"
+        );
+        let mut buf = Vec::new();
+        story.encode(&mut buf).expect("encode");
+        let echoed = StoryMessage::decode(buf.as_slice()).expect("decode");
+        match echoed.attachment {
+            Some(story_message::Attachment::FileAttachment(pointer)) => {
+                assert_eq!(pointer.caption, None);
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
     }
 }

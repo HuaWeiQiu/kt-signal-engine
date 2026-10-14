@@ -18,7 +18,7 @@ use crate::service::{
     storage_write, CallingRelaysError, DeleteForMeAuthor, DeleteForMeConversation,
     DeleteForMeEntry, DeviceCapabilitiesError, LinkError, MessageRequestTarget, SendMention,
     SendPreview, SendQuote, SendQuoteBodyRange, SendSticker, SendStoryContext, SendTextStyle,
-    Service, UserStatusError, MAX_SEND_TEXT_STYLES,
+    Service, UserStatusError, MAX_SEND_TEXT_STYLES, STORY_CAPTION_MAX_BYTES,
 };
 use crate::state::EngineState;
 
@@ -1510,6 +1510,11 @@ async fn dispatch(
         // Preview（官方 preview 面 image 可空同构），违规 fail-closed 不
         // 静默丢键。attachment（媒体 story 腿）：单条 data URI 字符串
         // （connector 上游附件形状同款，深解析/帽值归服务层上行闸）；
+        // caption（媒体 story caption 批 2026-10-15，engine-compat）：非空
+        // ≤65536 UTF-8 字节（官方 MAX_BODY_ATTACHMENT_BYTE_LENGTH 同源
+        // longAttachment.std.ts:8，字节面），媒体腿专属——官方 caption 进
+        // AttachmentPointer.caption=11（proto:940）随上传返回指针同载，
+        // textAttachment 无 caption 位（attachment 缺席 + caption 在场拒）。
         // **两腿恰一**（官方 StoryMessage.attachment oneof
         // fileAttachment=3|textAttachment=4 同构）：attachment 在场 =
         // 文件 story，message 文本腿禁入（同置 -32603——沉默丢正文是
@@ -1533,6 +1538,26 @@ async fn dispatch(
             let attachment = match params.get("attachment") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(uri)) if !uri.is_empty() => Some(uri.as_str()),
+                Some(_) => return internal_error(id),
+            };
+            // caption（媒体 story caption 批，2026-10-15）：媒体腿专属——
+            // 官方 caption 进 AttachmentPointer.caption=11
+            //（protos/SignalService.proto:940，uploadAttachment.preload.ts
+            // :99/:134 `caption || null` 随上传返回指针同载）；输入帽 = 官方
+            // MAX_BODY_ATTACHMENT_BYTE_LENGTH 64KiB（longAttachment.std.ts:8，
+            // CompositionInput.dom.tsx:686-692 Buffer.byteLength 字节面同源，
+            // previewTitle ≤1024 字节纪律同构）；缺失/null = 无；非字符串/
+            // 空串/超 65536 UTF-8 字节 fail-closed 不静默丢键。textAttachment
+            // 官方无 caption 位（getTextAttachmentProto 无此键）——仅
+            // attachment 腿可达，腿闸见下方两腿恰一延伸。
+            let caption = match params.get("caption") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) if !text.is_empty() => {
+                    if text.len() > STORY_CAPTION_MAX_BYTES {
+                        return internal_error(id);
+                    }
+                    Some(text.as_str())
+                }
                 Some(_) => return internal_error(id),
             };
             let message = params
@@ -1678,6 +1703,10 @@ async fn dispatch(
             // 丢键）；null 归缺席（本方法各参数统一口径）。双缺 = 无载荷
             // 整拒（message 必填现状口径）。bodyRanges 两腿共用（官方
             // getStoryMessage fileAttachment 分支同载）。
+            // caption 媒体腿专属（官方 textAttachment 无 caption 位，
+            // getTextAttachmentProto 无此键）：attachment 缺席时 caption
+            // 在场 = 无处挂载，同族禁入（含 caption+message 文本腿同置与
+            // caption 单独在场双缺载荷两形态，-32603 不静默丢键）。
             if attachment.is_some()
                 && (message.is_some()
                     || text_style.is_some()
@@ -1686,6 +1715,9 @@ async fn dispatch(
                     || preview_title.is_some()
                     || preview_date.is_some())
             {
+                return internal_error(id);
+            }
+            if caption.is_some() && attachment.is_none() {
                 return internal_error(id);
             }
             match (account, message, attachment) {
@@ -1699,6 +1731,7 @@ async fn dispatch(
                             message,
                             text_style,
                             &body_ranges,
+                            None,
                             None,
                             preview_image,
                             preview_url,
@@ -1724,9 +1757,11 @@ async fn dispatch(
                 }
                 // 媒体 story 腿（2026-10-14 批）：正文附件 data URI 走既有
                 // transit CDN 上行链，指针进 StoryMessage.fileAttachment
-                //（官方 getStoryMessage fileAttachment 臂同位）；文本腿
-                // 专属参数已在上方闸禁入，此处传缺省值。group 正交透传
-                //（官方群 story media 臂同源 getStoryMessage）。
+                //（官方 getStoryMessage fileAttachment 臂同位）；caption 随
+                // 附件 spec 上行直通返回指针（2026-10-15 批，官方
+                // uploadAttachment caption 进指针同构）；文本腿专属参数已在
+                // 上方闸禁入，此处传缺省值。group 正交透传（官方群 story
+                // media 臂同源 getStoryMessage）。
                 (Some(account), None, Some(attachment)) => {
                     match service
                         .send_story(
@@ -1738,6 +1773,7 @@ async fn dispatch(
                             None,
                             &body_ranges,
                             Some(attachment),
+                            caption,
                             None,
                             None,
                             None,

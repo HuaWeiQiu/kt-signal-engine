@@ -3052,6 +3052,167 @@ fn send_story_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// 媒体 story caption 批 fake 契约（2026-10-15，compat §5 媒体 story
+/// caption 批）：caption 媒体腿专属——合法批（attachment+caption，含群腿
+/// 正交）成功形状零变化；text 腿携 caption 拒（官方 textAttachment 无
+/// caption 位）、caption 单独在场（双缺载荷）拒；帽 = 官方
+/// MAX_BODY_ATTACHMENT_BYTE_LENGTH 64KiB 字节面（65536 字节恰边界成功/
+/// 65537 字节拒，CJK 字节面同钉）；类型闸 fail-closed；调度日志原样落参。
+#[test]
+fn send_story_caption_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("send-story-caption-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let attachment = json!("data:image/jpeg;base64,iVBORw0KGgo=");
+
+    // 合法批：attachment+caption（fake 纪律 = 参数闸全量生效后成功桩，
+    // 应答形状与 pre-caption 批零变化）。
+    assert_eq!(
+        engine
+            .request(
+                "sendStory",
+                json!({
+                    "account": "+15550000000",
+                    "recipients": ["+15555550101"],
+                    "attachment": attachment,
+                    "caption": "story caption"
+                })
+            )
+            .pointer("/result/results"),
+        Some(&json!([]))
+    );
+    // caption null 归缺席（本方法各参数统一口径）。
+    let null_caption = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": attachment,
+            "caption": null
+        }),
+    );
+    assert!(
+        null_caption["result"]["timestamp"].is_u64(),
+        "timestamp is u64"
+    );
+    // 群腿正交：attachment+caption+group（官方群 story media 臂同源
+    // getStoryMessage）应答 group 面 additive。
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    let media_caption_group = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": [],
+            "attachment": attachment,
+            "caption": "group caption",
+            "group": group_id
+        }),
+    );
+    assert_eq!(
+        media_caption_group["result"]["group"]["groupId"],
+        json!(group_id)
+    );
+    // 帽边界（字节面 = 官方 Buffer.byteLength 同构）：恰帽内成功——
+    // ascii 65536 字节恰边界；CJK「中」3 字节/字，21845 字 = 65535 字节
+    // 恰帽内（字符数 21845 远超任何字符面帽——钉字节面不是字符面）。
+    for caption in [json!("a".repeat(65_536)), json!("中".repeat(21_845))] {
+        let ok = engine.request(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "recipients": ["+15555550101"],
+                "attachment": attachment,
+                "caption": caption
+            }),
+        );
+        assert!(ok["result"]["timestamp"].is_u64(), "帽内合法");
+    }
+    // 缺席回归：caption 缺席媒体批现状零变化（pre-caption 帧同形）。
+    let no_caption = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": attachment
+        }),
+    );
+    assert_eq!(no_caption["result"]["results"], json!([]));
+
+    // fail-closed 闸：text 腿携 caption（官方 textAttachment 无 caption
+    // 位——media 专属键越腿同族禁入）；caption 单独在场（无 message 无
+    // attachment = 双缺载荷）；超帽（65537 ascii / 21846 中 = 65538 字节，
+    // 恰超字节面）；类型闸（非字符串/空串）。
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "text story",
+            "recipients": ["+15555550101"],
+            "caption": "wrong leg"
+        }),
+    );
+    assert_eq!(code, -32603, "text 腿携 caption 拒");
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "caption": "no payload"
+        }),
+    );
+    assert_eq!(code, -32603, "caption 单独在场 = 双缺载荷拒");
+    for caption in [
+        json!("a".repeat(65_537)),
+        json!("中".repeat(21_846)),
+        json!(42),
+        json!(""),
+    ] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "recipients": ["+15555550101"],
+                "attachment": attachment,
+                "caption": caption
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+
+    // 调度日志纪律：成功与被拒调用都落日志（send 系同款）；caption 原样
+    // 进 params（connector 侧依赖断言）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .filter(|entry: &Value| entry["method"] == "sendStory")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        12,
+        "成功六条 + 拒绝六条均落日志（append_dispatch 在参数闸之前）"
+    );
+    assert_eq!(
+        entries[0]["params"]["caption"],
+        json!("story caption"),
+        "caption 原样进日志"
+    );
+
+    // real 模式未注册账号：折叠 -32603 不触网（send 系同折叠）。
+    let real_dir = temp_dir("send-story-caption-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15559990000",
+            "recipients": ["+15555550101"],
+            "attachment": "data:image/jpeg;base64,iVBORw0KGgo=",
+            "caption": "story caption"
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// S4 story 反应发送批 fake 契约：合法批应答 `{}`（单收件人直聊腿，无
 /// results 面——sendStoryReaction 无收件人批）；参数闸 fail-closed 全量
 /// 生效（account/storyAuthor/storyTimestamp/emoji 四参，缺一/空串/0/非数
