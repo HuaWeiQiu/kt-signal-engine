@@ -1874,7 +1874,11 @@ impl Service {
 
     /// sendStory（Stories 发送批，KT 扩展方法）：text story 构造 + 逐收件人
     /// 分发 + best-effort 自同步，编排全量在 stories 模块（compat §3
-    /// sendStory 行）。
+    /// sendStory 行）。媒体 story 发送面（2026-10-14 批）：`attachment`
+    /// Some = 文件 story（data URI 走既有 transit CDN 上行链，指针进
+    /// `StoryMessage.fileAttachment`，官方 getStoryMessage fileAttachment
+    /// 臂同位），缺席 = text story 现状零变化（两腿互斥闸在 methods 参数
+    /// 面）；自同步 `story_message` 载两腿同形状值，恰好一次语义不变。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_story(
         self: &Arc<Self>,
@@ -1885,6 +1889,7 @@ impl Service {
         text: &str,
         text_style: Option<i32>,
         body_ranges: &[SendTextStyle],
+        attachment: Option<&str>,
         preview_image: Option<&str>,
         preview_url: Option<String>,
         preview_title: Option<String>,
@@ -1899,6 +1904,7 @@ impl Service {
             text,
             text_style,
             body_ranges,
+            attachment,
             preview_image,
             preview_url,
             preview_title,

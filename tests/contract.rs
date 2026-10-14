@@ -2848,6 +2848,74 @@ fn send_story_fake_shape_and_param_fail_closed() {
     );
     assert_eq!(url_only["result"]["results"], json!([]));
 
+    // 媒体 story 腿（2026-10-14 批）：attachment 合法批成功（message 缺席
+    // = 文件 story；fake 纪律 = 参数闸全量生效后成功桩，data URI 深解析
+    // 归服务层 real 上行闸）；bodyRanges 两腿共用（官方 getStoryMessage
+    // fileAttachment 分支同载）；message null 归缺席。
+    assert_eq!(
+        engine
+            .request(
+                "sendStory",
+                json!({
+                    "account": "+15550000000",
+                    "recipients": ["+15555550101"],
+                    "attachment": "data:image/jpeg;base64,iVBORw0KGgo=",
+                    "bodyRanges": [{ "style": "BOLD", "start": 0, "length": 4 }]
+                })
+            )
+            .pointer("/result/results"),
+        Some(&json!([]))
+    );
+    let null_message = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": null,
+            "recipients": ["+15555550101"],
+            "attachment": "data:image/jpeg;base64,iVBORw0KGgo="
+        }),
+    );
+    assert!(
+        null_message["result"]["timestamp"].is_u64(),
+        "timestamp is u64"
+    );
+
+    // 两腿恰一（官方 StoryMessage.attachment oneof 同构）：attachment +
+    // message 同置 -32603（沉默丢正文是 fail-open）；textAttachment 专属
+    // 键（textStyle/preview 族）oneof 另一臂在场时 proto 无处挂载，同禁。
+    for extra in [
+        json!({ "message": "story" }),
+        json!({ "textStyle": "BOLD" }),
+        json!({ "previewImage": "data:image/png;base64,iVBORw0KGgo=" }),
+        json!({ "previewUrl": "https://example.com/a" }),
+        json!({ "previewTitle": "Example" }),
+        json!({ "previewDate": 1_700_000_000_000_u64 }),
+    ] {
+        let mut params = json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": "data:image/jpeg;base64,iVBORw0KGgo="
+        });
+        for (key, value) in extra.as_object().expect("object") {
+            params[key] = value.clone();
+        }
+        let (code, _) = engine.error_of("sendStory", params);
+        assert_eq!(code, -32603);
+    }
+    // attachment 形状闸：非字符串/空串 fail-closed；双缺（无 message 无
+    // attachment）= 无载荷整拒（message 必填现状口径）。
+    for attachment in [json!(42), json!("")] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "recipients": ["+15555550101"],
+                "attachment": attachment
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+
     // 调度日志纪律：成功与被拒调用都落日志（send 系同款，updateGroup
     // 同构断言）；params 形状供 connector 侧依赖断言。
     let log_path = dir.join("engine-send-log.jsonl");
@@ -2862,8 +2930,9 @@ fn send_story_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         story_entries.len(),
-        34,
-        "成功四条 + 拒绝三十条均落日志（append_dispatch 在参数闸之前）"
+        44,
+        "成功六条 + 拒绝三十八条均落日志（append_dispatch 在参数闸之前；媒体 \
+         story 批新增成功两条/拒绝八条）"
     );
     assert_eq!(
         story_entries[0]["params"]["recipients"],

@@ -1454,26 +1454,48 @@ async fn dispatch(
             }
         }
         // sendStory（Stories 发送批，KT 扩展方法）：text story 一面（v1，
-        // 群 story / 文件 story 不做）。协议上行面落调度日志（send 系同纪
-        // 律）；参数面 fail-closed（-32603）：account/message 非空、
-        // recipients 非空字符串数组（story 面恒为名单展开集，无单字符串
-        // 形态——成员解析归 connector）、distributionListId 非空字符串缺省
-        // 官方 MY_STORY_ID、allowsReplies 布尔（缺省 false = 线上 proto 缺
-        // 席位，官方值源为名单属性）、textStyle 单词六值词表（官方
-        // TextAttachment.Style 词表，DEFAULT = proto 字段省略）、bodyRanges
-        // 五值内联样式 {style,start,length} ≤64（send textStyle 同款
-        // fail-closed 闸 + 服务层防御双保险）、previewImage 非空字符串
-        //（缺失/null = 无预览，其他类型 fail-closed 不静默丢弃）、
-        // previewUrl 非空 ≤2048 字符且 https:// 开头（官方 isValidLink
-        // https-only 同构，LinkPreview.std.ts:54-65）、previewTitle 非空
-        // ≤1024 UTF-8 字节——两键独立可选，任一在场即成 Preview（官方
-        // preview 面 image 可空同构），违规 fail-closed 不静默丢键。
+        // 群 story 不做）+ 媒体 story 发送面（2026-10-14 批，官方对齐
+        // Signal-Desktop abe80d3，wire additive，engine-compat——E1 批
+        // 「文件 story v1 不做」边界翻案，理由记档 compat §5 媒体 story 批）。
+        // 协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
+        //（-32603）：account/message 非空、recipients 非空字符串数组（story
+        // 面恒为名单展开集，无单字符串形态——成员解析归 connector）、
+        // distributionListId 非空字符串缺省官方 MY_STORY_ID、allowsReplies
+        // 布尔（缺省 false = 线上 proto 缺席位，官方值源为名单属性）、
+        // textStyle 单词六值词表（官方 TextAttachment.Style 词表，DEFAULT
+        // = proto 字段省略）、bodyRanges 五值内联样式 {style,start,length}
+        // ≤64（send textStyle 同款 fail-closed 闸 + 服务层防御双保险）、
+        // previewImage 非空字符串（缺失/null = 无预览，其他类型
+        // fail-closed 不静默丢弃）、previewUrl 非空 ≤2048 字符且 https://
+        // 开头（官方 isValidLink https-only 同构，LinkPreview.std.ts:54-65）、
+        // previewTitle 非空 ≤1024 UTF-8 字节——两键独立可选，任一在场即成
+        // Preview（官方 preview 面 image 可空同构），违规 fail-closed 不
+        // 静默丢键。attachment（媒体 story 腿）：单条 data URI 字符串
+        // （connector 上游附件形状同款，深解析/帽值归服务层上行闸）；
+        // **两腿恰一**（官方 StoryMessage.attachment oneof
+        // fileAttachment=3|textAttachment=4 同构）：attachment 在场 =
+        // 文件 story，message 文本腿禁入（同置 -32603——沉默丢正文是
+        // fail-open）、textAttachment 专属键 textStyle/previewImage/
+        // previewUrl/previewTitle/previewDate 亦禁入（oneof 另一臂在场时
+        // proto 无处挂载，fail-closed 不静默丢键），双缺 = 无载荷整拒
+        // （现状口径）；bodyRanges 两腿共用（官方 getStoryMessage
+        // fileAttachment 分支同载 bodyRanges，SendMessage.preload.ts:
+        // 1059-1061）。attachment 缺席 = text story 现状零变化。
         "sendStory" => {
             state.lock().await.append_dispatch(method, params);
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty());
+            // attachment（媒体 story 发送面，2026-10-14 批）：单条 data URI
+            // 字符串（connector 上游附件形状同款）；缺失/null = 无（text
+            // story 现状）；非字符串/空串 fail-closed。data URI 深解析
+            //（mediatype/base64/100MB 帽）归服务层上行闸（send 附件同纪律）。
+            let attachment = match params.get("attachment") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(uri)) if !uri.is_empty() => Some(uri.as_str()),
+                Some(_) => return internal_error(id),
+            };
             let message = params
                 .get("message")
                 .and_then(Value::as_str)
@@ -1594,8 +1616,26 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
-            match (account, message) {
-                (Some(account), Some(message)) => {
+            // 媒体 story 两腿恰一（官方 StoryMessage.attachment oneof
+            // fileAttachment=3|textAttachment=4 同构）：attachment 在场 =
+            // 文件 story——message 文本腿禁入（同置 -32603，沉默丢正文是
+            // fail-open）；textAttachment 专属键（textStyle/preview 四键）
+            // oneof 另一臂在场时 proto 无处挂载，同禁（fail-closed 不静默
+            // 丢键）；null 归缺席（本方法各参数统一口径）。双缺 = 无载荷
+            // 整拒（message 必填现状口径）。bodyRanges 两腿共用（官方
+            // getStoryMessage fileAttachment 分支同载）。
+            if attachment.is_some()
+                && (message.is_some()
+                    || text_style.is_some()
+                    || preview_image.is_some()
+                    || preview_url.is_some()
+                    || preview_title.is_some()
+                    || preview_date.is_some())
+            {
+                return internal_error(id);
+            }
+            match (account, message, attachment) {
+                (Some(account), Some(message), None) => {
                     match service
                         .send_story(
                             account,
@@ -1605,10 +1645,40 @@ async fn dispatch(
                             message,
                             text_style,
                             &body_ranges,
+                            None,
                             preview_image,
                             preview_url,
                             preview_title,
                             preview_date,
+                        )
+                        .await
+                    {
+                        Ok((timestamp, results)) => jsonrpc::success_response(
+                            id,
+                            json!({ "timestamp": timestamp, "results": results }),
+                        ),
+                        Err(_) => internal_error(id),
+                    }
+                }
+                // 媒体 story 腿（2026-10-14 批）：正文附件 data URI 走既有
+                // transit CDN 上行链，指针进 StoryMessage.fileAttachment
+                //（官方 getStoryMessage fileAttachment 臂同位）；文本腿
+                // 专属参数已在上方闸禁入，此处传缺省值。
+                (Some(account), None, Some(attachment)) => {
+                    match service
+                        .send_story(
+                            account,
+                            &recipients,
+                            distribution_list_id,
+                            allows_replies,
+                            "",
+                            None,
+                            &body_ranges,
+                            Some(attachment),
+                            None,
+                            None,
+                            None,
+                            None,
                         )
                         .await
                     {

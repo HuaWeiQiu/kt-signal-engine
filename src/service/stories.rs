@@ -13,9 +13,25 @@
 //! `MessageSender::send_story_message` 与 websocket/sender.rs
 //! `send_messages_unidentified_story`，官方锚点登记于 vendor/README.md）。
 //!
+//! 媒体 story 发送面（2026-10-14 批，官方对齐 Signal-Desktop abe80d3，
+//! wire additive）：`attachment` 可选参数扩文件 story——官方
+//! `StoryMessage.attachment` 本就 `fileAttachment=3 | textAttachment=4`
+//! oneof 双臂（protos/SignalService.proto:476-479），媒体腿 =
+//! `sendStory.preload.ts:186-190` 同构：正文附件走既有 transit CDN 上行链
+//! （presage `upload_attachments` 官方原语），上传返回指针原样进
+//! `StoryMessage.fileAttachment`（官方 `getStoryMessage`
+//! SendMessage.preload.ts:1043-1044 同位）；与文本腿两腿恰一（oneof 恰一
+//! 同构）。**边界翻案记档**：E1 批原定「文件 story v1 不做」——产品需要
+//! 媒体 story 发布（桌面 S6 批前置），且接收投影（E2 批）早已投
+//! fileAttachment 全脸（locator 指针族），收发不对称只剩发送面缺口；
+//! 上传链/自同步面全部既有复用、vendored proto 与 fork 发送路径零改动
+//! 即可承载（fork `send_story_message` 本就 `impl Into<ContentBody>`
+//! 泛型），故本批翻案落地，翻案理由随 compat §5 媒体 story 批记档。
+//! **群 story（GroupContextV2 位）边界保留不动**（发送面仍恒
+//! `group: None`）。
+//!
 //! 边界（任务口径）：distribution list 成员解析归 connector（引擎只收显式
-//! recipients）；群 story / 文件 story（image 正文）v1 不做；24h 过期纯客
-//! 户端语义不在引擎面。
+//! recipients）；群 story v1 不做；24h 过期纯客户端语义不在引擎面。
 //!
 //! 纪律（compat §1）：本层不产生任何 stderr 输出。
 
@@ -82,7 +98,8 @@ fn build_body_ranges(styles: &[SendTextStyle]) -> Result<Vec<BodyRange>, SendErr
 /// - `profile_key` 构造面 None——由 presage fork `send_story_message` 注入
 ///   发送者 profile key（与 presage `send_message` 注入 DataMessage 同构；
 ///   官方 sendStory profileKey 必需）；
-/// - `attachment` 恒 TextAttachment（文件 story v1 不做）；
+/// - `attachment` 恒 TextAttachment（文件 story 走 build_media_story_message
+///   另一构造面，两腿互斥）；
 /// - preview = 三件套组装（见 build_story_preview）：preview.image = 调用
 ///   方已上行的 CDN 指针（官方 sendStory 同构：preview 数据随正文附件同批
 ///   上行），url/title = previewUrl/previewTitle 扩展键如实透传（解析闸
@@ -113,6 +130,26 @@ pub(crate) fn build_story_message(
             preview: build_story_preview(preview_image, preview_url, preview_title, preview_date),
             background: None,
         })),
+    })
+}
+
+/// 媒体 story 构造（2026-10-14 批纯函数，单测钉形状）：官方 getStoryMessage
+/// fileAttachment 臂同位（SendMessage.preload.ts:1043-1044
+/// `attachment = { fileAttachment }`）——上传返回指针原样进
+/// `StoryMessage.fileAttachment`，bodyRanges 同臂照载（官方 :1059-1061
+/// fileAttachment 分支同构）；`profile_key` 构造面 None（send 面注入，与
+/// text 臂同构）、`group` 恒 None（群 story 边界保留）。
+pub(crate) fn build_media_story_message(
+    allows_replies: bool,
+    body_ranges: &[SendTextStyle],
+    file_attachment: presage::proto::AttachmentPointer,
+) -> Result<StoryMessage, SendError> {
+    Ok(StoryMessage {
+        profile_key: None,
+        group: None,
+        allows_replies: Some(allows_replies),
+        body_ranges: build_body_ranges(body_ranges)?,
+        attachment: Some(story_message::Attachment::FileAttachment(file_attachment)),
     })
 }
 
@@ -158,6 +195,11 @@ fn dedup_resolved(recipients: Vec<(ServiceId, String)>) -> Vec<(ServiceId, Strin
 /// 分发→best-effort 自同步。任一收件人发送失败整体 `-32603`（per-recipient
 /// 部分失败形状未对齐，send 系既有纪律 §5）；解析面先全量完成再触网，
 /// 任何号码不可解析 = 无上行直接内部失败。
+///
+/// `attachment`（媒体 story 发送面，2026-10-14 批）：Some = 文件 story——
+/// data URI 走既有 transit CDN 上行链（entries 单条、无预览图），上传返回
+/// 指针进 `StoryMessage.fileAttachment`（官方 sendStory.preload.ts:186-190
+/// 同构）；缺席 = text story 现状零变化。两腿互斥闸在 methods 参数面。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_story(
     service: &Arc<Service>,
@@ -168,6 +210,7 @@ pub(crate) async fn send_story(
     text: &str,
     text_style: Option<i32>,
     body_ranges: &[SendTextStyle],
+    attachment: Option<&str>,
     preview_image: Option<&str>,
     preview_url: Option<String>,
     preview_title: Option<String>,
@@ -182,22 +225,33 @@ pub(crate) async fn send_story(
     let mut manager = lock_registered_for_send(&shared).await;
     let timestamp = super::now_ms();
 
-    // previewImage 随批上行（官方 preview.image 同批 CDN 上行同构）；story
-    // 无正文附件位，entries 恒空。
-    let (_, preview_pointer) = match preview_image {
-        Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri)).await?,
-        None => (Vec::new(), None),
+    // 上传面：媒体腿 = 正文附件单条（官方正文附件随批 CDN 上行同构）；
+    // 文本腿 = previewImage 随批上行（官方 preview.image 同批 CDN 上行
+    // 同构）。两腿互斥（methods 参数闸），fail-closed 整批早退。
+    let story = match attachment {
+        Some(uri) => {
+            let (pointers, _) =
+                upload_attachments_for_send(&manager, &[uri.to_owned()], None).await?;
+            let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
+            build_media_story_message(allows_replies, body_ranges, file_pointer)?
+        }
+        None => {
+            let (_, preview_pointer) = match preview_image {
+                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri)).await?,
+                None => (Vec::new(), None),
+            };
+            build_story_message(
+                text,
+                text_style,
+                allows_replies,
+                body_ranges,
+                preview_pointer,
+                preview_url,
+                preview_title,
+                preview_date,
+            )?
+        }
     };
-    let story = build_story_message(
-        text,
-        text_style,
-        allows_replies,
-        body_ranges,
-        preview_pointer,
-        preview_url,
-        preview_title,
-        preview_date,
-    )?;
 
     // 解析全量前置（不可解析 = 无上行整拒），随后按解析序去重。
     let mut resolved = Vec::with_capacity(recipients.len());
@@ -569,5 +623,103 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].1, "+15550001111");
         assert_eq!(deduped[1].1, "+15550002222");
+    }
+
+    /// 媒体 story 构造钉形（2026-10-14 批）：上传返回指针原样进
+    /// StoryMessage.fileAttachment（官方 getStoryMessage fileAttachment 臂
+    /// 同位，SendMessage.preload.ts:1043-1044）——profileKey 构造面 None
+    ///（send 面注入）、group 恒 None（群 story 边界保留）、allowsReplies
+    /// 透传、bodyRanges 同臂照载（官方 :1059-1061 fileAttachment 分支
+    /// 同构）。
+    #[test]
+    fn media_story_message_shape() {
+        let pointer = presage::proto::AttachmentPointer {
+            cdn_number: Some(3),
+            content_type: Some("image/jpeg".to_owned()),
+            ..Default::default()
+        };
+        let story =
+            build_media_story_message(false, &[style("BOLD", 0, 4)], pointer).expect("shape");
+        assert_eq!(story.profile_key, None, "profileKey 由 send 面注入");
+        assert_eq!(story.group, None, "群 story 边界保留");
+        assert_eq!(story.allows_replies, Some(false));
+        assert_eq!(story.body_ranges.len(), 1, "bodyRanges 文件臂同载");
+        match story.attachment {
+            Some(story_message::Attachment::FileAttachment(pointer)) => {
+                assert_eq!(pointer.cdn_number, Some(3));
+                assert_eq!(pointer.content_type.as_deref(), Some("image/jpeg"));
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
+    }
+
+    /// 媒体 story 往返互逆钉定（2026-10-14 批，compat §5 媒体 story 批）：
+    /// 发送面产出的指针字段族（上传形状 key/cdnKey/cdnNumber/uploadTimestamp/
+    /// digest + 元数据 contentType/filename/size）必须被本仓接收投影
+    /// （project_story_message → project_attachment_pointer，mod.rs E2 批
+    /// fileAttachment 全脸）原样读回——sealed-sender 载荷与自同步
+    /// `SyncMessage.Sent.story_message` echo 载同一 story 值，两侧同判。
+    #[test]
+    fn media_story_pointer_round_trip_through_receive_projection() {
+        use base64::Engine as _;
+        let key: Vec<u8> = (0..64).collect();
+        let digest: Vec<u8> = (0..32).map(|byte| byte * 3 + 1).collect();
+        let pointer = presage::proto::AttachmentPointer {
+            content_type: Some("video/mp4".to_owned()),
+            key: Some(key.clone()),
+            size: Some(123_456),
+            digest: Some(digest.clone()),
+            file_name: Some("clip.mp4".to_owned()),
+            upload_timestamp: Some(1_700_000_000_000),
+            cdn_number: Some(3),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                    "AWESOME-CDN-KEY".to_owned(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let story = build_media_story_message(true, &[], pointer.clone()).expect("shape");
+
+        // 接收投影（E2 批既有面，不动）读回。
+        let out = crate::service::project_story_message(&story, &std::collections::HashMap::new())
+            .expect("story projection");
+        let face = &out["fileAttachment"];
+        assert_eq!(face["contentType"], json!("video/mp4"));
+        assert_eq!(face["filename"], json!("clip.mp4"));
+        assert_eq!(face["size"], json!(123_456));
+        assert_eq!(out["allowsReplies"], json!(true));
+        // locator 指针族逐字段读回（上传产出形状 → 投影原样）。
+        assert_eq!(
+            face["locator"]["key"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&key))
+        );
+        assert_eq!(face["locator"]["cdnKey"], json!("AWESOME-CDN-KEY"));
+        assert_eq!(face["locator"]["cdnNumber"], json!(3));
+        assert_eq!(
+            face["locator"]["uploadTimestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(
+            face["locator"]["digest"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&digest))
+        );
+
+        // 自同步 echo 载同一 story 值：Sent.story_message 反序列化往返后
+        // 投影不变（sync 面 = sealed-sender 载荷同值）。
+        use prost::Message as _;
+        let mut buf = Vec::new();
+        story.encode(&mut buf).expect("encode");
+        let echoed = StoryMessage::decode(buf.as_slice()).expect("decode");
+        let out = crate::service::project_story_message(&echoed, &std::collections::HashMap::new())
+            .expect("story projection");
+        assert_eq!(
+            out["fileAttachment"]["locator"]["cdnKey"],
+            json!("AWESOME-CDN-KEY")
+        );
+        assert_eq!(
+            out["fileAttachment"]["locator"]["key"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&key))
+        );
     }
 }
