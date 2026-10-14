@@ -152,6 +152,15 @@
   wrapWithSyncMessageSend.preload.ts / Android SignalServiceMessageSender
   均为副本失败不连坐主发送）。note-to-self 包裹腿（sync 即消息本体）不
   在此列，错误仍上抛。
+- `protobuf/SignalService.proto`（2026-10-14 语音笔记波形+时长批）—
+  `AttachmentPointer` 同步官方 proto 的语音元数据两位：`audioWaveform`(21,
+  bytes,每字节一桶 0=静音 255=最响 至多 100 桶) 与
+  `audioDurationSeconds`(22, float 秒)，注释逐字取自 Signal-Android
+  `lib/libsignal-service/src/main/protowire/SignalService.proto`（wire
+  权威在 Android 侧——语音笔记由手机端生成波形，桌面 abe80d3 proto 尚未
+  同步这两位、按未知字段跳过并本地重算显示波形；引擎发送面按官方算法
+  生成、收投影如实透传，engine 侧消费见 docs/jsonrpc-compat.md §5 同日
+  批）。wire additive-only，不与既有 1-20 位冲突。
 
 `vendor/presage/`（rev 33dd149）：
 

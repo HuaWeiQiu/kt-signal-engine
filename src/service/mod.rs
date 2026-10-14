@@ -76,6 +76,10 @@ pub(crate) mod storage_watch;
 pub(crate) mod storage_write;
 pub(crate) mod stories;
 pub(crate) mod username;
+/// 出向语音笔记波形+时长生成（send `;voice=true` 面，2026-10-14 批；
+/// 官方 AttachmentPointer.audioWaveform/audioDurationSeconds 算法对齐，
+/// 模块头注载 wire 形状/失败姿态/解码覆盖矩阵）。
+pub(crate) mod voice_note;
 pub(crate) mod zkgroup_consts;
 
 /// C 批群发提速：sender-key + 单请求 MRM 发送链（vendored 逐收件人路径
@@ -507,6 +511,19 @@ struct ParsedAttachment {
 fn apply_outgoing_gif_flag(pointer: &mut presage::proto::AttachmentPointer) {
     use presage::proto::attachment_pointer::Flags;
     pointer.flags = Some(pointer.flags.unwrap_or(0) | Flags::Gif as u32);
+}
+
+/// 出向语音元数据置位单点：官方 Android 发送侧生成
+/// （GenerateAudioWaveFormJob → `AttachmentPointer.audioWaveform=21`/
+/// `audioDurationSeconds=22`，vendored proto 已同步两位），上传返回指针
+/// 置位与官方消息组装期置位同构（GIF 旗标先例同位）。生成失败 = 两字段
+/// 全不带照发（官方 catch-all 姿态，wire 恒成对不产半对形状）。
+fn apply_outgoing_voice_metadata(
+    pointer: &mut presage::proto::AttachmentPointer,
+    metadata: &voice_note::VoiceAudioMetadata,
+) {
+    pointer.audio_waveform = Some(metadata.waveform.clone());
+    pointer.audio_duration_seconds = Some(metadata.duration_seconds);
 }
 
 /// send 附件条目解析：data URI 唯一形状 = connector 上游形状
@@ -8132,6 +8149,22 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
         .is_some_and(|flags| flags & Flags::Gif as u32 != 0);
     value["isBorderless"] = json!(is_borderless);
     value["isGif"] = json!(is_gif);
+    // 语音笔记元数据收投影（2026-10-14 批）：官方 Android 发送侧波形
+    // （audioWaveform=21，恒 100 桶 dB 尺度 0..255）/时长
+    // （audioDurationSeconds=22，float 秒）如实透传——waveform 标准
+    // base64 非空才投（blurHash 同款，空字节串零信息量），duration 在场
+    // 即投。官方发送端恒成对，收侧各自独立如实投位不加成对闸（宁多投
+    // 不误判，消费方自判）。
+    if let Some(waveform) = pointer
+        .audio_waveform
+        .as_deref()
+        .filter(|waveform| !waveform.is_empty())
+    {
+        value["waveform"] = json!(base64::engine::general_purpose::STANDARD.encode(waveform));
+    }
+    if let Some(duration) = pointer.audio_duration_seconds {
+        value["duration"] = json!(duration);
+    }
     let mut locator = serde_json::Map::new();
     if let Some(key) = pointer.key.as_deref().filter(|key| !key.is_empty()) {
         locator.insert(
@@ -8782,10 +8815,13 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
 /// 数字位匹配；都不中返回 None，回退语义由调用方决定。
 /// send 附件上行：官方 CDN v4 面零 fork（presage upload_attachments，加密/
 /// padding/digest/上传全官方原语）。任何一条失败整体 fail-closed（半发的
-/// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。GIF 旗标
-/// 在上传后按 parsed 序对齐置位（presage join_all 保序，input 序 = output
-/// 序）——flags 纯客户端线上陈述，见 apply_outgoing_gif_flag；贴纸图走
-/// upload_sticker_image 单条面不经此处（官方贴纸指针无 GIF 位）。
+/// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。上传
+/// 返回后按 parsed 序对齐置位两类客户端线上陈述（presage join_all 保序，
+/// input 序 = output 序）：GIF 旗标（`;gif=true` → Flags.GIF，见
+/// apply_outgoing_gif_flag）与语音波形+时长（`;voice=true` → 官方算法
+/// 生成 audioWaveform/audioDurationSeconds，见 apply_outgoing_voice_
+/// metadata）；贴纸图走 upload_sticker_image 单条面不经此处（官方贴纸
+/// 指针无 GIF 位、无语音元数据）。
 async fn upload_attachments_for_send(
     manager: &Manager<SqliteStore, Registered>,
     entries: &[String],
@@ -8815,10 +8851,19 @@ async fn upload_attachments_for_send(
     if parsed.is_empty() {
         return Ok((Vec::new(), None));
     }
-    let mut is_gif_flags = Vec::with_capacity(parsed.len());
+    let mut outgoing_faces = Vec::with_capacity(parsed.len());
     let mut batch = Vec::with_capacity(parsed.len());
     for item in parsed {
-        is_gif_flags.push(item.is_gif);
+        // 语音元数据生成（2026-10-14 批）：`;voice=true` 附件在解码面
+        // 算波形+时长（官方 Android 发送侧生成位），失败姿态 None = 照发
+        // 不带字段；预览图/普通附件/贴纸不经此面。生成先于上传（纯本地
+        // CPU 面），上传失败仍整批 fail-closed。
+        let voice_metadata = if item.spec.voice_note == Some(true) {
+            voice_note::generate(&item.bytes)
+        } else {
+            None
+        };
+        outgoing_faces.push((item.is_gif, voice_metadata));
         batch.push((item.spec, item.bytes));
     }
     let uploads = manager
@@ -8830,15 +8875,17 @@ async fn upload_attachments_for_send(
         .map(|result| result.ok())
         .collect::<Option<Vec<_>>>()
         .ok_or(SendError::Internal)?;
-    for (pointer, is_gif) in pointers.iter_mut().zip(is_gif_flags) {
+    for (pointer, (is_gif, voice_metadata)) in pointers.iter_mut().zip(outgoing_faces) {
         if is_gif {
             apply_outgoing_gif_flag(pointer);
+        }
+        if let Some(metadata) = voice_metadata {
+            apply_outgoing_voice_metadata(pointer, &metadata);
         }
     }
     let image = image_index.map(|index| pointers.remove(index));
     Ok((pointers, image))
 }
-
 /// send 文本 dataMessage 公共构造（直聊/群组同形状，compat §3 send 行
 /// quoteTimestamp/quoteAuthor/previewUrl/mentions/attachments/textStyle 扩面）：
 /// - quote：assemble_quote 单点组装（与贴纸分支同源）。
@@ -10194,6 +10241,62 @@ mod tests {
         assert_eq!(out["isBorderless"], json!(false));
         assert_eq!(out["isGif"], json!(false));
         assert_eq!(out["isVoiceNote"], json!(false));
+    }
+
+    /// 语音笔记元数据收投影（2026-10-14 批）：waveform 标准 base64
+    /// 非空才投（空字节串零信息量）、duration float 秒在场即投；全缺 =
+    /// 两键不在（历史普通附件行零新增键）。
+    #[test]
+    fn attachment_pointer_projection_carries_voice_waveform_and_duration() {
+        let out = project_attachment_pointer(&AttachmentPointer {
+            audio_waveform: Some(vec![0, 128, 255]),
+            audio_duration_seconds: Some(2.5),
+            ..Default::default()
+        });
+        assert_eq!(
+            out["waveform"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0u8, 128, 255])
+                    .as_str()
+            )
+        );
+        assert_eq!(out["duration"], json!(2.5));
+
+        // 空字节串 waveform 不投；duration 独立如实投（无成对闸）。
+        let out = project_attachment_pointer(&AttachmentPointer {
+            audio_waveform: Some(Vec::new()),
+            audio_duration_seconds: Some(1.5),
+            ..Default::default()
+        });
+        assert!(out.get("waveform").is_none());
+        assert_eq!(out["duration"], json!(1.5));
+
+        let out = project_attachment_pointer(&AttachmentPointer::default());
+        assert!(out.get("waveform").is_none());
+        assert!(out.get("duration").is_none());
+    }
+
+    /// 出向语音元数据置位面（2026-10-14 批）：置位后指针带波形+时长两位；
+    /// 与 GIF 旗标共存互不挤占（flags 按位掩码、元数据独立字段）。
+    #[test]
+    fn outgoing_voice_metadata_applied_to_pointer() {
+        let metadata = voice_note::VoiceAudioMetadata {
+            waveform: vec![7_u8; 100],
+            duration_seconds: 1.5,
+        };
+        let mut pointer = AttachmentPointer::default();
+        apply_outgoing_voice_metadata(&mut pointer, &metadata);
+        assert_eq!(pointer.audio_waveform.as_deref(), Some(&[7_u8; 100][..]));
+        assert_eq!(pointer.audio_duration_seconds, Some(1.5));
+
+        apply_outgoing_gif_flag(&mut pointer);
+        assert_eq!(pointer.flags, Some(Flags::Gif as u32));
+        assert_eq!(
+            pointer.audio_waveform.as_deref().map(<[u8]>::len),
+            Some(100)
+        );
+        assert_eq!(pointer.audio_duration_seconds, Some(1.5));
     }
 
     /// P14 收投影缺批（组 2）：payment=20（notification 臂 note 有/无两面

@@ -110,6 +110,20 @@ ctr = "0.10.1"
 # 已在图），不新增任何版本入图；许可 AGPL-3.0-only 与本仓一致。
 usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
 
+# 语音笔记波形+时长生成（send `;voice=true` 发送面，2026-10-14 批）：官方
+# 算法（AttachmentPointer.audioWaveform=21/audioDurationSeconds=22）需把
+# 音频解码为 PCM 后降采样。全图此前零音频解码能力，两 crate 为最小充分集：
+# - ogg 0.9（BSD-3-Clause）：OGG 物理流解包（页/包/granule），零传递依赖、
+#   纯 Rust——拆出 Opus 逻辑流与官方容器时长（granule）。
+# - opus-decoder 0.1（MIT OR Apache-2.0）：纯 Rust Opus 解码（RFC 8251
+#   同构，no unsafe/no FFI），零传递依赖——KT 语音链路主格式 audio/ogg(Opus)
+#   （connector §4.30 voiceNote 闸 audio/*、fixture 即 audio/ogg）。
+# 两者均不引 C/系统依赖，保持本仓 bundled 纯构建姿态；WAV/PCM 走仓内自
+# 解析；其余容器（mp3/m4a/ogg-vorbis 等）按官方「生成失败即不带波形」
+# 姿态发裸附件（覆盖矩阵见 docs/jsonrpc-compat.md §5 同日批）。
+ogg = "0.9"
+opus-decoder = "0.1"
+
 [dev-dependencies]
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。
