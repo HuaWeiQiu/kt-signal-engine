@@ -774,6 +774,94 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // deleteStoryForEveryone（story 删除扇出批 S5，官方
+        // sendDeleteStoryForEveryone 行为对齐）：targetTimestamp = 被删 story
+        // 发送时刻毫秒；recipients 缺席/空批 = 无逐收件人腿直落自同步腿
+        // （官方零收件人 Special case 同构），条目非空字符串；updatedStory-
+        // Recipients 必填非空——{destinationUuid 非空字符串, distribution-
+        // ListIds 字符串数组（可缺省=空）, isAllowedToReply 布尔}，wire
+        // storyMessageRecipients 扇出名单展开形态。应答 {timestamp}（DOE
+        // 信封 ts）。
+        "deleteStoryForEveryone" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let target = params
+                .get("targetTimestamp")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0);
+            let recipients = match params.get("recipients") {
+                None | Some(Value::Null) => Some(Vec::new()),
+                Some(Value::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item.as_str().filter(|text| !text.is_empty()) {
+                            Some(text) => out.push(text.to_owned()),
+                            None => {
+                                out.clear();
+                                break;
+                            }
+                        }
+                    }
+                    // 半途遇非法条目时 out 已清空且短于 items——借长度差判
+                    // 非法（fail-closed）。
+                    if out.len() == items.len() {
+                        Some(out)
+                    } else {
+                        None
+                    }
+                }
+                Some(_) => None,
+            };
+            let updated = params
+                .get("updatedStoryRecipients")
+                .and_then(Value::as_array)
+                .filter(|items| !items.is_empty())
+                .and_then(|items| {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let destination = item
+                            .get("destinationUuid")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())?;
+                        let is_allowed_to_reply =
+                            item.get("isAllowedToReply").and_then(Value::as_bool)?;
+                        let distribution_list_ids = match item.get("distributionListIds") {
+                            None | Some(Value::Null) => Vec::new(),
+                            Some(Value::Array(ids)) => {
+                                let mut list = Vec::with_capacity(ids.len());
+                                for id in ids {
+                                    list.push(id.as_str()?.to_owned());
+                                }
+                                list
+                            }
+                            Some(_) => return None,
+                        };
+                        out.push(crate::service::stories::SendStoryRecipientUpdate {
+                            destination: destination.to_owned(),
+                            distribution_list_ids,
+                            is_allowed_to_reply,
+                        });
+                    }
+                    Some(out)
+                });
+            match (account, target, recipients, updated) {
+                (Some(account), Some(target), Some(recipients), Some(updated)) => {
+                    match service
+                        .send_story_delete_for_everyone(account, target, &recipients, &updated)
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         "sendPinMessage" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);

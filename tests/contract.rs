@@ -3015,6 +3015,169 @@ fn send_story_reaction_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// S5 story 删除扇出批 fake 契约：合法批应答 `{timestamp}`（DOE 信封 ts，
+/// u64）；参数闸 fail-closed 全量生效（account/targetTimestamp 必填、
+/// updatedStoryRecipients 必填非空且条目 destinationUuid 非空字符串 +
+/// isAllowedToReply 布尔 + distributionListIds 字符串数组可缺省、
+/// recipients 数组形态条目非空字符串可缺省=空批）；dispatch 日志原样落参。
+#[test]
+fn delete_story_for_everyone_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("delete-story-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let entry = |destination: Value, list_ids: Value, allowed: Value| {
+        let mut item = json!({});
+        if !destination.is_null() {
+            item["destinationUuid"] = destination;
+        }
+        if !list_ids.is_null() {
+            item["distributionListIds"] = list_ids;
+        }
+        if !allowed.is_null() {
+            item["isAllowedToReply"] = allowed;
+        }
+        item
+    };
+
+    // fake 合法批（recipients 在场 + 全字段条目）：应答 {timestamp}。
+    let full = engine.request(
+        "deleteStoryForEveryone",
+        json!({
+            "account": "+15550000000",
+            "targetTimestamp": 1_700_000_000_000_u64,
+            "recipients": ["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"],
+            "updatedStoryRecipients": [entry(
+                json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"),
+                json!(["00000000-0000-0000-0000-000000000000"]),
+                json!(true)
+            )]
+        }),
+    );
+    assert!(full["result"]["timestamp"].is_u64(), "timestamp is u64");
+
+    // 缺省面：recipients 缺席 = 空批合法（官方零收件人 Special case 同构）；
+    // 条目 distributionListIds 缺省 = 空名单合法。
+    let minimal = engine.request(
+        "deleteStoryForEveryone",
+        json!({
+            "account": "+15550000000",
+            "targetTimestamp": 1_700_000_000_000_u64,
+            "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), json!(false))]
+        }),
+    );
+    assert!(minimal["result"]["timestamp"].is_u64());
+
+    // account/targetTimestamp 参数闸。
+    for account in [None, Some(json!(""))] {
+        let mut params = json!({ "targetTimestamp": 1, "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), json!(true))] });
+        if let Some(account) = account {
+            params["account"] = account;
+        }
+        let (code, _) = engine.error_of("deleteStoryForEveryone", params);
+        assert_eq!(code, -32603);
+    }
+    for target in [None, Some(json!(0)), Some(json!("1700000000000"))] {
+        let mut params = json!({ "account": "+15550000000", "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), json!(true))] });
+        if let Some(target) = target {
+            params["targetTimestamp"] = target;
+        }
+        let (code, _) = engine.error_of("deleteStoryForEveryone", params);
+        assert_eq!(code, -32603);
+    }
+    // updatedStoryRecipients：缺失/空批/非数组。
+    for updated in [None, Some(json!([])), Some(json!("x"))] {
+        let mut params = json!({ "account": "+15550000000", "targetTimestamp": 1 });
+        if let Some(updated) = updated {
+            params["updatedStoryRecipients"] = updated;
+        }
+        let (code, _) = engine.error_of("deleteStoryForEveryone", params);
+        assert_eq!(code, -32603);
+    }
+    // 条目 destinationUuid：缺失/空串/非字符串。
+    for destination in [json!(null), json!(""), json!(42)] {
+        let (code, _) = engine.error_of(
+            "deleteStoryForEveryone",
+            json!({
+                "account": "+15550000000",
+                "targetTimestamp": 1,
+                "updatedStoryRecipients": [entry(destination, json!(null), json!(true))]
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // 条目 isAllowedToReply：缺失/非布尔。
+    for allowed in [json!(null), json!("yes")] {
+        let (code, _) = engine.error_of(
+            "deleteStoryForEveryone",
+            json!({
+                "account": "+15550000000",
+                "targetTimestamp": 1,
+                "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), allowed)]
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // 条目 distributionListIds：非数组/条目非字符串。
+    for list_ids in [json!(42), json!([42])] {
+        let (code, _) = engine.error_of(
+            "deleteStoryForEveryone",
+            json!({
+                "account": "+15550000000",
+                "targetTimestamp": 1,
+                "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), list_ids, json!(true))]
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    // recipients：单字符串形态（恒数组）/条目非字符串/空串条目。
+    for recipients in [json!("+15555550101"), json!([42]), json!([""])] {
+        let (code, _) = engine.error_of(
+            "deleteStoryForEveryone",
+            json!({
+                "account": "+15550000000",
+                "targetTimestamp": 1,
+                "recipients": recipients,
+                "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), json!(true))]
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+
+    // 调度日志纪律：成功与被拒调用都落日志（append_dispatch 在参数闸之前）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let delete_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "deleteStoryForEveryone")
+        .collect();
+    assert_eq!(delete_entries.len(), 20, "成功两条 + 拒绝十八条均落日志");
+    assert_eq!(
+        delete_entries[0]["params"]["recipients"],
+        json!(["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
+    );
+    assert_eq!(
+        delete_entries[1]["params"]["recipients"],
+        json!(null),
+        "缺省参数原样进日志（缺省值归服务层）"
+    );
+
+    // real 模式未注册账号：折叠 -32603 不触网（send 系同折叠）。
+    let real_dir = temp_dir("delete-story-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "deleteStoryForEveryone",
+        json!({
+            "account": "+15559990000",
+            "targetTimestamp": 1,
+            "updatedStoryRecipients": [entry(json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10"), json!(null), json!(true))]
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");

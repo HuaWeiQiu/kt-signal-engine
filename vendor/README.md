@@ -295,6 +295,13 @@
     适配（非 fork 叠加）。上游 5 提交中 messagepipe/envelope/协议
     存储面零触碰，QueueEmpty 时序/ack 契约/identity 事件三行为锚
     上游面零变化。
+- `presage/src/manager/registered.rs`（2026-10-14 story 删除扇出批 S5）—
+  `Manager::send_story_message` 加第 4 参 `include_profile_key: bool`：
+  profile-key 注入面从恒 StoryMessage 扩为「StoryMessage 恒注入 +
+  DataMessage 调用方显式选入」（S5 名单 story DOE 逐收件人腿 DataMessage
+  载体走 story 通道，官方 sendMessageToServiceId deleteForEveryone 同携
+  profileKey，注入由引擎 P9 profileSharing 闸裁定）；既有调用点
+  （stories 发送批）传 `false` 行为零变化。
 
 `vendor/presage/presage-store-sqlite/`：
 

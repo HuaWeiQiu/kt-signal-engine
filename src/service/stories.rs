@@ -25,8 +25,8 @@ use std::sync::Arc;
 use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::proto::{
-    story_message, sync_message, text_attachment, BodyRange, Preview, StoryMessage, SyncMessage,
-    TextAttachment,
+    data_message, story_message, sync_message, text_attachment, BodyRange, DataMessage, Preview,
+    StoryMessage, SyncMessage, TextAttachment,
 };
 use serde_json::{json, Value};
 
@@ -216,6 +216,7 @@ pub(crate) async fn send_story(
                 *recipient,
                 ContentBody::StoryMessage(story.clone()),
                 timestamp,
+                false,
             )
             .await
             .map_err(send_error_of)?;
@@ -257,6 +258,114 @@ pub(crate) async fn send_story(
     }
 
     Ok((timestamp, results))
+}
+
+/// story 删除扇出条目（S5，wire `SyncMessage.Sent.storyMessageRecipients`
+/// 条目展开形态；connector 从名单记录展开后显式传入）。
+pub(crate) struct SendStoryRecipientUpdate {
+    pub destination: String,
+    pub distribution_list_ids: Vec<String>,
+    pub is_allowed_to_reply: bool,
+}
+
+/// story 删除 DOE 腿构造（S5 纯函数，单测钉形状）：官方名单 story 逐收件人
+/// 腿同位——`deleteForEveryone {targetSentTimestamp: story ts}` DataMessage
+/// 走 story 通道（fork `send_story_message`），timestamp = 删除消息自身
+/// 时刻；无正文/附件/反应位（官方 sendMessageToServiceId deleteForEveryone
+/// 载荷同构，ts/util/deleteStoryForEveryone.preload.ts）。
+fn build_story_delete_data_message(target_timestamp: u64, timestamp: u64) -> DataMessage {
+    DataMessage {
+        timestamp: Some(timestamp),
+        delete: Some(data_message::Delete {
+            target_sent_timestamp: Some(target_timestamp),
+        }),
+        ..DataMessage::default()
+    }
+}
+
+/// deleteStoryForEveryone 编排（S5，compat §3）：官方
+/// sendDeleteStoryForEveryone + util/deleteStoryForEveryone 行为对齐——
+/// 名单 story（1:1 扇出）= 逐收件人 DOE DataMessage 走 story 通道（群 story
+/// 腿 = 普通 group DOE，既有 sendRemoteDelete 覆盖，v1 边界不做）；之后
+/// 恰好一次自同步 `SyncMessage.Sent{timestamp: story ts, isRecipientUpdate:
+/// true, storyMessageRecipients: updated}`——无 message/storyMessage 面
+/// （多设备官方 StoryRecipientUpdate 事件载体），零收件人官方 Special
+/// case 同构照发。per-recipient 失败整拒无 sync（sendStory 既有纪律；
+/// 官方按 sendStatus 重试的偏差登记 compat §5）。解析全量前置 + 解析序
+/// 去重（sendStory 同构）；24h 过期纯客户端语义不设引擎面。
+pub(crate) async fn send_story_delete_for_everyone(
+    service: &Arc<Service>,
+    account: &str,
+    target_timestamp: u64,
+    recipients: &[String],
+    updated: &[SendStoryRecipientUpdate],
+) -> Result<u64, SendError> {
+    if !service.real {
+        return Ok(super::now_ms());
+    }
+    let (shared, account_dir) = super::open_registered_with_dir(service, account)
+        .await
+        .ok_or(SendError::UnknownAccount)?;
+    let mut manager = lock_registered_for_send(&shared).await;
+    let timestamp = super::now_ms();
+    // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+    let whitelist = super::profile_sharing_whitelist(service, account).await;
+
+    // 解析全量前置（不可解析 = 无上行整拒），随后按解析序去重（sendStory
+    // 同构——同一 conversation 只发一次）。
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::with_capacity(recipients.len());
+    for number in recipients {
+        let service_id = resolve_recipient(&manager, number)
+            .await
+            .ok_or(SendError::Internal)?;
+        if seen.insert(service_id) {
+            resolved.push(service_id);
+        }
+    }
+
+    let body = build_story_delete_data_message(target_timestamp, timestamp);
+    for recipient in &resolved {
+        // P9 身份拒发闸（DOE 同为内容面）。
+        super::identity_send_gate(&account_dir, recipient)?;
+        // P9 profileSharing 闸（S3）：官方逐收件人 sendMessage profileKey
+        // 携带同源，未同意 → 不注入本机 profile_key。
+        let include_profile_key = super::include_profile_key_for(&whitelist, recipient);
+        manager
+            .send_story_message(*recipient, body.clone(), timestamp, include_profile_key)
+            .await
+            .map_err(send_error_of)?;
+    }
+
+    // 自同步（官方收尾同构，恰好一次，零收件人 Special case 照发）：
+    // timestamp = story ts（官方同源），isRecipientUpdate = true，
+    // expirationStartTimestamp 缺席（官方 null）。best-effort——单设备无
+    // 下游（NoMessagesToSend）与同步失败都不回滚已成功的 DOE 上行。
+    let own_aci = manager.registration_data().service_ids.aci();
+    let sent = sync_message::Sent {
+        destination_service_id: Some(own_aci.service_id_string()),
+        timestamp: Some(target_timestamp),
+        is_recipient_update: Some(true),
+        story_message_recipients: updated
+            .iter()
+            .map(|update| sync_message::sent::StoryMessageRecipient {
+                destination_service_id: Some(update.destination.clone()),
+                distribution_list_ids: update.distribution_list_ids.clone(),
+                is_allowed_to_reply: Some(update.is_allowed_to_reply),
+                destination_service_id_binary: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sent)),
+        ..Default::default()
+    };
+    let _ = manager
+        .send_message(own_aci, ContentBody::SynchronizeMessage(sync), timestamp)
+        .await;
+
+    Ok(timestamp)
 }
 
 #[cfg(test)]
@@ -426,6 +535,23 @@ mod tests {
         assert!(build_body_ranges(&[style("DEFAULT", 0, 1)]).is_err());
         assert!(build_body_ranges(&[style("NONE", 0, 1)]).is_err());
         assert!(build_body_ranges(&[style("bold", 0, 1)]).is_err());
+    }
+
+    #[test]
+    fn story_delete_data_message_shape() {
+        // S5 DOE 腿构造钉形：delete.targetSentTimestamp = story ts，消息
+        // timestamp = 删除腿自身时刻；无正文/附件/reaction/群位（官方
+        // deleteForEveryone 载荷同构——remoteDelete 呈现面由收投影照投）。
+        let dm = build_story_delete_data_message(1_700_000_000_000, 7_777);
+        assert_eq!(dm.timestamp, Some(7_777));
+        let delete = dm.delete.expect("delete set");
+        assert_eq!(delete.target_sent_timestamp, Some(1_700_000_000_000));
+        assert!(dm.body.is_none());
+        assert!(dm.reaction.is_none());
+        assert!(dm.story_context.is_none());
+        assert!(dm.group_v2.is_none());
+        assert!(dm.attachments.is_empty());
+        assert!(dm.profile_key.is_none(), "profileKey 由 send 面闸定注入");
     }
 
     #[test]

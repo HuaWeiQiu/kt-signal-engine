@@ -1907,6 +1907,28 @@ impl Service {
         .await
     }
 
+    /// deleteStoryForEveryone（story 删除扇出批 S5，KT 扩展方法）：官方
+    /// sendDeleteStoryForEveryone 行为对齐——名单 story 逐收件人 DOE 腿走
+    /// story 通道 + 恰好一次自同步 storyMessageRecipients 扇出面（编排
+    /// 全量在 stories 模块，compat §3/§5；群 story 腿 = 普通 group DOE，
+    /// sendRemoteDelete 覆盖，v1 边界不做）。
+    pub(crate) async fn send_story_delete_for_everyone(
+        self: &Arc<Self>,
+        account: &str,
+        target_timestamp: u64,
+        recipients: &[String],
+        updated: &[stories::SendStoryRecipientUpdate],
+    ) -> Result<u64, SendError> {
+        stories::send_story_delete_for_everyone(
+            self,
+            account,
+            target_timestamp,
+            recipients,
+            updated,
+        )
+        .await
+    }
+
     /// sendStoryReaction（story 反应发送批 S4，KT 扩展方法）：官方
     /// reactToStory 行为对齐（stories.preload.ts:556 →
     /// enqueueReactionForSend → sendNormalMessage getMessageSendData）——
@@ -6128,6 +6150,32 @@ async fn project_content_inner(
                         );
                         envelope["syncMessage"] =
                             json!({ "sentMessage": Value::Object(sent_json) });
+                    } else if sent.is_recipient_update == Some(true)
+                        && !sent.story_message_recipients.is_empty()
+                    {
+                        // S5 story 删除扇出批：官方 storyRecipientUpdate 门
+                        // （MessageReceiver.preload.ts:3002-3030——
+                        // isRecipientUpdate ∧ storyMessageRecipients 非空 →
+                        // StoryRecipientUpdateEvent，判定先于 storyMessage 面
+                        // 同序镜像）。官方多名单 story 发送 sync（sendStory
+                        // isSyncMessageUpdate = 有名单即 isUpdate=true）同落
+                        // 此脸——行为变化记档 compat §5：该形状此前投影
+                        // storyMessage echo。形状镜像官方事件体
+                        // StoryRecipientUpdateData {destinationServiceId,
+                        // timestamp, storyMessageRecipients}（timestamp = 信封
+                        // ts 官方同源；destination = 信封 destinationServiceId
+                        // 恒自有 ACI 不投——sync 恒指向自有号纪律）。
+                        envelope["syncMessage"] = json!({
+                            "storyRecipientUpdate": {
+                                "timestamp": envelope_ts,
+                                "storyMessageRecipients": Value::Array(
+                                    sent.story_message_recipients
+                                        .iter()
+                                        .map(sent_story_message_recipient_json)
+                                        .collect(),
+                                ),
+                            }
+                        });
                     } else if let Some(story) = sent.story_message.as_ref() {
                         // Q6③：sent.storyMessage 投影（Sent.storyMessage=8，
                         // story 发送的多设备转录面——此前被整臂丢弃）。复用
@@ -17731,6 +17779,174 @@ mod tests {
         assert!(project_content("acct", &store, &content, &registry)
             .await
             .is_empty());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// S5 story 删除扇出批：官方 storyRecipientUpdate 门三腿
+    /// （MessageReceiver.preload.ts:3002-3030 门序镜像）。①命中腿：
+    /// isRecipientUpdate ∧ storyMessageRecipients 非空 → `syncMessage.
+    /// storyRecipientUpdate` 脸（{timestamp, storyMessageRecipients[]}，
+    /// timestamp = 信封 ts 官方同源；destination 恒自有 ACI 不投），
+    /// sentMessage 脸不在；②优先级腿：同信封再携 storyMessage 面也归新脸
+    /// （官方门先于 storyMessage 判定同序——多名单 story 发送 sync
+    /// isUpdate=true 形状自此改投新脸，行为变化记档 compat §5）；③负腿：
+    /// storyMessage 面但 isRecipientUpdate 缺位 / recipients 空批 → 既有
+    /// storyMessage echo 形状不变（门不命中走原路）。
+    #[tokio::test]
+    async fn sent_sync_story_recipient_update_gate_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{sync_message, StoryMessage, SyncMessage, TextAttachment};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-rcpt-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let recipient = || sync_message::sent::StoryMessageRecipient {
+            destination_service_id: Some("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10".to_owned()),
+            distribution_list_ids: vec!["00000000-0000-0000-0000-000000000000".to_owned()],
+            is_allowed_to_reply: Some(true),
+            destination_service_id_binary: None,
+        };
+        let sent_body = |sent: sync_message::Sent| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_message::Content::Sent(sent)),
+                    ..SyncMessage::default()
+                }),
+                metadata.clone(),
+            )
+        };
+        let story_face = || StoryMessage {
+            attachment: Some(presage::proto::story_message::Attachment::TextAttachment(
+                TextAttachment {
+                    text: Some("hello story".to_owned()),
+                    ..TextAttachment::default()
+                },
+            )),
+            ..StoryMessage::default()
+        };
+
+        // ①命中腿：isRecipientUpdate + 名单非空 → storyRecipientUpdate 脸。
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            is_recipient_update: Some(true),
+            story_message_recipients: vec![recipient()],
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "recipient update projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(
+            envelope["syncMessage"].get("sentMessage").is_none(),
+            "命中分支不产 sentMessage 脸（isRecipientUpdate/storyMessageRecipients 键不落旧位）"
+        );
+        let face = &envelope["syncMessage"]["storyRecipientUpdate"];
+        assert_eq!(face["timestamp"], json!(1_700_000_000_000_u64), "信封 ts");
+        assert_eq!(
+            face["storyMessageRecipients"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            face["storyMessageRecipients"][0]["destinationUuid"],
+            json!("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10")
+        );
+        assert_eq!(
+            face["storyMessageRecipients"][0]["distributionListIds"],
+            json!(["00000000-0000-0000-0000-000000000000"])
+        );
+        assert_eq!(
+            face["storyMessageRecipients"][0]["isAllowedToReply"],
+            json!(true)
+        );
+
+        // ②优先级腿：+storyMessage 面同信封仍归新脸（官方门序镜像）。
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            is_recipient_update: Some(true),
+            story_message: Some(story_face()),
+            story_message_recipients: vec![recipient()],
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "gate precedes story face",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope["syncMessage"]
+            .get("storyRecipientUpdate")
+            .is_some());
+        assert!(envelope["syncMessage"].get("sentMessage").is_none());
+
+        // ③负腿：storyMessage 面在场但门键不齐 → 既有 storyMessage echo。
+        // isRecipientUpdate 缺位：
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            story_message: Some(story_face()),
+            story_message_recipients: vec![recipient()],
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "no isUpdate keeps echo",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["storyMessage"]["textAttachment"]["text"],
+            json!("hello story")
+        );
+        assert!(envelope["syncMessage"]
+            .get("storyRecipientUpdate")
+            .is_none());
+        // recipients 空批（isRecipientUpdate 在场）：
+        let content = sent_body(sync_message::Sent {
+            timestamp: Some(1_700_000_000_123),
+            is_recipient_update: Some(true),
+            story_message: Some(story_face()),
+            ..sync_message::Sent::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "empty recipients keeps echo",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["storyMessage"]["textAttachment"]["text"],
+            json!("hello story")
+        );
+        assert!(envelope["syncMessage"]
+            .get("storyRecipientUpdate")
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }

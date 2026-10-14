@@ -176,6 +176,7 @@ send message: Signal server unavailable.
 | `transfer.downloadStatus` | `{account}` | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?, errorCode?}`——phase：`downloading`=在途（字节计数有效，total 缺席不给假 0）/`failed`=终态失败（`errorCode` 短码透出，快照保留至清除触发器，不装死）；`errorCode` 词表：`no_archive`（204 重试耗尽 = 手机端没有可传档案，独立信息态非故障）/`network`（transfer_archive 长轮询面传输失败）/`cdn_unreachable`（CDN 下载段失败）/`decode_failed`（manifest 非法或档案解密导出失败）/`io`（本地文件面失败）；phase/errorCode 为 wire additive（1.53 形状零回归）。快照缺席（未开始/已成功收尾/终态已被清除/引擎重启过）答 `{present:false}`，不猜 | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态） | **2026-10-06 real（KT 扩展，契约 1.53 §4.38 扩展）；2026-10-14 失败显形批扩面（官方对齐 Signal-Desktop「失败带错误与重试」，wire additive，engine-compat）**：transfer_archive 下载进度快照查询——`history.importStatus` progress 组合面的引擎侧只读数据源。进程内 per-account 注册表（`src/service/transfer_progress.rs`，std Mutex + Arc，不落盘不走文件），下载任务边读 CDN 响应边累计（块读）、content-length 有则记 total（拿不到只报 stage 不给假 0）；**失败不再静默清快照**：任务任何一步失败保留 `failed` 终态（已计字节如实保留 + 短错误码），「手机端没传历史」= `no_archive` 独立信息态；终态清除触发器恰三：下次 begin（新会话）、`history.importCancel` 取消、账号重链。官方对齐（语义零拷贝）：Signal-Desktop Download 段 currentBytes/totalBytes 进度（`ts/state/ducks/installer.preload.ts` L143-152 + reducer L642-675）。只读不落调度日志零 stderr（backup.exportStatus 同纪律）
 | `history.importCancel` | `{account}` | `{"cancelled": bool}`——true = 确实中止了在途导入任务；false = 无在途任务（幂等成功，不假装取消了什么）。取消动作：按账号中止在途 transfer_archive 下载与云备份 restore 两腿任务（abort 即在下一个 await 点弃任务，在途长轮询/CDN 流随 future 断），清理半成品（按腿：取消哪腿清哪腿——transfer 腿 `transfer-archive.bin`/`history-import.ndjson`、restore 腿 `cloud-backup/`/`history-import-cloud.ndjson`，被中止任务的在写 NDJSON 一并删：应答 cancelled:true 后被取消腿不残留完整 NDJSON，否则 connector 消费链会把「已取消」的导入悄悄补上；另一腿已完成待消费的产物不连坐）与快照面（在途 + failed 终态两腿同清）；restore 单槽属其他账号时不动其快照 | account 缺失/非字符串 `-32603`；无其他错误面（未注册/fake 账号答 `cancelled:false`：快照面是进程内观测，不泄露注册状态） | **2026-10-14 real（KT 扩展，官方行为基准对齐：Signal-Desktop 链接导入可取消——取消=立即中止下载并清理半成品；失败显形带重试，engine-compat）**：transfer 腿取消句柄 = per-account 任务注册表（`TransferDownloadRegistry`，单线程 LocalSet 语义下 abort 返回后任务不再执行任何指令，取消侧清理与任务写盘无竞争）；restore 腿取消句柄 = 进程级单槽（归属账号 + JoinHandle），运行闸挂 `RunningGuard`（Drop 释放——abort 路径闭包收尾不执行，闸不泄漏 BACKUP_RUNNING）；取消同时是 transfer failed 终态的清除触发器之一；不落调度日志零 stderr（backups.restoreFromCloud 同纪律）；fake：恒 `{"cancelled": false}` |
 | `terminateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "terminated"}`（幂等：已终止群再次调用同形状成功，不重复上传） | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；服务器拒绝 `GROUP_TERMINATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批）**：官方桌面 buildTerminateChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、terminate_group action，change epoch 7），群凭据 basic auth（get_authorization_for_today 同语义链，§5 群终止批）；发送联动面：已终止群 send 系硬拒 `SEND_TARGET_TERMINATED`（`-1` + message）；receive 联动面：terminated change 投影 `groupTerminated` 事件（§5 群终止批）；fake：成功 `{status: "terminated"}`（落调度日志，协议上行面纪律） |
+| `deleteStoryForEveryone` | `{account, targetTimestamp(u64 必填 >0 毫秒——被删 story 发送时刻), recipients?(非空字符串数组——逐收件人 DOE 腿名单，缺席/空批 = 无腿直落自同步腿——官方零收件人 Special case 同构), updatedStoryRecipients(必填非空数组——wire `SyncMessage.Sent.storyMessageRecipients` 扇出名单展开形态：{destinationUuid(必填非空字符串), distributionListIds(字符串数组，可缺省=空名单), isAllowedToReply(必填布尔)}；名单成员展开归 connector)}` | `{timestamp}`（DOE 信封时间戳） | account 缺失·空串/targetTimestamp 缺席·0·非数/recipients 非数组·单字符串形态·条目非字符串·空串/updatedStoryRecipients 缺失·空批·非数组·条目缺 destinationUuid·destinationUuid 空串·非字符串·isAllowedToReply 缺失·非布尔·distributionListIds 非数组·条目非字符串 `-32603`；号码不可解析/收件人发送失败/未注册账号 同 send 折叠 `-32603` | **2026-10-14 real（KT 扩展，story 删除扇出批 S5，官方 sendDeleteStoryForEveryone 行为对齐，wire additive，engine-compat，§5 块）**：名单 story（1:1 扇出）= 逐收件人 `DataMessage{delete{targetSentTimestamp}}` 走 story 通道（fork `send_story_message` DataMessage 载体 + `include_profile_key` 选入位，P9 profileSharing 闸裁定注入——官方逐收件人 sendMessage profileKey 携带同源）；解析全量前置 + 解析序去重（sendStory 同构）；per-recipient 失败整拒无 sync（sendStory 既有纪律；官方按 sendStatus 重试为偏差，§5）；之后恰好一次自同步 `SyncMessage.Sent{timestamp=story ts, isRecipientUpdate:true, storyMessageRecipients=updated}` 无 message/storyMessage 面（多设备官方 StoryRecipientUpdate 事件载体）；24h 窗官方 UI 层闸（isOlderThan DAY）wire 面不设；群 story 腿 = 普通 group DOE（既有 remoteDelete 覆盖）不在本面；接收面 `syncMessage.storyRecipientUpdate` 新脸见 §3 receive/§5 S5 块；fake：成功 `{timestamp}`（落调度日志，send 系同款） |
 | `leaveGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源)}` | `{status: "left"}` | 参数缺失/groupId 非 base64 或长度 ≠32B `-32603`；未注册账号 `-32603`；self 既非成员也非待邀 `-32603`（官方桌面 leaveGroupV2 仅日志不行动的 GUI 语义，API 面整拒不静默，§5 登记偏差）；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE` | **2026-10-11 real（群写面 P4 退群批，KT 扩展，§5 块）**：官方桌面 leaveGroupV2（models/conversations.preload.ts:2882）行为对齐——群态读面 self 分类（官方同序：ACI pending → 撤 pending 邀请 `delete_members_pending_profile_key`、ACI member → `delete_members[self ACI]` 退群、ACI 都不是且 PNI pending → 撤 PNI 邀请[官方 syncMessageOnly 面]、都不是 → `-32603`）；`PATCH v2/groups`（version = revision+1 饱和，vendored build_remove_member_action/build_remove_pending_member_action 原语）；写后本地群态刷新 best-effort（群登记不删，terminate 面同纪律）；fake：成功 `{status: "left"}`（落调度日志，协议上行面纪律） |
 | `updateGroup` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源), expiration?, title?, avatar?, addMembers?: [service-id 串\|联系人号码…], removeMembers?: [同 addMembers 形状], addFromInviteLinkAccess?, inviteLinkPassword?}`（expiration：0=关闭，u32；title：非空 string，null/非字符串/空串 `-32603`——官方 `if (title)` 对空串 falsy no-op 的语义引擎不静默收，全缺整拒同纪律；addMembers：非空字符串数组（createGroup members 同解析——不可解析整拒 `-32603`，官方桌面静默跳过是 GUI 语义登记偏差；self 静默剔除；有凭据 = 全成员、凭据失败/无 key/PNI = pending 邀请）；removeMembers：非空字符串数组（同解析；群态 members 面 → delete_members、pending 面 → delete_members_pending_profile_key、审批申请者面 → delete_members_pending_admin_approval（P15b 审计项6 deny 臂，官方 denyPendingMembershipFromGroupV2 / signal-cli GroupV2Helper.refuseJoinRequestMembers 三向判别同构——此前 requesting 目标落整拒臂，connector §4.53 refuse 流端到端断链）、三者皆非整拒 `-32603`——官方 buildDeleteMemberChange 不设防的 GUI 前置，API 面不静默）；addFromInviteLinkAccess：词表字符串 `ANY`/`MEMBER`/`ADMINISTRATOR`/`UNSATISFIABLE`（UNKNOWN 是读面兜底词不作写意图，其他词/null/非字符串 `-32603`）；inviteLinkPassword：标准 base64 非空字符串（null/空串/坏 base64/非字符串 `-32603`；长度服务器裁决不本地硬闸）；avatar 三态镜像 setProfile——缺省=保留、data URI `data:image/*;base64,` 规范 base64=换新、null=移除；解码后 ≤10MiB、非 image 族/非规范 base64/超帽/非字符串 `-32603`；expiration/title/avatar/addMembers/removeMembers/链接两面至少一项在场，全缺 = 无操作整拒 `-32603` 不静默 no-op；单项或组合在场均合法（同调合成单 change 一次 PATCH）） | `{status: "sent"}`（群族成功答同纪律，connector 契约 1.45 §4.44 同形状） | 参数缺失/形状错（groupId 非 base64 或长度 ≠32B、expiration null·字符串·负数·小数·超 u32、avatar 非 image 族 data URI/非规范 base64/解码超 10MiB/非字符串、title null·非字符串·空串、addMembers/removeMembers 非数组·空数组·条目非字符串·成员不可解析、removeMembers 目标既非成员也非待邀也非审批申请者、addFromInviteLinkAccess 非法词（含 UNKNOWN）·null·非字符串、inviteLinkPassword null·空串·非字符串·坏 base64、expiration/title/avatar/addMembers/removeMembers/链接两面全缺）`-32603`；未注册账号 `-32603`；群头像上行链（avatar/form 拉取·属性校验·加密·CDN POST）失败 `GROUP_AVATAR_UPLOAD_FAILED`（`-1` + message，data `{retryable:true, textSaved:false}`——合成单 change 语义下伴生面未提交，见 §5）；服务器拒绝 `GROUP_UPDATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：403/401 非 admin/凭据无效、409 revision 竞争、400 形状被拒）；网络面 `STORAGE_UNAVAILABLE`（`-1` + message，STORAGE 族 retryable 语义） | **2026-10-06 real（KT 扩展批，群 expiration）**：官方桌面 buildDisappearingMessagesTimerChange 行为对齐——`PATCH v2/groups` 上传 GroupChange.Actions（version = revision+1 饱和、modify_disappearing_message_timer action（field 12），timer = 加密 `GroupAttributeBlob{disappearingMessagesDuration}`（uint32 秒，0=关）），群凭据 basic auth（§5 群终止批同链）；receive 联动面：expiration change 投影 `groupUpdated` 事件（§5 群 expiration 批）；connector 侧由 `conversations.setExpireTimer` 群形态路由至此（契约 1.45，kt-engine 面 INVALID_REQUEST 债务随本批解除）；**2026-10-09 real（群头像上行面批，§5 块）**：avatar 三态 + 合成单 change（expiration/avatar 同 version 双 action 一次 PATCH），上行链 = 群凭据 `GET v2/groups/avatar/form`（AvatarUploadAttributes protobuf）→ `GroupAttributeBlob{avatar}` 加密 → CDN0 multipart POST → avatar path 进 modify_avatar action（field 11，官方 buildUpdateAttributesChange/uploadAvatar/uploadGroupAvatar 行为对齐，镜像 setProfile 头像面先例）；receive 投影 avatar change 不投影（宁缺勿错，§5）；fake：expiration/avatar 缺省·null 臂成功 `{status: "sent"}`、data URI 臂失败 `GROUP_AVATAR_UPLOAD_FAILED`（两臂纪律 §5）；调度日志 avatar 键形状摘要化（data URI/base64 载荷零字节落盘）；**2026-10-11 real（群写面 P2 改名批，§5 块）**：title 臂 = modify_title action（field 10，加密 `GroupAttributeBlob{title}`，官方 buildUpdateAttributesChange `if (title)` + buildGroupTitleBuffer 同构），与 expiration/avatar 合成单 change 同 version 一次 PATCH；调度日志 title 键明文逐字保留（群名短标签非敏感载荷，avatar 摘要化纪律不外溢）；fake title 臂随缺省/null 臂成功形状桩；**2026-10-11 real（群写面 P3 加成员批，§5 块）**：addMembers 臂合成进同一 change（有凭据 = add_members presentation、否则 pending 邀请，官方 buildAddMembersChange 分流同构），成员解析 createGroup P1 同链；写后本地群态刷新全路径生效；fake addMembers 臂随缺省/null 臂成功形状桩；**2026-10-11 real（群写面 P4 移除成员批，§5 块）**：removeMembers 臂按群态分类（members 面 = delete_members[deleted_user_id = ACI 加密]、pending 面 = delete_members_pending_profile_key，vendored build_remove_member_action/build_remove_pending_member_action 原语，官方 buildDeleteMemberChange/buildDeletePendingMemberChange 行为对齐）；fake removeMembers 臂随缺省/null 臂成功形状桩；**2026-10-11 real（群链接写面批 P13/任务2，connector 契约 1.83 wire 面，engine-compat，§5 块）**：addFromInviteLinkAccess 臂 = modify_add_from_invite_link_access action（field 15，proto 枚举直通——官方 buildAccessControlAddFromInviteLinkChange/buildNewGroupLinkChange 同字段）、inviteLinkPassword 臂 = modify_invite_link_password action（field 19，原始密码字节直入——官方 buildInviteLinkPasswordChange `Bytes.fromBase64` 同位）；两面合成进同 version 单 change 单次 PATCH（官方 buildNewGroupLinkChange「启用即同改双面」同形）；单测钉 wire 字节（field 15 tag 0x7a、field 19 tag 0x9a 0x01）；fake 两臂随缺省/null 臂成功形状桩；调度日志两键逐字保留；**2026-10-11 real（P15b 审计项6，§5 块）**：removeMembers 第三臂 = 审批 deny（requesting 面 → delete_members_pending_admin_approval，官方 denyPendingMembershipFromGroupV2 / signal-cli GroupV2Helper.refuseJoinRequestMembers 三向判别同构；connector §4.53 refuse 流经此面，此前 requesting 目标整拒 `-32603` 端到端断链）；ban 写面求证 = `setConversationBlocked`（GroupV2Record.blocked 位，2026-10-06 批）已存在无缺口 |
 | `createGroup` | `{account, title(必填非空字符串——官方 createGroupV2 name: string 必填同位), members?: [service-id 串(ACI/PNI)\|联系人号码…], expiration?(u32，0 = 官方 `if (expireTimer)` falsy 落缺省同语义：建群不带 timer action), avatar?(三态镜像 updateGroup——缺省=无、data URI=换新、null=无 avatar action；解码 ≤10MiB)}` | `{groupId(随机 32B master key 标准 base64，listGroups/updateGroup/terminateGroup 的 groupId 同源口径), revision(服务器 GroupResponse.group.version 回读，解码失败退化 0)}` | 参数缺失/形状错（title 缺席·空串·非字符串、members 非数组·空数组·条目非字符串、members 条目不可解析（非 service-id 且号码不在本机 contacts——官方桌面缺本地联系人静默跳过是 GUI 语义，API 面整拒）、expiration 非法形状、avatar 非 image 族/非规范 base64）`-32603`；未注册账号 `-32603`；self profile key 凭据取材失败（无 presentation 服务器必拒创建，不硬造材料）/服务器拒绝 `GROUP_CREATE_FAILED`（`-1` + message，data.status = HTTP 状态码诚实透传：400 群超限/形状被拒、401 凭据无效；self 凭据失败 status 缺省）；avatar 上行链失败 `GROUP_AVATAR_UPLOAD_FAILED`（伴生面未提交，updateGroup 同 data）；网络面 `STORAGE_UNAVAILABLE` | **2026-10-11 real（KT 扩展批，群写面 P1）**：官方桌面 createGroupV2（groups.preload.ts:1810）行为对齐——随机 master key（32B CSPRNG）→ zkgroup 派生链（`GroupSecretParams::derive_from_master_key` → public params → groupId = `get_group_identifier`，官方 deriveGroupFields 同构；wire 面 groupId = master key 标准 base64 引擎口径，非官方桌面 conversation id 的 GroupIdentifier base64）→ self ExpiringProfileKeyCredential 取材（zkgroup 官方原语链：request context → unauth chat WS `GET /v1/profile/{aci}/{version}/{request}?credentialType=expiringProfileKey` + Unidentified-Access-Key → receive；失败 = 建群失败不硬造）→ 初始 Group proto（version 0 + 官方 accessControl 默认 attributes/members/memberLabel=MEMBER、addFromInviteLink=UNSATISFIABLE + 加密 title/timer + avatar path，官方 buildGroupProto/createGroupV2 同形状；members 分流：ACI+profile key+凭据 = 全成员 presentation、profile key 在凭据失败 = pending 降级、无 profile key/PNI = pending——官方 createGroupV2 成员分流同构）→ `PUT v1/groups`（storage host、群凭据 basic auth、body = 加密 Group proto，官方 createGroup WebAPI 同端点同形状）→ 服务器群态拉取落 presage store（本地群态初始化，best-effort）；客户端不做群人数上限闸（官方 getGroupSizeHardLimit 服务器 remote config 值，超限由服务器 400 诚实透传）；fake：title 臂成功形状桩 `{groupId(随机 32B 标准 base64), revision: 0}`、avatar data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED（两臂纪律同 updateGroup）
@@ -471,6 +472,18 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   面 {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎只投
   mediaRootBackupKey——偏差落 §5 组 6 块；Request{Keys} 应答停答面
   （P9 S2）与此接收投影面互不相干。
+- `syncMessage.storyRecipientUpdate {timestamp, storyMessageRecipients[]
+  {destinationUuid?, distributionListIds, isAllowedToReply?}}`（story 删除
+  扇出批 S5，2026-10-14，官方 StoryRecipientUpdateEvent 镜像
+  MessageReceiver.preload.ts:3002-3030）：门序 = `Sent.isRecipientUpdate ∧
+  storyMessageRecipients 非空` 判定**先于 storyMessage 面**（官方同序；
+  editMessage 面在门之前——官方同序），命中 = 独立脸整体替换 sentMessage
+  （isRecipientUpdate/storyMessageRecipients 公共位不落旧键——矛盾形状
+  不产出）；timestamp = 信封 ts（官方 envelope.timestamp 同源），
+  destination = 信封 destinationServiceId 恒自有 ACI 不投（sync 恒指向
+  自有号纪律）；消费面 = `deleteStoryForEveryone` 自同步扇出腿 + story
+  名单成员更新（多名单 story 发送 sync `isUpdate=true` 形状自此归本脸，
+  行为变化 §5 S5 块记档）。
 
 接收流共生三通知（独立方法名即事件，**非 envelope 载体**——流态观测/
 流态事件无信封可挂；wire additive）：
@@ -2100,7 +2113,8 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
 - **fake 纪律**：参数闸全量生效后成功 `{timestamp, results:[]}`，只落调度
   日志不触网（send 系同款）；real 模式未注册账号折叠 `-32603` 不触网。
 - **边界（本批红线）**：群 story（GroupContextV2 位）/文件 story（image
-  正文 attachment）/story 删除（remoteDelete story 形态）/24h 过期（纯客
+  正文 attachment）/story 删除（remoteDelete story 形态，S5 批解除——
+  见「story 删除扇出面」块）/24h 过期（纯客
   户端语义）不做；接收投影在 E2 批（下一 commit），两批零交集；
   `distributionListId` 引擎不校验 UUID 形状（官方钉定 id = MY_STORY_ID 零
   UUID，其余名单 id 为任意 UUID 串——引擎透传给同步面，connector 侧闸）。
@@ -2163,7 +2177,7 @@ KT 扩展方法；上批「收包投影批」红线登记的本面立项）：
   投——description/date 官方 story 预览面仍未消费，缺席键不在）。
 - **边界（本批红线）**：24h 过期纯客户端语义不做（story 时间线过期归
   connector/宿主，引擎只投影不计时）；不做 story 删除（remoteDelete story
-  形态）/已读回执/查看回执面；
+  形态，S5 批解除——见「story 删除扇出面」块）/已读回执/查看回执面；
   引擎零 stderr（官方两条 story warn 路径只保留判面行为，无日志输出）。
 
 **story 反应收发面（S4，2026-10-14，KT 扩展 `sendStoryReaction`，
@@ -2213,6 +2227,65 @@ engine-compat）**
   形态，v1 边界与群 story 发送同批处理）；②官方发送前 profileSharing
   本地置位（enqueueReactionForSend 落库）引擎无对应写面，由 P9 S3
   whitelist 读闸同语义承接（闸面差异既有登记）。
+
+**story 删除扇出面（S5，2026-10-14，KT 扩展 `deleteStoryForEveryone` +
+接收 `syncMessage.storyRecipientUpdate`，engine-compat）**
+
+- **背景与口径**：Stories 块原边界「不做 story 删除（remoteDelete story
+  形态）」随本批解除——发送侧 DOE 扇出面 + 接收侧两脸记档；多设备
+  storyRecipientUpdate 脸为 wire additive 新增（§3 receive 行）。
+- **官方发送锚（abe80d3 第一手实读）**：`sendDeleteStoryForEveryone.
+  preload.ts` + `util/deleteStoryForEveryone.preload.ts`——群 story =
+  普通 group DOE（既有 remoteDelete 覆盖）；名单 story（1:1 扇出）=
+  逐收件人 `sendMessageToServiceId{deleteForEveryone:{isAdminDelete:
+  false, targetSentTimestamp: story ts, targetAuthorAci: ourAci},
+  timestamp, profileKey(若 profileSharing)}` 走 **story=true sealed-sender
+  通道**；之后**恰好一次**自同步 `SyncMessage.Sent{destinationServiceId:
+  own, timestamp: story ts, isRecipientUpdate: true,
+  storyMessageRecipients: updatedStoryRecipients, expirationStartTimestamp:
+  null, urgent: false}`（无 message/storyMessage 面）；零收件人官方仍发
+  sync（Special case 腿）；24h 窗官方 throw（isOlderThan DAY）= UI 层
+  闸，wire 面不设。
+- **引擎发送面**：解析全量前置 + 解析序去重（sendStory 同构）→ 逐收件人
+  身份拒发闸 + P9 profileSharing 闸 + fork `send_story_message`（
+  DataMessage 载体 `{timestamp, delete{targetSentTimestamp}}`，story 通
+  道）→ 全成功或零收件人 → 恰好一次自同步（`Sent{timestamp=story ts,
+  isRecipientUpdate=true, storyMessageRecipients=updated}`，best-effort
+  不回滚已成功上行，sendStory 同口径）；返回 `{timestamp}`（DOE 信封
+  ts）；sync Sent.timestamp = targetTimestamp（官方 story ts 同源）。
+- **fork 改动**：`Manager::send_story_message` 加第 4 参
+  `include_profile_key: bool`（StoryMessage 恒注入 profile key 不变 +
+  DataMessage 调用方显式选入——官方逐收件人 sendMessage profileKey 携带
+  同源，注入与否由引擎 P9 profileSharing 闸裁定）；既有 story 发送调用
+  点传 false 行为零变化；vendor/README.md fork 清单登记。
+- **接收侧两脸**：①他人删除 story = dataMessage.delete + 信封 story 位 →
+  E2 闸豁免（is_delete_for_everyone）→ `remoteDelete{timestamp}` +
+  `isStory:true`（E2 批既有形状，本批补测试+记档）；②多设备自同步扇出
+  = 新脸 `syncMessage.storyRecipientUpdate`（官方
+  StoryRecipientUpdateEvent messageReceiverEvents.std.ts:737-750 镜像）—
+  门序 = isRecipientUpdate ∧ storyMessageRecipients 非空，判定**先于
+  storyMessage 面**（官方 MessageReceiver.preload.ts:3002-3030 同序镜像：
+  editMessage → 门 → storyMessage）；timestamp = 信封 ts（官方
+  envelope.timestamp 同源），destination 恒自有 ACI 不投；命中分支不落
+  sentMessage 脸（isRecipientUpdate/storyMessageRecipients 键不落旧位
+  ——矛盾形状不产出）。
+- **行为变化记档（门序镜像的代价）**：官方多名单 story 发送 sync 可能
+  `isUpdate=true`（sendStory.preload.ts:246/485 isSyncMessageUpdate =
+  sentRecipientIds.length>0）——该 wire 形状此前投影
+  `sentMessage.storyMessage` echo，门序镜像后归
+  `syncMessage.storyRecipientUpdate` 新脸。engine 与 connector 同机同版
+  部署、接收侧消费面在 connector 批衔接；跨版本窗口内 connector 对该
+  形状按「storyMessage echo 或 storyRecipientUpdate 脸」双形态判读。
+- **偏差登记**：①per-recipient 失败官方按 sendStatus 重试，引擎整拒无
+  sync（sendStory 既有纪律镜像）；②官方 sync `urgent:false` 位钉定
+  proto 无对应字段、`expirationStartTimestamp:null` 缺席即缺省——线面
+  均缺席，升级上游需补钉（Stories 发送批偏差①同族）；③24h 窗/story
+  查看回执不做（UI 层闸归 connector/宿主）。
+- **测试钉定**：DOE body 构造钉形（story_delete_data_message_shape）；
+  接收三腿（sent_sync_story_recipient_update_gate_faces——命中/优先级/
+  负腿两形）；fake 契约（delete_story_for_everyone_fake_shape_and_param_
+  fail_closed——合法批 `{timestamp}`、recipients 缺省空批、
+  updatedStoryRecipients 条目逐字段闸、调度日志、real 未注册折叠）。
 
 transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批；
 消费方 connector 契约 1.76 §4.38 扩面）：

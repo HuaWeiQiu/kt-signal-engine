@@ -1488,17 +1488,21 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// KT fork (stories): send a story message (`ContentBody::StoryMessage`)
-    /// to a single recipient over the official story transport face
-    /// (sealed sender + `?story=true`, see libsignal-service
-    /// `MessageSender::send_story_message`).
+    /// KT fork (stories): send a story-channel message
+    /// (`ContentBody::StoryMessage` or — since the story-delete batch S5 —
+    /// a `ContentBody::DataMessage` carrier) to a single recipient over the
+    /// official story transport face (sealed sender + `?story=true`, see
+    /// libsignal-service `MessageSender::send_story_message`).
     ///
     /// Differences from [`Self::send_message`], each mirroring the official
     /// client (behavioral comparison, no code copied):
     /// - the sender's own profile key is injected into the `StoryMessage`
     ///   (Signal-Desktop `ts/jobs/helpers/sendStory.preload.ts:72` refuses
     ///   to send without it, `:198-205` puts it in the proto — same shape
-    ///   `send_message` applies to `DataMessage`);
+    ///   `send_message` applies to `DataMessage`); `include_profile_key`
+    ///   extends the injection to a `DataMessage` body (S5 story-DOE legs
+    ///   mirror the official per-recipient sendMessage profileKey carry,
+    ///   gated by the caller's profile-sharing state);
     /// - the message is **not** saved to the local store: stories do not
     ///   belong to the local timeline (upstream presage already skips
     ///   saving received `StoryMessage`s, and the desktop story flow keeps
@@ -1513,15 +1517,24 @@ impl<S: Store> Manager<S, Registered> {
         recipient: impl Into<ServiceId>,
         message: impl Into<ContentBody>,
         timestamp: u64,
+        include_profile_key: bool,
     ) -> Result<(), Error<S::Error>> {
         let recipient = recipient.into();
         let mut content_body: ContentBody = message.into();
 
         // we need to put our profile key in StoryMessage
-        if let ContentBody::StoryMessage(message) = &mut content_body {
-            message
-                .profile_key
-                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+        match &mut content_body {
+            ContentBody::StoryMessage(message) => {
+                message
+                    .profile_key
+                    .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+            }
+            ContentBody::DataMessage(message) if include_profile_key => {
+                message
+                    .profile_key
+                    .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+            }
+            _ => {}
         }
 
         let sender_certificate = self.sender_certificate().await?;
