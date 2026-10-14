@@ -303,6 +303,132 @@ fn build_call_message(payload: &SendCallMessage) -> presage::proto::CallMessage 
     }
 }
 
+/// sendCallEvent 参数（通话事件出向同步批，KT 扩展方法）：官方桌面
+/// updateRemoteCallHistory/getDeleteCallEvent 同构——本机通话事件（接听/
+/// 挂断/未接/删除/observed）即时向自有设备发 SyncMessage.callEvent=19，
+/// 各设备会话据此落通话记录条。词表镜像入向 `syncMessage.callEvent` 投影
+///（§3 receive 行）互逆：type ∈ audio|video|group|ad-hoc、direction ∈
+/// incoming|outgoing、event ∈ accepted|not-accepted|delete|observed
+///（官方 statusToProto 非空位才同步——missed/ringing/pending 等中间态
+/// 不出线，UNKNOWN 词不作发送意图）。conversationId 形态随 type：直聊 =
+/// 号码/service-id 双形态（resolve_recipient 同链）→ 16B UUID 字节；群 =
+/// 32B master key 标准 base64（官方 getBytesForPeerId fromBase64 同位）；
+/// ad-hoc = roomId 小写 hex（官方 fromHex 同位，与入向投影 hex_encode
+/// 互逆）。callId 十进制串（官方 longToString 同构，u64 域）：直聊/群必带
+///（官方「For other calls, we expect a valid callId」同位）；ad-hoc 可缺
+///（官方 call-link 占位记录「only send the timestamp」同臂）。timestamp
+/// 缺省 now（官方调用方 Date.now() 事件时刻同位）。
+pub(crate) struct SendCallEvent {
+    pub(crate) kind: presage::proto::sync_message::call_event::Type,
+    pub(crate) direction: presage::proto::sync_message::call_event::Direction,
+    pub(crate) outcome: presage::proto::sync_message::call_event::Event,
+    pub(crate) conversation: CallEventConversation,
+    pub(crate) call_id: Option<u64>,
+    pub(crate) timestamp: Option<u64>,
+}
+
+/// sendCallEvent 会话腿三形：直聊腿存原始寻址串（号码/service-id，服务层
+/// 开管理器后按 store 解析）；群/ad-hoc 腿参数层即解字节（形状错参数层
+/// 拒，不触服务层）。
+pub(crate) enum CallEventConversation {
+    Direct(String),
+    Group(Vec<u8>),
+    AdHoc(Vec<u8>),
+}
+
+/// sendCallEvent 参数解析闸（fail-closed -32603 → None）：词表三面 +
+/// callId 十进制 u64（非空全数字；负号/小数/hex/超 u64 全拒——官方
+/// BigInt 十进制串同域）+ 直聊/群腿 callId 必带 + timestamp 正整数
+///（0/负/小数拒）+ 群 32B base64 / ad-hoc 小写 hex（hex_decode 小写纪律
+/// 同源）。conversationId 空串/非字符串整拒。
+pub(crate) fn parse_call_event(params: &serde_json::Map<String, Value>) -> Option<SendCallEvent> {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let kind = match params.get("type")?.as_str()? {
+        "audio" => Type::AudioCall,
+        "video" => Type::VideoCall,
+        "group" => Type::GroupCall,
+        "ad-hoc" => Type::AdHocCall,
+        _ => return None,
+    };
+    let direction = match params.get("direction")?.as_str()? {
+        "incoming" => Direction::Incoming,
+        "outgoing" => Direction::Outgoing,
+        _ => return None,
+    };
+    let outcome = match params.get("event")?.as_str()? {
+        "accepted" => Event::Accepted,
+        "not-accepted" => Event::NotAccepted,
+        "delete" => Event::Delete,
+        "observed" => Event::Observed,
+        _ => return None,
+    };
+    let conversation_id = params.get("conversationId")?.as_str()?;
+    let conversation = match kind {
+        Type::GroupCall => CallEventConversation::Group(decode_group_id(conversation_id)?),
+        Type::AdHocCall => {
+            let bytes = hex_decode(conversation_id)?;
+            (!bytes.is_empty()).then_some(CallEventConversation::AdHoc(bytes))?
+        }
+        _ => {
+            let trimmed = conversation_id.trim();
+            (!trimmed.is_empty()).then_some(CallEventConversation::Direct(trimmed.to_owned()))?
+        }
+    };
+    let call_id = match params.get("callId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(parse_u64_decimal(text)?),
+        Some(_) => return None,
+    };
+    // 直聊/群腿 callId 必带（官方 getCallIdForProto 非 ad-hoc 腿严格面）。
+    if call_id.is_none() && kind != Type::AdHocCall {
+        return None;
+    }
+    let timestamp = match params.get("timestamp") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let millis = value.as_u64()?;
+            Some((millis > 0).then_some(millis)?)
+        }
+    };
+    Some(SendCallEvent {
+        kind,
+        direction,
+        outcome,
+        conversation,
+        call_id,
+        timestamp,
+    })
+}
+
+/// 十进制串 → u64（官方 longToString 逆运算同域）：非空、全 ASCII 数字、
+/// u64 容量内；"0" 合法（proto uint64 域），"+1"/"-1"/" 1"/"0x1"/"1.0"/
+/// 空串全拒。
+fn parse_u64_decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// sendCallEvent CallEvent proto 构造单点（官方 getProtoForCallHistory
+/// 同位）：六字段全显式（conversationId 字节/callId/timestamp/type/
+/// direction/event），语义与入向投影 project_call_event 严格互逆
+///（单测往返钉定）；conversation_bytes 由调用方解析回填（直聊腿 =
+/// resolve_recipient → 16B UUID 字节，群/ad-hoc 腿 = 参数层已解字节）。
+fn build_call_event(
+    event: &SendCallEvent,
+    conversation_bytes: Vec<u8>,
+) -> presage::proto::sync_message::CallEvent {
+    presage::proto::sync_message::CallEvent {
+        conversation_id: Some(conversation_bytes),
+        call_id: event.call_id,
+        timestamp: event.timestamp,
+        r#type: Some(event.kind as i32),
+        direction: Some(event.direction as i32),
+        event: Some(event.outcome as i32),
+    }
+}
+
 /// sendContact 名片参数（窗D B11，官方 EmbeddedContact/DataMessage.Contact
 /// 同构，SendMessage.preload.ts:418-492 toProto contact 段同位）：name 六
 /// 子字段、number/email 条目 {value, type?, label?}、address 九子字段条目、
@@ -2477,6 +2603,60 @@ impl Service {
             .await
             .map_err(send_error_of)
             .map(|_| ())?;
+        Ok(timestamp)
+    }
+
+    /// sendCallEvent（通话事件出向同步批，KT 扩展方法）：官方桌面
+    /// updateRemoteCallHistory/getDeleteCallEvent（SendMessage.preload.ts:
+    /// 2055 getDeleteCallEvent 单帧作业 + callDisposition.preload.ts:376
+    /// getProtoForCallHistory 构造）同构——每事件即发，`SyncMessage.callEvent`
+    ///（content oneof 字段 19）padded sync message 向自己 ACI 单发（官方
+    /// sendIndividualProto(ourAci) urgent:false Resendable 同位；presage
+    /// self-send 通路 sendViewOnceOpen 先例已验证，compat §5 E4；钉定 rev
+    /// 同内容二次转录重发怪癖同面，接收端幂等）。无 sent-transcript、无
+    /// 群/设备定向位（CallEvent proto 六字段封闭，官方 wire 同形）。直聊腿
+    /// 号码/service-id 双形态解析（resolve_recipient，send 系同口径；PNI 形
+    /// 服务 id 原样 16B 直写——CallEvent.conversationId 线面无 ACI/PNI 语义
+    /// 位，收端 16B → UUID 串归一）；无身份拒发闸（自发同步面，对端加密
+    /// 不涉）。callId 缺席仅 ad-hoc 腿放行（参数层闸），timestamp 缺省 =
+    /// 信封时刻（官方调用方 Date.now() 同位）。返回信封 timestamp
+    ///（sendCallMessage 同款）。触发时机归事件源（connector/sidecar 每事件
+    /// 即调，引擎不做本地通话态）。
+    pub(crate) async fn send_call_event(
+        self: &Arc<Self>,
+        account: &str,
+        event: SendCallEvent,
+    ) -> Result<u64, SendError> {
+        if !self.real {
+            return Ok(now_ms());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let conversation_bytes = match &event.conversation {
+            CallEventConversation::Direct(recipient) => {
+                let service_id = resolve_recipient(&manager, recipient)
+                    .await
+                    .ok_or(SendError::Internal)?;
+                aci_to_bytes(&service_id.service_id_string()).ok_or(SendError::Internal)?
+            }
+            CallEventConversation::Group(bytes) | CallEventConversation::AdHoc(bytes) => {
+                bytes.clone()
+            }
+        };
+        let own_aci = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
+        let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+            content: Some(presage::proto::sync_message::Content::CallEvent(
+                build_call_event(&event, conversation_bytes),
+            )),
+            ..presage::proto::SyncMessage::with_padding(&mut rng())
+        });
+        let timestamp = now_ms();
+        manager
+            .send_message(own_aci, body, timestamp)
+            .await
+            .map_err(send_error_of)?;
         Ok(timestamp)
     }
 
@@ -14134,6 +14314,277 @@ mod tests {
 
         // modern 面共存键：legacy 键缺席 = None（不报错、不误伤 modern 路径）。
         assert!(parse_legacy_call_face(None).is_none());
+    }
+
+    /// sendCallEvent 直聊腿 wire 逐字节（通话事件出向同步批）：官方
+    /// getProtoForCallHistory 构造同位——CallEvent 六字段按号序
+    /// conversationId(1,tag 0x0a)/callId(2,0x10)/timestamp(3,0x18)/type(4,
+    /// 0x20)/direction(5,0x28)/event(6,0x30)；callId 用 2^53+1 钉 u64 全域
+    ///（JS 安全区外——wire 十进制串的意义所在）；type=AUDIO_CALL(1)/
+    /// direction=INCOMING(1)/event=ACCEPTED(1)。
+    #[test]
+    fn call_event_direct_builds_six_field_wire() {
+        use presage::proto::sync_message::call_event::{Direction, Event, Type};
+        use prost::Message as _;
+
+        let conversation: Vec<u8> = (1u8..=16).collect();
+        let event = SendCallEvent {
+            kind: Type::AudioCall,
+            direction: Direction::Incoming,
+            outcome: Event::Accepted,
+            conversation: CallEventConversation::Direct("+15551234567".into()),
+            call_id: Some(9007199254740993),
+            timestamp: Some(1700000000000),
+        };
+        let proto = build_call_event(&event, conversation.clone());
+        let mut bytes = Vec::new();
+        proto.encode(&mut bytes).expect("proto encodes");
+        assert_eq!(
+            bytes,
+            [
+                0x0a, 0x10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                16, // field1 16B
+                0x10, 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10, // field2 callId
+                0x18, 0x80, 0xd0, 0x95, 0xff, 0xbc, 0x31, // field3 timestamp
+                0x20, 0x01, // field4 type AUDIO_CALL
+                0x28, 0x01, // field5 direction INCOMING
+                0x30, 0x01, // field6 event ACCEPTED
+            ],
+            "直聊腿 wire = 六字段号序"
+        );
+        // 解码回读：值域逐面一致（u64 不经 f64 有损面）。
+        let decoded =
+            presage::proto::sync_message::CallEvent::decode(bytes.as_slice()).expect("decodes");
+        assert_eq!(
+            decoded.conversation_id.as_deref(),
+            Some(conversation.as_slice())
+        );
+        assert_eq!(decoded.call_id, Some(9007199254740993));
+        assert_eq!(decoded.timestamp, Some(1700000000000));
+        assert_eq!(decoded.r#type, Some(Type::AudioCall as i32));
+        assert_eq!(decoded.direction, Some(Direction::Incoming as i32));
+        assert_eq!(decoded.event, Some(Event::Accepted as i32));
+    }
+
+    /// type 词表三面映射（官方 typeToProto/statusToProto/directionToProto
+    /// 同位）：audio/video/group/ad-hoc → 1/2/3/4；accepted/not-accepted/
+    /// delete/observed → 1/2/3/4；incoming/outgoing → 1/2。
+    #[test]
+    fn call_event_vocabulary_maps_to_proto_enums() {
+        use presage::proto::sync_message::call_event::{Direction, Event, Type};
+        let params = |kind: &str| {
+            let conversation_id = if kind == "ad-hoc" {
+                "0123456789abcdef" // ad-hoc 腿 hex 占位
+            } else {
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // 32B base64 占位
+            };
+            json!({
+                "type": kind,
+                "direction": "outgoing",
+                "event": "not-accepted",
+                "conversationId": conversation_id,
+                "callId": "42",
+            })
+        };
+        let parse = |value: Value| parse_call_event(value.as_object().expect("object"));
+        for (word, value) in [
+            ("audio", Type::AudioCall),
+            ("video", Type::VideoCall),
+            ("group", Type::GroupCall),
+            ("ad-hoc", Type::AdHocCall),
+        ] {
+            let parsed = parse(params(word)).expect("parses");
+            assert_eq!(parsed.kind, value, "type 词 {word} → {value:?}");
+        }
+        for (word, value) in [
+            ("accepted", Event::Accepted),
+            ("not-accepted", Event::NotAccepted),
+            ("delete", Event::Delete),
+            ("observed", Event::Observed),
+        ] {
+            let mut params = params("group");
+            params["event"] = json!(word);
+            let parsed = parse(params).expect("parses");
+            assert_eq!(parsed.outcome, value, "event 词 {word} → {value:?}");
+        }
+        for (word, value) in [
+            ("incoming", Direction::Incoming),
+            ("outgoing", Direction::Outgoing),
+        ] {
+            let mut params = params("audio");
+            params["direction"] = json!(word);
+            let parsed = parse(params).expect("parses");
+            assert_eq!(parsed.direction, value, "direction 词 {word} → {value:?}");
+        }
+        // UNKNOWN 词不作发送意图（官方 statusToProto 中间态 null 不出线同位）。
+        for bad in ["unknown", "AUDIO", "", "missed"] {
+            let mut params = params("audio");
+            params["type"] = json!(bad);
+            assert!(parse(params).is_none(), "type 词 {bad} 拒绝");
+        }
+    }
+
+    /// ad-hoc 腿：roomId 小写 hex 字节直写（官方 getBytesForPeerId fromHex
+    /// 同位），callId 缺席放行（官方 call-link 占位「only send the
+    /// timestamp」同臂）；群腿 32B master key base64、callId 必带。
+    #[test]
+    fn call_event_adhoc_and_group_conversation_legs() {
+        use presage::proto::sync_message::call_event::Type;
+        let parse = |value: Value| parse_call_event(value.as_object().expect("object"));
+        let room_hex = "0123456789abcdef0123456789abcdef";
+        let adhoc = parse(json!({
+            "type": "ad-hoc",
+            "direction": "incoming",
+            "event": "observed",
+            "conversationId": room_hex,
+        }))
+        .expect("adhoc parses without callId");
+        assert_eq!(adhoc.call_id, None);
+        let room_bytes = hex_decode(room_hex).expect("hex");
+        match &adhoc.conversation {
+            CallEventConversation::AdHoc(bytes) => {
+                assert_eq!(bytes, &room_bytes);
+            }
+            _ => panic!("ad-hoc leg expected"),
+        }
+        let proto = build_call_event(&adhoc, room_bytes);
+        assert_eq!(proto.call_id, None, "ad-hoc 无 callId 位");
+        assert_eq!(proto.r#type, Some(Type::AdHocCall as i32));
+
+        let master_key: Vec<u8> = (0u8..32).collect();
+        let group = parse(json!({
+            "type": "group",
+            "direction": "outgoing",
+            "event": "accepted",
+            "conversationId": base64::engine::general_purpose::STANDARD.encode(&master_key),
+            "callId": "42",
+        }))
+        .expect("group parses");
+        match group.conversation {
+            CallEventConversation::Group(bytes) => assert_eq!(bytes, master_key),
+            _ => panic!("group leg expected"),
+        }
+        // 群腿坏 base64/≠32B 全拒（合法 32B 已由上方 group 正例覆盖）。
+        let short_key = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        for conversation_id in ["not-base64!".to_string(), short_key] {
+            let params = json!({
+                "type": "group", "direction": "outgoing", "event": "accepted",
+                "conversationId": conversation_id, "callId": "42",
+            });
+            assert!(
+                parse_call_event(params.as_object().expect("object")).is_none(),
+                "群腿形状 {conversation_id} 拒绝"
+            );
+        }
+        let group_missing_call_id = json!({
+            "type": "group", "direction": "outgoing", "event": "accepted",
+            "conversationId": base64::engine::general_purpose::STANDARD.encode(&master_key),
+        });
+        assert!(
+            parse_call_event(group_missing_call_id.as_object().expect("object")).is_none(),
+            "群腿 callId 必带"
+        );
+    }
+
+    /// 参数闸 fail-closed 全臂：callId 十进制 u64 域（负号/小数/hex/超
+    /// u64/数字类型全拒）、直聊腿 callId 必带、timestamp 正整数、
+    /// conversationId 空/缺、必填词表键缺席。
+    #[test]
+    fn call_event_param_gates_fail_closed() {
+        let base = json!({
+            "type": "audio",
+            "direction": "incoming",
+            "event": "accepted",
+            "conversationId": "+15551234567",
+            "callId": "42",
+        });
+        let parse = |value: Value| parse_call_event(value.as_object().expect("object"));
+        assert!(parse(base.clone()).is_some(), "基线形状通过");
+
+        for bad_call_id in [
+            "-1",
+            "1.0",
+            "0x10",
+            "abc",
+            "",
+            "18446744073709551616",
+            " 42",
+            "+42",
+        ] {
+            let mut params = base.clone();
+            params["callId"] = json!(bad_call_id);
+            assert!(parse(params).is_none(), "callId {bad_call_id:?} 拒绝");
+        }
+        let mut numeric_call_id = base.clone();
+        numeric_call_id["callId"] = json!(42);
+        assert!(
+            parse(numeric_call_id).is_none(),
+            "callId 数字类型拒绝（wire 恒十进制串，官方 longToString 同构）"
+        );
+
+        let mut missing_call_id = base.clone();
+        missing_call_id.as_object_mut().unwrap().remove("callId");
+        assert!(parse(missing_call_id).is_none(), "直聊腿 callId 必带");
+
+        for bad_ts in [json!(0), json!(-1), json!(1.5)] {
+            let mut params = base.clone();
+            params["timestamp"] = bad_ts.clone();
+            assert!(parse(params).is_none(), "timestamp {bad_ts} 拒绝");
+        }
+
+        for empty in ["", "   "] {
+            let mut params = base.clone();
+            params["conversationId"] = json!(empty);
+            assert!(parse(params).is_none(), "conversationId {empty:?} 拒绝");
+        }
+        let odd_hex = json!({
+            "type": "ad-hoc", "direction": "incoming", "event": "delete",
+            "conversationId": "abc", // 奇数长 hex
+        });
+        assert!(parse(odd_hex).is_none(), "ad-hoc 奇数长 hex 拒绝");
+        let upper_hex = json!({
+            "type": "ad-hoc", "direction": "incoming", "event": "delete",
+            "conversationId": "ABCDEF", // 大写 hex（hex_decode 小写纪律）
+        });
+        assert!(parse(upper_hex).is_none(), "ad-hoc 大写 hex 拒绝");
+
+        for key in ["type", "direction", "event", "conversationId"] {
+            let mut params = base.clone();
+            params.as_object_mut().unwrap().remove(key);
+            assert!(parse(params).is_none(), "必填键 {key} 缺席拒绝");
+        }
+    }
+
+    /// 出向构造 ↔ 入向投影互逆（同批词表契约）：构造 → 编码 → 解码 →
+    /// project_call_event → JSON 词与入参逐面同形（type/direction/event/
+    /// callId 十进制串/conversationId 直聊 UUID 串）。
+    #[test]
+    fn call_event_outbound_inbound_round_trip() {
+        use presage::proto::sync_message::call_event::{Direction, Event, Type};
+        use prost::Message as _;
+
+        let aci = "6e56f7d5-8ab1-4a0e-b34e-2e3a5c9f0d17";
+        let bytes = aci_to_bytes(aci).expect("valid uuid");
+        let event = SendCallEvent {
+            kind: Type::VideoCall,
+            direction: Direction::Outgoing,
+            outcome: Event::NotAccepted,
+            conversation: CallEventConversation::Direct(aci.to_owned()),
+            call_id: Some(1234567890123),
+            timestamp: Some(1234567890123),
+        };
+        let proto = build_call_event(&event, bytes);
+        let mut encoded = Vec::new();
+        proto.encode(&mut encoded).expect("encodes");
+        let decoded =
+            presage::proto::sync_message::CallEvent::decode(encoded.as_slice()).expect("decodes");
+        let projected = project_call_event(&decoded).expect("projects");
+        assert_eq!(projected["type"], json!("video"));
+        assert_eq!(projected["direction"], json!("outgoing"));
+        assert_eq!(projected["event"], json!("not-accepted"));
+        assert_eq!(projected["callId"], json!("1234567890123"));
+        assert_eq!(projected["timestamp"], json!(1234567890123u64));
+        assert_eq!(projected["conversationId"], json!(aci));
     }
 
     /// 收投影全信封面：CallMessage 体 → receive 通知信封 callMessage 键；

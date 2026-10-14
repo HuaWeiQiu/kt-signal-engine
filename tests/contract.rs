@@ -3635,6 +3635,106 @@ fn call_message_fake_shape_and_param_fail_closed() {
     );
 }
 
+/// 通话事件出向同步面（sendCallEvent，KT 扩展批）：fake 形状成功
+/// {"timestamp":u64}（直聊/群/ad-hoc 三腿同口径）；参数面 fail-closed 逐
+/// 形状（-32603）：account/type/direction/event/conversationId 必填、
+/// 词表外值、callId 直聊/群腿必带、callId 十进制 u64 域、timestamp 正整
+/// 数、群腿 32B master key base64、ad-hoc 腿小写 hex；协议上行面落调度
+/// 日志（send 系同纪律）。
+#[test]
+fn call_event_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("call-event");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake 成功面：直聊（号码/UUID 寻址）、群（32B master key base64）、
+    // ad-hoc（roomId hex，callId 可缺省）三腿同口径 {"timestamp": u64}；
+    // timestamp 缺省臂同形。
+    for params in [
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "9007199254740993", "timestamp": 1700000000000u64 }),
+        json!({ "account": number, "type": "video", "direction": "outgoing", "event": "not-accepted", "conversationId": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "callId": "42" }),
+        json!({ "account": number, "type": "group", "direction": "outgoing", "event": "delete", "conversationId": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=", "callId": "7" }),
+        json!({ "account": number, "type": "ad-hoc", "direction": "incoming", "event": "observed", "conversationId": "0123456789abcdef" }),
+        json!({ "account": number, "type": "ad-hoc", "direction": "incoming", "event": "delete", "conversationId": "0123456789abcdef", "callId": "9", "timestamp": 1700000000001u64 }),
+    ] {
+        let ok = engine.request("sendCallEvent", params.clone());
+        assert!(
+            ok["result"]["timestamp"].is_u64(),
+            "fake sendCallEvent ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状。
+    let group = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    let rejects = [
+        json!({ "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "type": "audio", "event": "accepted", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "callId": "42" }),
+        json!({ "account": number, "type": "missed", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "type": "audio", "direction": "unknown", "event": "accepted", "conversationId": "+15555550101", "callId": "42" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "ringing", "conversationId": "+15555550101", "callId": "42" }),
+        // 直聊腿 callId 必带 + 十进制 u64 域（数字类型/负数/小数/hex/超
+        // u64/空串）。
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": 42 }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "-1" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "1.5" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "0x2a" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "18446744073709551616" }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "" }),
+        // 群腿 callId 必带 + master key 形状。
+        json!({ "account": number, "type": "group", "direction": "outgoing", "event": "accepted", "conversationId": group }),
+        json!({ "account": number, "type": "group", "direction": "outgoing", "event": "accepted", "conversationId": "not-base64!", "callId": "42" }),
+        json!({ "account": number, "type": "group", "direction": "outgoing", "event": "accepted", "conversationId": "QUJDREVG", "callId": "42" }),
+        // ad-hoc 腿 hex 形状（大写/奇数长）。
+        json!({ "account": number, "type": "ad-hoc", "direction": "incoming", "event": "delete", "conversationId": "ABCDEF" }),
+        json!({ "account": number, "type": "ad-hoc", "direction": "incoming", "event": "delete", "conversationId": "abc" }),
+        json!({ "account": number, "type": "ad-hoc", "direction": "incoming", "event": "delete", "conversationId": "" }),
+        // timestamp 正整数。
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42", "timestamp": 0 }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42", "timestamp": -1 }),
+        json!({ "account": number, "type": "audio", "direction": "incoming", "event": "accepted", "conversationId": "+15555550101", "callId": "42", "timestamp": "1700000000000" }),
+    ];
+    for params in &rejects {
+        let response = engine.request("sendCallEvent", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "sendCallEvent rejects {params}"
+        );
+    }
+
+    // 调度日志：type/direction/event/conversationId/callId 逐字保留（协议
+    // 上行面纪律）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["method"] == "sendCallEvent")
+        .expect("sendCallEvent logged");
+    assert_eq!(entry["params"]["type"], json!("audio"));
+    assert_eq!(entry["params"]["direction"], json!("incoming"));
+    assert_eq!(entry["params"]["event"], json!("accepted"));
+    assert_eq!(entry["params"]["callId"], json!("9007199254740993"));
+    assert_eq!(entry["params"]["timestamp"], json!(1700000000000u64));
+    assert_eq!(entry["params"]["account"], json!(number));
+}
+
 /// 名片发送臂（sendContact，窗D B11）：fake 形状成功 {"timestamp":u64}（直
 /// 聊/群两腿同口径）；参数面 fail-closed 逐形状（-32603）：contact 缺席/非
 /// 对象、name 非对象/子字段非字符串、number/email/address 非数组/条目非对

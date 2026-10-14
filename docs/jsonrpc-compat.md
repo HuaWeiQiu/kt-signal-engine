@@ -167,6 +167,7 @@ send message: Signal server unavailable.
 | `calls.groupMembers` | `{account, groupId(同 calls.groupProof)}` | `{members: [{uuid(ACI 字符串), userIdCipherText(标准 base64 = UuidCiphertext bincode 序列化)}]}`（服务器群态成员序；RingRTC GroupMemberInfo{userId, userIdCipherText} 材料面） | 参数缺失/groupId 形状错/未注册账号 `-32603`；群态拉取被拒/解密失败 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 getMembershipList 同语义（groups.preload.ts:7611-7632：群成员逐一 encryptServiceId）——`GET v1/groups/` + decrypt_group（fetch_group_state 既有面复用）→ 每成员 `GroupSecretParams::encrypt_service_id(ACI)` → UuidCiphertext 序列化；uuid = ACI 字符串（relay-api-v2 §2 帧面对位）；fake：参数闸后 `{members: []}` |
 | `calls.endorsementsPublicKey` | `{}`（常量派生面，无 account——getStickerPackManifest 匿名面同纪律） | `{endorsementPublicKey(标准 base64 = EndorsementPublicKey bincode 序列化)}` | 无（常量派生不触网，fake 同码路真实答） | **2026-10-09 real（同批）**：legacy ServerPublicParams 派生 `get_endorsement_public_key()`（zkgroup pin 树 server_params.rs:347；官方 `serverPublicParams.getEndorsementPublicKey()` 同位，消费位 calling.preload.ts:1134/:2018 = RingRTC getCallLinkCall 的 endorsementPublicKey 槽）；共享常量模块 `zkgroup_consts` 单一真相源（云备份面同源不重复嵌） |
 | `calls.relays` | `{account}` | `{account, relays: [{username, password, urls?, urlsWithIps?, hostname?, ttl?}], fetchedAtMs?, expiresAtMs?, stale, lastError?}`（relays 条目 = 官方 IceServerGroupType 逐字段透传，未知字段丢弃不发明；`fetchedAtMs`/`expiresAtMs` 为 epoch 毫秒，无缓存空态整键缺席不出 null；条目内可选字段 None 整键缺席；`stale` = 无缓存恒 true，有条目 = now ≥ expiresAtMs；`lastError` = 最近一次重拉失败诚实原因） | 未知/未注册账号 `-32603`（折叠惯例）；账号凭据失效（服务器 401/403）`-32603` + getUserStatus 解绑原文同款（缓存不动）；网络/应答形状失败**不是错误应答**——空态或旧值 + `lastError` 如实成功应答（错误不连坐，§5 块） | **2026-10-13 real（KT 扩展，批次 G 第一腿，wire additive，【engine-compat】，§5 块）**：官方 getIceServers 同端点（WebAPI.preload.ts:796 路径 + :3064 调用，chatService identified 账号 Basic Auth——presage 链接账号凭据同类用法，代理随进程 ALL_PROXY 自动生效）；缓存 + TTL 官方 calling.preload.ts #getIceServers 同口径（TTL = relays[].ttl 最小秒值、任一缺失/0 不缓存、TTL 内零网络、空应答不覆盖旧缓存、失败诚实保旧 + lastError、401/403 归解绑）；进程内存 per-account 缓存不落盘（delete_account 摘除）；fake 面 = 空态（`{account, relays: [], stale: true}`）；**connector 消费面后续批次登记**（connector 仓另有 agent 在写，本批不动） |
+| `sendCallEvent` | `{account, type("audio"\|"video"\|"group"\|"ad-hoc"), direction("incoming"\|"outgoing"), event("accepted"\|"not-accepted"\|"delete"\|"observed"), conversationId(形态随 type：直聊 = 号码/service-id 串，服务层 resolve_recipient 解析；group = 32B 群 master key 标准 base64；ad-hoc = roomId 小写 hex——与入向投影 hex_encode 互逆), callId?(十进制 u64 串——官方 longToString 同构；直聊/群腿必带，ad-hoc 可缺省), timestamp?(u64 毫秒正整数，缺省 = 信封时刻)}` | `{timestamp}`（信封时间戳） | 参数缺失/形状错（type/direction/event 词表外或缺席或非字符串、conversationId 缺席·空串·群腿非 base64·≠32B·ad-hoc 腿非小写 hex·奇数长、callId 非十进制串·负号·小数·hex·超 u64·数字 JSON 类型、直聊/群腿 callId 缺席、timestamp 0·负·小数·字符串）/未注册账号 `-32603`；直聊寻址不可解析 `-32603`（send 系同折叠） | **2026-10-14 real（KT 扩展，通话事件出向同步批，官方对齐 Signal-Desktop abe80d3 updateRemoteCallHistory/getDeleteCallEvent，wire additive，engine-compat，§5 块）**：SyncMessage.callEvent=19 每事件即发向自有设备（presage self-send 通路 sendViewOnceOpen 先例）；与入向投影 `syncMessage.callEvent`（§3 receive 行）同词表严格互逆（单测往返钉定）；触发时机归事件源（connector/sidecar 每事件即调，引擎无本地通话态）；fake：成功 `{timestamp:u64}` 三腿同口径（落调度日志，send 系同款） |
 | `backup.export` | `{account}` | `{"status": "started"}`（后台任务已启动，进度走 `backup.exportStatus`） | 未注册/fake 账号 `-32603`；该账号任务已在跑 `BACKUP_EXPORT_ALREADY_RUNNING`；工件缺失 `BACKUP_ARTIFACT_MISSING`；首行非法 `BACKUP_ARTIFACT_INVALID`（工件当场删除）——结构化码均 `-1` + message 码位（备份导出契约 §10.7，connector 1.47 白名单计划） | **消费批一期 real（2026-10-05）**：文件工件交接（备份导出契约 §10）——读 `<账号目录>/backup-export-input.ndjson`（connector 写入，引擎契约 §10.2 行格式/帽值）→ 专用 OS 线程装配 `MainStreamWriter` → `export_local_backup` 落官方 §5 快照；任务离开 running 即删工件（§10.2 硬边界）；每账号至多一任务；不落调度日志零 stderr；fake 模式账号无 store，按未注册 `-32603` |
 | `backup.exportStatus` | `{account}` | `{account, state: idle\|running\|completed\|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]}`（快照清单 ≤32 条新→旧；`frames` 仅本进程任务产出已知；诚实缺席不发明 0） | 未注册账号 `-32603` | **消费批一期 real（2026-10-05）**：只读轮询面，仿 connector `history.importStatus` 语义（无推送事件，轮询到终态）；任务注册表进程内存不跨重启；快照清单只报告不清理（生命周期归 connector，备份导出契约 §10.6）；不落调度日志零 stderr |
 | `backup.importSnapshot` | `{account, snapshotDir}`（官方桌面本地备份快照目录，官方布局 `signal-backup-<ts>/{metadata, main, files/}`；connector 传入的同机路径，引擎不持久化） | `{"status": "started"}`（后台任务已启动，进度走 `backup.importSnapshotStatus`） | 未注册/fake 账号/AEP 缺失 `-32603`；该账号导入任务在跑 `BACKUP_IMPORT_ALREADY_RUNNING`；目录或 metadata/main 缺 `BACKUP_SNAPSHOT_MISSING`；metadata decode 失败/version≠1/形状不合规 `BACKUP_SNAPSHOT_METADATA_INVALID`；backupId 比对不等（非本账号备份）`BACKUP_SNAPSHOT_KEY_MISMATCH`——结构化码均 `-1` + message 码位（备份导出契约 §11.4，connector 1.78 白名单） | **B2 批 real（2026-10-08，快照导入收向）**：官方 `importLocalBackup`/`verifyLocalBackupMetadata` 行为对齐（AGPL 只读参照零拷贝）——metadata 校验（官方 strict assert 面：version==1、iv 12B、encryptedId 16B、CTR 解密 backupId 逐字节比对）前移为 start 同步闸，main 全链（官方 FramesReader 解密+HMAC+分帧）后台 `spawn_local`（帧导出 future 非 Send），逐帧投影复用 `history::export_frames_loop` 落 `<账号目录>/history-import.ndjson`（connector §4.38 通路同一落点，临时名+rename 原子替换，失败删半成品既有 NDJSON 不动）；密钥边界 §10.5 延续（任务 future 内即用即弃）；fake 模式账号无 store，按未注册 `-32603`；不落调度日志零 stderr |
@@ -359,7 +360,9 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   标准 base64；ad-hoc = 房间 id hex；空字节键省略）；callId 缺席 = 无记录
   主键整事件丢弃（warn-only，零 stderr）。CallEvent 经 presage 落库
   （registered.rs message_for_sync CallMessage/CallEvent 分支）——引擎
-  store 有行，connector 消费面按自身会话管线取用。
+  store 有行，connector 消费面按自身会话管线取用。出向写面 =
+  `sendCallEvent` 同词表严格互逆（2026-10-14 通话事件出向批，§3 行/
+  §5 块）。
 - `syncMessage.messageRequestResponse {threadAci?, groupId?,
   messageRequestResponseType}`（2026-10-06，KT 扩展批，官方 content oneof
   messageRequestResponse=14 投影）：多设备 echo 的消息请求接受/拒绝终态
@@ -1402,7 +1405,8 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   libsignal-service `create_multi_device_sent_transcript_content` 对
   CallMessage 返回 None（presage 发送面 `if let Some` 守卫静默跳过），
   本机其他设备不收自发 call 记录（官方桌面自发 call 的多设备同步走
-  CallEvent sync 通道，与 transcript 面独立）；不向 self 发 call
+  CallEvent sync 通道，与 transcript 面独立；该通道引擎写面 =
+  `sendCallEvent`，2026-10-14 通话事件出向批 §5 块）；不向 self 发 call
   （self-send 走 message_to_self 分支对 CallMessage 报 NoMessagesToSend，
   引擎无此调用形状）。**CallMessage/CallEvent 经 presage 接收面落库**
   （registered.rs message_for_sync 两分支 Some(message)）——引擎 store
@@ -4833,6 +4837,61 @@ connector 原样冒上桌面。本批闭合引擎供给腿（connector/桌面零
   全缺键不在）。真机端到端（真语音附件 send/receive roundtrip）归真机
   回归。
 
+### 通话事件出向同步批（2026-10-14，官方对齐 Signal-Desktop abe80d3 updateRemoteCallHistory/getDeleteCallEvent，wire additive【engine-compat】）
+
+官方通话事件跨设备同步出向 = 通话接听/挂断/未接/删除/observed 等事件
+发生时，客户端向自己其他关联设备发 `SyncMessage.callEvent`（content
+oneof 字段 19），各设备会话据此落通话记录条。引擎此前只有入向投影
+（2026-10-06 通话消息面批，§3 receive 行 `syncMessage.callEvent`——本批
+核实其与 proto 一致，零改动只记档），出向半本批闭合。
+
+- **proto 核实结论（vendor/libsignal-service/protobuf/SignalService.proto
+  逐字，与既有蒸馏记档无出入）**：`SyncMessage.CallEvent` 六字段封闭——
+  `conversationId=1`(bytes：1:1 = 对端 service id、群 = group id、ad-hoc =
+  room id)、`callId=2`(uint64：1:1 直接生成、群/ad-hoc 自 era id 派生)、
+  `timestamp=3`(uint64)、`type=4`、`direction=5`、`event=6`；枚举域
+  `Type{UNKNOWN_TYPE=0, AUDIO_CALL=1, VIDEO_CALL=2, GROUP_CALL=3,
+  AD_HOC_CALL=4}`、`Direction{UNKNOWN_DIRECTION=0, INCOMING=1,
+  OUTGOING=2}`、`Event{UNKNOWN_EVENT=0, ACCEPTED=1, NOT_ACCEPTED=2,
+  DELETE=3, OBSERVED=4}`；`SyncMessage.callEvent=19`。桌面
+  `callEventNormalizeSchema`（CallDisposition.std.ts:287-311）与 proto
+  同构：conversationId 16B → UUID 串/否则群标准 base64/ad-hoc hex、
+  callId longToString 十进制串——引擎入向投影词表（§3）逐面命中。
+- **触发时机（官方，事件源对位）**：`updateRemoteCallHistory` 每本地通话
+  历史状态迁移即发（statusToProto 非空位才同步：Accepted → ACCEPTED、
+  Declined → NOT_ACCEPTED、Deleted → DELETE、GenericAdhocCall →
+  OBSERVED、JoinedAdhoc → ACCEPTED；missed/ringing/pending/joined 等
+  中间态 null 不出线）；删除通话记录 = `getDeleteCallEvent` 单帧作业同
+  形状（event=DELETE）。urgent:false、contentHint Resendable、padSync
+  Message 包裹、sendIndividualProto(ourAci) 自发。
+- **引擎发送面（`sendCallEvent`，KT 扩展）**：参数三词表 + 会话三腿
+  （直聊号码/service-id、群 32B master key base64、ad-hoc roomId hex）
+  与入向投影同词表严格互逆（往返单测钉定）；callId 直聊/群腿必带（官方
+  getCallIdForProto 非 ad-hoc 严格面同位）、ad-hoc 可缺省（官方 call-link
+  占位「only send the timestamp」同臂）；timestamp 缺省信封时刻（官方
+  调用方 Date.now() 同位）。构造 `build_call_event` 单点六字段全显式，
+  presage self-send 通路（sendViewOnceOpen 先例，compat §5 E4）：padded
+  sync message 向自己 ACI 单发，`Manager::send_message` 硬编码
+  online_only=false 与官方 call 面不设 online 位一致（通话消息块勘误同
+  源）。无 sent-transcript、无群/设备定向位（CallEvent 六字段封闭）。
+  直聊腿无身份拒发闸（自发同步面，对端加密不涉——与 read/viewed/
+  viewOnceOpen 自发面同纪律）；直聊寻址 = resolve_recipient（send 系同
+  口径），PNI 形 service id 原样 16B 直写（线面无 ACI/PNI 语义位，收端
+  16B → UUID 串归一）。
+- **触发时机归属（本批边界）**：引擎无本地通话态（RingRTC 侧职责），
+  每事件即发的调用接线归 connector/sidecar 后续批——engine 侧只保证
+  「一调用一 sync 信封、每事件即发」的发送面语义。
+- **失败姿态**：参数面 fail-closed（-32603，§3 行）；上行失败沿 send 系
+  错误族（Unbound/RateLimited/ProofRequired/ServerUnavailable/
+  Internal，§3 结构化三分类），不重试不静默；fake 面成功形状桩
+  `{timestamp}` 三腿同口径 + 落调度日志（send 系同纪律，payload 逐字
+  保留——callEvent 参数是记录元数据非正文）。
+- **单测**：直聊腿 wire 逐字节六字段号序（callId 用 2^53+1 钉 u64 全
+  域）、三词表全枚举映射 + UNKNOWN 词拒绝、ad-hoc（callId 缺席臂 +
+  hex 腿）/群（32B 闸 + callId 必带）两腿、参数闸 fail-closed 全臂、
+  出向构造 ↔ 入向投影互逆往返；契约测试 fake 形状 + 25 形状拒绝 +
+  调度日志纪律。真机回归归 connector/desktop 接线批。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
@@ -4843,7 +4902,8 @@ connector 原样冒上桌面。本批闭合引擎供给腿（connector/桌面零
 
 参数层 fail-closed 闸在 fake 模式同样生效（`-32603` 可契约测试）：
 `sendGroupCallUpdate` 的 groupId 32B 形状闸（decode_group_id）、
-`editMessage` 两腿恰一/recipient 形状闸属此列——闸在 dispatch 参数解析
-层，先于服务层 fake 早退。服务层闸（open_group_sender 群态刷新/
+`sendCallEvent` 三词表/会话三腿/callId 域闸（parse_call_event，2026-10-14
+通话事件出向批）、`editMessage` 两腿恰一/recipient 形状闸属此列——闸在
+dispatch 参数解析层，先于服务层 fake 早退。服务层闸（open_group_sender 群态刷新/
 announcements/terminated、收件人解析、profileSharing 白名单）仅 real
 模式生效，fake 形状桩一律早退成功。

@@ -1217,6 +1217,32 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // sendCallEvent（通话事件出向同步批，KT 扩展方法）：官方桌面
+        // updateRemoteCallHistory/getDeleteCallEvent 同构——SyncMessage.
+        // callEvent=19 向自有设备单发，多设备会话落通话记录条（出向半，与
+        // 入向投影 syncMessage.callEvent 同词表互逆）。协议上行面落调度日志
+        //（send 系同纪律）；参数面 fail-closed（-32603）：type/direction/
+        // event 词表三面（词表外/缺席/非字符串全拒）、conversationId 形状随
+        // type（群 = 32B master key base64、ad-hoc = 小写 hex、直聊 =
+        // 非空串服务层解析）、callId 十进制 u64 串且直聊/群腿必带、timestamp
+        // 正整数 u64。成功 `{timestamp}`（信封时间戳，sendCallMessage 同
+        // 款）；事件源接线（connector 每事件即调）归 connector 批。
+        "sendCallEvent" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let event = crate::service::parse_call_event(params);
+            match (account, event) {
+                (Some(account), Some(event)) => {
+                    match service.send_call_event(account, event).await {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // sendContact（名片发送臂，窗D B11）：官方 DataMessage.contact=9
         // repeated 单条目面（SendMessage.preload.ts:418-492 toProto contact
         // 段 + EmbeddedContact.std.ts numberTo*Type 词表面同位）。协议上行
