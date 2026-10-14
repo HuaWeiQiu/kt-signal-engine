@@ -25,9 +25,12 @@ fixture 同款）：
   除号码/目录名以外的任何内容）。
 - `--receive-mode on-start`：daemon 就绪即拉取服务器消息（P1b 起 presage
   websocket 生效：每账号一条接收管线，断流退避重连）。
-- `--ignore-attachments` / `--ignore-stories` / `--ignore-stickers`：接受。
-  媒体开关语义（ADR 0002：去掉 `--ignore-attachments` 即下载入站附件）
-  在 P2 附件阶段生效，P1a 仅接受参数。
+- `--ignore-attachments` / `--ignore-stories` / `--ignore-stickers`：接受但
+  **恒为 no-op**——仅为 argv 形状兼容而存在（ADR 0002 argv 兼容小节），引擎
+  收发行为与三旗标无关，不是 signal-cli 时代「丢弃贴纸/故事」语义。接收面现状：
+  贴纸 metadata-only 投影（字节永不下载）、story transient 投影不落库（§5
+  story 块）、附件 locator 指针投影（§5 附件 locator 勘误，metadata-only
+  立项红线，字节按需归 connector §4.54 transit 链）。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
 - stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除两处启动期输出外
