@@ -1907,6 +1907,58 @@ impl Service {
         .await
     }
 
+    /// sendStoryReaction（story 反应发送批 S4，KT 扩展方法）：官方
+    /// reactToStory 行为对齐（stories.preload.ts:556 →
+    /// enqueueReactionForSend → sendNormalMessage getMessageSendData）——
+    /// 被回应 story 的锚（作者 ACI + story 发送时刻）同时进
+    /// `Reaction.targetAuthor/targetSentTimestamp` 与
+    /// `StoryContext.author/sentTimestamp` 两位，单收件人直聊腿发往
+    /// story 作者会话（官方 1:1 story reaction targetConversation 同位；
+    /// 群 story 腿 v1 边界不做，compat §5）。remove 官方恒 false
+    /// （sendNormalMessage reactionForSend 同位硬编码），方法面不带参。
+    /// 官方发送前 profileSharing 置位（enqueueReactionForSend:72-82）由
+    /// P9 白名单闸同语义承接；sync 面 = 普通 sent 转录（presage fork
+    /// send_message 自动产出），无独立回执面（核实记档 compat §5）。
+    pub(crate) async fn send_story_reaction(
+        self: &Arc<Self>,
+        account: &str,
+        story_author: &str,
+        story_timestamp: u64,
+        emoji: &str,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let (shared, account_dir) = open_registered_with_dir(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let timestamp = now_ms();
+        // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
+        // 锚作者（targetAuthorAci/storyContext.authorAci 同一 ACI）：本机号
+        // 走注册数据、contacts E.164 命中、UUID 直通（sendReaction 同链）；
+        // 都未命中按内部失败，不透传号码。
+        let author_aci = resolve_author_aci(manager.store(), story_author)
+            .await
+            .ok_or(SendError::Internal)?;
+        // 目的地 = story 作者会话（号码/UUID 双形态收敛同一 ServiceId）。
+        let service_id = resolve_recipient(&manager, story_author)
+            .await
+            .ok_or(SendError::Internal)?;
+        // P9 身份拒发闸（story 反应同为直聊内容发送）。
+        identity_send_gate(&account_dir, &service_id)?;
+        // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
+        let include_profile_key = include_profile_key_for(&whitelist, &service_id);
+        let body =
+            build_story_reaction_data_message(&author_aci, story_timestamp, emoji, timestamp);
+        manager
+            .send_message_with_profile_sharing(service_id, body, timestamp, include_profile_key)
+            .await
+            .map_err(send_error_of)?;
+        Ok(())
+    }
+
     pub(crate) async fn send_reaction(
         self: &Arc<Self>,
         account: &str,
@@ -8733,6 +8785,36 @@ fn pin_message_proto(
     }
 }
 
+/// sendStoryReaction dataMessage 构造（story 反应发送批 S4，纯函数单测
+/// 钉形；官方 sendNormalMessage getMessageSendData storyReaction 同位——
+/// Reaction 与 StoryContext 两面同锚：targetAuthorAci/storyContext.
+/// authorAci 同一作者 ACI、targetSentTimestamp/sentTimestamp 同一 story
+/// 时刻；remove 恒 false，官方 reactionForSend 同位硬编码；string 形
+/// authorAci 沿 mentions/quote/storyReply 先例，binary 位不写）。
+fn build_story_reaction_data_message(
+    author_aci: &str,
+    story_timestamp: u64,
+    emoji: &str,
+    timestamp: u64,
+) -> DataMessage {
+    DataMessage {
+        timestamp: Some(timestamp),
+        reaction: Some(presage::proto::data_message::Reaction {
+            emoji: Some(emoji.to_owned()),
+            target_author_aci: Some(author_aci.to_owned()),
+            target_sent_timestamp: Some(story_timestamp),
+            remove: Some(false),
+            ..presage::proto::data_message::Reaction::default()
+        }),
+        story_context: Some(presage::proto::data_message::StoryContext {
+            author_aci: Some(author_aci.to_owned()),
+            sent_timestamp: Some(story_timestamp),
+            author_aci_binary: None,
+        }),
+        ..DataMessage::default()
+    }
+}
+
 /// poll 三臂 proto 公共构造（窗D A7，官方 SendMessage.preload.ts toProto
 /// pollCreate / createDataMessageProtoForPollVote / …ForPollTerminate 同位）。
 fn poll_create_proto(
@@ -12042,6 +12124,29 @@ mod tests {
         .is_err());
     }
 
+    /// S4 story 反应发送批：`build_story_reaction_data_message` 钉形——
+    /// Reaction 与 StoryContext 两面同锚（targetAuthorAci/storyContext.
+    /// authorAci 同一作者 ACI，targetSentTimestamp/sentTimestamp 同一 story
+    /// 时刻毫秒）；remove 恒 Some(false)（官方 reactionForSend 硬编码同位，
+    /// 方法面无 remove 参）；string 形 authorAci（mentions/quote/storyReply
+    /// 先例），binary 位不写；timestamp = 腿发送时刻。
+    #[test]
+    fn story_reaction_data_message_build_shape() {
+        let author = "11111111-2222-4333-8444-555555555555";
+        let dm = build_story_reaction_data_message(author, 1_700_000_000_000, "👍", 7_777);
+        let reaction = dm.reaction.expect("reaction set");
+        assert_eq!(reaction.emoji.as_deref(), Some("👍"));
+        assert_eq!(reaction.target_author_aci.as_deref(), Some(author));
+        assert_eq!(reaction.target_sent_timestamp, Some(1_700_000_000_000));
+        assert_eq!(reaction.remove, Some(false));
+        let context = dm.story_context.expect("storyContext set");
+        assert_eq!(context.author_aci.as_deref(), Some(author));
+        assert_eq!(context.sent_timestamp, Some(1_700_000_000_000));
+        assert!(context.author_aci_binary.is_none());
+        assert_eq!(dm.timestamp, Some(7_777));
+        assert!(dm.body.is_none(), "story reaction 无正文位");
+    }
+
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构
     /// 校验，非法行补 viewOnceInvalid（metadata-only 只标记不擦除）；合法行
     /// 不带该键；非 view-once 行完全不受影响。
@@ -13446,6 +13551,137 @@ mod tests {
         );
         assert_eq!(face["allowsReplies"], json!(false), "bool 缺省如实投影");
         assert!(face.get("profileKey").is_none(), "空 key 不投");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// S4 story 反应接收面三腿（官方 MessageReceiver:1534-1544 门序镜像，
+    /// 接收投影零 wire 改动——reaction/storyReply 既有键共在即 story 锚定
+    /// 形状）：①1:1 story reaction（信封无 story 位）走普通路径——reaction
+    /// 与 storyReply 共在（storyReply 键在场 = 宿主区分 story 反应与普通
+    /// 反应的判别键），isStory 键不在；②信封 story 位 + reaction+storyContext
+    /// 无 groupV2 = 官方整信封丢弃（story 位 1:1 reaction 形状非法）；③信封
+    /// story 位 + reaction+storyContext+groupV2 = 群 story 回复豁免照投
+    /// （isStory + reaction + storyReply + groupInfo 共在）。
+    #[tokio::test]
+    async fn receive_story_reaction_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{data_message, GroupContextV2};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-reaction-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |story| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let story_reaction = |group: Option<GroupContextV2>| DataMessage {
+            reaction: Some(presage::proto::data_message::Reaction {
+                emoji: Some("👍".to_owned()),
+                target_author_aci: Some("11111111-2222-4333-8444-555555555555".to_owned()),
+                target_sent_timestamp: Some(1_700_000_000_000),
+                remove: Some(false),
+                ..Default::default()
+            }),
+            story_context: Some(data_message::StoryContext {
+                author_aci: Some("11111111-2222-4333-8444-555555555555".to_owned()),
+                sent_timestamp: Some(1_700_000_000_000),
+                author_aci_binary: None,
+            }),
+            group_v2: group,
+            ..Default::default()
+        };
+
+        // ①1:1 story reaction：信封无 story 位，普通路径照投。
+        let content = Content::from_body(
+            ContentBody::DataMessage(story_reaction(None)),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "1:1 story reaction projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(envelope.get("isStory").is_none());
+        assert_eq!(
+            envelope["dataMessage"]["reaction"],
+            json!({
+                "emoji": "👍",
+                "targetAuthor": "11111111-2222-4333-8444-555555555555",
+                "targetSentTimestamp": 1_700_000_000_000_u64,
+                "isRemove": false
+            })
+        );
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"],
+            json!({
+                "authorAci": "11111111-2222-4333-8444-555555555555",
+                "sentTimestamp": 1_700_000_000_000_u64
+            })
+        );
+
+        // ②信封 story 位 + 1:1 reaction 形状（无 groupV2）：官方整信封丢弃。
+        let content = Content::from_body(
+            ContentBody::DataMessage(story_reaction(None)),
+            metadata(Some(true)),
+        );
+        assert!(
+            project_content("acct", &store, &content, &registry)
+                .await
+                .is_empty(),
+            "story 位 1:1 reaction 形状丢弃"
+        );
+
+        // ③信封 story 位 + reaction+storyContext+groupV2：群 story 反应豁免
+        // 照投（isStory + reaction + storyReply + groupInfo 共在）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(story_reaction(Some(GroupContextV2 {
+                master_key: Some(vec![0x33u8; 32]),
+                revision: None,
+                group_change: None,
+            }))),
+            metadata(Some(true)),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "group story reaction projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["isStory"], json!(true));
+        assert_eq!(envelope["dataMessage"]["reaction"]["emoji"], json!("👍"));
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"]["sentTimestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert!(
+            envelope["dataMessage"]["groupInfo"]["groupId"].is_string(),
+            "群 story 反应另带既有 groupInfo 投影"
+        );
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }

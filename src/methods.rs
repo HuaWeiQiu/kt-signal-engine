@@ -737,6 +737,43 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // sendStoryReaction（story 反应发送批 S4，官方 reactToStory 行为
+        // 对齐）：storyAuthor/storyTimestamp = 被回应 story 锚（作者 ACI/
+        // 号码 + story 发送时刻毫秒），emoji 必填非空；remove 无参——官方
+        // story 反应恒 remove:false（sendNormalMessage reactionForSend 同位
+        // 硬编码）。目的地 = story 作者会话（服务层解析，1:1 腿；群 story
+        // v1 边界不做）。
+        "sendStoryReaction" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let author = params
+                .get("storyAuthor")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let target = params
+                .get("storyTimestamp")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0);
+            let emoji = params
+                .get("emoji")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            match (account, author, target, emoji) {
+                (Some(account), Some(author), Some(target), Some(emoji)) => {
+                    match service
+                        .send_story_reaction(account, author, target, emoji)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         "sendPinMessage" => {
             state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);

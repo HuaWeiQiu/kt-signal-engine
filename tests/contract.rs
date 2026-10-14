@@ -2891,6 +2891,130 @@ fn send_story_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// S4 story 反应发送批 fake 契约：合法批应答 `{}`（单收件人直聊腿，无
+/// results 面——sendStoryReaction 无收件人批）；参数闸 fail-closed 全量
+/// 生效（account/storyAuthor/storyTimestamp/emoji 四参，缺一/空串/0/非数
+/// 皆 -32603）；remove 无参（官方恒 false，方法面不带）；dispatch 日志
+/// 原样落参（connector 侧依赖断言）。
+#[test]
+fn send_story_reaction_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("send-story-reaction-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // fake 合法批：成功应答 `{}`（sendReaction 同款无 results 面）。
+    assert_eq!(
+        engine
+            .request(
+                "sendStoryReaction",
+                json!({
+                    "account": "+15550000000",
+                    "storyAuthor": "+15555550101",
+                    "storyTimestamp": 1_700_000_000_000_u64,
+                    "emoji": "👍"
+                })
+            )
+            .get("result"),
+        Some(&json!({}))
+    );
+
+    // account/storyAuthor：缺失/空串。
+    for account in [None, Some(json!(""))] {
+        let mut params =
+            json!({ "storyAuthor": "+15555550101", "storyTimestamp": 1, "emoji": "👍" });
+        if let Some(account) = account {
+            params["account"] = account;
+        }
+        let (code, _) = engine.error_of("sendStoryReaction", params);
+        assert_eq!(code, -32603);
+    }
+    for author in [None, Some(json!(""))] {
+        let mut params = json!({ "account": "+15550000000", "storyTimestamp": 1, "emoji": "👍" });
+        if let Some(author) = author {
+            params["storyAuthor"] = author;
+        }
+        let (code, _) = engine.error_of("sendStoryReaction", params);
+        assert_eq!(code, -32603);
+    }
+    // storyTimestamp：缺失/0/非数。
+    for target in [
+        None,
+        Some(json!(0)),
+        Some(json!("1700000000000")),
+        Some(json!(-1)),
+    ] {
+        let mut params =
+            json!({ "account": "+15550000000", "storyAuthor": "+15555550101", "emoji": "👍" });
+        if let Some(target) = target {
+            params["storyTimestamp"] = target;
+        }
+        let (code, _) = engine.error_of("sendStoryReaction", params);
+        assert_eq!(code, -32603);
+    }
+    // emoji：缺失/空串/非字符串。
+    for emoji in [None, Some(json!("")), Some(json!(42))] {
+        let mut params = json!({
+            "account": "+15550000000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1
+        });
+        if let Some(emoji) = emoji {
+            params["emoji"] = emoji;
+        }
+        let (code, _) = engine.error_of("sendStoryReaction", params);
+        assert_eq!(code, -32603);
+    }
+    // remove 参数面不存在：带上也不影响合法批（引擎不读——官方恒 false，
+    // 兼容面如实无此参）。
+    let with_remove = engine.request(
+        "sendStoryReaction",
+        json!({
+            "account": "+15550000000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1_700_000_000_000_u64,
+            "emoji": "👍",
+            "remove": true
+        }),
+    );
+    assert_eq!(with_remove.get("result"), Some(&json!({})));
+
+    // 调度日志纪律：成功与被拒调用都落日志（append_dispatch 在参数闸之前）；
+    // params 原样供 connector 侧依赖断言。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let reaction_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "sendStoryReaction")
+        .collect();
+    assert_eq!(reaction_entries.len(), 13, "成功两条 + 拒绝十一条均落日志");
+    assert_eq!(
+        reaction_entries[0]["params"]["storyAuthor"],
+        json!("+15555550101")
+    );
+    assert_eq!(
+        reaction_entries[0]["params"]["storyTimestamp"],
+        json!(1_700_000_000_000_u64)
+    );
+    assert_eq!(reaction_entries[0]["params"]["emoji"], json!("👍"));
+
+    // real 模式未注册账号：折叠 -32603 不触网（send 系同折叠）。
+    let real_dir = temp_dir("send-story-reaction-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "sendStoryReaction",
+        json!({
+            "account": "+15559990000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1,
+            "emoji": "👍"
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 #[test]
 fn mutating_methods_log_dispatch_and_reply() {
     let dir = temp_dir("dispatch-log");
