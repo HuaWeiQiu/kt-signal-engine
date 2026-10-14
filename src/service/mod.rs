@@ -1186,11 +1186,18 @@ pub(crate) struct Service {
     snapshot_imports: Arc<snapshot_import::SnapshotImportRegistry>,
     /// 已终止群登记表（进程内存，groups 模块：receive 投影 → send 面拦截）。
     terminated_groups: groups::TerminatedGroups,
-    /// transfer_archive 下载进度快照（进程内存，不落盘；§4.38 progress 面）。
+    /// transfer_archive 下载进度快照（进程内存，不落盘；§4.38 progress 面；
+    /// 失败终态同面透出，`transfer.downloadStatus` 观测）。
     transfer_progress: transfer_progress::TransferProgress,
+    /// transfer_archive 下载任务句柄注册表（进程内存；`history.importCancel`
+    /// 取消面 transfer 腿）。
+    transfer_downloads: transfer_progress::TransferDownloadRegistry,
     /// 云备份 restore 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
     /// §2 cloudStatus 面）。
     cloud_restore_progress: cloud_backup::CloudRestoreProgress,
+    /// 云备份 restore 在途任务句柄（进程级单槽：归属账号 + JoinHandle；
+    /// `history.importCancel` 取消面 restore 腿）。
+    cloud_restore_task: StdMutex<Option<(String, tokio::task::JoinHandle<()>)>>,
     /// 云备份 upload 进度/终态快照（进程内存单槽，不落盘；cloud-backup-contract
     /// §6.2 uploadStatus 面）。
     cloud_upload_progress: cloud_upload::CloudUploadProgress,
@@ -1249,7 +1256,9 @@ impl Service {
             snapshot_imports: Arc::new(StdMutex::new(HashMap::new())),
             terminated_groups: groups::TerminatedGroups::new(),
             transfer_progress: transfer_progress::TransferProgress::new(),
+            transfer_downloads: transfer_progress::TransferDownloadRegistry::new(),
             cloud_restore_progress: cloud_backup::CloudRestoreProgress::new(),
+            cloud_restore_task: StdMutex::new(None),
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
             conversation_state_books: StdMutex::new(HashMap::new()),
@@ -1355,8 +1364,9 @@ impl Service {
         let task_dir = store_dir.clone();
         let task_slot = Arc::clone(&slot);
         let task_progress = self.transfer_progress.clone();
+        let task_downloads = self.transfer_downloads.clone();
         tokio::task::spawn_local(async move {
-            match link_flow(store, url_tx, task_dir, task_progress).await {
+            match link_flow(store, url_tx, task_dir, task_progress, task_downloads).await {
                 Ok(number) => task_slot.complete(Ok(number)),
                 Err(()) => task_slot.complete(Err(())),
             }
@@ -1457,6 +1467,10 @@ impl Service {
             .map_err(|_| LinkError::Internal)?;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
+        // 同号重链：旧链接会话的在途存量下载中止 + 导入终态清缺（终态清除
+        // 触发器之三）——旧任务若继续跑会写旧目录、复活旧账号名下的快照面。
+        let _ = self.transfer_downloads.cancel(&number);
+        self.transfer_progress.clear(&number);
         // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
         // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
         let aci = account_aci(&pending.store_dir).await;
@@ -1487,10 +1501,11 @@ impl Service {
         rows
     }
 
-    /// transfer_archive 下载进度查询（契约 1.53 §4.38 扩展，connector 的
+    /// transfer_archive 下载进度/终态查询（契约 1.53 §4.38 扩展，connector 的
     /// `history.importStatus` progress 组合面消费）：进程内快照只读，无
-    /// 网络、无 store。快照缺席（未开始/已结束/引擎重启过）= None，消费方
-    /// 维持无 progress 的诚实投影。
+    /// 网络、无 store。快照缺席（未开始/已成功收尾/终态已被清除/引擎重启过）
+    /// = None，消费方维持无 progress 的诚实投影；`failed` 终态（短错误码）
+    /// 保留至清除触发器（begin/取消/重链）。
     pub(crate) fn transfer_archive_snapshot(
         &self,
         account: &str,
@@ -1499,6 +1514,10 @@ impl Service {
     }
 
     pub(crate) async fn delete_account(&self, account: &str) -> std::io::Result<bool> {
+        // 取消面：在途导入任务随账号摘除中止（transfer 下载 + 云备份 restore
+        // 两腿），进度/终态快照同步清缺——账号没了终态无人消费，半成品随
+        // 下面的目录删除一并消失。
+        let _ = self.history_import_cancel(account).await;
         // 注册表摘除并取回目录（fake 账号 dir=None）。
         let removed_dir: Option<PathBuf> = {
             let mut state = self.state.lock().await;
@@ -4163,11 +4182,14 @@ impl Service {
         let store = context.store.clone();
         let progress = self.cloud_restore_progress.clone();
         // 重入闸置位（原子 compare-and-set）：前置检查全过后、spawn 前抢占；
-        // 闭包收尾释放（finish_running），并发第二请求如实吃 AlreadyRunning。
-        if !cloud_backup::CloudRestoreProgress::try_begin_running() {
+        // 并发第二请求如实吃 AlreadyRunning。闸挂 RunningGuard——abort（取消）
+        // 路径闭包收尾不执行，守卫 Drop 保证闸不泄漏。
+        let Some(_running) = cloud_backup::CloudRestoreProgress::try_begin_running() else {
             return Err(cloud_backup::CloudRestoreError::AlreadyRunning);
-        }
-        tokio::task::spawn_local(async move {
+        };
+        // 会话归属登记（取消面按账号判定终态清不清）。
+        progress.start_session(account);
+        let task_handle = tokio::task::spawn_local(async move {
             use rand::SeedableRng as _;
             let mut rng = rand::rngs::StdRng::from_seed(rand::random());
             let rng: &mut (dyn rand::CryptoRng + Send) = &mut rng;
@@ -4186,8 +4208,15 @@ impl Service {
                 Ok(_) => progress.clear(),
                 Err(e) => progress.fail(e.rpc_code()),
             }
-            cloud_backup::CloudRestoreProgress::finish_running();
+            // _running 守卫随闭包收尾 Drop 释放闸；abort 路径则随 future
+            // 弃置 Drop——两路都不泄漏。
         });
+        // 句柄入单槽（归属账号随行）——`history.importCancel` 按账号中止
+        // 在途 restore（restore 腿）。
+        *self
+            .cloud_restore_task
+            .lock()
+            .expect("cloud restore task lock") = Some((account.to_owned(), task_handle));
         Ok(())
     }
 
@@ -4195,6 +4224,64 @@ impl Service {
     /// `{present:false}`）。
     pub(crate) fn cloud_backup_status(&self) -> Option<cloud_backup::CloudRestoreSnapshot> {
         self.cloud_restore_progress.snapshot()
+    }
+
+    /// 账号 store 目录（注册表快照后放锁；fake 账号/未知账号 = None）。
+    async fn account_dir(&self, account: &str) -> Option<PathBuf> {
+        let rel = self.state.lock().await.account_dir(account)?;
+        Some(self.data_dir.join(rel))
+    }
+
+    /// 存量历史导入取消（`history.importCancel` 服务面，KT 扩展）：按账号
+    /// 中止在途导入任务——transfer_archive 下载（transfer 腿）与云备份
+    /// restore（restore 腿）两腿都查——并清理半成品（`transfer-archive.bin`/
+    /// `history-import.ndjson`/`cloud-backup/`/`history-import-cloud.ndjson`）
+    /// 与快照面（在途 + failed 终态，两腿同清）。半成品按腿清理：取消哪腿
+    /// 清哪腿（被中止任务的在写 NDJSON 一并删——被取消的导入不得被
+    /// connector 消费链悄悄补上）；另一腿已完成待消费的产物不连坐。
+    ///
+    /// 返回 `true` = 确实中止了在途任务；无在途任务 = `false`（幂等成功，
+    /// 不假装取消了什么）。终态清除是取消的附带效果（终态清除触发器恰三：
+    /// begin/取消/重链）；restore 单槽属于其他账号时快照不动。
+    pub(crate) async fn history_import_cancel(&self, account: &str) -> bool {
+        // transfer 腿：abort 即弃（单线程 LocalSet，返回后任务不再执行）。
+        let transfer_cancelled = self.transfer_downloads.cancel(account);
+        // restore 腿：进程级单槽，仅当在途任务属于本账号才动；无在途时按
+        // 会话归属判定终态快照清不清（failed 终态挂在最近会话的账号上）。
+        let (restore_ours, restore_cancelled) = {
+            let mut slot = self
+                .cloud_restore_task
+                .lock()
+                .expect("cloud restore task lock");
+            match slot.as_ref() {
+                Some((owner, _)) if owner == account => {
+                    let mut cancelled = false;
+                    if let Some((_, handle)) = slot.take() {
+                        if !handle.is_finished() {
+                            handle.abort();
+                            cancelled = true;
+                        }
+                    }
+                    (true, cancelled)
+                }
+                _ => (self.cloud_restore_progress.owned_by(account), false),
+            }
+        };
+        // 半成品清理按腿进行：取消哪腿清哪腿——另一腿已完成的产物（等待
+        // connector 消费的 NDJSON）不连坐。
+        if let Some(dir) = self.account_dir(account).await {
+            if transfer_cancelled {
+                transfer_progress::remove_transfer_artifacts(&dir);
+            }
+            if restore_cancelled {
+                cloud_backup::remove_restore_artifacts(&dir);
+            }
+        }
+        self.transfer_progress.clear(account);
+        if restore_ours {
+            self.cloud_restore_progress.clear();
+        }
+        transfer_cancelled || restore_cancelled
     }
 
     /// 云备份 upload 启动（cloud-backup-contract §6.2：`backups.uploadToCloud`；
@@ -8075,6 +8162,7 @@ async fn link_flow(
     url_tx: futures::channel::oneshot::Sender<url::Url>,
     store_dir: PathBuf,
     transfer_progress: transfer_progress::TransferProgress,
+    transfer_downloads: transfer_progress::TransferDownloadRegistry,
 ) -> Result<String, ()> {
     let mut rng = rng();
     let password = Alphanumeric.sample_string(&mut rng, 24);
@@ -8192,8 +8280,9 @@ async fn link_flow(
             device_id: Some(device_id),
         };
         // 导出面 future 非 Send（上游 FramesReader 持 Rc 状态）：与链接/
-        // 接收任务同策略，LocalSet 承载（main 装配提供上下文）。
-        tokio::task::spawn_local(download_transfer_archive(
+        // 接收任务同策略，LocalSet 承载（main 装配提供上下文）。句柄入
+        // 注册表——`history.importCancel` 按账号中止在途下载（transfer 腿）。
+        let handle = tokio::task::spawn_local(download_transfer_archive(
             store_dir,
             service_ids.aci,
             backup_key,
@@ -8201,6 +8290,7 @@ async fn link_flow(
             number.clone(),
             transfer_progress,
         ));
+        transfer_downloads.register(&number, handle);
     }
     Ok(number)
 }
@@ -8208,13 +8298,26 @@ async fn link_flow(
 /// 存量历史迁移下载（best-effort）：`transfer_archive` 长轮询等手机上传
 /// 就绪（204 重试上限 10 次、间隔 3s、服务端单次挂起 60s），200 后从 CDN
 /// 拉档案，`history::export_archive` 解密逐帧导出 NDJSON 到账号 store 目录
-/// （`history-import.ndjson`，S3 connector 消费）。任何一步失败静默放弃并
-/// 清理半成品——失败形态即 NDJSON 缺席，消费方以文件存在性判定导入结果；
-/// 本任务不产生 stderr（compat §1），不影响链接成功。
+/// （`history-import.ndjson`，S3 connector 消费）。
+///
+/// 失败不再静默（官方行为基准：失败显形带错误与重试，桌面 UI 不傻等）：
+/// 任何一步失败在进度快照上保留 `failed` 终态（短错误码，
+/// `transfer.downloadStatus` 观测）——`no_archive`（204 耗尽 = 手机端没有
+/// 可传档案，独立信息态非故障）、`network`（长轮询面传输失败）、
+/// `cdn_unreachable`（CDN 段失败）、`decode_failed`（manifest/档案解不开）、
+/// `io`（本地文件面失败）；半成品清理纪律不变。本任务仍是 best-effort、
+/// 不影响链接成功，且不产生 stderr（compat §1）。
 ///
 /// 下载段边读边累计进程内进度快照（`account` 名下的 `progress` 观测面，
-/// 契约 1.53 §4.38 扩展）；无论成败，任务收尾清快照——快照缺席即引擎
-/// 无在途下载，消费方不猜。
+/// 契约 1.53 §4.38 扩展）；成功收尾清快照——快照缺席 = 无在途下载；
+/// 失败保留 failed 终态，清除触发器恰三：下次 begin（新会话）、
+/// `history.importCancel` 取消、账号重链。
+///
+/// 取消面：任务句柄入 `TransferDownloadRegistry`（per-account 单槽），
+/// `history.importCancel` abort 即在下一个 await 点弃任务（在途长轮询/
+/// CDN 流随 future 断），半成品由取消侧清理（单线程 LocalSet：abort 返回
+/// 后任务不再执行任何指令，两侧无写盘竞争）。
+#[allow(clippy::too_many_lines)]
 async fn download_transfer_archive(
     store_dir: PathBuf,
     aci: presage::libsignal_service::prelude::Uuid,
@@ -8223,6 +8326,7 @@ async fn download_transfer_archive(
     account: String,
     transfer_progress: transfer_progress::TransferProgress,
 ) {
+    use transfer_progress::failure;
     transfer_progress.begin(&account, None);
     let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
 
@@ -8236,14 +8340,14 @@ async fn download_transfer_archive(
             ) {
                 Ok(builder) => builder,
                 Err(_) => {
-                    transfer_progress.clear(&account);
+                    transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
             };
             let response = match response.send().await {
                 Ok(response) => response,
                 Err(_) => {
-                    transfer_progress.clear(&account);
+                    transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
             };
@@ -8252,20 +8356,22 @@ async fn download_transfer_archive(
                     let bytes = match response.bytes().await {
                         Ok(bytes) => bytes,
                         Err(_) => {
-                            transfer_progress.clear(&account);
+                            transfer_progress.fail(&account, failure::NETWORK);
                             return;
                         }
                     };
                     match serde_json::from_slice(&bytes) {
                         Ok(value) => break value,
                         Err(_) => {
-                            transfer_progress.clear(&account);
+                            transfer_progress.fail(&account, failure::DECODE_FAILED);
                             return;
                         }
                     }
                 }
                 204 if polls >= 9 => {
-                    transfer_progress.clear(&account);
+                    // 手机端没有可传档案：独立信息态（官方行为基准，非故障），
+                    // 快照同样终态保留供桌面诚实呈现。
+                    transfer_progress.fail(&account, failure::NO_ARCHIVE);
                     return;
                 }
                 204 => {
@@ -8273,7 +8379,7 @@ async fn download_transfer_archive(
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 _ => {
-                    transfer_progress.clear(&account);
+                    transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
             }
@@ -8283,7 +8389,7 @@ async fn download_transfer_archive(
         manifest["cdn"].as_u64().map(|value| value as u32),
         manifest["key"].as_str().map(str::to_owned),
     ) else {
-        transfer_progress.clear(&account);
+        transfer_progress.fail(&account, failure::DECODE_FAILED);
         return;
     };
 
@@ -8294,17 +8400,21 @@ async fn download_transfer_archive(
     ) {
         Ok(builder) => builder,
         Err(_) => {
-            transfer_progress.clear(&account);
+            transfer_progress.fail(&account, failure::CDN_UNREACHABLE);
             return;
         }
     };
     let response = match response.send().await {
         Ok(response) => response,
         Err(_) => {
-            transfer_progress.clear(&account);
+            transfer_progress.fail(&account, failure::CDN_UNREACHABLE);
             return;
         }
     };
+    if !response.status().is_success() {
+        transfer_progress.fail(&account, failure::CDN_UNREACHABLE);
+        return;
+    }
     // content-length 缺席（chunked/代理剥头）是诚实形态：total=None，只报
     // stage（官方 Process 段同理只有文案没有数字）。
     let bytes_total = response.content_length().filter(|total| *total > 0);
@@ -8322,7 +8432,7 @@ async fn download_transfer_archive(
                     archive_bytes.extend_from_slice(&chunk);
                 }
                 Err(_) => {
-                    transfer_progress.clear(&account);
+                    transfer_progress.fail(&account, failure::CDN_UNREACHABLE);
                     return;
                 }
             }
@@ -8331,12 +8441,13 @@ async fn download_transfer_archive(
 
     let archive_path = store_dir.join("transfer-archive.bin");
     if std::fs::write(&archive_path, &archive_bytes).is_err() {
-        transfer_progress.clear(&account);
+        transfer_progress.fail(&account, failure::IO);
         return;
     }
     // 导出（解密+分帧）是本地计算不再有下载字节：快照在导出前清掉——
     // connector 观测的 progress 只覆盖官方 Download 段，Process 段由
-    // connector 自己的导入 pass 投影（§4.38 progress 语义）。
+    // connector 自己的导入 pass 投影（§4.38 progress 语义）。导出失败
+    // 照样立 failed 终态（无快照也立，不依赖字节段曾开始）。
     transfer_progress.clear(&account);
     let ndjson_path = store_dir.join("history-import.ndjson");
     let outcome = std::fs::File::create(&ndjson_path)
@@ -8346,6 +8457,7 @@ async fn download_transfer_archive(
         Ok(writer) => writer,
         Err(_) => {
             let _ = std::fs::remove_file(&archive_path);
+            transfer_progress.fail(&account, failure::IO);
             return;
         }
     };
@@ -8355,6 +8467,7 @@ async fn download_transfer_archive(
     drop(writer);
     if exported.is_err() {
         let _ = std::fs::remove_file(&ndjson_path);
+        transfer_progress.fail(&account, failure::DECODE_FAILED);
     }
     let _ = std::fs::remove_file(&archive_path);
 }

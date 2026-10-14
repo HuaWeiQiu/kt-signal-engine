@@ -328,11 +328,15 @@ mod tests {
     }
 
     /// 进度面生命周期：begin/add/fail/clear + 在途前失败立 failed 相位；
-    /// 运行闸互斥（CAS 单抢到，finish 释放后可再抢）。
+    /// 运行闸互斥（守卫单抢到，Drop 释放后可再抢）+ 会话归属（取消面判定）。
     #[test]
     fn progress_lifecycle_and_running_gate() {
         let progress = CloudRestoreProgress::new();
         assert!(progress.snapshot().is_none());
+        assert!(!progress.owned_by("lk-a"), "未开会话无归属");
+        progress.start_session("lk-a");
+        assert!(progress.owned_by("lk-a"));
+        assert!(!progress.owned_by("lk-b"), "归属单槽，不串账号");
         progress.begin(Some(100));
         progress.add(40);
         let s = progress.snapshot().expect("in-flight");
@@ -346,9 +350,10 @@ mod tests {
         assert_eq!(s.phase, "failed");
         assert_eq!(s.bytes_read, 40);
         assert_eq!(s.error_code, Some("BACKUP_DOWNLOAD_FAILED"));
-        // 成功终态：清缺（transfer_archive 同纪律）。
+        // 成功终态：清缺（transfer_archive 同纪律）；归属一并清。
         progress.clear();
         assert!(progress.snapshot().is_none());
+        assert!(!progress.owned_by("lk-a"), "clear 连归属一起清");
         // 在途前失败（凭据段）：无快照也立 failed。
         progress.fail("BACKUP_AUTH_FAILED");
         let s = progress.snapshot().expect("early failure");
@@ -357,12 +362,43 @@ mod tests {
         progress.clear();
         assert!(progress.snapshot().is_none());
 
-        // 运行闸互斥。
-        assert!(CloudRestoreProgress::try_begin_running());
-        assert!(!CloudRestoreProgress::try_begin_running());
+        // 运行闸互斥（守卫持闸，Drop 释放）。
+        {
+            let guard = CloudRestoreProgress::try_begin_running();
+            assert!(guard.is_some(), "首抢命中");
+            assert!(
+                CloudRestoreProgress::try_begin_running().is_none(),
+                "在闸期间重入如实拒"
+            );
+            // 守卫 Drop 释放（含 abort 路径——闭包收尾不执行的场景）。
+        }
+        assert!(
+            CloudRestoreProgress::try_begin_running().is_some(),
+            "Drop 后闸已释放"
+        );
+        // 显式释放同路（测试直用关联函数钉释放语义）。
         CloudRestoreProgress::finish_running();
-        assert!(CloudRestoreProgress::try_begin_running());
-        CloudRestoreProgress::finish_running();
+    }
+
+    /// 取消侧半成品清理：密文工作目录与半途 NDJSON 双删，其余文件不动，
+    /// 幂等不因缺席炸。
+    #[test]
+    fn restore_artifact_cleanup_removes_workdir_and_ndjson() {
+        let dir =
+            std::env::temp_dir().join(format!("kt-engine-restore-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("cloud-backup")).expect("workdir");
+        std::fs::write(dir.join("cloud-backup/main"), b"ciphertext").expect("main");
+        std::fs::write(dir.join("history-import-cloud.ndjson"), b"{\"partial\"").expect("ndjson");
+        std::fs::write(dir.join("keep-me"), b"untouched").expect("other file");
+        remove_restore_artifacts(&dir);
+        assert!(!dir.join("cloud-backup").exists());
+        assert!(!dir.join("history-import-cloud.ndjson").exists());
+        assert!(
+            dir.join("keep-me").exists(),
+            "只清 restore 产物，不动其他文件"
+        );
+        remove_restore_artifacts(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -831,24 +867,42 @@ pub struct CloudRestoreSnapshot {
 }
 
 /// 进度注册表（Clone 供 Service 与 spawn 任务双持；进程内存不落盘）。
+/// owner = 当前/最近一次 restore 会话的账号（不投影 wire，只供按账号取消
+/// 与终态清除判定——快照面进程级单槽，cloudStatus 的 account 参数不参与
+/// 路由，但取消面必须区分「这是谁的 restore」）。
 #[derive(Clone, Default)]
 pub struct CloudRestoreProgress {
-    inner: std::sync::Arc<std::sync::Mutex<Option<CloudRestoreSnapshot>>>,
+    inner: std::sync::Arc<std::sync::Mutex<RestoreSession>>,
+}
+
+#[derive(Default)]
+struct RestoreSession {
+    snapshot: Option<CloudRestoreSnapshot>,
+    owner: Option<String>,
 }
 
 static CLOUD_RESTORE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 运行闸守卫（Drop 释放）：`history.importCancel` 经 abort 中止 restore
+/// 任务时闭包收尾代码不再执行——闸的释放挂守卫 Drop，取消路径不泄漏
+/// BACKUP_RUNNING（否则取消后的 restore 重入被永久误拒）。
+pub(crate) struct RunningGuard;
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        CloudRestoreProgress::finish_running();
+    }
+}
+
 impl CloudRestoreProgress {
     pub(crate) fn new() -> Self {
-        Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
+        Self::default()
     }
 
     /// 重入闸抢占（`backups.restoreFromCloud` start 前置检查全过后调用）：
-    /// false→true 原子换位成功 = 抢到；已 true = 并发/在途，如实拒。
-    pub(crate) fn try_begin_running() -> bool {
+    /// 抢到 = 持闸（守卫 Drop 释放）；已 true = 并发/在途，如实拒。
+    pub(crate) fn try_begin_running() -> Option<RunningGuard> {
         CLOUD_RESTORE_RUNNING
             .compare_exchange(
                 false,
@@ -857,15 +911,31 @@ impl CloudRestoreProgress {
                 std::sync::atomic::Ordering::SeqCst,
             )
             .is_ok()
+            .then_some(RunningGuard)
     }
 
-    /// 重入闸释放（spawn 闭包收尾唯一出口，成败同路）。
+    /// 重入闸释放（守卫 Drop 单点；保留关联函数供测试直用）。
     pub(crate) fn finish_running() {
         CLOUD_RESTORE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// 登记当前会话归属账号（start 闭包首行；取消/终态清除按账号判定）。
+    pub(crate) fn start_session(&self, owner: &str) {
+        self.inner.lock().expect("cloud progress lock").owner = Some(owner.to_owned());
+    }
+
+    /// 当前/最近一次会话是否属于该账号（取消面判定：终态快照清不清）。
+    pub(crate) fn owned_by(&self, account: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("cloud progress lock")
+            .owner
+            .as_deref()
+            == Some(account)
+    }
+
     pub(crate) fn begin(&self, bytes_total: Option<u64>) {
-        *self.inner.lock().expect("cloud progress lock") = Some(CloudRestoreSnapshot {
+        self.inner.lock().expect("cloud progress lock").snapshot = Some(CloudRestoreSnapshot {
             phase: "downloading",
             bytes_read: 0,
             bytes_total,
@@ -874,16 +944,16 @@ impl CloudRestoreProgress {
     }
 
     pub(crate) fn add(&self, bytes: u64) {
-        let mut guard = self.inner.lock().expect("cloud progress lock");
-        if let Some(snapshot) = guard.as_mut() {
+        let mut session = self.inner.lock().expect("cloud progress lock");
+        if let Some(snapshot) = session.snapshot.as_mut() {
             snapshot.bytes_read += bytes;
         }
     }
 
     /// 终态失败：保留已计字节（部分下载如实），翻相位 + 结构化 code。
     pub(crate) fn fail(&self, code: &'static str) {
-        let mut guard = self.inner.lock().expect("cloud progress lock");
-        let snapshot = guard.get_or_insert(CloudRestoreSnapshot {
+        let mut session = self.inner.lock().expect("cloud progress lock");
+        let snapshot = session.snapshot.get_or_insert(CloudRestoreSnapshot {
             phase: "failed",
             bytes_read: 0,
             bytes_total: None,
@@ -894,12 +964,22 @@ impl CloudRestoreProgress {
     }
 
     pub(crate) fn snapshot(&self) -> Option<CloudRestoreSnapshot> {
-        *self.inner.lock().expect("cloud progress lock")
+        self.inner.lock().expect("cloud progress lock").snapshot
     }
 
+    /// 会话收尾清快照（成功终态不留痕；取消/重登清除同路）——归属一并
+    /// 清除，旧账号名不残留到下一次会话。
     pub(crate) fn clear(&self) {
-        *self.inner.lock().expect("cloud progress lock") = None;
+        *self.inner.lock().expect("cloud progress lock") = RestoreSession::default();
     }
+}
+
+/// 取消侧半成品清理（云备份 restore 腿）：密文暂存工作目录（main）与
+/// 半途 NDJSON 产物。best-effort，不产生 stderr（compat §1）；账号目录
+/// 不存在（fake/已删除）同样安静。
+pub(crate) fn remove_restore_artifacts(account_dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(account_dir.join("cloud-backup"));
+    let _ = std::fs::remove_file(account_dir.join("history-import-cloud.ndjson"));
 }
 
 /// methods 挂载包装（mod.rs start 调用同签名）：AEP/ACI 从 store 取（

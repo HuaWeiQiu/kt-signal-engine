@@ -2731,7 +2731,8 @@ async fn dispatch(
         }
         // 云备份 restore 进度/状态（backups.cloudStatus，KT 扩展方法）：
         // transfer.downloadStatus 同款快照读（缺席={present:false}；在跑=
-        // {present:true, bytesRead, bytesTotal?}）；只读不落调度日志零 stderr
+        // {present:true, bytesRead, bytesTotal?}）；取消经 history.importCancel
+        // （在途与 failed 终态同清）；只读不落调度日志零 stderr
         // （storage 状态面纪律）。
         "backups.cloudStatus" => {
             // 进度面进程级单槽（同引擎至多一个 restore，运行闸全局）；account
@@ -2809,14 +2810,37 @@ async fn dispatch(
                 None => jsonrpc::success_response(id, json!({ "present": false })),
             }
         }
-        // transfer_archive 下载进度快照查询（transfer.downloadStatus，KT 扩展
-        // 方法）：`history.importStatus` progress 组合面的引擎侧只读数据源
-        // （契约 1.53 §4.38 扩展）。快照缺席（未开始/已结束/引擎重启过）=
-        // `{present: false}`；在跑 = `{present: true, bytesRead,
-        // bytesTotal?}`——total 缺席是诚实形态（content-length 拿不到），
-        // 消费方不给假 0。只读不落调度日志零 stderr，同 backup.exportStatus
-        // 纪律。未注册/fake 账号同样答 `{present: false}`：快照面是进程内
-        // 观测，不泄露注册状态。
+        // 存量历史导入取消（history.importCancel，KT 扩展方法）：按账号中止
+        // 在途导入任务——transfer_archive 下载与云备份 restore 两腿——并清理
+        // 半成品与进度/终态快照。响应 {"cancelled": bool}：true = 确实中止了
+        // 在途任务；无在途任务 = false（幂等成功，不假装取消了什么）。官方
+        // 行为基准对齐：Signal-Desktop 链接导入可取消（取消 = 立即中止下载
+        // 并清理半成品），失败显形带重试——取消与失败显形（transfer.download-
+        // Status failed 相位）是同一基准的两面。快照面纪律同 transfer.download-
+        // Status：进程内观测，不泄露注册状态（未注册/fake 账号同样答
+        // cancelled:false）；account 参数缺失/非字符串 -32603。不落调度日志
+        // 零 stderr（backups.restoreFromCloud 同纪律）。
+        "history.importCancel" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let cancelled = service.history_import_cancel(account).await;
+            jsonrpc::success_response(id, json!({ "cancelled": cancelled }))
+        }
+        // transfer_archive 下载进度/终态快照查询（transfer.downloadStatus，KT
+        // 扩展方法）：`history.importStatus` progress 组合面的引擎侧只读数据
+        // 源（契约 1.53 §4.38 扩展）。快照缺席（未开始/已成功收尾/终态已被
+        // 清除/引擎重启过）= `{present: false}`；在跑 = `{present: true,
+        // phase: "downloading", bytesRead, bytesTotal?}`——total 缺席是诚实
+        // 形态（content-length 拿不到），消费方不给假 0；失败终态显形（官方
+        // 行为基准：失败带错误与重试，桌面 UI 不傻等）= `{present: true,
+        // phase: "failed", bytesRead, bytesTotal?, errorCode}`——errorCode 短
+        // 码词表 no_archive（204 耗尽 = 手机端没传历史，独立信息态非故障）/
+        // network / cdn_unreachable / decode_failed / io，终态保留至清除触发
+        // 器（下次 begin / history.importCancel / 账号重链）。phase/errorCode
+        // 为 wire additive（1.53 形状零回归）。只读不落调度日志零 stderr，同
+        // backup.exportStatus 纪律。未注册/fake 账号同样答 `{present: false}`：
+        // 快照面是进程内观测，不泄露注册状态。
         "transfer.downloadStatus" => {
             let account = params.get("account").and_then(Value::as_str).unwrap_or("");
             let snapshot = service.transfer_archive_snapshot(account);
@@ -2825,10 +2849,14 @@ async fn dispatch(
                 Some(snapshot) => {
                     let mut value = json!({
                         "present": true,
+                        "phase": snapshot.phase,
                         "bytesRead": snapshot.bytes_read,
                     });
                     if let Some(total) = snapshot.bytes_total {
                         value["bytesTotal"] = json!(total);
+                    }
+                    if let Some(code) = snapshot.error_code {
+                        value["errorCode"] = json!(code);
                     }
                     value
                 }

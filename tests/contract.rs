@@ -5942,3 +5942,67 @@ fn delete_for_me_conversation_faces_and_param_fail_closed() {
         .expect("localOnly arm logged");
     assert_eq!(logged_local["params"]["localOnly"], json!(true));
 }
+
+/// history.importCancel（存量历史导入取消，KT 扩展方法）：按账号中止在途
+/// 导入任务（transfer_archive 下载 + 云备份 restore 两腿）并清理半成品与
+/// 快照面。契约面钉定：无在途任务 = `{"cancelled": false}` 幂等成功（不
+/// 假装取消了什么；未注册/fake 账号同形状——快照面是进程内观测，不泄露
+/// 注册状态）；account 参数缺失/非字符串 -32603；取消面与
+/// transfer.downloadStatus 同不落调度日志（进程内观测面纪律）。在途中止/
+/// 半成品清理需真机（下载链路触网），归真机回归；单测面见
+/// transfer_progress.rs 注册表语义与清理器测试。
+#[test]
+fn history_import_cancel_idempotent_and_absent_shape() {
+    let assert_shape = |result: &Value| {
+        let obj = result.as_object().expect("result object");
+        assert_eq!(obj.keys().collect::<Vec<_>>().as_slice(), ["cancelled"]);
+        assert_eq!(obj["cancelled"], json!(false), "无在途任务 = false");
+    };
+
+    // fake 模式：无网络无在途任务，取消恒幂等 false。
+    let fake_dir = temp_dir("import-cancel-fake");
+    let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    assert_shape(
+        &fake_engine.request("history.importCancel", json!({ "account": "+15550001111" }))
+            ["result"],
+    );
+    // 参数闸：account 缺失/非字符串 -32603（fail-closed dispatch 层）。
+    assert_eq!(
+        fake_engine.error_of("history.importCancel", json!({})).0,
+        -32603
+    );
+    assert_eq!(
+        fake_engine
+            .error_of("history.importCancel", json!({ "account": 42 }))
+            .0,
+        -32603
+    );
+    // 配套面：transfer.downloadStatus 快照缺席形状（fake 无下载）。
+    assert_eq!(
+        fake_engine.request(
+            "transfer.downloadStatus",
+            json!({ "account": "+15550001111" })
+        )["result"],
+        json!({ "present": false })
+    );
+    drop(fake_engine);
+    assert!(
+        !fake_dir.join("engine-send-log.jsonl").exists(),
+        "取消/进度观测面不落调度日志"
+    );
+
+    // real 模式 + 全新数据目录：未注册账号同形状（不泄露注册状态）。
+    let real_dir = temp_dir("import-cancel-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_shape(
+        &real_engine.request("history.importCancel", json!({ "account": "+15550001111" }))
+            ["result"],
+    );
+    assert_eq!(
+        real_engine.request(
+            "transfer.downloadStatus",
+            json!({ "account": "+15550001111" })
+        )["result"],
+        json!({ "present": false })
+    );
+}
