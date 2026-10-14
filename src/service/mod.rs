@@ -493,14 +493,30 @@ const ATTACHMENT_MAX_BYTES: usize = 100_000_000;
 struct ParsedAttachment {
     spec: presage::libsignal_service::sender::AttachmentSpec,
     bytes: Vec<u8>,
+    /// `;gif=true` 出向 GIF 旗标——钉定 presage AttachmentSpec 无 gif 位，
+    /// 不能走 spec 面；由 upload_attachments_for_send 在上传后按本位对返回
+    /// 指针置 Flags.GIF（官方消息组装期置位同构，见 apply_outgoing_gif_flag）。
+    is_gif: bool,
+}
+
+/// 出向 GIF 旗标单点：官方 GIF 消息 = 普通附件 DataMessage.attachments[].flags
+/// 带 Flags.GIF=8 位（接收投影 isGif 同位读回，Attachment.std.ts 收发同位）。
+/// flags 是客户端线上陈述，CDN 上行面零涉及——上传返回指针直接置位与官方
+/// 消息组装期置位同构；与既有位（voice/borderless）按位掩码叠加，重复置位
+/// 幂等。
+fn apply_outgoing_gif_flag(pointer: &mut presage::proto::AttachmentPointer) {
+    use presage::proto::attachment_pointer::Flags;
+    pointer.flags = Some(pointer.flags.unwrap_or(0) | Flags::Gif as u32);
 }
 
 /// send 附件条目解析：data URI 唯一形状 = connector 上游形状
-/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true];base64,<payload>`
+/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true];base64,<payload>`
 /// （RFC 2397 扩展 filename 参数同款；voice 参数映射官方 VOICE_MESSAGE
-/// flags，presage voice_note→AttachmentPointer.flags 官方同构）。mediatype
-/// 缺省 application/octet-stream；非 base64 / 坏 percent / 坏 base64 /
-/// 坏 voice 值 / 超上限一律 None（fail-closed）。
+/// flags，presage voice_note→AttachmentPointer.flags 官方同构；gif 参数映射
+/// 官方 Flags.GIF=8 位，参数面无 mediatype 闸——官方 Tenor GIF 即
+/// video/mp4 载体带 GIF 位，媒体类自判归消费方，收投影 isGif 同口径）。
+/// mediatype 缺省 application/octet-stream；非 base64 / 坏 percent / 坏
+/// base64 / 坏 voice/gif 值 / 超上限一律 None（fail-closed）。
 fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     let rest = uri.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
@@ -514,6 +530,7 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     let mut filename = None;
     let mut is_base64 = false;
     let mut is_voice = false;
+    let mut is_gif = false;
     for param in parts {
         if param.eq_ignore_ascii_case("base64") {
             is_base64 = true;
@@ -524,6 +541,14 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
         } else if let Some(value) = param.strip_prefix("voice=") {
             match value {
                 "true" => is_voice = true,
+                "false" => {}
+                _ => return None,
+            }
+        } else if param.eq_ignore_ascii_case("gif") {
+            is_gif = true;
+        } else if let Some(value) = param.strip_prefix("gif=") {
+            match value {
+                "true" => is_gif = true,
                 "false" => {}
                 _ => return None,
             }
@@ -548,6 +573,7 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
             ..presage::libsignal_service::sender::AttachmentSpec::default()
         },
         bytes,
+        is_gif,
     })
 }
 
@@ -8756,7 +8782,10 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
 /// 数字位匹配；都不中返回 None，回退语义由调用方决定。
 /// send 附件上行：官方 CDN v4 面零 fork（presage upload_attachments，加密/
 /// padding/digest/上传全官方原语）。任何一条失败整体 fail-closed（半发的
-/// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。
+/// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。GIF 旗标
+/// 在上传后按 parsed 序对齐置位（presage join_all 保序，input 序 = output
+/// 序）——flags 纯客户端线上陈述，见 apply_outgoing_gif_flag；贴纸图走
+/// upload_sticker_image 单条面不经此处（官方贴纸指针无 GIF 位）。
 async fn upload_attachments_for_send(
     manager: &Manager<SqliteStore, Registered>,
     entries: &[String],
@@ -8786,13 +8815,14 @@ async fn upload_attachments_for_send(
     if parsed.is_empty() {
         return Ok((Vec::new(), None));
     }
+    let mut is_gif_flags = Vec::with_capacity(parsed.len());
+    let mut batch = Vec::with_capacity(parsed.len());
+    for item in parsed {
+        is_gif_flags.push(item.is_gif);
+        batch.push((item.spec, item.bytes));
+    }
     let uploads = manager
-        .upload_attachments(
-            parsed
-                .into_iter()
-                .map(|item| (item.spec, item.bytes))
-                .collect(),
-        )
+        .upload_attachments(batch)
         .await
         .map_err(send_error_of)?;
     let mut pointers = uploads
@@ -8800,6 +8830,11 @@ async fn upload_attachments_for_send(
         .map(|result| result.ok())
         .collect::<Option<Vec<_>>>()
         .ok_or(SendError::Internal)?;
+    for (pointer, is_gif) in pointers.iter_mut().zip(is_gif_flags) {
+        if is_gif {
+            apply_outgoing_gif_flag(pointer);
+        }
+    }
     let image = image_index.map(|index| pointers.remove(index));
     Ok((pointers, image))
 }
@@ -9608,6 +9643,62 @@ mod tests {
         none("data:text/plain,aGVsbG8=");
         none("data:text/plain;filename=%zz;base64,aGVsbG8=");
         none("data:text/plain;base64,not@base64!");
+    }
+
+    #[test]
+    fn attachment_data_uri_parses_gif_param() {
+        let parsed = |uri| parse_attachment_data_uri(uri).expect("parses");
+        let none = |uri| assert!(parse_attachment_data_uri(uri).is_none());
+
+        // 基线：mediatype image/gif 不自动带旗标——GIF 位是显式参数面，
+        // 非内容嗅探（官方 Tenor GIF 常为 video/mp4 载体，同不嗅探）。
+        let plain = parsed("data:image/gif;base64,aGVsbG8=");
+        assert!(!plain.is_gif);
+
+        // gif 裸参数与 gif=true 等价（voice 同款参数面）。
+        for uri in [
+            "data:video/mp4;gif;base64,aGVsbG8=",
+            "data:video/mp4;gif=true;base64,aGVsbG8=",
+            "data:video/mp4;gif=true;filename=tenor%20clip.mp4;base64,aGVsbG8=",
+        ] {
+            assert!(parsed(uri).is_gif);
+        }
+
+        // gif=false 显式不带旗标；非 bool 值 fail-closed（voice 同款）。
+        assert!(!parsed("data:image/gif;gif=false;base64,aGVsbG8=").is_gif);
+        none("data:image/gif;gif=1;base64,aGVsbG8=");
+        none("data:image/gif;gif=yes;base64,aGVsbG8=");
+
+        // voice+gif 共存：两旗标互不挤占（wire 按位掩码叠加）。
+        let both = parsed("data:video/mp4;voice=true;gif=true;base64,aGVsbG8=");
+        assert_eq!(both.spec.voice_note, Some(true));
+        assert!(both.is_gif);
+    }
+
+    #[test]
+    fn outgoing_gif_flag_or_masks_and_is_idempotent() {
+        use presage::proto::attachment_pointer::Flags;
+        use presage::proto::AttachmentPointer;
+
+        // 平指针：置位后恰 GIF=8 单位。
+        let mut plain = AttachmentPointer::default();
+        apply_outgoing_gif_flag(&mut plain);
+        assert_eq!(plain.flags, Some(Flags::Gif as u32));
+
+        // voice 已置位指针：按位叠加不挤占（官方 voice+gif 同位掩码面）。
+        let mut voiced = AttachmentPointer {
+            flags: Some(Flags::VoiceMessage as u32),
+            ..AttachmentPointer::default()
+        };
+        apply_outgoing_gif_flag(&mut voiced);
+        assert_eq!(
+            voiced.flags,
+            Some(Flags::VoiceMessage as u32 | Flags::Gif as u32)
+        );
+
+        // 已置 GIF 再置：幂等（不翻倍不变形）。
+        apply_outgoing_gif_flag(&mut plain);
+        assert_eq!(plain.flags, Some(Flags::Gif as u32));
     }
 
     #[test]
