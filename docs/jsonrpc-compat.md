@@ -161,7 +161,7 @@ send message: Signal server unavailable.
 | `setExpirationTimer` | `{account, recipient(单字符串), expirationInSeconds}`（0=关闭） | `{timestamp}`（广播信封时间戳；同值 no-op = 处理时刻） | 参数缺失/形状错（recipient 数组、timer 字符串/负数/小数/超 u32）/未注册联系人/未注册账号 `-32603` | **E 批 real（2026-10-05 消失消息对齐）**：1:1 计时器设置 + expiration-update 广播（signal-cli `Manager.setExpirationTimer` 语义对位：先持久化 presage store Contact 面 (timer, version+1) 再广播；构造面不设 expire_timer，presage send 面注入，详见 §5）；fake：成功 `{"timestamp":u64}` |
 | `sendCallMessage` | `{account, recipient(单号码/ACI)?\|group(32B 群 master key 标准 base64，listGroups/terminateGroup/updateGroup 的 groupId 同源口径)?——寻址两腿恰一互斥, data?(base64 opaque), urgency?("droppable"\|"handleImmediately" 缺省 droppable), legacy?({kind:"busy", id:正数} \| {kind:"hangup", id:正数, type?("normal"\|"accepted"\|"declined"\|"busy"\|"needPermission" 缺省 normal), deviceId?}), destinationDeviceId?}`（modern 面=data+urgency 构造 `CallMessage{opaque{data,urgency}}`；legacy 面=busy/hangup 官方裸帧族构造 `CallMessage{busy{id}}`/`CallMessage{hangup{id,type,deviceId?}}` 无 opaque 字段；**两面互斥**——同置或都缺 `-32603`；**两腿恰一**（2026-10-08 群臂批）——`group` 与 `recipient` 同置/都缺/任一腿形状非法 `-32603`；群腿仅 modern 面放行（官方群信令恒 opaque，legacy 裸帧族群向无先例；sender-key 群发无设备定向位——destinationDeviceId 与 group 同置 `-32603`）；`groupId` 键维持禁入（wire 参数名是 `group`）） | `{timestamp}`（信封时间戳） | 参数缺失/形状错（data 非 base64/空负载、urgency 非法值或非字符串、legacy 未知 kind/id 缺席·≤0/type 非法词/deviceId 超 u32、两面同置、destinationDeviceId 超 u32 或非数值、group 非法 base64/≠32B/非字符串、两腿同置/都缺、groupId 键在场、群腿携 legacy 或 destinationDeviceId）/未注册账号 `-32603`；群腿目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-08 群臂批） | **2026-10-06 real（KT 扩展，通话消息面）**：官方 Content.callMessage=3 信封（Signal-RTC 层信令负载，引擎不解析只透传）；**2026-10-06 legacy 帧批（1.53 协同）**：legacy busy/hangup 按官方 proto 裸帧族编码（官方桌面 callingMessageToProto busy={id}/hangup={id,type}；RingRTC 2.72.1 出向 hangup/busy 实证无 opaque 材料；signal-cli 0.14.7 CallManager sendBusyViaSignal/sendHangupViaSignal 同构）——单测钉 prost 字节编码（busy=字段5{id}、hangup=字段7{id,type,deviceId}、两面无字段10）；presage `send_message` 通路（sent-transcript 缺席见 §5 通话消息块；online 位 2026-10-11 六问批勘误：官方桌面 call 发送链同样不设 online——仅 typing 消息设 online:true，**无偏差**，原「online=false 偏差」登记作废，§5 六问批）；**2026-10-08 群臂批（P4b，connector 契约 1.82 wire 面对位，engine-compat）**：`group` 腿 sender-key 群发（官方 #handleSendCallMessageToGroup calling.preload.ts:3338-3407 → sendCallingMessage.preload.ts:99-118 isGroup 臂 sendContentMessageToGroup 同落点），群头 = open_group_sender（terminated 硬拒，send 系群组形态同纪律）+ `send_message_to_group`（sendTyping 群臂同原语）；单测钉群臂 wire = `CallMessage{opaque{data,urgency}}` 字段10（无 busy/hangup/destinationDeviceId 位）；fake：成功 `{"timestamp":u64}` 两臂同口径（落调度日志，协议上行面纪律） |
 | `sendGroupCallUpdate` | `{account, groupId(32B 标准 base64 群 master key，listGroups id 同源；参数层 decode_group_id 闸——fake 面同口径), eraId(必填非空字符串)}` | `{}` | 参数缺失/形状错（groupId 缺席·非 base64·≠32B、eraId 缺席·空串·非字符串、account 缺席）/未注册账号 `-32603`；announcements-only 群非 admin `SEND_TARGET_ANNOUNCEMENTS_ONLY`、群已终止 `SEND_TARGET_TERMINATED`（`-1` + message，群发送系同口径） | **2026-10-11 real（KT 扩展，六问批 Q4，官方群通话开始/结束信令发送面对位）**：官方 `sendToGroup {groupCallUpdate:{eraId}, groupV2, timestamp}`（jobs/helpers/sendGroupCallUpdate.preload.ts:23-100 同构）——`DataMessage.groupCallUpdate{eraId}`（field 19）走 dispatch_group MRM 主路径（group_v2 上下文 + announcements 闸 + terminated 硬拒沿群发送系；官方不设 announcements 闸，KT 群发送闸族统一收口 = 偏差登记 §5）；1:1 通话信令无此形态（走 sendCallMessage）；接收投影 `dataMessage.groupCallUpdate {eraId}` 见 §3 receive 面；fake：成功 `{}`（落调度日志，协议上行面纪律） |
-| `sendStoryReaction` | `{account, storyAuthor(必填非空——被回应 story 作者 ACI/号码), storyTimestamp(u64 必填 >0 毫秒——被回应 story 发送时刻), emoji(必填非空)}`（remove 无参——官方 story 反应恒 remove:false，sendNormalMessage reactionForSend 同位硬编码；目的地 = story 作者会话 1:1 直聊腿） | `{}` | account/storyAuthor/emoji 缺失·空串·非字符串/storyTimestamp 缺席·0·非数 `-32603`；storyAuthor 不可解析（本机号走注册数据→contacts E.164→UUID 直通，sendReaction 同链）/未注册账号/身份拒发闸/profileSharing 折叠 同 send `-32603` | **2026-10-14 real（KT 扩展，story 反应发送批 S4，官方 reactToStory 行为对齐，wire additive，engine-compat，§5 块）**：官方 `stories.preload.ts:556 reactToStory → StoryViewer.dom.tsx:649-657` 同链——reaction 锚双写：`Reaction{emoji, targetAuthorAci, targetSentTimestamp, remove:false}` ∧ `StoryContext{authorAci, sentTimestamp}` 同一作者/同一 story 时刻（SendMessage.preload.ts toProto:637-649 同构）；1:1 story reaction 走普通直聊腿不走 story 通道（官方 sendNormalMessage.preload.ts:430「1:1 story replies should not set story=true」同构——信封无 story 位）；P9 profileSharing 闸 + 身份拒发闸在闸面；sync 面 = presage fork send_message 自带普通 sent 转录，无独立回执面（story 查看回执另批，边界）；群 story 腿（story 通道 groupV2 形态）v1 不做；fake：成功 `{}`（落调度日志，send 系同款） |
+| `sendStoryReaction` | `{account, storyAuthor(必填非空——被回应 story 作者 ACI/号码), storyTimestamp(u64 必填 >0 毫秒——被回应 story 发送时刻), emoji(必填非空), groupId?(非空字符串——engine groupId 群 master key 标准 base64，与 sendStory group/sendTextGroup 同一口径，E-S7r 批；在场 = 群 story 反应腿，缺席/null = 1:1 作者直发腿现状零变化)}`（remove 无参——官方 story 反应恒 remove:false，sendNormalMessage reactionForSend 同位硬编码；目的地 = story 作者会话 1:1 直聊腿 / groupId 在场 = 群会话普通群通道） | `{}`（1:1 腿）· 群腿 `{group: {groupId, timestamp}}`（groupId 回显 + 群腿时刻 u64，E-S7r 批 additive——对齐 sendStory group 应答先例） | account/storyAuthor/emoji 缺失·空串·非字符串/storyTimestamp 缺席·0·非数/groupId 非字符串·空串 `-32603`；storyAuthor 不可解析（本机号走注册数据→contacts E.164→UUID 直通，sendReaction 同链）/未注册账号/身份拒发闸/profileSharing 折叠 同 send `-32603`；群腿：groupId 32B 解码失败 `-32603`/群已终止 `-1`+`SEND_TARGET_TERMINATED`/announcements-only 非 admin `-1`+`SEND_TARGET_ANNOUNCEMENTS_ONLY`/作者不可解析 `-32603`（结构化错误面同群发送，send_error 单点） | **2026-10-14 real（KT 扩展，story 反应发送批 S4，官方 reactToStory 行为对齐，wire additive，engine-compat，§5 块）**：官方 `stories.preload.ts:556 reactToStory → StoryViewer.dom.tsx:649-657` 同链——reaction 锚双写：`Reaction{emoji, targetAuthorAci, targetSentTimestamp, remove:false}` ∧ `StoryContext{authorAci, sentTimestamp}` 同一作者/同一 story 时刻（SendMessage.preload.ts toProto:637-649 同构）；1:1 story reaction 走普通直聊腿不走 story 通道（官方 sendNormalMessage.preload.ts:430「1:1 story replies should not set story=true」同构——信封无 story 位）；P9 profileSharing 闸 + 身份拒发闸在闸面；sync 面 = presage fork send_message 自带普通 sent 转录，无独立回执面（story 查看回执另批，边界）；群 story 腿（story 通道 groupV2 形态）v1 不做（**措辞失真与边界已由 E-S7r 批翻案订正，见后**）；fake：成功 `{}`（落调度日志，send 系同款）；**2026-10-15 real（KT 扩展，群 story 反应发送面批 E-S7r，官方对齐 Signal-Desktop abe80d3，wire additive，engine-compat，§5 块）**：`groupId` 可选参数扩群腿——S4 批「群 story 腿（story 通道 groupV2 形态）」措辞失真随本批订正：官方群 story 反应走**普通群通道 dataMessage** 非 Content.storyMessage（enqueueReactionForSend.preload.ts:84-91 群 story targetConversation = 群本身；sendNormalMessage 群臂 groupSendOptions 携 reaction+storyContext，remove 恒 false :711-723；toProto groupV2:642/storyContext:567-579/reaction:663-679 三键共存）；引擎群腿 = 共享群发送路径单点（open_group_sender 三闸 + dispatch_group group_v2 注入 {masterKey, revision, groupChange:None}）+ 复用 build_story_reaction_data_message；群腿不走直聊身份/profileSharing 闸（群发送面同口径）；sync 面 = 群发送路径 Sent 转录自带；fake：群腿成功 `{group:{groupId, timestamp}}`、缺席腿 `{}` 零变化（落调度日志，send 系同款） |
 | `calls.linkPresentation` | `{account, rootKey(标准 base64，解码后恰 16B(V0)/21B(V1)——RingRTC CallLinkRootKey 两版本定长，zkgroup 派生只取前 16B CRN)}` | `{presentation(标准 base64 = CallLinkAuthCredentialPresentation bincode 序列化字节，当天 UTC 兑换日呈现)}` | 参数缺失/rootKey 非 base64·解码后非 16/21B/未注册账号 `-32603`；服务器拒绝·zkgroup 兑换/呈现验证失败·当日凭据缺席 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? = HTTP 状态码诚实透传）；网络/传输面 `CALL_CREDENTIALS_UNAVAILABLE`（`-1` + message，retryable=true 语义）（**两枚新码位，connector 白名单登记归 connector 批**） | **2026-10-09 real（KT 扩展，P4c 切一 call-link 凭据材料面，§5 块）**：官方 getCallLinkAuthCredentialPresentation 同链（util/callLinks/zkgroup.preload.ts:16-49）——双族凭据缓存取当日 CallLinkAuthCredential（窗口算法逐字对齐官方 getDatesForRequest，§5 块）→ `present(ACI, 兑换日秒, GenericServerPublicParams, CallLinkSecretParams::derive_from_root_key)` → bincode 序列化出字节（官方返未序列化对象给 RingRTC 绑定，引擎字节化出 RPC）；凭据/呈现字节只内存转发零日志零落盘（relay-api-v2 §5 纪律）；fake：参数闸后形状桩 `{presentation}`（桩字节非有效 zk 材料仅钉形状），不落调度日志 |
 | `calls.createLinkAuth` | `{account, rootKey(同 calls.linkPresentation 闸), roomId(标准 base64，解码后恰 32B——RingRTC `derive_room_id` HKDF-SHA256 固定 32B 输出)}` | `{presentation(标准 base64 = CreateCallLinkCredentialPresentation bincode 序列化), callLinkPublicParams(标准 base64 = CallLinkPublicParams bincode 序列化)}`（官方 createCallLink 凭据段双材料同形） | 参数缺失/rootKey·roomId 形状错/未注册账号 `-32603`；服务器拒绝·zkgroup 两段式兑换验证失败 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE`（同上行列） | **2026-10-09 real（同批）**：官方 createCallLink 凭据段同链（calling.preload.ts:860-940）——`CreateCallLinkCredentialRequestContext::new(roomId)` → `POST v1/call-link/create-auth`（chatService host 本机凭据，json `{createCallLinkCredentialRequest: b64}` → `{credential: b64}`，WebAPI.preload.ts:3439-3453 端点+形状、:1471-1473 schema；官方 2026-09-10 起加 `?v101=true` 切 V1 族，v0.99.0 钉不移植）→ `context.receive(ACI, GenericServerPublicParams)` → `present(roomId, ACI, generic, derive_from_root_key(rootKey))` + `get_public_params()` 双序列化；rootKey 生成/roomId 派生/adminPasskey 皆 RingRTC 侧职责引擎不收不做；单次 RPC 内两段式（无跨调用状态）；fake：参数闸后形状桩双键 |
 | `calls.groupProof` | `{account, groupId(32B 标准 base64 群 master key，listGroups/terminateGroup 的 groupId 同源)}` | `{proof(token 字符串 = ExternalGroupCredential.token 原样透出；RingRTC setMembershipProof 消费其 UTF-8 字节)}` | 参数缺失/groupId 非 base64·≠32B/未注册账号 `-32603`；服务器拒绝（凭据无效/非群成员）·响应 proto 解码失败·当日凭据缺席 `CALL_CREDENTIALS_FAILED`（`-1` + message，data.status? 透传）；网络面 `CALL_CREDENTIALS_UNAVAILABLE` | **2026-10-09 real（同批）**：官方 fetchMembershipProof 同链（groups.preload.ts:1782-1806 → WebAPI getExternalGroupCredential:4566-4586）——双族缓存取当日 AuthCredentialWithPni → present(group) → `GET v2/groups/token`（storageService host，basic auth = `hex(GroupPublicParams):hex(presentation)`，generateGroupAuth:4533-4540 同构）→ `ExternalGroupCredential{token=1}`（Groups.proto:285-287，presage::proto 生成面复用）解 token 透出；fake：参数闸后形状桩 `{proof}` |
@@ -2475,6 +2475,74 @@ Signal-Desktop abe80d3，wire additive，engine-compat）
   群态/成员解析归 real 面 fake 不可达）。契约测试
   `send_story_fake_shape_and_param_fail_closed` 扩面（群单腿/混合受众/
   group 形状闸/recipients 空批双态/群腿结构化错误面）。
+
+群 story 反应发送面（E-S7r，2026-10-15，KT 扩展 `sendStoryReaction`
+groupId 腿，官方对齐 Signal-Desktop abe80d3，wire additive，engine-compat）
+
+- **边界翻案记档**：S4 批（2026-10-14）原定「群 story 反应发送腿不做」
+  并把群 story 反应线格式记为「story 通道 groupV2 形态」——本批明示翻
+  案并订正措辞：官方实锚是**普通群通道 dataMessage**（DataMessage 三键
+  共存），非 Content.storyMessage（story 通道）——`enqueueReactionForSend
+  .preload.ts:84-91` 群 story `targetConversation = 群本身`（仅 1:1 story
+  才换作者会话 `get(targetAuthorAci)`），群臂走 sendToGroup
+  （sendNormalMessage.preload.ts:355-383 groupSendOptions 携
+  reaction+storyContext）。transport 的 story 位（`story:
+  Boolean(storyContext)` :381——群发送 endorsement 跳过/access key XOR
+  story 位）不对齐，传输细节，DataMessage 形状不变（边界①）。
+- **官方发送锚（abe80d3 第一手实读，行为对齐不抄码）**：
+  - 目的地：`enqueueReactionForSend.preload.ts:84-91`（群 story → 群
+    本身；1:1 story → 作者会话，S4 批已落）。
+  - remove 恒 false：`sendNormalMessage.preload.ts:711-723`
+    （reactionForSend 硬编码 `remove: false`，群腿与 1:1 腿同源无
+    remove 参）。
+  - 三键共存：`SendMessage.preload.ts` toProto——groupV2 :642 /
+    storyContext :567-579 / reaction :663-679 三独立键同一 DataMessage
+    （DataMessage 字段位非 oneof，官方同帧共存即 wire 事实）。
+  - 群上下文值源：群发送既有 `getGroupV2Info()` 本地群态同源（群 story
+    发送面批已锚）——引擎侧 = dispatch_group 群态注入单点。
+- **引擎发送面**：`sendStoryReaction` params 增可选 `groupId`（非空字符
+  串 = engine groupId，32B master key 标准 base64，sendStory group/
+  sendTextGroup 同一口径；缺失/null = 1:1 作者直发腿现状零变化逐字节；
+  非字符串/空串 fail-closed）。群腿 = 共享群发送路径全单点：
+  `open_group_sender`（32B 解码 fail-closed + terminated 硬拒）+
+  `dispatch_group`（announcementsOnly 非 admin 拒 group_mrm:225-227 同
+  源 + group_v2 自动注入 `{masterKey, revision, groupChange: None}`
+  :211-216 同源——MRM 主路 + vendored failover + Sent 转录群发送同款）；
+  reaction/storyContext 两键复用 `build_story_reaction_data_message`
+  （1:1 腿构造单点，双锚同值、remove 恒 Some(false) 官方同位）；作者
+  ACI 解析与 1:1 腿同链同严（本机号→contacts E.164→UUID 直通，不可解
+  析 Internal 不透传号码）。群腿不走直聊身份拒发闸/profileSharing 白名
+  单（群发送面同口径，sendReactionGroup 同构）；1:1 腿双闸维持现状。
+- **应答面（additive）**：群腿 `{group: {groupId, timestamp}}`（groupId
+  回显 + 群腿时刻 u64；对齐 sendStory group 应答先例——additive 键缺
+  席不在，1:1 腿 `{}` 零变化，无顶层 timestamp/results 面）；群腿错误
+  走 send_error 结构化单点（-1 词族 + -32603 折叠，群发送同款），1:1
+  腿错误面零变化。
+- **fail-closed 闸（逐键理由）**：①groupId 非字符串/空串 `-32603`
+  （静默丢群腿是 fail-open）；②32B 解码失败 `-32603`（decode_group_id
+  单点，官方 deriveGroupFields 非 32B 抛错同构）；③terminated `-1` +
+  `SEND_TARGET_TERMINATED`；④announcementsOnly 非 admin `-1` +
+  `SEND_TARGET_ANNOUNCEMENTS_ONLY`（官方 story 面按「跳过该群」降级 vs
+  引擎 fail-closed 上抛——sendStory 群腿同款偏差，记档）；⑤作者不可解
+  析 `-32603`（不透传号码）。
+- **sync/回执面**：sync 面 = 共享群发送路径 Sent 转录自带
+  （build_group_sent_transcript，message 载 group_v2+reaction+
+  storyContext 同一 DataMessage），无独立回执面（story 查看回执既
+  有边界）。接收侧零改动：直收群 story 反应（官方带信封 story 位 +
+  三键）→ E2 闸 is_group_story_reply 豁免照投（既有）；本批自发腿信封
+  无 story 位（普通群通道）→ 普通路径 reaction+storyReply+group 照投
+  （E2 既有投影）。
+- **边界记档**：①transport story 位（群发送 endorsement 跳过/access
+  key XOR story 位）不对齐——传输细节，DataMessage 形状不变；②canReact
+  系官方 UI 闸（allowsReplies/会话成员等）engine 不设，归桌面裁量；③
+  remove 恒 false 维持（群腿无 remove 参，官方 reactionForSend 同位）；
+  ④群 story 回复（sendText 群腿 + storyReply 两键）已端到端现成
+  （05b1bce），本批不触碰。
+- **测试钉定**：bin——`story_reaction_group_data_message_three_keys_
+  shape`（三键共存逐键镜像钉形）/ `story_reaction_group_gate_faces_and_
+  decode_gate`（三闸脸 -1 词族逐字 + 32B 解码闸 fail-closed）；contract
+  ——`send_story_reaction_group_fake_shape_and_param_fail_closed`（群腿
+  应答 group 面/缺席回归 `{}`/groupId 参数闸/调度日志/real 未注册折叠）。
 
 transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批；
 消费方 connector 契约 1.76 §4.38 扩面）：

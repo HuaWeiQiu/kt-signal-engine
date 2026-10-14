@@ -3176,6 +3176,134 @@ fn send_story_reaction_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// E-S7r 群 story 反应发送面 fake 契约：群腿应答 `{"group": {groupId,
+/// timestamp}}`（additive——对齐 sendStory group 应答先例，缺席键不在）；
+/// group 缺席回归（同批不带/null groupId = 1:1 腿 `{}` 零变化）；groupId
+/// 参数闸 fail-closed（非字符串/空串 -32603）；调度日志原样落参
+///（connector 侧依赖断言）。
+#[test]
+fn send_story_reaction_group_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("send-story-reaction-group-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // 群腿合法批：应答恰 group 一键（groupId 回显 + 群腿时刻 u64）。
+    let group_face = engine.request(
+        "sendStoryReaction",
+        json!({
+            "account": "+15550000000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1_700_000_000_000_u64,
+            "emoji": "👍",
+            "groupId": group_id
+        }),
+    );
+    assert_eq!(
+        group_face["result"]["group"]["groupId"],
+        json!(group_id),
+        "群腿应答面 groupId 回显"
+    );
+    assert!(
+        group_face["result"]["group"]["timestamp"].is_u64(),
+        "群腿应答面 timestamp = 群腿时刻"
+    );
+    assert_eq!(
+        group_face["result"]
+            .as_object()
+            .expect("result object")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["group"],
+        "群腿应答恰 group 一键（additive，无顶层 timestamp/results 面）"
+    );
+
+    // group 缺席回归（pre-E-S7r 行为零变化）：不带 groupId 与 groupId null
+    // 同走 1:1 腿 `{}`（null 归缺席）。
+    for group in [None, Some(json!(null))] {
+        let mut params = json!({
+            "account": "+15550000000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1_700_000_000_000_u64,
+            "emoji": "👍"
+        });
+        if let Some(group) = group {
+            params["groupId"] = group;
+        }
+        assert_eq!(
+            engine.request("sendStoryReaction", params).get("result"),
+            Some(&json!({})),
+            "group 缺席 = 1:1 腿现状零变化"
+        );
+    }
+
+    // groupId 参数闸：非字符串/空串 fail-closed（静默丢群腿是 fail-open）。
+    for group in [json!(42), json!("")] {
+        let (code, _) = engine.error_of(
+            "sendStoryReaction",
+            json!({
+                "account": "+15550000000",
+                "storyAuthor": "+15555550101",
+                "storyTimestamp": 1_700_000_000_000_u64,
+                "emoji": "👍",
+                "groupId": group
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+
+    // 调度日志纪律：群腿/缺席腿/被拒调用均落日志（append_dispatch 在参数
+    // 闸之前）；params 原样供 connector 侧依赖断言。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let reaction_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "sendStoryReaction")
+        .collect();
+    assert_eq!(
+        reaction_entries.len(),
+        5,
+        "群腿一条 + 缺席两条 + 群闸拒两条均落日志"
+    );
+    let group_string_entries: Vec<&Value> = reaction_entries
+        .iter()
+        .copied()
+        .filter(|entry| entry["params"]["groupId"].is_string())
+        .collect();
+    assert_eq!(
+        group_string_entries.len(),
+        2,
+        "群腿一条 + 空串闸拒一条（字符串形 groupId；非串 42 形态另落但非字符串）"
+    );
+    assert_eq!(
+        group_string_entries[0]["params"]["groupId"],
+        json!(group_id)
+    );
+    let null_entry = reaction_entries
+        .iter()
+        .find(|entry| entry["params"].get("groupId") == Some(&Value::Null))
+        .expect("null 归缺席调用亦原样落日志");
+    assert_eq!(null_entry["params"]["storyAuthor"], json!("+15555550101"));
+
+    // real 模式未注册账号（群腿在场）：折叠 -32603 不触网（send 系同折叠）。
+    let real_dir = temp_dir("send-story-reaction-group-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "sendStoryReaction",
+        json!({
+            "account": "+15559990000",
+            "storyAuthor": "+15555550101",
+            "storyTimestamp": 1,
+            "emoji": "👍",
+            "groupId": group_id
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// S5 story 删除扇出批 fake 契约：合法批应答 `{timestamp}`（DOE 信封 ts，
 /// u64）；参数闸 fail-closed 全量生效（account/targetTimestamp 必填、
 /// updatedStoryRecipients 必填非空且条目 destinationUuid 非空字符串 +

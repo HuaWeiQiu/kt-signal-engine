@@ -1983,7 +1983,8 @@ impl Service {
     /// `Reaction.targetAuthor/targetSentTimestamp` 与
     /// `StoryContext.author/sentTimestamp` 两位，单收件人直聊腿发往
     /// story 作者会话（官方 1:1 story reaction targetConversation 同位；
-    /// 群 story 腿 v1 边界不做，compat §5）。remove 官方恒 false
+    /// 群 story 腿 = `send_story_reaction_group`，E-S7r 批，compat §5）。
+    /// remove 官方恒 false
     /// （sendNormalMessage reactionForSend 同位硬编码），方法面不带参。
     /// 官方发送前 profileSharing 置位（enqueueReactionForSend:72-82）由
     /// P9 白名单闸同语义承接；sync 面 = 普通 sent 转录（presage fork
@@ -2026,6 +2027,51 @@ impl Service {
             .await
             .map_err(send_error_of)?;
         Ok(())
+    }
+
+    /// sendStoryReaction 群腿（群 story 反应发送面批 E-S7r，KT 扩展，compat
+    /// §5 群 story 反应发送面）：官方群 story 反应走普通群通道——
+    /// enqueueReactionForSend.preload.ts:84-91 群 story targetConversation =
+    /// 群本身（仅 1:1 story 才换作者会话），sendNormalMessage 群臂
+    /// sendToGroup 载 DataMessage{groupV2, reaction, storyContext}
+    ///（reactionForSend remove 恒 false :711-723；toProto 三键共存
+    /// SendMessage.preload.ts :642/:567-579/:663-679），非
+    /// Content.storyMessage（S4 批「story 通道 groupV2 形态」措辞失真随本
+    /// 批订正）。三键共存全走共享群发送路径单点：`open_group_sender`
+    ///（32B 解码 fail-closed + terminated 硬拒）+ `dispatch_group`
+    ///（announcementsOnly 非 admin 拒 group_mrm:225-227 同源 + group_v2
+    /// 自动注入 {masterKey, revision, groupChange: None} :211-216 同源，
+    /// sendTextGroup/sendReactionGroup 同款——MRM 主路 + vendored failover
+    /// 及 Sent 转录自带）；reaction/storyContext 两键复用
+    /// build_story_reaction_data_message（1:1 腿构造单点，双锚同值、remove
+    /// 恒 Some(false) 官方同位——群腿无 remove 参）。作者 ACI 解析与 1:1
+    /// 腿同链同严（本机号→contacts E.164→UUID 直通，不可解析 Internal 不
+    /// 透传号码）；群腿不走直聊身份拒发闸/profileSharing 白名单（群发送面
+    /// 同口径，send_reaction_group 同构）。应答 = {groupId, timestamp 群腿
+    /// 时刻}（fake 同形状；sync 面 = 共享群发送路径 Sent 转录，无独立面）。
+    pub(crate) async fn send_story_reaction_group(
+        self: &Arc<Self>,
+        account: &str,
+        group_id: &str,
+        story_author: &str,
+        story_timestamp: u64,
+        emoji: &str,
+    ) -> Result<Value, SendError> {
+        if !self.real {
+            let timestamp = now_ms();
+            return Ok(json!({ "groupId": group_id, "timestamp": timestamp }));
+        }
+        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        // 被回应 story 作者锚（reaction.targetAuthorAci/storyContext.
+        // authorAci 同一 ACI）：解析链与 1:1 腿同源同严。
+        let author_aci = resolve_author_aci(manager.store(), story_author)
+            .await
+            .ok_or(SendError::Internal)?;
+        let body =
+            build_story_reaction_data_message(&author_aci, story_timestamp, emoji, timestamp);
+        dispatch_group(self, &mut manager, group_id, body, timestamp).await?;
+        Ok(json!({ "groupId": group_id, "timestamp": timestamp }))
     }
 
     pub(crate) async fn send_reaction(
@@ -12240,6 +12286,46 @@ mod tests {
         assert!(context.author_aci_binary.is_none());
         assert_eq!(dm.timestamp, Some(7_777));
         assert!(dm.body.is_none(), "story reaction 无正文位");
+    }
+
+    /// E-S7r 群 story 反应腿 wire 钉形：`DataMessage{groupV2, reaction,
+    /// storyContext}` 三键共存逐键（官方 sendNormalMessage 群臂
+    /// groupSendOptions 载 reaction+storyContext + SendMessage toProto
+    /// groupV2/storyContext/reaction 三独立键同位；非 Content.storyMessage
+    /// ——S4 批「story 通道 groupV2 形态」措辞失真随本批订正）。构造复用
+    /// build_story_reaction_data_message（1:1 腿单点），群上下文注入形状与
+    /// group_mrm::dispatch_group_message:211-216 逐字同源（dispatch 离线
+    /// 不可达，镜像钉形）：{master_key 32B, revision 群态, group_change
+    /// 恒 None}。
+    #[test]
+    fn story_reaction_group_data_message_three_keys_shape() {
+        let author = "11111111-2222-4333-8444-555555555555";
+        let mut body = build_story_reaction_data_message(author, 1_700_000_000_000, "👍", 7_777);
+        body.group_v2 = Some(presage::proto::GroupContextV2 {
+            master_key: Some(vec![9u8; 32]),
+            revision: Some(7),
+            group_change: None,
+        });
+        // 群上下文键：32B master key + 群态 revision + groupChange 恒缺。
+        let group_v2 = body.group_v2.as_ref().expect("groupV2 set");
+        assert_eq!(group_v2.master_key, Some(vec![9u8; 32]));
+        assert_eq!(group_v2.revision, Some(7));
+        assert!(group_v2.group_change.is_none());
+        // reaction 键（与 1:1 腿同构：remove 恒 Some(false)）。
+        let reaction = body.reaction.as_ref().expect("reaction set");
+        assert_eq!(reaction.emoji.as_deref(), Some("👍"));
+        assert_eq!(reaction.target_author_aci.as_deref(), Some(author));
+        assert_eq!(reaction.target_sent_timestamp, Some(1_700_000_000_000));
+        assert_eq!(reaction.remove, Some(false));
+        // storyContext 键（与 reaction 同锚同值）。
+        let context = body.story_context.as_ref().expect("storyContext set");
+        assert_eq!(context.author_aci.as_deref(), Some(author));
+        assert_eq!(context.sent_timestamp, Some(1_700_000_000_000));
+        // 纯三键共存：正文/附件/删除位缺席。
+        assert!(body.body.is_none());
+        assert!(body.attachments.is_empty());
+        assert!(body.delete.is_none());
+        assert_eq!(body.timestamp, Some(7_777));
     }
 
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构

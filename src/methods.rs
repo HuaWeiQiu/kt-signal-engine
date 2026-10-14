@@ -737,12 +737,17 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
-        // sendStoryReaction（story 反应发送批 S4，官方 reactToStory 行为
-        // 对齐）：storyAuthor/storyTimestamp = 被回应 story 锚（作者 ACI/
-        // 号码 + story 发送时刻毫秒），emoji 必填非空；remove 无参——官方
-        // story 反应恒 remove:false（sendNormalMessage reactionForSend 同位
-        // 硬编码）。目的地 = story 作者会话（服务层解析，1:1 腿；群 story
-        // v1 边界不做）。
+        // sendStoryReaction（story 反应发送批 S4 + 群 story 反应发送面批
+        // E-S7r，官方 reactToStory 行为对齐）：storyAuthor/storyTimestamp =
+        // 被回应 story 锚（作者 ACI/号码 + story 发送时刻毫秒），emoji 必填
+        // 非空；remove 无参——官方 story 反应恒 remove:false
+        //（sendNormalMessage reactionForSend 同位硬编码）。groupId 可选
+        //（E-S7r 批）：缺席 = 1:1 作者直发腿（story 作者会话，服务层解析）
+        // 现状零变化；在场 = 群 story 反应腿——官方群 story 反应走普通群
+        // 通道 dataMessage（enqueueReactionForSend.preload.ts:84-91 群
+        // story targetConversation = 群本身；非 Content.storyMessage，S4 批
+        // 「story 通道 groupV2 形态」措辞失真随本批订正），应答加性
+        // group:{groupId, timestamp}。
         "sendStoryReaction" => {
             state.lock().await.append_dispatch(method, params);
             let account = params
@@ -761,16 +766,41 @@ async fn dispatch(
                 .get("emoji")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty());
+            // groupId（群 story 反应发送面，E-S7r 批）：可选 engine groupId
+            //（群 master key 标准 base64，与 sendStory group/sendTextGroup
+            // 同一口径）；缺失/null = 无群腿（1:1 腿现状零变化）；非字符串/
+            // 空串 fail-closed 不静默丢键。
+            let group_id = match params.get("groupId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(group_id)) if !group_id.is_empty() => Some(group_id.as_str()),
+                Some(_) => return internal_error(id),
+            };
             match (account, author, target, emoji) {
-                (Some(account), Some(author), Some(target), Some(emoji)) => {
-                    match service
-                        .send_story_reaction(account, author, target, emoji)
-                        .await
-                    {
-                        Ok(()) => jsonrpc::success_response(id, json!({})),
-                        Err(error) => send_error(id, error),
+                (Some(account), Some(author), Some(target), Some(emoji)) => match group_id {
+                    // 群腿（E-S7r 批）：32B 解码 + terminated + announcements-
+                    // Only 三闸与群上下文注入全在共享群发送路径
+                    //（open_group_sender + dispatch_group）；错误走结构化
+                    // 面同群发送（send_error 单点，-1 词族）。
+                    Some(group_id) => {
+                        match service
+                            .send_story_reaction_group(account, group_id, author, target, emoji)
+                            .await
+                        {
+                            Ok(face) => jsonrpc::success_response(id, json!({ "group": face })),
+                            Err(error) => send_error(id, error),
+                        }
                     }
-                }
+                    // 1:1 作者直发腿（S4 现状，逐字节零变化）。
+                    None => {
+                        match service
+                            .send_story_reaction(account, author, target, emoji)
+                            .await
+                        {
+                            Ok(()) => jsonrpc::success_response(id, json!({})),
+                            Err(error) => send_error(id, error),
+                        }
+                    }
+                },
                 _ => internal_error(id),
             }
         }
@@ -4729,5 +4759,31 @@ mod tests {
             assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
             assert!(message.contains(anchor));
         }
+    }
+
+    /// E-S7r 群 story 反应腿三闸脸 + 32B 解码闸：群腿错误全走 send_error
+    /// 结构化面（send_error_face 单点，群发送同款）——terminated/
+    /// announcementsOnly 非 admin = `-1` 词族逐字（connector 分类器按
+    /// message 命中）；32B 解码闸 fail-closed（decode_group_id：坏 base64/
+    /// 非 32B/空串 → None → 群腿 Internal，好 id → 32B key）。闸本体在
+    /// open_group_sender/dispatch_group 共享路径（本批零改动），闸脸经此
+    /// 钉面。
+    #[test]
+    fn story_reaction_group_gate_faces_and_decode_gate() {
+        use crate::service::SendError;
+        assert_eq!(
+            send_error_face(&SendError::TargetTerminated),
+            (-1, "SEND_TARGET_TERMINATED")
+        );
+        assert_eq!(
+            send_error_face(&SendError::AnnouncementsOnly),
+            (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY")
+        );
+        assert!(crate::service::decode_group_id("not-base64!!").is_none());
+        assert!(crate::service::decode_group_id("QUJDREVG").is_none());
+        assert!(crate::service::decode_group_id("").is_none());
+        let decoded =
+            crate::service::decode_group_id("q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=");
+        assert_eq!(decoded.map(|key| key.len()), Some(32));
     }
 }
