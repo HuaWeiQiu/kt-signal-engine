@@ -1879,6 +1879,11 @@ impl Service {
     /// `StoryMessage.fileAttachment`，官方 getStoryMessage fileAttachment
     /// 臂同位），缺席 = text story 现状零变化（两腿互斥闸在 methods 参数
     /// 面）；自同步 `story_message` 载两腿同形状值，恰好一次语义不变。
+    /// 群 story 受众腿（2026-10-15 批）：`group` Some = 群受众腿
+    ///（stories::send_story_group 官方群 story 行为对齐），与名单腿共存
+    /// 官方同构（混合受众 = 两 job 两 sync：名单腿先行，群腿 ts+1 官方
+    /// +index+1 同款；recipients 空 = 群单腿），返回值第三位 = 群腿应答面
+    /// `{groupId, timestamp}`（缺席 = None）。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_story(
         self: &Arc<Self>,
@@ -1894,23 +1899,59 @@ impl Service {
         preview_url: Option<String>,
         preview_title: Option<String>,
         preview_date: Option<u64>,
-    ) -> Result<(u64, Vec<Value>), SendError> {
-        stories::send_story(
-            self,
-            account,
-            recipients,
-            distribution_list_id,
-            allows_replies,
-            text,
-            text_style,
-            body_ranges,
-            attachment,
-            preview_image,
-            preview_url,
-            preview_title,
-            preview_date,
-        )
-        .await
+        group: Option<&str>,
+    ) -> Result<(u64, Vec<Value>, Option<Value>), SendError> {
+        // 名单受众腿（recipients 空 = 群单腿跳过名单腿；群缺席时空批由
+        // methods 参数闸整拒，不达此处——现状口径零变化）。
+        let (timestamp, results) = if recipients.is_empty() {
+            (now_ms(), Vec::new())
+        } else {
+            stories::send_story(
+                self,
+                account,
+                recipients,
+                distribution_list_id,
+                allows_replies,
+                text,
+                text_style,
+                body_ranges,
+                attachment,
+                preview_image,
+                preview_url.clone(),
+                preview_title.clone(),
+                preview_date,
+            )
+            .await?
+        };
+        // 群受众腿（官方混合受众两 job 两 sync 同构；群 ts = 名单腿 ts+1
+        // 保跨腿唯一——官方 groupTimestamp = timestamp + index + 1 同款；
+        // 群单腿 = 自取 now）。
+        let group_face = match group {
+            Some(group_id) => {
+                let (_, face) = stories::send_story_group(
+                    self,
+                    account,
+                    group_id,
+                    if recipients.is_empty() {
+                        timestamp
+                    } else {
+                        timestamp + 1
+                    },
+                    text,
+                    text_style,
+                    body_ranges,
+                    attachment,
+                    preview_image,
+                    preview_url,
+                    preview_title,
+                    preview_date,
+                )
+                .await?;
+                Some(face)
+            }
+            None => None,
+        };
+        Ok((timestamp, results, group_face))
     }
 
     /// deleteStoryForEveryone（story 删除扇出批 S5，KT 扩展方法）：官方

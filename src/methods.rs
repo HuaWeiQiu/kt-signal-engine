@@ -1457,12 +1457,20 @@ async fn dispatch(
         // 群 story 不做）+ 媒体 story 发送面（2026-10-14 批，官方对齐
         // Signal-Desktop abe80d3，wire additive，engine-compat——E1 批
         // 「文件 story v1 不做」边界翻案，理由记档 compat §5 媒体 story 批）。
-        // 协议上行面落调度日志（send 系同纪律）；参数面 fail-closed
-        //（-32603）：account/message 非空、recipients 非空字符串数组（story
-        // 面恒为名单展开集，无单字符串形态——成员解析归 connector）、
-        // distributionListId 非空字符串缺省官方 MY_STORY_ID、allowsReplies
-        // 布尔（缺省 false = 线上 proto 缺席位，官方值源为名单属性）、
-        // textStyle 单词六值词表（官方 TextAttachment.Style 词表，DEFAULT
+        // 群 story 受众腿（2026-10-15 批，engine-compat——E1 批「群 story
+        // v1 不做」边界翻案，理由记档 compat §5 群 story 批）：`group`
+        // 可选 engine groupId（群 master key 标准 base64，与 sendTextGroup
+        // 群 id 同一口径；32B 形状闸归服务层 decode_group_id），与名单受众
+        // 共存官方同构（混合受众 = 名单腿 + 群腿两 sync，群腿 ts+1）；
+        // recipients 空批在 group 在场时放行 = 群单腿（官方受众至少一域
+        // sendStoryMessage.preload.ts:57-63 双缺才 drop），group 缺席时空批
+        // 维持现状整拒。协议上行面落调度日志（send 系同纪律）；参数面
+        // fail-closed（-32603）：account/message 非空、recipients 非空字符串
+        // 数组（story 面恒为名单展开集，无单字符串形态——成员解析归
+        // connector）、distributionListId 非空字符串缺省官方 MY_STORY_ID、
+        // allowsReplies 布尔（缺省 false = 线上 proto 缺席位，官方值源为
+        // 名单属性；只辖名单腿——群腿线上恒 true 官方同位）、textStyle
+        // 单词六值词表（官方 TextAttachment.Style 词表，DEFAULT
         // = proto 字段省略）、bodyRanges 五值内联样式 {style,start,length}
         // ≤64（send textStyle 同款 fail-closed 闸 + 服务层防御双保险）、
         // previewImage 非空字符串（缺失/null = 无预览，其他类型
@@ -1480,7 +1488,8 @@ async fn dispatch(
         // proto 无处挂载，fail-closed 不静默丢键），双缺 = 无载荷整拒
         // （现状口径）；bodyRanges 两腿共用（官方 getStoryMessage
         // fileAttachment 分支同载 bodyRanges，SendMessage.preload.ts:
-        // 1059-1061）。attachment 缺席 = text story 现状零变化。
+        // 1059-1061）。attachment 缺席 = text story 现状零变化；group 与
+        // 内容两腿正交（官方群 story text/media 双臂同源 getStoryMessage）。
         "sendStory" => {
             state.lock().await.append_dispatch(method, params);
             let account = params
@@ -1500,8 +1509,10 @@ async fn dispatch(
                 .get("message")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty());
+            // recipients（名单受众腿）：字符串数组（现状口径逐条目非空
+            // fail-closed）；空批仅当 group 在场放行（群单腿，下方闸）。
             let recipients = match params.get("recipients") {
-                Some(Value::Array(entries)) if !entries.is_empty() => {
+                Some(Value::Array(entries)) => {
                     let mut parsed = Vec::with_capacity(entries.len());
                     for entry in entries {
                         match entry.as_str() {
@@ -1513,6 +1524,19 @@ async fn dispatch(
                 }
                 _ => return internal_error(id),
             };
+            // group（群受众腿，2026-10-15 批）：可选 engine groupId 字符串
+            //（群 master key 标准 base64）；缺失/null = 无群腿（现状零
+            // 变化）；非字符串/空串 fail-closed 不静默丢键。受众域至少一腿
+            //（官方双缺才 drop 同构）：group 缺席 + recipients 空批 =
+            // 现状整拒；group 在场 + recipients 空批 = 群单腿放行。
+            let group = match params.get("group") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(group_id)) if !group_id.is_empty() => Some(group_id.as_str()),
+                Some(_) => return internal_error(id),
+            };
+            if group.is_none() && recipients.is_empty() {
+                return internal_error(id);
+            }
             let distribution_list_id = match params.get("distributionListId") {
                 None | Some(Value::Null) => crate::service::stories::MY_STORY_ID,
                 Some(Value::String(list_id)) if !list_id.is_empty() => list_id.as_str(),
@@ -1650,20 +1674,29 @@ async fn dispatch(
                             preview_url,
                             preview_title,
                             preview_date,
+                            group,
                         )
                         .await
                     {
-                        Ok((timestamp, results)) => jsonrpc::success_response(
-                            id,
-                            json!({ "timestamp": timestamp, "results": results }),
-                        ),
+                        Ok((timestamp, results, group_face)) => {
+                            let mut body = json!({ "timestamp": timestamp, "results": results });
+                            if let Some(face) = group_face {
+                                body["group"] = face;
+                            }
+                            jsonrpc::success_response(id, body)
+                        }
+                        // 群腿在场 = 结构化错误面（TargetTerminated/
+                        // AnnouncementsOnly -1 词族群发送同款，其余 -32603
+                        // 归型）；群缺席 = 名单腿现状 -32603 零变化。
+                        Err(error) if group.is_some() => send_error(id, error),
                         Err(_) => internal_error(id),
                     }
                 }
                 // 媒体 story 腿（2026-10-14 批）：正文附件 data URI 走既有
                 // transit CDN 上行链，指针进 StoryMessage.fileAttachment
                 //（官方 getStoryMessage fileAttachment 臂同位）；文本腿
-                // 专属参数已在上方闸禁入，此处传缺省值。
+                // 专属参数已在上方闸禁入，此处传缺省值。group 正交透传
+                //（官方群 story media 臂同源 getStoryMessage）。
                 (Some(account), None, Some(attachment)) => {
                     match service
                         .send_story(
@@ -1679,13 +1712,18 @@ async fn dispatch(
                             None,
                             None,
                             None,
+                            group,
                         )
                         .await
                     {
-                        Ok((timestamp, results)) => jsonrpc::success_response(
-                            id,
-                            json!({ "timestamp": timestamp, "results": results }),
-                        ),
+                        Ok((timestamp, results, group_face)) => {
+                            let mut body = json!({ "timestamp": timestamp, "results": results });
+                            if let Some(face) = group_face {
+                                body["group"] = face;
+                            }
+                            jsonrpc::success_response(id, body)
+                        }
+                        Err(error) if group.is_some() => send_error(id, error),
                         Err(_) => internal_error(id),
                     }
                 }

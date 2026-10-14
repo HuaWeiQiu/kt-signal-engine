@@ -2916,6 +2916,98 @@ fn send_story_fake_shape_and_param_fail_closed() {
         assert_eq!(code, -32603);
     }
 
+    // 群 story 受众腿（2026-10-15 批）：group 与内容两腿正交（text+group、
+    // media+group 均可达）；群单腿 = recipients 空批 + group 在场；应答
+    // group 面 additive（缺席键不在）。32B 群 id 与 calls.* 夹具同源形状。
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    let group_only = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "group story",
+            "recipients": [],
+            "group": group_id
+        }),
+    );
+    assert!(
+        group_only["result"]["timestamp"].is_u64(),
+        "群单腿 timestamp = 群腿 ts"
+    );
+    assert_eq!(
+        group_only["result"]["results"],
+        json!([]),
+        "群单腿 results 恒空"
+    );
+    assert_eq!(
+        group_only["result"]["group"]["groupId"],
+        json!(group_id),
+        "群腿应答面 groupId 回显"
+    );
+    assert!(
+        group_only["result"]["group"]["timestamp"].is_u64(),
+        "群腿应答面 timestamp = 群腿 ts"
+    );
+    // 混合受众（名单 + 群共存，官方双域同一 send 同构）：两腿面齐备。
+    let mixed = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "mixed story",
+            "recipients": ["+15555550101"],
+            "group": group_id
+        }),
+    );
+    assert_eq!(mixed["result"]["results"], json!([]));
+    assert_eq!(mixed["result"]["group"]["groupId"], json!(group_id));
+    assert!(
+        mixed["result"]["group"]["timestamp"].as_u64() >= mixed["result"]["timestamp"].as_u64(),
+        "群腿 ts ≥ 名单腿 ts（真实面 = 名单 ts+1，fake 双腿同刻取 now）"
+    );
+    // media+group 组合腿：attachment 与 group 正交（官方群 story media 臂
+    // 同源 getStoryMessage）。
+    let media_group = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": "data:image/jpeg;base64,iVBORw0KGgo=",
+            "group": group_id
+        }),
+    );
+    assert_eq!(media_group["result"]["group"]["groupId"], json!(group_id));
+    // group 缺席应答无 group 键（现状零变化，additive 键不在）。
+    let no_group = engine.request(
+        "sendStory",
+        json!({ "account": "+15550000000", "message": "plain", "recipients": ["+15555550101"] }),
+    );
+    assert!(no_group["result"].get("group").is_none(), "缺席键不在");
+
+    // group 形状闸：非字符串/空串 fail-closed；recipients 空批仅在 group
+    // 在场时放行（group 缺席 + 空批 = 现状整拒，上方 recipients 闸已覆盖；
+    // null 归缺席故空批 + null 同拒）。
+    for group in [json!(42), json!("")] {
+        let (code, _) = engine.error_of(
+            "sendStory",
+            json!({
+                "account": "+15550000000",
+                "message": "story",
+                "recipients": ["+15555550101"],
+                "group": group
+            }),
+        );
+        assert_eq!(code, -32603);
+    }
+    let (code, _) = engine.error_of(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": [],
+            "group": null
+        }),
+    );
+    assert_eq!(code, -32603, "空批 + group null 归缺席 = 现状整拒");
+
     // 调度日志纪律：成功与被拒调用都落日志（send 系同款，updateGroup
     // 同构断言）；params 形状供 connector 侧依赖断言。
     let log_path = dir.join("engine-send-log.jsonl");
@@ -2930,9 +3022,9 @@ fn send_story_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         story_entries.len(),
-        44,
+        51,
         "成功六条 + 拒绝三十八条均落日志（append_dispatch 在参数闸之前；媒体 \
-         story 批新增成功两条/拒绝八条）"
+         story 批新增成功两条/拒绝八条；群 story 批新增成功四条/拒绝三条）"
     );
     assert_eq!(
         story_entries[0]["params"]["recipients"],

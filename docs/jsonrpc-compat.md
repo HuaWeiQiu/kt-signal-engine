@@ -121,7 +121,7 @@ send message: Signal server unavailable.
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
 | `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, quoteType?("normal"\|"giftBadge" 缺省 normal——官方 isGiftBadge 同构；六问批 Q5), quoteBodyRanges?: [{number?, style?(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64（mention/style 恰一；两键须挂 quote 键对——quote 对象缺席无处挂载；六问批 Q5）, previewUrl?, previewTitle?, previewDescription?, previewImage?, previewDate?(u64 毫秒发布时刻——P14 Preview.date 两端批；须挂 previewUrl 键对，0 归缺席，非整数 `-32603`), mentions?: [{number, start, length}], textStyle?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, storyReplyAuthor?, storyReplyTimestamp?(u64 毫秒——P14 组 4 storyContext 发送面；**双参同进退**：同置=story 回复（author ACI/号码，服务层解析不可解析 `-32603`；timestamp ≤0·非整数 `-32603`），单边在场 `-32603`——官方 storyContext 同位 SendMessage.preload.ts:565-577), viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/storyReply 双参单边在场·author 缺席或空串·timestamp 缺席·≤0·非整数/storyReplyAuthor 不可解析（服务层 resolve_author_aci）/quoteType 词表外（含 poll——官方 Quote.Type POLL 枚举在，KT quote 发送面未扩，窗D A7 批记档）·非字符串、quoteBodyRanges 条目 mention/style 同置或都缺·缺 start/length·start/length 超 u32·style 词表外·>64 条（cap 镜像整拒不截断）·非数组、quoteType/quoteBodyRanges 与 quote 键对脱挂/mentions 条目缺字段/textStyle 条目词表外（五值白名单；NONE 一并拒——官方 composer 永不发出的 no-op 标记）·缺字段·style 非字符串·start/length 超 u32·>64 条（cap 镜像整拒不截断）·非数组/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5）；announcements-only 群非 admin 发送系整拒 `SEND_TARGET_ANNOUNCEMENTS_ONLY`（`-1` + message，2026-10-11 群发送语义批，§5）；账号解绑（服务端 401 凭据拒绝）`-32603` + getUserStatus 同款解绑原文（2026-10-10 凭据失效归一批，`SendError::Unbound`，确定性失败不重试，§5）；服务端限流（429/413）`-32603` + `Rate limited` 原文、人机验证（428）`-32603` + `Proof required` 原文（两者不自动重试）、服务端不可用（5xx）`-32603` + `Signal server unavailable` 原文（建议可重试——重试决策均在 connector/desktop；2026-10-11 错误码结构化批，§5）；对端身份钥变更未确认（身份拒发闸：协议层旧钥会话/换钥 bundle 拒加密 + 服务层 sidecar 挂起闸，直聊内容/撤回/回应/pin/unpin/直聊通话信令/回执面生效，typing/群发送/story 不在闸面）`-32603` + `Failed to send message: Identity unverified. (UntrustedIdentityException)` 原文（确定性失败不重试；确认钩子 = `trust` 写面，2026-10-11 P9 身份拒发批，§5） | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；textStyle→BodyRange.Style 五值词表单点映射（2026-10-06 透传批，connector 契约 1.69 §4.62 引擎侧缺口闭合：UTF-16 offsets 透传不查 body 边界——官方 parseTextStyles 同口径，与 mentions 同款调用方纪律，详见 §5）；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true][;gif=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags + 官方算法波形/时长生成面（`AttachmentPointer.audioWaveform=21`/`audioDurationSeconds=22`，生成失败两字段全不带照发，2026-10-14 批 §5；presage voice_note 同构，2026-10-04）；gif=true 映射官方 Flags.GIF=8 位（flags 纯客户端线上陈述 CDN 上行面零涉及，engine 侧上传返回指针置位与官方消息组装期置位同构，与 voice/borderless 按位叠加；2026-10-14 GIF 批，§5））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立；2026-10-11 群发送语义批（§5）：发送前刷群态（typing 免刷、取态失败回落本地 fail-open）+ 群形态 `results` 逐成员填充（成功/失败条目与直聊同构，type 四词表 additive）+ transcript 无论成败一律落库（群黑洞消除）+ 单成员 profile 行不可读降级 identified 不炸批；**2026-10-11 六问批 Q5（§5）**：quoteType/quoteBodyRanges 发送扩面——vendored SendQuote 扩 `gift_badge`/`body_ranges` 位（Quote.type=GIFT_BADGE 枚举 1/Quote.bodyRanges 字段 6——原文「Quote.type=2」系笔误，窗D A7 批订正），assemble_quote 单点同写 type（恒写 NORMAL/GIFTBADGE）与 BodyRange 条目，官方发送侧不 bump requiredProtocolVersion（构造面不设该字段，viewOnce 先例同构）；**2026-10-11 P15b 批（时序审计组二#9，§5，wire additive）**：直聊腿 per-recipient 成败收集——不再 fail-fast 丢弃部分成功（重试全批会对已达收件人重复投递）；混合结局（既有成功又有失败）返回 `{timestamp, results(成功条目原样), failures: [{recipientNumber, error: {code, message}}]}`（failures 空表键不在，旧宿主零变化；error 分类与整批错误面逐字同源——send_error_face 分类单点）；全败维持整批错误面（首错分类上抛，零已达收件人整批重试无重复风险）；附件/贴纸图上行失败仍整批早退（批级共享指针，未进逐收件人面）；群腿/editMessage/群发送系不变 |
 | `editMessage` | `{account, message(必填非空——官方 canEditMessage body 非空闸), targetTimestamp(u64 必填——被编辑消息原 sent timestamp), recipient[]/groupId(32B 标准 base64 群 master key，listGroups id 同源)}`（**两腿恰一**（sendMessageRequestResponse 同构）：同置/都缺/腿形状非法（recipient 空批·条目非字符串·groupId 非 base64·≠32B）`-32603`） | `{timestamp, results:[]}`（同 send 形状，群组 results 逐成员填充） | 参数缺失/形状错（message 空·缺席·非字符串、targetTimestamp 缺席·非数字、两腿同置/都缺、recipient 形状非法、groupId 非 base64·≠32B）`-32603`；未注册账号/身份拒发闸/announcements-only 群/群已终止 同 send 折叠；24h 窗口/10 次上限是官方 UI 层闸（canEditMessage），wire 面不设 | **2026-10-11 real（KT 扩展，六问批 Q1，官方编辑发送面对位，engine-compat）**：官方编辑 = `Content.editMessage{targetSentTimestamp, dataMessage}`（SendMessage.preload.ts:1075-1092，内层 dataMessage 只携新 body+timestamp）；直聊腿 = vendored `send_message_with_profile_sharing` 逐收件人（P9 S3 profileSharing 闸 + 身份拒发闸沿 send_text 同纪律）；群腿 = vendored `send_message_to_group`（MRM 主路径只支持 DataMessage，EditMessage 不在其列）+ 内层 DataMessage 手注 group_v2（master key + revision——revision 经 fetch_group_with_endorsements best-effort，失败 None proto 缺席合法）；多设备转录：vendored create_multi_device_sent_transcript_content 已把 EditMessage 转 `Sent.editMessage`，本机其他设备收 `syncMessage.sentMessage.editMessage {targetSentTimestamp, dataMessage}` echo（§3 receive 面）；详见 §5 六问批；fake：成功 `{timestamp, results:[]}`（落调度日志，协议上行面纪律） |
-| `sendStory` | `{account, message(非空——文本腿；attachment 在场时禁入，两腿恰一), recipients(非空字符串数组——名单展开集，成员解析归 connector), distributionListId?(非空字符串，缺省官方 MY_STORY_ID 零 UUID), allowsReplies?(布尔，缺省 false=线上 proto 缺席位), textStyle?(单词 DEFAULT\|REGULAR\|BOLD\|SERIF\|SCRIPT\|CONDENSED，缺省 DEFAULT=proto 字段省略——text 腿专属，attachment 在场禁入), bodyRanges?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64（两腿共用）, previewImage?(非空 data URI——text 腿专属，attachment 在场禁入), previewUrl?(非空 ≤2048 字符且 https:// 开头——text 腿专属，attachment 在场禁入), previewTitle?(非空 ≤1024 UTF-8 字节——text 腿专属，attachment 在场禁入), previewDate?(u64 毫秒发布时刻——P14 Preview.date 两端批；须挂 previewUrl/previewTitle/previewImage 任一键对，0 归缺席，非整数 `-32603`——官方 sendStory hydratedPreview 同位透传；text 腿专属，attachment 在场禁入), attachment?(非空 data URI 单条——媒体 story 正文附件，2026-10-14 批；connector 上游附件形状同款 `data:<mediatype>[;filename=<pct>][;voice=true][;gif=true];base64,<payload>`，深解析/帽值归服务层上行闸；在场 = 文件 story 腿，缺席 = text story 现状)}` | `{timestamp, results:[{recipientNumber, success:{timestamp}}]}`（fake `results` 恒空） | account/message 缺失或空串（双缺 = 无载荷整拒）/recipients 缺失·空批·单字符串形态·条目非字符串·空串/distributionListId 空串·非字符串/allowsReplies 非布尔/textStyle 词表外（含内联样式词与大小写漂移）·非字符串/bodyRanges 条目缺字段·style 词表外·>64 条（cap 镜像整拒不截断）·非数组/previewImage 非字符串·空串/previewUrl 非字符串·空串·非 `https://` 开头·>2048 字符/previewTitle 非字符串·空串·>1024 UTF-8 字节/attachment 非字符串·空串/attachment 与 message·textStyle·previewImage·previewUrl·previewTitle·previewDate 同置（两腿恰一，官方 oneof 同构）`-32603`；号码不可解析/收件人发送失败/未注册账号 同 send 折叠 `-32603` | **2026-10-08 real（KT 扩展，Stories 发送批）**：官方 sendStory 行为对齐——text story 单面（群 story 边界保留；文件 story 由 2026-10-14 媒体 story 批解除，见后）；textAttachment{text, textStyle, preview.image=previewImage 随批 CDN 上行} 构造 + profileKey 由 fork send 面注入；preview 面 2026-10-09 扩：previewUrl/previewTitle 如实进 proto preview.url/preview.title（两键互相独立可选，image/url/title 三件任一在场即成 Preview——官方 preview 面 image 可空同构 `hydratedPreview.image && upload`；接收面投影见 Stories 接收批）；解析全量前置→按解析后 ServiceId 去重保首现序→单时间戳逐收件人 sealed-sender `?story=true` 分发（任一失败整体 `-32603`，per-recipient 部分失败形状未对齐纪律 §5）→≥1 成功后 best-effort 自同步 `SyncMessage.Sent{story_message, story_message_recipients}`（官方「≥1 成功且有其他设备」同闸，同步失败不回滚）；urgent 位钉定 rev proto 无此字段（偏差登记 §5）；详见 §5 Stories 发送批；**2026-10-14 real（KT 扩展，媒体 story 发送面批，官方对齐 Signal-Desktop abe80d3，wire additive，engine-compat，§5 块）**：`attachment` 可选参数扩文件 story 腿——E1 批「文件 story v1 不做」边界翻案（理由记档 §5）；官方 `StoryMessage.attachment` oneof fileAttachment=3\|textAttachment=4 双臂（protos/SignalService.proto:476-479），media 腿 = sendStory.preload.ts:186-190 同构：attachment data URI 走既有 transit CDN 上行链（presage upload_attachments 官方原语），返回指针原样进 StoryMessage.fileAttachment（官方 getStoryMessage SendMessage.preload.ts:1043-1044 同位），bodyRanges 两腿共用（官方 :1059-1061 fileAttachment 分支同载）；两腿恰一（同置/text 专属键越腿 -32603）；attachment 缺席 = text story 现状零变化；与接收投影 fileAttachment locator 全脸严格互逆（往返单测钉定 §5）；自同步 story_message 载同一 story 值恰好一次不变；vendored proto/fork 发送路径零改动；群 story（GroupContextV2 位）边界保留 |
+| `sendStory` | `{account, message(非空——文本腿；attachment 在场时禁入，两腿恰一), recipients(非空字符串数组——名单展开集，成员解析归 connector), distributionListId?(非空字符串，缺省官方 MY_STORY_ID 零 UUID), allowsReplies?(布尔，缺省 false=线上 proto 缺席位), textStyle?(单词 DEFAULT\|REGULAR\|BOLD\|SERIF\|SCRIPT\|CONDENSED，缺省 DEFAULT=proto 字段省略——text 腿专属，attachment 在场禁入), bodyRanges?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64（两腿共用）, previewImage?(非空 data URI——text 腿专属，attachment 在场禁入), previewUrl?(非空 ≤2048 字符且 https:// 开头——text 腿专属，attachment 在场禁入), previewTitle?(非空 ≤1024 UTF-8 字节——text 腿专属，attachment 在场禁入), previewDate?(u64 毫秒发布时刻——P14 Preview.date 两端批；须挂 previewUrl/previewTitle/previewImage 任一键对，0 归缺席，非整数 `-32603`——官方 sendStory hydratedPreview 同位透传；text 腿专属，attachment 在场禁入), attachment?(非空 data URI 单条——媒体 story 正文附件，2026-10-14 批；connector 上游附件形状同款 `data:<mediatype>[;filename=<pct>][;voice=true][;gif=true];base64,<payload>`，深解析/帽值归服务层上行闸；在场 = 文件 story 腿，缺席 = text story 现状), group?(非空字符串——engine groupId 群 master key 标准 base64，与 sendTextGroup 群 id 同一口径，2026-10-15 批；32B 形状闸归服务层 decode_group_id；在场 = 群受众腿，与名单腿/内容两腿正交——官方受众双域共存 sendStoryMessage.preload.ts:40-63；recipients 可空当且仅当 group 在场 = 群单腿，group 缺席时空批维持现状整拒)}` | `{timestamp, results:[{recipientNumber, success:{timestamp}}], group?:{groupId, timestamp}}`（group 键 = 群腿应答面 2026-10-15 批 additive，缺席键不在；群单腿时 timestamp = 群腿 ts、results 恒空；fake `results` 恒空） | account/message 缺失或空串（双缺 = 无载荷整拒）/recipients 缺失·非数组·单字符串形态·条目非字符串·空串/空批且 group 缺席/distributionListId 空串·非字符串/allowsReplies 非布尔/textStyle 词表外（含内联样式词与大小写漂移）·非字符串/bodyRanges 条目缺字段·style 词表外·>64 条（cap 镜像整拒不截断）·非数组/previewImage 非字符串·空串/previewUrl 非字符串·空串·非 `https://` 开头·>2048 字符/previewTitle 非字符串·空串·>1024 UTF-8 字节/attachment 非字符串·空串/attachment 与 message·textStyle·previewImage·previewUrl·previewTitle·previewDate 同置（两腿恰一，官方 oneof 同构）/group 非字符串·空串`-32603`；名单腿：号码不可解析/收件人发送失败/未注册账号 同 send 折叠 `-32603`（现状面零变化）；群腿：groupId 非 32B base64/群已终止（`-1`+`SEND_TARGET_TERMINATED`）/announcements-only 非 admin（`-1`+`SEND_TARGET_ANNOUNCEMENTS_ONLY`）/群态不可得/成员发送失败 同群发送结构化错误面（send_error 单点）| **2026-10-08 real（KT 扩展，Stories 发送批）**：官方 sendStory 行为对齐——text story 单面（群 story 边界保留；文件 story 由 2026-10-14 媒体 story 批解除，见后）；textAttachment{text, textStyle, preview.image=previewImage 随批 CDN 上行} 构造 + profileKey 由 fork send 面注入；preview 面 2026-10-09 扩：previewUrl/previewTitle 如实进 proto preview.url/preview.title（两键互相独立可选，image/url/title 三件任一在场即成 Preview——官方 preview 面 image 可空同构 `hydratedPreview.image && upload`；接收面投影见 Stories 接收批）；解析全量前置→按解析后 ServiceId 去重保首现序→单时间戳逐收件人 sealed-sender `?story=true` 分发（任一失败整体 `-32603`，per-recipient 部分失败形状未对齐纪律 §5）→≥1 成功后 best-effort 自同步 `SyncMessage.Sent{story_message, story_message_recipients}`（官方「≥1 成功且有其他设备」同闸，同步失败不回滚）；urgent 位钉定 rev proto 无此字段（偏差登记 §5）；详见 §5 Stories 发送批；**2026-10-14 real（KT 扩展，媒体 story 发送面批，官方对齐 Signal-Desktop abe80d3，wire additive，engine-compat，§5 块）**：`attachment` 可选参数扩文件 story 腿——E1 批「文件 story v1 不做」边界翻案（理由记档 §5）；官方 `StoryMessage.attachment` oneof fileAttachment=3\|textAttachment=4 双臂（protos/SignalService.proto:476-479），media 腿 = sendStory.preload.ts:186-190 同构：attachment data URI 走既有 transit CDN 上行链（presage upload_attachments 官方原语），返回指针原样进 StoryMessage.fileAttachment（官方 getStoryMessage SendMessage.preload.ts:1043-1044 同位），bodyRanges 两腿共用（官方 :1059-1061 fileAttachment 分支同载）；两腿恰一（同置/text 专属键越腿 -32603）；attachment 缺席 = text story 现状零变化；与接收投影 fileAttachment locator 全脸严格互逆（往返单测钉定 §5）；自同步 story_message 载同一 story 值恰好一次不变；vendored proto/fork 发送路径零改动；群 story（GroupContextV2 位）边界保留；**2026-10-15 real（KT 扩展，群 story 发送面批，官方对齐 Signal-Desktop abe80d3，wire additive，engine-compat，§5 块）**：`group` 可选参数扩群受众腿——E1 批「群 story v1 不做」边界翻案（理由记档 §5）；官方发送面 = sendStoryMessage.preload.ts:40-63 受众双域（名单 ∧ 群，同一 send 共存）+ 群候选三闸（isGroupV2 :210/非 terminated :218/announcementsOnly 需 admin :226-232）；线格式 = `Content.storyMessage`（protos/SignalService.proto:115）内 `StoryMessage.group = GroupContextV2{masterKey=1, revision=2, groupChange=3}`（:474/:947-951，官方组装 SendMessage.preload.ts:1054-1060，groupChange 恒缺）；群腿 allowsReplies 恒 true（sendStory.preload.ts:199/:352-354，allowsReplies 参数只辖名单腿）；混合受众 = 名单腿 ts + 群腿 ts+1 官方 +index+1 同款、两 sync 官方两 job 同构（sendStoryMessage.preload.ts:327-332/:337-378）；群 sync 形状 = 空名单位 + 恒可回位 + destination 缺席（sendStory.preload.ts:587-589）；recipients 空批 + group 在场 = 群单腿（官方受众至少一域 :57-63 同构）；group 缺席 = 现状零变化 |
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
@@ -2370,6 +2370,111 @@ engine-compat）**
   式未注册账号折叠 `-32603` 不触网。契约测试
   `send_story_fake_shape_and_param_fail_closed` 扩面（合法批/两腿恰一/
   text 专属键禁入/形状闸/调度日志 44 条）。
+
+群 story 发送面（2026-10-15，KT 扩展 `sendStory` group 腿，官方对齐
+Signal-Desktop abe80d3，wire additive，engine-compat）
+
+- **边界翻案记档**：Stories 发送批（E1）原定「群 story（GroupContextV2
+  位）v1 不做」，媒体 story 批（2026-10-14）再次确认保留，本批明示翻
+  案——①官方发送面群受众是正式域：SendStoryModal.dom.tsx:55-58 受众三
+  域 distributionLists ∧ groupConversations ∧ groupStories（:176-182
+  群受众入选回显），发送编排 `sendStoryMessage.preload.ts:40-63`
+  listIds ∧ conversationIds 双域同一 send；②接收投影（E2 批）早已投群
+  story 全链（`project_story_message` group 位 masterKey base64 /
+  `is_group_story_reply` 信封闸 / storyReply 回复路由 / sync echo
+  storyMessage+storyMessageRecipients），「收得到、发不出」不对称只剩
+  发送面缺口；③线格式 vendored proto 已在（`StoryMessage.group=2`
+  oneof 同位），fork 发送原语（story 通道单收件人）既有复用、vendored
+  proto 与 fork 零改动即承载。
+- **官方发送锚（abe80d3 第一手实读，行为对齐不抄码）**：
+  - 受众面：`ts/util/sendStoryMessage.preload.ts:40-63`（listIds +
+    conversationIds；双缺 drop）、群候选三闸 :210（isGroupV2）/ :218
+    （terminated 拒）/ :226-232（announcementsOnly 需 admin）；
+    SendStoryModal.dom.tsx:518/625（选中群经 toggleGroupsForStorySend
+    置 storySendMode=Always :238-251——宿主会话态，不在引擎面）。
+  - 线格式：`Content.storyMessage = 9`（protos/SignalService.proto:115，
+    非 dataMessage.groupContext 位）；`StoryMessage{profileKey=1,
+    group=2, fileAttachment=3|textAttachment=4, allowsReplies=5,
+    bodyRanges=6}`（:473-482）；`GroupContextV2{masterKey=1, revision=2,
+    groupChange=3}`（:947-951）；官方组装 `getStoryMessage`
+    SendMessage.preload.ts:1022-1067——`group: {masterKey, revision,
+    groupChange ?? null}`（story 发送无 groupChange 传入源，恒缺）、
+    群值源 `conversation.getGroupV2Info()` conversations.preload.ts:
+    1412-1434（本地群态 masterKey+revision）。群定位键 = masterKey
+    （32B；群 id 收方派生，processDataMessage.preload.ts:149-169
+    processGroupV2Context → deriveGroupFields 同语义）+ revision；与
+    storyRecipientUpdate 无关（该面 = 名单扇出 sync 载体，S5 批已接）。
+  - 允许回复：群腿 `allowsReplies` 恒 true（sendStory.preload.ts:199
+    `allowsReplies: true` 硬编码 + :352-354 `isGroupV2 ||
+    Boolean(...)` 短路）——RPC allowsReplies 参数只辖名单腿。
+  - 分发面：官方主路 = sender-key 群发（`sendContentMessageToGroup`
+    sendToGroup.preload.ts:191-263 → sendToGroupViaSenderKey；story=true
+    不用 GSE：:362 `groupId != null && !story`，isValidSenderKeyRecipient
+    :1303-1330 story 臂走 story access key）；fallback = 逐收件人
+    sendGroupProto（:240-263，官方合法回退）。引擎走逐成员 story 通道
+    （fork `Manager::send_story_message` sealed-sender `?story=true`）=
+    fallback 同构传输面，与名单腿同一 story 通道纪律（E1 既有偏差族）；
+    群成员解析 = 引擎群态（缓存优先 miss 才 fetch，group_mrm R1 同构），
+    不归 connector。
+  - 自同步：官方群 story sync（sendStory.preload.ts:565-598 收尾 + 群
+    分支）——`storyMessageRecipients` 每成员
+    `{destinationServiceId, distributionListIds: [], isAllowedToReply:
+    true}`（addDistributionListToServiceIdSent :219-244 listId=undefined
+    → 空名单位；群 sendState isAllowedToReplyToStory:true
+    sendStoryMessage.preload.ts:259-263 → 恒可回位），
+    `destinationE164/destinationServiceId` 双缺（:587-589 注释明示群发
+    送 undefined）；`storyMessage` 载含 group 的同一 story。引擎恰好一次
+    best-effort（≥1 成员成功才发，同步失败不回滚；零成员 solo 群 =
+    零发送零 sync，官方 storyMessageRecipients 空 → 不发 sync 同构）。
+  - 混合受众：官方 = 每 audience 一个 story job（名单 job
+    sendStoryMessage.preload.ts:327-332，群 job :337-378），群时间戳
+    `timestamp + index + 1` 保跨腿唯一，各自收尾 sync（两 job 两 sync）。
+    引擎同构：名单腿 ts、群腿 ts+1、两条 sync 先后发送；群单腿 =
+    recipients 空批 + group 在场（官方受众至少一域 :57-63 双缺才 drop
+    同构）。
+- **wire 形状（additive）**：`sendStory` params 增可选 `group`（非空
+  字符串 = engine groupId，群 master key 标准 base64，与 sendTextGroup
+  群 id 同一口径）；应答增可选 `group:{groupId, timestamp}` 群腿面（群
+  单腿时顶层 timestamp = 群腿 ts、results 恒空）；null 归缺席。group 与
+  内容两腿正交（官方群 story text/media 双臂同源 getStoryMessage——
+  text+group、media+group 均可达）；group 缺席 = 现状零变化。
+- **fail-closed 闸（逐键理由）**：①group 非字符串/空串 `-32603`
+  （静默丢受众是 fail-open）；②groupId 解码非 32B `-32603`（群 id 即
+  master key 标准 base64，形状闸 = decode_group_id 既有单点；官方
+  deriveGroupFields 对非 32B 直接抛错同构）；③群已终止 `-1` +
+  `SEND_TARGET_TERMINATED`（官方 :218-224 拒发位；引擎群发送同款缓存化
+  闸）；④群态不可得 `-32603`（revision 无源不发明——官方值源本地群态，
+  引擎无群态即无发送面）；⑤announcementsOnly 非 admin `-1` +
+  `SEND_TARGET_ANNOUNCEMENTS_ONLY`（官方 :226-232——官方按「跳过该群」
+  降级，引擎单群参数面无剩余受众可降，fail-closed 上抛不静默吞，偏差
+  ⑥登记）；⑥成员发送失败整体 `-32603`（sendStory 既有 per-recipient
+  纪律）。错误面分工：群腿走 `send_error` 结构化单点（-1 词族群发送
+  同款），名单腿维持现状 `-32603` 折叠零变化。
+- **编排面**：`stories::send_story_group`（群腿独立编排——官方混合受众
+  两 job 两 sync 同构，Service::send_story 先名单腿后群腿顺序编排）；
+  构造面 `build_story_group_context`/`group_story_sync_recipients` 纯
+  函数单测钉形；`build_story_message`/`build_media_story_message` 增
+  `group` 透传位（名单腿传 None 零变化）。群 sync 形状接收侧已有面照投
+  （`sent.storyMessage` 分支 + `storyMessageRecipients` 位 + story
+  group 位，E2/P14 既有）——收侧零改动。
+- **接收投影查漏结论（记档不发明）**：直收群 story →
+  `storyMessage.group`（masterKey 标准 base64）已投（E2）；自发群 story
+  多设备 echo → `sentMessage.storyMessage.group` +
+  `storyMessageRecipients` 已投（P14）；群 story 回复路由 →
+  dataMessage `group`（groupId）+ `storyReply` 已投（E2）；信封闸
+  `is_group_story_reply` 已有（E2）。缺口 follow-up（不本批发明）：
+  ①`story.group` 投影只携 masterKey，revision/groupChange 不投（官方
+  processGroupV2Context 携带；connector 按 groupId 路由够用，revision
+  面消费需求出现再扩）；②官方收侧拒收 blocked 群 story
+  （MessageReceiver.preload.ts #handleStoryMessage #isGroupBlocked），
+  引擎无群会话态不设闸（宿主裁量）；③群 story 的 replies/查看回执特殊
+  语义（官方 handleDataMessage.preload.ts:505/617 群回复过期计时器随父
+  story 同步等）刻意不做（任务口径），收侧 storyReply 位已够路由。
+- **fake 纪律**：group 在场 = 参数闸全量生效后成功
+  `{timestamp, results:[], group:{groupId, timestamp}}`（send 系同款；
+  群态/成员解析归 real 面 fake 不可达）。契约测试
+  `send_story_fake_shape_and_param_fail_closed` 扩面（群单腿/混合受众/
+  group 形状闸/recipients 空批双态/群腿结构化错误面）。
 
 transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批；
 消费方 connector 契约 1.76 §4.38 扩面）：

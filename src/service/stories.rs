@@ -27,11 +27,38 @@
 //! 上传链/自同步面全部既有复用、vendored proto 与 fork 发送路径零改动
 //! 即可承载（fork `send_story_message` 本就 `impl Into<ContentBody>`
 //! 泛型），故本批翻案落地，翻案理由随 compat §5 媒体 story 批记档。
-//! **群 story（GroupContextV2 位）边界保留不动**（发送面仍恒
-//! `group: None`）。
+//! 群 story 发送面（2026-10-15 批，官方对齐 Signal-Desktop abe80d3，
+//! wire additive）：`group` 可选参数扩群受众腿——E1 批「群 story
+//! （GroupContextV2 位）v1 不做」边界翻案（理由记档 compat §5 群 story
+//! 批）。官方发送面 = `ts/util/sendStoryMessage.preload.ts:40-63` 受众
+//! 双域（名单 listIds ∧ 群 conversationIds，同一 send 可共存）+ 群候选
+//! 三闸（isGroupV2 :210 / 非 terminated :218 / announcementsOnly 需
+//! admin :226-232）；线格式 = `Content.storyMessage`（proto
+//! SignalService.proto:115）内 `StoryMessage.group = GroupContextV2`
+//!（:474，`{masterKey=1, revision=2, groupChange=3}` :947-951），群定位
+//! 键 = masterKey（32B，群 id 由收方派生，processDataMessage.preload.ts
+//! :149-169 deriveGroupFields 同语义）+ revision（官方
+//! `conversation.getGroupV2Info()` conversations.preload.ts:1412-1434
+//! 本地群态同源；引擎 = 群态取面缓存优先 miss 才 fetch，group_mrm R1
+//! 同构）；`groupChange` 官方 story 发送恒不带（getStoryMessage
+//! SendMessage.preload.ts:1054-1060 `groupChange ?? null`，无传入源）。
+//! 群腿 `allowsReplies` 线上恒 true（sendStory.preload.ts:199 硬编码 +
+//! :352-354 `isGroupV2 ||` 短路；RPC allowsReplies 参数只辖名单腿）。
+//! 分发面 = 逐成员 story 通道（fork `Manager::send_story_message`
+//! sealed-sender `?story=true`）——官方主路 sender-key（story=true 不用
+//! GSE，sendToGroup.preload.ts:362 `groupId != null && !story`）+
+//! 逐收件人合法 fallback（:250-263 sendGroupProto）；引擎与名单腿同一
+//! 传输纪律（E1 批既有偏差族，§5 记档）。自同步 = 官方群 story sync
+//! 形状：`Sent{timestamp, story_message（载 group）,
+//! story_message_recipients: 成员×{distributionListIds: [],
+//! isAllowedToReply: true}}` 且 `destination_service_id` 缺席
+//!（sendStory.preload.ts:587-589 群发送两 destination 位 undefined；
+//! 空名单位 + 恒可回位 = addDistributionListToServiceIdSent listId=undefined
+//! + 群 sendState isAllowedToReplyToStory:true 同构）。
 //!
 //! 边界（任务口径）：distribution list 成员解析归 connector（引擎只收显式
-//! recipients）；群 story v1 不做；24h 过期纯客户端语义不在引擎面。
+//! recipients）；群 story 成员解析 = 引擎群态（sendTextGroup 同源）；
+//! 24h 过期纯客户端语义不在引擎面。
 //!
 //! 纪律（compat §1）：本层不产生任何 stderr 输出。
 
@@ -39,10 +66,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use presage::libsignal_service::content::ContentBody;
-use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::prelude::Uuid;
+use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::proto::{
-    data_message, story_message, sync_message, text_attachment, BodyRange, DataMessage, Preview,
-    StoryMessage, SyncMessage, TextAttachment,
+    data_message, story_message, sync_message, text_attachment, BodyRange, DataMessage,
+    GroupContextV2, Preview, StoryMessage, SyncMessage, TextAttachment,
 };
 use serde_json::{json, Value};
 
@@ -105,7 +133,10 @@ fn build_body_ranges(styles: &[SendTextStyle]) -> Result<Vec<BodyRange>, SendErr
 ///   上行），url/title = previewUrl/previewTitle 扩展键如实透传（解析闸
 ///   在 methods 参数面：https-only ≤2048 字符 / 非空 ≤1024 UTF-8 字节）；
 /// - `allows_replies` 透传（官方值源 = distribution list 属性，缺省线上
-///   false；connector 从名单记录展开后显式传入）。
+///   false；connector 从名单记录展开后显式传入）；
+/// - `group` 透传（群 story 腿传 Some(GroupContextV2)，官方 getStoryMessage
+///   group 位同构；名单腿传 None）。群腿 allows_replies 恒 true 由编排面
+///   传参裁定（官方 sendStory.preload.ts:199 同位），构造面不特判。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_story_message(
     text: &str,
@@ -116,10 +147,11 @@ pub(crate) fn build_story_message(
     preview_url: Option<String>,
     preview_title: Option<String>,
     preview_date: Option<u64>,
+    group: Option<GroupContextV2>,
 ) -> Result<StoryMessage, SendError> {
     Ok(StoryMessage {
         profile_key: None,
-        group: None,
+        group,
         allows_replies: Some(allows_replies),
         body_ranges: build_body_ranges(body_ranges)?,
         attachment: Some(story_message::Attachment::TextAttachment(TextAttachment {
@@ -138,19 +170,56 @@ pub(crate) fn build_story_message(
 /// `attachment = { fileAttachment }`）——上传返回指针原样进
 /// `StoryMessage.fileAttachment`，bodyRanges 同臂照载（官方 :1059-1061
 /// fileAttachment 分支同构）；`profile_key` 构造面 None（send 面注入，与
-/// text 臂同构）、`group` 恒 None（群 story 边界保留）。
+/// text 臂同构）、`group` 透传（群 story 腿 Some，2026-10-15 批）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_media_story_message(
     allows_replies: bool,
     body_ranges: &[SendTextStyle],
     file_attachment: presage::proto::AttachmentPointer,
+    group: Option<GroupContextV2>,
 ) -> Result<StoryMessage, SendError> {
     Ok(StoryMessage {
         profile_key: None,
-        group: None,
+        group,
         allows_replies: Some(allows_replies),
         body_ranges: build_body_ranges(body_ranges)?,
         attachment: Some(story_message::Attachment::FileAttachment(file_attachment)),
     })
+}
+
+/// 群 story 群上下文构造（2026-10-15 批纯函数，单测钉形状）：官方
+/// getStoryMessage group 位同构（SendMessage.preload.ts:1054-1060）——
+/// `{masterKey, revision, groupChange: null}`，proto GroupContextV2
+/// `{masterKey=1, revision=2, groupChange=3}`
+///（Signal-Desktop protos/SignalService.proto:947-951）；groupChange 官方
+/// story 发送恒缺（无传入源），fail-closed 不发明。
+pub(crate) fn build_story_group_context(master_key: Vec<u8>, revision: u32) -> GroupContextV2 {
+    GroupContextV2 {
+        master_key: Some(master_key),
+        revision: Some(revision),
+        group_change: None,
+    }
+}
+
+/// 群 story 自同步扇出条目构造（2026-10-15 批纯函数，单测钉形状）：官方
+/// 群 story sync 同构——每成员一条
+/// `{destinationServiceId, distributionListIds: [], isAllowedToReply:
+/// true}`（sendStory.preload.ts addDistributionListToServiceIdSent
+/// 群臂 listId=undefined → 空名单位；群 sendState
+/// isAllowedToReplyToStory:true → 恒可回位）；空成员批 = 空 vec（官方
+/// storyMessageRecipients 空 → 整条 sync 不发，闸在编排面）。
+pub(crate) fn group_story_sync_recipients(
+    members: &[ServiceId],
+) -> Vec<sync_message::sent::StoryMessageRecipient> {
+    members
+        .iter()
+        .map(|service_id| sync_message::sent::StoryMessageRecipient {
+            destination_service_id: Some(service_id.service_id_string()),
+            distribution_list_ids: Vec::new(),
+            is_allowed_to_reply: Some(true),
+            destination_service_id_binary: None,
+        })
+        .collect()
 }
 
 /// story preview 组装（纯函数，单测钉形状）：image/url/title/date 四件任一
@@ -200,6 +269,11 @@ fn dedup_resolved(recipients: Vec<(ServiceId, String)>) -> Vec<(ServiceId, Strin
 /// data URI 走既有 transit CDN 上行链（entries 单条、无预览图），上传返回
 /// 指针进 `StoryMessage.fileAttachment`（官方 sendStory.preload.ts:186-190
 /// 同构）；缺席 = text story 现状零变化。两腿互斥闸在 methods 参数面。
+/// 本函数 = 名单受众腿（2026-10-15 批拆分）：群受众腿独立编排于
+/// `send_story_group`（混合受众官方 = 两 job 两 sync，sendStoryMessage
+/// .preload.ts:327-332 名单 job / :337-378 群 job 各自带收尾 sync——引擎
+/// 同构先后两腿，时间戳名单腿 ts、群腿 ts+1 官方 +index+1 同款），由
+/// Service::send_story 编排调用。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_story(
     service: &Arc<Service>,
@@ -233,7 +307,7 @@ pub(crate) async fn send_story(
             let (pointers, _) =
                 upload_attachments_for_send(&manager, &[uri.to_owned()], None).await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
-            build_media_story_message(allows_replies, body_ranges, file_pointer)?
+            build_media_story_message(allows_replies, body_ranges, file_pointer, None)?
         }
         None => {
             let (_, preview_pointer) = match preview_image {
@@ -249,6 +323,7 @@ pub(crate) async fn send_story(
                 preview_url,
                 preview_title,
                 preview_date,
+                None,
             )?
         }
     };
@@ -312,6 +387,184 @@ pub(crate) async fn send_story(
     }
 
     Ok((timestamp, results))
+}
+
+/// sendStory 群受众腿（2026-10-15 批，compat §3 sendStory 行 + §5 群 story
+/// 批）：官方群 story 发送行为对齐——
+///
+/// - **受众与闸面**（官方 sendStoryMessage.preload.ts:198-251 群候选三闸
+///   同序镜像）：群 id fail-closed 解码（32B master key，decode_group_id
+///   形状闸）→ terminated 硬拒（官方 :218-224 `terminated` 跳过位；引擎
+///   群发送同款 `send_target_terminated` 缓存化闸）→ 群态取面（缓存优先
+///   miss 才 fetch，group_mrm R1 同构；取不到 = 官方无群态发送面等价失败
+///   fail-closed）→ announcementsOnly 需 admin（官方 :226-232；引擎群发送
+///   同款 AnnouncementsOnly 错误面——官方 story 面按「跳过该群」降级，
+///   引擎单群参数面无剩余受众可降，fail-closed 上抛不静默吞）。
+/// - **线格式**：`StoryMessage.group = GroupContextV2{masterKey, revision,
+///   groupChange: None}`（build_story_group_context）；revision = 群态
+///   revision（官方 `conversation.getGroupV2Info()` 本地群态同源）。
+/// - **分发面**：逐成员（群态 members 去自身，排序去重确定序）story 通道
+///   （fork `Manager::send_story_message` sealed-sender `?story=true`）。
+///   官方主路 = sender-key（story=true 不用 GSE，sendToGroup.preload.ts:
+///   362 `groupId != null && !story`）+ 逐收件人 fallback（:250-263）；
+///   引擎走 fallback 同构传输面，与名单腿同一 story 通道纪律（§5 记档）。
+///   任一成员失败整体 `-32603`（sendStory 既有纪律）。
+/// - **allowsReplies**：群腿线上恒 true（官方 sendStory.preload.ts:199
+///   硬编码 + :352-354 `isGroupV2 ||` 短路；RPC allowsReplies 只辖名单腿）。
+/// - **自同步**（官方群 story sync 形状，恰好一次）：≥1 成员发送成功才发
+///   `SyncMessage.Sent{timestamp, story_message（载 group）,
+///   story_message_recipients = group_story_sync_recipients（空名单位 +
+///   恒可回位），destination_service_id 缺席}`（官方群发送两 destination
+///   位 undefined，sendStory.preload.ts:587-589）；best-effort——同步失败
+///   不回滚已成功上行（名单腿同口径）；零成员（ solo 群）= 零发送零
+///   sync（官方 storyMessageRecipients 空 → 不发 sync 同构），成功形状
+///   返回。
+///
+/// `timestamp` 由调用方给定：群单腿 = now_ms()，混合受众 = 名单腿 ts+1
+/// （官方 groupTimestamp = timestamp + index + 1 同款保跨腿唯一）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_story_group(
+    service: &Arc<Service>,
+    account: &str,
+    group_id: &str,
+    timestamp: u64,
+    text: &str,
+    text_style: Option<i32>,
+    body_ranges: &[SendTextStyle],
+    attachment: Option<&str>,
+    preview_image: Option<&str>,
+    preview_url: Option<String>,
+    preview_title: Option<String>,
+    preview_date: Option<u64>,
+) -> Result<(u64, Value), SendError> {
+    let group_face = json!({ "groupId": group_id, "timestamp": timestamp });
+    if !service.real {
+        return Ok((timestamp, group_face));
+    }
+    let shared = open_registered(service, account)
+        .await
+        .ok_or(SendError::UnknownAccount)?;
+    let mut manager = lock_registered_for_send(&shared).await;
+
+    // master key 形状闸（32B）：群 id 即 master key 标准 base64（引擎群面
+    // 统一口径），decode_group_id 已含长度闸——非 32B = 内部失败，不发明
+    // 群上下文。
+    let master_key = super::decode_group_id(group_id).ok_or(SendError::Internal)?;
+    // terminated 硬拒（官方群候选闸二；缓存化闸群发送同款零稳态探针）。
+    if service.send_target_terminated(account, group_id).await {
+        return Err(SendError::TargetTerminated);
+    }
+    // 群态取面：本地缓存（store 群态 + kv GSE 双校验）优先，miss 才 fetch
+    // 并落缓存（group_mrm R1 同构；fetch 失败上抛不降级）。取不到群态 =
+    // 官方无群态发送面等价失败（fail-closed，revision 无源不发明）。
+    let fetched =
+        match super::group_cache::cached_group_with_endorsements(&mut manager, &master_key).await {
+            Some(hit) => Some(hit),
+            None => {
+                let fresh = manager
+                    .fetch_group_with_endorsements(&master_key)
+                    .await
+                    .map_err(send_error_of)?;
+                super::group_cache::store_endorsements(manager.store(), &master_key, &fresh).await;
+                fresh
+            }
+        };
+    let Some((group, _)) = fetched else {
+        return Err(SendError::Internal);
+    };
+    // announcementsOnly 闸（官方群候选闸三）：发送方非 admin 拒发（引擎群
+    // 发送同款错误面；官方 story 面按「跳过该群」降级，单群参数面无受众
+    // 可降，fail-closed 上抛——§5 记档）。
+    let own_aci = manager.registration_data().service_ids.aci();
+    let own_uuid: Uuid = own_aci.into();
+    let own_protocol_aci = Aci::from(own_uuid);
+    let own_service_id = ServiceId::from(own_protocol_aci);
+    if group.announcements_only
+        && !presage::manager::group_member_is_admin(&group, &own_protocol_aci)
+    {
+        return Err(SendError::AnnouncementsOnly);
+    }
+
+    // 成员面：群态 members 去自身，排序去重（确定序，group_mrm 同构）。
+    let mut targets: Vec<ServiceId> = group
+        .members
+        .iter()
+        .map(|member| ServiceId::from(member.aci))
+        .filter(|service_id| *service_id != own_service_id)
+        .collect();
+    targets.sort();
+    targets.dedup();
+
+    // 载荷构造（两内容腿与名单腿同构正交；群上下文进 StoryMessage.group，
+    // 群腿 allowsReplies 恒 true 官方同位）。
+    let story = match attachment {
+        Some(uri) => {
+            let (pointers, _) =
+                upload_attachments_for_send(&manager, &[uri.to_owned()], None).await?;
+            let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
+            build_media_story_message(
+                true,
+                body_ranges,
+                file_pointer,
+                Some(build_story_group_context(master_key, group.revision)),
+            )?
+        }
+        None => {
+            let (_, preview_pointer) = match preview_image {
+                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri)).await?,
+                None => (Vec::new(), None),
+            };
+            build_story_message(
+                text,
+                text_style,
+                true,
+                body_ranges,
+                preview_pointer,
+                preview_url,
+                preview_title,
+                preview_date,
+                Some(build_story_group_context(master_key, group.revision)),
+            )?
+        }
+    };
+
+    // 逐成员 story 通道分发（任一失败整体失败，sendStory 既有纪律）。
+    for target in &targets {
+        manager
+            .send_story_message(
+                *target,
+                ContentBody::StoryMessage(story.clone()),
+                timestamp,
+                false,
+            )
+            .await
+            .map_err(send_error_of)?;
+    }
+
+    // 自同步（官方群 story sync 形状，恰好一次，零成员不发）：≥1 成员
+    // 成功才发；destination_service_id 缺席（官方群发送同位）；best-effort
+    // 不回滚。
+    if !targets.is_empty() {
+        let sent = sync_message::Sent {
+            timestamp: Some(timestamp),
+            story_message: Some(story),
+            story_message_recipients: group_story_sync_recipients(&targets),
+            ..Default::default()
+        };
+        let sync = SyncMessage {
+            content: Some(sync_message::Content::Sent(sent)),
+            ..Default::default()
+        };
+        let _ = manager
+            .send_message(
+                own_service_id,
+                ContentBody::SynchronizeMessage(sync),
+                timestamp,
+            )
+            .await;
+    }
+
+    Ok((timestamp, group_face))
 }
 
 /// story 删除扇出条目（S5，wire `SyncMessage.Sent.storyMessageRecipients`
@@ -451,10 +704,10 @@ mod tests {
 
     #[test]
     fn story_message_shape() {
-        let story = build_story_message("hello", Some(2), true, &[], None, None, None, None)
+        let story = build_story_message("hello", Some(2), true, &[], None, None, None, None, None)
             .expect("shape");
         assert_eq!(story.profile_key, None, "profileKey 由 send 面注入");
-        assert_eq!(story.group, None, "群 story v1 不做");
+        assert_eq!(story.group, None, "名单腿不携群位");
         assert_eq!(story.allows_replies, Some(true));
         assert!(story.body_ranges.is_empty());
         match story.attachment {
@@ -472,8 +725,8 @@ mod tests {
 
     #[test]
     fn story_message_default_style_omits_field() {
-        let story =
-            build_story_message("hi", None, false, &[], None, None, None, None).expect("shape");
+        let story = build_story_message("hi", None, false, &[], None, None, None, None, None)
+            .expect("shape");
         let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
             panic!("text attachment expected");
         };
@@ -493,6 +746,7 @@ mod tests {
             true,
             &[style("BOLD", 0, 4), style("SPOILER", 5, 2)],
             Some(pointer),
+            None,
             None,
             None,
             None,
@@ -543,6 +797,7 @@ mod tests {
             Some(url.clone()),
             Some(title.clone()),
             None,
+            None,
         )
         .expect("shape");
         let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
@@ -564,6 +819,7 @@ mod tests {
             Some(url.clone()),
             None,
             None,
+            None,
         )
         .expect("shape");
         let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
@@ -574,8 +830,8 @@ mod tests {
         assert!(preview.title.is_none() && preview.image.is_none());
 
         // 缺席：不发明 Preview。
-        let story =
-            build_story_message("bare", None, true, &[], None, None, None, None).expect("shape");
+        let story = build_story_message("bare", None, true, &[], None, None, None, None, None)
+            .expect("shape");
         let Some(story_message::Attachment::TextAttachment(text)) = story.attachment else {
             panic!("text attachment expected");
         };
@@ -628,9 +884,8 @@ mod tests {
     /// 媒体 story 构造钉形（2026-10-14 批）：上传返回指针原样进
     /// StoryMessage.fileAttachment（官方 getStoryMessage fileAttachment 臂
     /// 同位，SendMessage.preload.ts:1043-1044）——profileKey 构造面 None
-    ///（send 面注入）、group 恒 None（群 story 边界保留）、allowsReplies
-    /// 透传、bodyRanges 同臂照载（官方 :1059-1061 fileAttachment 分支
-    /// 同构）。
+    ///（send 面注入）、名单腿 group None、allowsReplies 透传、bodyRanges
+    /// 同臂照载（官方 :1059-1061 fileAttachment 分支同构）。
     #[test]
     fn media_story_message_shape() {
         let pointer = presage::proto::AttachmentPointer {
@@ -639,9 +894,9 @@ mod tests {
             ..Default::default()
         };
         let story =
-            build_media_story_message(false, &[style("BOLD", 0, 4)], pointer).expect("shape");
+            build_media_story_message(false, &[style("BOLD", 0, 4)], pointer, None).expect("shape");
         assert_eq!(story.profile_key, None, "profileKey 由 send 面注入");
-        assert_eq!(story.group, None, "群 story 边界保留");
+        assert_eq!(story.group, None, "名单腿不携群位");
         assert_eq!(story.allows_replies, Some(false));
         assert_eq!(story.body_ranges.len(), 1, "bodyRanges 文件臂同载");
         match story.attachment {
@@ -679,7 +934,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let story = build_media_story_message(true, &[], pointer.clone()).expect("shape");
+        let story = build_media_story_message(true, &[], pointer.clone(), None).expect("shape");
 
         // 接收投影（E2 批既有面，不动）读回。
         let out = crate::service::project_story_message(&story, &std::collections::HashMap::new())
@@ -721,5 +976,109 @@ mod tests {
             out["fileAttachment"]["locator"]["key"],
             json!(base64::engine::general_purpose::STANDARD.encode(&key))
         );
+    }
+
+    /// 群上下文构造钉形（2026-10-15 批）：官方 getStoryMessage group 位
+    /// 同构（SendMessage.preload.ts:1054-1060）——masterKey/revision 载入，
+    /// groupChange 恒缺（官方 story 发送无传入源，fail-closed 不发明）。
+    #[test]
+    fn story_group_context_shape() {
+        let key: Vec<u8> = (0..32).collect();
+        let context = build_story_group_context(key.clone(), 7);
+        assert_eq!(context.master_key.as_deref(), Some(key.as_slice()));
+        assert_eq!(context.revision, Some(7));
+        assert_eq!(context.group_change, None, "groupChange 官方恒缺");
+    }
+
+    /// 群 story 文本腿构造钉形（2026-10-15 批）：group 上下文原样进
+    /// StoryMessage.group、群腿 allowsReplies 恒 true（官方
+    /// sendStory.preload.ts:199/:352-354 同位）、文本位照常。
+    #[test]
+    fn group_story_text_message_shape() {
+        let key: Vec<u8> = (0..32).collect();
+        let context = build_story_group_context(key.clone(), 3);
+        let story = build_story_message(
+            "group story",
+            Some(2),
+            true,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(context),
+        )
+        .expect("shape");
+        let group = story.group.expect("group carried");
+        assert_eq!(group.master_key.as_deref(), Some(key.as_slice()));
+        assert_eq!(group.revision, Some(3));
+        assert_eq!(group.group_change, None);
+        assert_eq!(story.allows_replies, Some(true), "群腿恒可回");
+        match story.attachment {
+            Some(story_message::Attachment::TextAttachment(text)) => {
+                assert_eq!(text.text.as_deref(), Some("group story"));
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
+    }
+
+    /// 群 story 媒体腿构造钉形（2026-10-15 批）：与 text+group 正交组合
+    /// （官方群 story 两内容臂同源 getStoryMessage），指针进
+    /// fileAttachment、群上下文同载。
+    #[test]
+    fn group_story_media_message_shape() {
+        let key: Vec<u8> = (0..32).collect();
+        let pointer = presage::proto::AttachmentPointer {
+            cdn_number: Some(3),
+            content_type: Some("video/mp4".to_owned()),
+            ..Default::default()
+        };
+        let story = build_media_story_message(
+            true,
+            &[style("MONOSPACE", 0, 2)],
+            pointer,
+            Some(build_story_group_context(key, 11)),
+        )
+        .expect("shape");
+        let group = story.group.expect("group carried");
+        assert_eq!(group.revision, Some(11));
+        assert_eq!(story.allows_replies, Some(true));
+        assert_eq!(story.body_ranges.len(), 1, "bodyRanges 群媒体腿同载");
+        match story.attachment {
+            Some(story_message::Attachment::FileAttachment(pointer)) => {
+                assert_eq!(pointer.content_type.as_deref(), Some("video/mp4"));
+            }
+            other => panic!("unexpected attachment: {other:?}"),
+        }
+    }
+
+    /// 群 story 自同步扇出条目钉形（2026-10-15 批）：每成员
+    /// {destinationServiceId, distributionListIds: [], isAllowedToReply:
+    /// true}（官方群 story sync 同构——addDistributionListToServiceIdSent
+    /// 群臂空名单位 + 群 sendState 恒可回位）；空成员批 = 空 vec（sync 整
+    /// 条不发闸在编排面）；保传入序。
+    #[test]
+    fn group_story_sync_recipients_shape() {
+        assert!(group_story_sync_recipients(&[]).is_empty(), "空批空 vec");
+        let parse = |uuid: &str| ServiceId::parse_from_service_id_string(uuid).expect("uuid");
+        let a = parse("9d0652a1-8b1c-4e0d-9d24-4cbd1d5b4d01");
+        let b = parse("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10");
+        let entries = group_story_sync_recipients(&[a, b]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].destination_service_id.as_deref(),
+            Some("9d0652a1-8b1c-4e0d-9d24-4cbd1d5b4d01")
+        );
+        assert!(
+            entries[0].distribution_list_ids.is_empty(),
+            "群位空名单位（官方同构）"
+        );
+        assert_eq!(entries[0].is_allowed_to_reply, Some(true), "恒可回");
+        assert_eq!(
+            entries[1].destination_service_id.as_deref(),
+            Some("f4b3a2c0-1d2e-4f5a-8b7c-6d5e4f3a2b10")
+        );
+        assert_eq!(entries[1].distribution_list_ids, Vec::<String>::new());
+        assert_eq!(entries[1].is_allowed_to_reply, Some(true));
     }
 }
