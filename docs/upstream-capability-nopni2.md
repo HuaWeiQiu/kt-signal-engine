@@ -108,8 +108,48 @@ methods.rs startLink
 1. **升级哨兵**：下次同类异动的最快信号仍是 signal-cli issues（本轮 #2140
    早于任何官方公告）；`nopni2 → nopniN` 若再 bump，症状相同（OUTDATED_DEVICE），
    照桌面发出端形状追加即可。
-2. **backup5**：引擎若实现 link-and-sync（transfer archive 链接同步），
+2. **backup5**：~~引擎若实现 link-and-sync（transfer archive 链接同步），
    需评估后经 `link_uri` 追加 `backup5`——报了手机就走 VALID_WITH_SYNC 流，
-   引擎必须承接 archive 上传，未承接前禁报。
+   引擎必须承接 archive 上传，未承接前禁报。~~
+   **（2026-10-05 翻案）** 引擎 ADR 0005 S2 已落地 transfer archive 下载侧
+   （`download_transfer_archive`，0eedc8c），`backup5` 声明随之生效——但
+   追加位置引发双参数缺陷，见 §5。
 3. **spqr 线不动**：`LinkCapabilities::default()`（confirm_device 侧）与本次
    无关，spqr=true 维持。
+
+## 5. 追加取证（2026-10-15）：双 `capabilities` 参数缺陷与修复
+
+**症状**：手机扫码后链接成功，但不弹「是否转移聊天记录」、不上传迁移档案，
+引擎 `download_transfer_archive` 空等至预算上限（真机 15:30 链接成功复现；
+用户侧对照实验：解绑后重扫官方桌面二维码转移弹框正常出现）。
+
+**根因**：0eedc8c 在引擎 `link_flow` 里对 `link_uri` 产物
+`append_pair("capabilities", "backup5")`——而 26cc201 已让 `link_uri`
+自带 `capabilities=nopni,nopni2`，最终 QR 出现**两个同名参数**：
+
+```
+sgnl://linkdevice?uuid=…&pub_key=…&capabilities=nopni,nopni2&capabilities=backup5
+                                     ↑ 手机只读这个            ↑ 被吞
+```
+
+**手机侧裁定（真源码实查，Signal-Android main
+`linkdevice/LinkDeviceViewModel.kt`）**：
+
+```kotlin
+private fun Uri.getCapabilities(): Set<Capability> {
+  return this.getQueryParameter("capabilities")   // 单数 API：同名参数只取第一个
+    ?.split(",")?.mapNotNull { … }?.toSet() ?: emptySet()
+}
+```
+
+`Uri.getQueryParameter` 取**第一个**同名参数 → 手机只见 `nopni,nopni2` →
+`LinkAndSync(backup5) !in capabilities` → `VALID_WITHOUT_SYNC`：链接继续、
+转移不发起。官方桌面（`Provisioner.preload.ts`）capabilities 数组经
+toAppUrl 一次成**单参数**，故无此问题。
+
+**修复**：引擎 `src/service/mod.rs` `qr_link_url()`——渲染面把声明位收敛为
+单个 `capabilities` 参数（去重保序 + 保证 `backup5` 在位），幂等（定点性质
+有测试钉定：`qr_link_url_collapses_duplicate_capabilities_into_single_param`/
+`…_appends_backup5_when_capabilities_absent`/`…_is_idempotent`）。编码面
+`append_pair` 的 form-urlencoded 归一化（`,` → `%2C`）对手机侧
+`getQueryParameter` 解码透明，与现行 `pub_key` 编码产出同源。

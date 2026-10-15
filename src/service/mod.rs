@@ -8662,11 +8662,50 @@ fn project_attachment_pointer(pointer: &presage::proto::AttachmentPointer) -> Va
 // ADR 0005 S2：backup5 链接流程与存量历史迁移下载
 // ---------------------------------------------------------------------------
 
+/// 渲染面 QR URL（startLink `deviceLinkUri` 的最终形状）：把声明位收敛成
+/// **单个** `capabilities` 查询参数并保证 `backup5` 在位，值序与参数序对齐
+/// 官方（Signal-Desktop `Provisioner.preload.ts` capabilities 数组经
+/// toAppUrl 一次成形单参数；`uuid`/`pub_key` 在前，`capabilities` 收尾）。
+///
+/// 为什么不能两个同名参数：Android 扫码侧 `LinkDeviceViewModel.getCapabilities`
+/// 走 `Uri.getQueryParameter`（单数 API，同名参数只取第一个）——重复参数令
+/// `backup5` 被静默吞掉，手机判 `VALID_WITHOUT_SYNC`：链接成功但不弹
+/// 「转移聊天记录」、不上传迁移档案，引擎空等 archive 至预算上限
+/// （2026-10-15 真机取证复现，15:30 链接成功无弹框）。
+fn qr_link_url(mut url: url::Url) -> url::Url {
+    const BACKUP5: &str = "backup5";
+    let mut capabilities: Vec<String> = Vec::new();
+    let mut rest: Vec<(String, String)> = Vec::new();
+    for (key, value) in url.query_pairs() {
+        let (key, value) = (key.into_owned(), value.into_owned());
+        if key == "capabilities" {
+            for name in value.split(',').filter(|name| !name.is_empty()) {
+                if capabilities.iter().all(|existing| existing != name) {
+                    capabilities.push(name.to_string());
+                }
+            }
+        } else {
+            rest.push((key, value));
+        }
+    }
+    if capabilities.iter().all(|name| name != BACKUP5) {
+        capabilities.push(BACKUP5.to_string());
+    }
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        pairs.extend_pairs(rest.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        pairs.append_pair("capabilities", &capabilities.join(","));
+    }
+    url
+}
+
 /// 链接主流程：绕过 `Manager::link_secondary_device`（其内部丢弃
 /// `ephemeral_backup_key`，且 `RegistrationData` 的 password/profile_key 为
-/// pub(crate) 无法外部构造），直调 provisioning 层 `link_device`；QR URL 追加
-/// `capabilities=backup5`（官方 Provisioner 语义：手机读到声明才发起存量历史
-/// 迁移上传；URL 文本层追加，connector 展示面零改动）。拿到
+/// pub(crate) 无法外部构造），直调 provisioning 层 `link_device`；QR URL 经
+/// `qr_link_url` 收敛为单 `capabilities` 参数并保证 `backup5` 在位（官方
+/// Provisioner 语义：手机读到声明才发起存量历史迁移上传；URL 文本层变换，
+/// connector 展示面零改动）。拿到
 /// `NewDeviceRegistration` 后按官方 store 落库格式经 serde 数据面构造
 /// `RegistrationData`，回归既有 `load_registered` 收发管线。key 命中时后台
 /// best-effort 下载迁移档案，不阻塞链接成功（ADR 0005 §S2 定案）。
@@ -8700,11 +8739,7 @@ async fn link_flow(
                 Some(SecondaryDeviceProvisioning::Url(url)) => url,
                 _ => return Err(()),
             };
-            let mut qr_url = url;
-            qr_url
-                .query_pairs_mut()
-                .append_pair("capabilities", "backup5");
-            let _ = url_tx.send(qr_url);
+            let _ = url_tx.send(qr_link_url(url));
             match event_rx.next().await {
                 Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => Ok(data),
                 _ => Err(()),
@@ -16180,8 +16215,9 @@ mod tests {
 
     /// 链接 URI 的 numberless capability 门（取证 docs/upstream-capability-nopni2.md）：
     /// Android 8.30+/8.31 扫码侧对无 PNI 账号强制 `nopni2`、旧版强制 `nopni`，
-    /// 缺失即 OUTDATED_DEVICE 拒连；双报对齐官方桌面，`backup5` 不报
-    /// （引擎未实现 link-and-sync，报了手机会走 archive 同步链接流）。
+    /// 缺失即 OUTDATED_DEVICE 拒连；双报对齐官方桌面。vendored 层不报
+    /// `backup5`——该声明位由引擎渲染面 `qr_link_url` 统一收敛追加（见下），
+    /// vendor 语义保持与上游单一职责。
     #[test]
     fn link_uri_advertises_numberless_capabilities() {
         use presage::libsignal_service::provisioning::link_uri;
@@ -16199,6 +16235,65 @@ mod tests {
         assert!(names.contains(&"nopni"), "{capabilities}");
         assert!(names.contains(&"nopni2"), "{capabilities}");
         assert!(!names.contains(&"backup5"), "{capabilities}");
+    }
+
+    /// 渲染面 QR URL 收敛钉形：capabilities 必须是**单个**查询参数——
+    /// Android 扫码侧 `Uri.getQueryParameter`（单数）只读第一个同名参数，
+    /// 双参数形状令 `backup5` 不可见（2026-10-15 真机取证：链接成功但手机
+    /// 不弹「转移聊天记录」、不上传迁移档案）。
+    #[test]
+    fn qr_link_url_collapses_duplicate_capabilities_into_single_param() {
+        let base = url::Url::parse(
+            "sgnl://linkdevice?uuid=u1&pub_key=PK=&capabilities=nopni,nopni2&capabilities=backup5",
+        )
+        .expect("static URL parses");
+        let url = qr_link_url(base);
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let capability_values: Vec<&str> = pairs
+            .iter()
+            .filter(|(key, _)| key == "capabilities")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(capability_values.len(), 1, "{pairs:?}");
+        assert_eq!(
+            capability_values[0].split(',').collect::<Vec<_>>(),
+            vec!["nopni", "nopni2", "backup5"],
+            "{pairs:?}"
+        );
+        assert!(pairs.contains(&("uuid".to_owned(), "u1".to_owned())));
+        assert!(pairs.contains(&("pub_key".to_owned(), "PK=".to_owned())));
+    }
+
+    /// 旧 vendor 形状（无 capabilities 底参）收敛为单参数并补齐 `backup5`
+    /// （幂等安全网：上游 link_uri 语义变化时渲染面仍保证单参数声明）。
+    #[test]
+    fn qr_link_url_appends_backup5_when_capabilities_absent() {
+        let base =
+            url::Url::parse("sgnl://linkdevice?uuid=u1&pub_key=PK=").expect("static URL parses");
+        let url = qr_link_url(base);
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("uuid".to_owned(), "u1".to_owned()),
+                ("pub_key".to_owned(), "PK=".to_owned()),
+                ("capabilities".to_owned(), "backup5".to_owned()),
+            ]
+        );
+    }
+
+    /// 幂等（定点）：`backup5` 已在位时应用两次与应用一次结果一致
+    /// （重试/重复 startLink 面安全；不与字面输入比串——append_pair 的
+    /// form-urlencoded 归一化对未触及参数对同样生效，语义透明）。
+    #[test]
+    fn qr_link_url_is_idempotent() {
+        let base = url::Url::parse(
+            "sgnl://linkdevice?uuid=u1&pub_key=PK=&capabilities=nopni,nopni2,backup5",
+        )
+        .expect("static URL parses");
+        let once = qr_link_url(base);
+        let twice = qr_link_url(once.clone());
+        assert_eq!(twice, once);
     }
 
     /// DecryptionError 结构化事件形状（止血批①，加面）：receive 事件族

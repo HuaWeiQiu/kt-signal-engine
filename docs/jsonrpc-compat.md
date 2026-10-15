@@ -113,7 +113,7 @@ send message: Signal server unavailable.
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
 | `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version}`（双字符串键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答 |
-| `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…`） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩 |
+| `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number", "aci"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
 | `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
@@ -570,7 +570,9 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
   （provisioning 协议要求先给名字）；finishLink 的 `deviceName` 在本地
   store 改写 + 接收管线首推 attributes 覆盖为真名。窗口内设备管理器里
   可见占位名，属已知一次性噪音。
-- **URI 形状**：real 模式发官方 `sgnl://linkdevice?uuid=…&pub_key=…`；
+- **URI 形状**：real 模式发官方 `sgnl://linkdevice?uuid=…&pub_key=…` + 单
+  `capabilities=nopni,nopni2,backup5`（`qr_link_url` 收敛面，2026-10-15 起；
+  重复同名参数会被 Android 扫码侧 getQueryParameter 单数语义吞掉 backup5）；
   fake 夹具保持 `sgnl://link?…`（仅测试）。连接器对 URI 不解析、只透传
   回 finishLink，两侧均不受影响。
 - **per-recipient results**：~~成功仅含 `{recipientNumber, success:{timestamp}}`，
