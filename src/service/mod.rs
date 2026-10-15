@@ -13941,6 +13941,211 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// storyContext 接收投影 wire additive 钉形批（2026-10-15，接收侧零
+    /// wire 改动——storyReply 键形与四腿挂点已在 E2 批落地，本批补钉形与
+    /// 记档，compat §5 键名裁定块）：①1:1 腿 binary 优先裁定（官方
+    /// isProtoBinaryEncodingEnabled 双写面 binary 权威——binary 与 string
+    /// 同在且不一致时 binary 赢，mentions/quote/reaction 先例同款）；
+    /// ②缺席同形（story_context 缺席 = pre-批帧逐字节同形：普通正文行与
+    /// 普通 reaction 行 storyReply 键都不在，旧宿主零变化）；③sent sync
+    /// 腿（多设备自发 story 回复/反应 echo 平铺面 storyReply 在场、
+    /// reaction+storyReply 共在——storyReply 投影单点四腿覆盖的最后一腿
+    /// 钉形）。
+    #[tokio::test]
+    async fn receive_story_reply_wire_additive_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{data_message, GroupContextV2};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-story-additive-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = |story| Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let binary_author = presage::libsignal_service::prelude::Uuid::parse_str(
+            "9a1f2b3c-4d5e-4f60-8a71-9b2c3d4e5f60",
+        )
+        .expect("binary author uuid");
+
+        // ①1:1 腿 binary 优先裁定：binary（合法 UUID A）与 string（不同值
+        // B）同在 → authorAci = A（binary 权威；string 是旧客户端兼容面）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("story reply".to_owned()),
+                story_context: Some(data_message::StoryContext {
+                    author_aci: Some("22222222-3333-4444-8555-666666666666".to_owned()),
+                    sent_timestamp: Some(1_700_000_000_500),
+                    author_aci_binary: Some(binary_author.as_bytes().to_vec()),
+                }),
+                ..Default::default()
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "binary-first story reply projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["dataMessage"]["storyReply"],
+            json!({
+                "authorAci": binary_author.to_string(),
+                "sentTimestamp": 1_700_000_000_500_u64
+            }),
+            "binary 与 string 不一致时 binary 优先"
+        );
+
+        // ②缺席同形（pre-批帧逐字节同形）：story_context 缺席的普通正文行
+        // 与普通 reaction 行 storyReply 键都不在——投影输出与 E2 批之前
+        // 完全同形（旧宿主零变化）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                body: Some("plain".to_owned()),
+                ..Default::default()
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "plain row projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(
+            envelope["dataMessage"].get("storyReply").is_none(),
+            "无 storyContext = storyReply 键不在（缺席同形）"
+        );
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                reaction: Some(presage::proto::data_message::Reaction {
+                    emoji: Some("👍".to_owned()),
+                    target_author_aci: Some("22222222-3333-4444-8555-666666666666".to_owned()),
+                    target_sent_timestamp: Some(1_700_000_000_000),
+                    remove: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            metadata(None),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "plain reaction projects",
+        )["params"]["envelope"]
+            .clone();
+        assert!(
+            envelope["dataMessage"]["reaction"].is_object(),
+            "反应面照投"
+        );
+        assert!(
+            envelope["dataMessage"].get("storyReply").is_none(),
+            "无 storyContext 的普通反应 = storyReply 键不在（缺席同形）"
+        );
+
+        // ③sent sync 腿：多设备自发 story 回复 echo（body+storyContext）与
+        // 自发 story 反应 echo（reaction+storyContext）——平铺面
+        // sentMessage.storyReply 在场，反应 echo reaction+storyReply 共在
+        // （自发腿信封无 story 位，官方 1:1 story 同位）。
+        let sent_content = |message: DataMessage| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
+                    content: Some(presage::proto::sync_message::Content::Sent(
+                        presage::proto::sync_message::Sent {
+                            timestamp: Some(1_700_000_000_500),
+                            message: Some(message),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                metadata(None),
+            )
+        };
+        let content = sent_content(DataMessage {
+            body: Some("story reply".to_owned()),
+            story_context: Some(data_message::StoryContext {
+                author_aci: None,
+                sent_timestamp: Some(1_700_000_000_400),
+                author_aci_binary: Some(binary_author.as_bytes().to_vec()),
+            }),
+            ..Default::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent story reply projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["storyReply"],
+            json!({
+                "authorAci": binary_author.to_string(),
+                "sentTimestamp": 1_700_000_000_400_u64
+            }),
+            "sent sync 腿 storyReply 平铺照投"
+        );
+        let content = sent_content(DataMessage {
+            reaction: Some(presage::proto::data_message::Reaction {
+                emoji: Some("❤️".to_owned()),
+                target_author_aci: Some(binary_author.to_string()),
+                target_sent_timestamp: Some(1_700_000_000_400),
+                remove: Some(false),
+                ..Default::default()
+            }),
+            story_context: Some(data_message::StoryContext {
+                author_aci: None,
+                sent_timestamp: Some(1_700_000_000_400),
+                author_aci_binary: Some(binary_author.as_bytes().to_vec()),
+            }),
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(vec![0x44u8; 32]),
+                revision: None,
+                group_change: None,
+            }),
+            ..Default::default()
+        });
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry).await,
+            "sent story reaction projects",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["reaction"]["emoji"],
+            json!("❤️")
+        );
+        assert_eq!(
+            envelope["syncMessage"]["sentMessage"]["storyReply"]["sentTimestamp"],
+            json!(1_700_000_000_400_u64),
+            "sent sync 腿 reaction+storyReply 共在"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// 群终止投影放开（最小面）：dataMessage.groupV2 携带 terminated change
     /// → 整信封替换为 `groupTerminated` 事件（{groupId, terminator,
     /// timestamp}）并落登记表；非 terminated change（改标题等）→ 群更新消息

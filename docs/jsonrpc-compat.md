@@ -240,6 +240,14 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   同源）；dataMessage/editMessage/sent echo 同走本信封单键齐备。
 - `dataMessage`：`timestamp`、`message`、`quote {id, author, text?, type(NORMAL\|GIFTBADGE——proto 词原值恒产，缺席/枚举外 coerce NORMAL，官方 isKnownProtoEnumMember 同构；六问批 Q5), bodyRanges?: [{number?, style?, start, length}] ≤64（mention 二进制优先 + author_numbers E.164 映射、Style 臂归同条目 style 键、NONE 丢、未知枚举整条丢；六问批 Q5）}`、
   `reaction {emoji, targetAuthor, targetSentTimestamp, isRemove}`、
+  `storyReply {authorAci, sentTimestamp}`（2026-10-15 正条目补录——投影
+  E2 批已落地，键名裁定见 §5：storyContext → 桌面既有消费形直投，官方
+  DataMessage.storyContext=21 同字段名；author binary 16B UUID 优先、
+  string 兜底（官方 isProtoBinaryEncodingEnabled 双写面 binary 权威，
+  不一致时 binary 赢），两者皆缺/不可解析整键缺席宁缺勿错；story_
+  context 缺席键不在 = pre-批帧逐字节同形；1:1/群/sent sync/edit 四腿
+  同形状（群回复另带既有 groupInfo），reaction+storyReply 共在 = story
+  锚定反应判别面——S4 判别语义见下）、
   `remoteDelete {timestamp}`、`attachments[] {id, contentType, filename?,
   size?, width?, height?, caption?, isVoiceNote, isBorderless, isGif,
   locator?}`（≤32；元数据
@@ -2692,6 +2700,63 @@ Signal-Desktop abe80d3，wire additive，engine-compat）
   媒体批同边界——形状/互逆往返单测覆盖）；connector 透传臂与桌面消费是
   后续批（排队中——透传 = 应答键逐字过境，桌面 = own story 回看挂
   locator 下载链），本批零跨仓。
+
+storyContext 接收投影键名裁定（2026-10-15，接收侧零 wire 改动，
+tests-only 钉形批，engine-compat）
+
+- **背景与口径（任务前提翻案）**：本批任务输入「storyContext 零消费」
+  经开工 grep 实证翻案——接收投影 `project_data_message` 早在 E2 批
+  （94bc6f7，2026-10-08）已把 DataMessage.storyContext 投为
+  `storyReply {authorAci, sentTimestamp}`，且投影为函数级单点，1:1 腿
+  （receive DataMessage 臂）/群腿（同臂 + groupInfo）/sent sync 腿
+  （sentMessage 平铺）/editMessage 腿四腿同过；S4 批（4822e99）补
+  reaction 共存三腿钉形（1:1 共在/信封 story 位 malformed 丢弃/群
+  story 反应豁免）。本批逐腿核实覆盖完整性后**零代码行为变更**，只补
+  缺口钉形（binary 优先裁定腿/缺席同形腿/sent sync 腿）与键名裁定
+  记档。
+- **官方锚（abe80d3 第一手实读，行为对齐不抄码）**：proto 面
+  `DataMessage.storyContext = 21`（vendored SignalService.proto:436），
+  `StoryContext{authorAci=1(string), sentTimestamp=2(uint64),
+  authorAciBinary=3(bytes 16B UUID)}`（:355-359）。官方对 story 的反应
+  与回复走**普通消息通道** `DataMessage{groupV2? + storyContext +
+  (reaction | body)}` 三键共存（非 Content.storyMessage）：反应锚
+  enqueueReactionForSend.preload.ts:84-91（targetConversation = story
+  作者或群本身）、Reactions.preload.ts:606-611（群 story 反应走
+  NormalMessage 作业）、sendNormalMessage.preload.ts:744-755
+  （storyContext 恒带）；回复 = body+storyContext 同通道；1:1 与群同构
+  （groupV2 在场与否）。vendored `DataMessage::is_story_reaction` 辅助
+  （content/data_message.rs:5-7）同构在。引擎 reaction 投影与
+  storyReply 投影同函数平级共在（reaction+storyReply 同信封即官方三键
+  共存的投影面）——任务所称「反应脸/消息脸两处」在引擎现实中就是
+  project_data_message 一处的两个加性臂，无第二投影点。
+- **键名裁定（`storyReply {authorAci, sentTimestamp}` 维持）**：KT
+  桌面既有消费位 `src/view/signal/SignalMessageBubble.vue` storyReply
+  标记条（`v-if="message.storyReply"` 存在性判断 → 固定文案「回复了
+  故事」，桌面扩展批 2026-10-08，本批 git show 只读实证）——消费面
+  注释明文「引擎只投 {authorAci, sentTimestamp} 引用指针（无内容面），
+  诚实简面」，桌面零翻译消费。候选形否决理由：①`{author,
+  sentTimestamp}` 需引擎翻译 authorAci→author，发明翻译层（官方字段
+  名直投纪律不容，且桌面注释已钉 authorAci）；②两平键
+  storyReplyAuthor/storyReplyTimestamp 稀释 storyReply 单键在场性
+  判别面（S4 批宿主判别键 = storyReply 键在场性——reaction 行携
+  storyReply = story 锚定反应），破坏既有判别契约。author 解析 =
+  binary 16B UUID 优先、string 兜底（官方 isProtoBinaryEncodingEnabled
+  双写面 binary 权威，mentions/quote/reaction 先例同款；不一致时
+  binary 赢），两者皆缺/不可解析整键缺席宁缺勿错。
+- **本批测试钉定（tests 只增，零既有测试改动）**：
+  `receive_story_reply_wire_additive_faces` 三腿——①1:1 腿 binary 与
+  string 同在不一致 → binary 赢；②缺席同形：story_context 缺席的普通
+  正文行与普通 reaction 行 storyReply 键都不在（pre-批帧逐字节同形，
+  旧宿主零变化）；③sent sync 腿：自发 story 回复 echo 平铺
+  sentMessage.storyReply 照投 + 自发 story 反应 echo reaction+
+  storyReply 共在（四腿钉形收口——1:1 string 形/群豁免 binary 形/
+  author 不可解析整键缺席/reaction 三腿既有测试已钉，本批不再重复）。
+- **边界（本批红线）**：connector storyReply 键透传批与桌面气泡物化
+  收尾是后续批（connector 占仓中；桌面标记条已上线，connector 侧
+  storyReply 键透传待其契约批），本批零跨仓（desktop 仓只读 git
+  show，零写入）；real 端到端不可跑（无夹具服务器）——形状/往返单测
+  覆盖；storyReply 引用内容面（story 正文内容指针，桌面标记条固定
+  文案不消费）与 story 查看回执仍是边界（E2 批既有边界不翻案）。
 
 transfer 历史回填非文本扩面·第一类型 sticker（2026-10-08，B1 批；
 消费方 connector 契约 1.76 §4.38 扩面）：
