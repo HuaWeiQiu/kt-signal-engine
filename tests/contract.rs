@@ -5738,6 +5738,113 @@ fn username_lookup_fake_echo_and_param_fail_closed() {
     );
 }
 
+/// phoneLookup（按手机号查找读面，KT 扩展方法，CDSI 批）：fake 逐条回显
+/// `{number, isRegistered:false}`（输入序，不发明 aci/pni 键）+ 参数面
+/// fail-closed（numbers 缺席/非数组/空批/超 20/条目非字符串 -32603）+
+/// E.164 语法闸 fail-closed（缺 +/位数越界/非数字 PHONE_INVALID）+
+/// real 模式未注册账号 -32603（不触网）。
+#[test]
+fn phone_lookup_fake_echo_and_param_fail_closed() {
+    let dir = temp_dir("phone-lookup");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // fake：逐条回显（输入序），单键形状。
+    assert_eq!(
+        engine.request(
+            "phoneLookup",
+            json!({ "account": number, "numbers": ["+15551234567", "+447700900123"] }),
+        )["result"],
+        json!([
+            { "number": "+15551234567", "isRegistered": false },
+            { "number": "+447700900123", "isRegistered": false },
+        ])
+    );
+
+    // 参数面 fail-closed 逐形状（-32603）。
+    let over_cap = vec!["+15551234567"; 21];
+    let rejects = [
+        json!({ "account": number }),
+        json!({ "account": number, "numbers": "+15551234567" }),
+        json!({ "account": number, "numbers": [] }),
+        json!({ "account": number, "numbers": over_cap }),
+        json!({ "account": number, "numbers": [7] }),
+    ];
+    for params in rejects {
+        assert_eq!(
+            engine.error_of("phoneLookup", params),
+            (-32603, "Internal error".to_owned()),
+            "param face must reject"
+        );
+    }
+
+    // E.164 语法闸 fail-closed（PHONE_INVALID）：缺 +/6 位下界外/16 位
+    // 上界外/内嵌空白/非数字/双 +。
+    let invalid = [
+        json!({ "account": number, "numbers": ["15551234567"] }),
+        json!({ "account": number, "numbers": ["+123456"] }),
+        json!({ "account": number, "numbers": ["+1234567890123456"] }),
+        json!({ "account": number, "numbers": ["+1 555 123 4567"] }),
+        json!({ "account": number, "numbers": ["+1555abc23456"] }),
+        json!({ "account": number, "numbers": ["++15551234567"] }),
+    ];
+    for params in invalid {
+        assert_eq!(
+            engine.error_of("phoneLookup", params),
+            (-1, "PHONE_INVALID".to_owned()),
+            "E.164 gate must reject"
+        );
+    }
+
+    // 边界内放行：恰 20 条、恰 7 位下界、恰 15 位上界（fake 回显面）。
+    let at_cap = ["+15551234567"; 20].to_vec();
+    assert_eq!(
+        engine.request(
+            "phoneLookup",
+            json!({ "account": number, "numbers": at_cap }),
+        )["result"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    assert_eq!(
+        engine.request(
+            "phoneLookup",
+            json!({ "account": number, "numbers": ["+1234567"] }),
+        )["result"][0]["number"],
+        json!("+1234567")
+    );
+    assert_eq!(
+        engine.request(
+            "phoneLookup",
+            json!({ "account": number, "numbers": [format!("+{}", "1".repeat(15))] }),
+        )["result"][0]["isRegistered"],
+        json!(false)
+    );
+
+    // real 模式未注册账号：账号解析前置即内部失败（不触网）。
+    let real_dir = temp_dir("phone-lookup-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_eq!(
+        real_engine.error_of(
+            "phoneLookup",
+            json!({ "account": "+15559990000", "numbers": ["+15551234567"] }),
+        ),
+        (-32603, "Internal error".to_owned())
+    );
+}
+
 /// 用户名写面（usernameReserve/usernameConfirm/usernameDelete，KT 扩展
 /// 方法）：fake 本地形状桩（语法/hash/link 加解密走同一 crate 面，无网络）
 /// 与参数面 fail-closed 逐形状（-32603）、服务器态结构化码位的 fake 不可达

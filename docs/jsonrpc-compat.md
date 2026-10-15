@@ -191,6 +191,7 @@ send message: Signal server unavailable.
 | `storage.write` | `{accountId, updates: [{type: "INSERT"\|"UPDATE"\|"DELETE", key(标准 base64，16B storage item key), record?(标准 base64，StorageRecord 明文 protobuf bytes)}]}`（字段名 `accountId` 为本扩展契约原形，非白名单面惯用的 `account`；INSERT/UPDATE 必带 record，DELETE 带 record 拒；updates 空批拒；批量内 key 重复拒） | `{version, results: [{type, key, writtenKey?, noop?}]}`（version = 写后 manifest version，全 no-op = 当前 version，从未有 storage 状态 = 0；results 与 updates 输入序对齐；`writtenKey`：INSERT = 原 key 回显、UPDATE = 引擎轮换出的新 16B item id——官方换写必轮换 item id 语义，旧 key 进 deleteKey；DELETE 无 writtenKey；no-op 条目带 `noop: true`） | 参数缺失/形状错（accountId 缺失·非字符串·空、updates 非数组·空批、条目非对象、type 非三枚举、key 非 base64·≠16B、INSERT/UPDATE record 缺失·null·非 base64·空、DELETE 带 record、批量 key 重复）`-32603`；record 解码不出白名单记录 arm（Contact=1/GroupV1=2/GroupV2=3/StoryDistributionList=5/StickerPack=6 之外，含 Account——账号记录归专用写面）`-32603`；INSERT 目标 key 已存在且内容不同/UPDATE 换记录类型（意图冲突 fail-closed）`-32603`；未注册账号 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、item 读取/解密失败 `STORAGE_READ_FAILED`、PUT 失败 `STORAGE_WRITE_FAILED`（均 `-1` + message，置顶面同款）；版本冲突（服务器 409 = base version 失配）`STORAGE_VERSION_CONFLICT`（`-1` + message + data `{retryable: false, serverVersion?}`——写意图未落地，引擎**不自动重试**，调用方重读 manifest 后重放） | **2026-10-06 real（KT 扩展，storage 写面 P0）**：通用批量 manifest item 写（官方 WriteOperation 同构：manifest version+1、新 item 加密入 insertItem、换出 key 进 deleteKey、source_device/record_ikm 透传）；读侧 manifest version 解析复用既有面（`StorageService::manifest`/`decrypt_manifest`），写通道复用既有自建 PUT 薄封装（presage/libsignal-service 上游无写面，§5 storage 写面 P0 块）；幂等：INSERT 同 key 同内容/UPDATE 同内容/DELETE key 不在 = no-op（全 no-op 不 PUT 不 bump version，整批重放安全）；从未有 storage 状态：纯 UPDATE/DELETE 批 = 幂等成功不播种（version 0），含 INSERT → master key 播种 + version 1 最小 AccountRecord 同批首写（§5 首写分支同款）；fake：成功 `{version: 0, results: [...]}`，不落调度日志（storage 状态面纪律） |
 | `getUsername` | `{account}` | `{username?, usernameLink?}`（键缺席 = 未设，不发明 null/空串；usernameLink 重建为完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；链接材料形状错该键缺席） | 参数缺失/非字符串 `-32603`；未注册账号 `-32603`；storage 读链：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（均 `-1` + message，置顶面同款） | **2026-10-08 real（KT 扩展，用户名读面批）**：真相源 = Storage Service AccountRecord.username(33)/usernameLink(35)（官方 proto 注释「仅 server confirm/delete 时更新」同语义；多设备经 storage sync 收敛，无第二真相源）；从未有 storage 状态（无 master key / manifest 404 / 无 Account item）→ `{}`（未设不报错）；fake：恒 `{}`，不落调度日志（读面纪律） |
 | `usernameLookup` | `{account, usernames[1..20]}`（每条 1..64 字符——connector 契约 1.59 §4.55 帧界同源镜像，帧界而非语法界；条目 = 全名或 `https://signal.me/#eu/…` 链接） | `[{recipient, username?, uuid?, isRegistered}]`（输入序逐条投影；recipient = 条目回显；单条失败诚实降级 `{recipient, isRegistered:false}` 不炸整批——语法不符/链接打不开/解不开/未命中/网络皆同） | 参数缺失/形状错（usernames 缺席·非数组·空批·超 20、条目非字符串·空·超 64）`-32603`；未注册账号 `-32603` | **2026-10-08 real（KT 扩展，用户名读面批）**：官方同款服务端匿名 lookup 通路——全名条目 hash（libsignal usernames crate 权威语法面）→ `GET v1/accounts/username_hash/{hash}`（强制匿名，200 `{uuid}`/404）；链接条目 → `GET v1/accounts/username_link/{uuid}`（200 `{usernameLinkEncryptedValue}`）→ crate `decrypt_username`（entropy 系链接自带）→ 再走 hash lookup（官方 resolveUsernameLink 同序）；base64 一律 URL-safe 无 padding；匿名 PushService（带凭据反而 400，avatar CDN 先例同构）；fake：逐条回显 `{recipient, isRegistered:false}`，不落调度日志（读面纪律） |
+| `phoneLookup` | `{account, numbers[1..20]}`（每条 E.164 语法 `^\+\d{7,15}$`——语法面 fail-closed；帧界 20 条/批 = usernameLookup 同源镜像） | `[{number, aci?, pni?, isRegistered}]`（输入序逐条投影；number = 条目回显；aci/pni = CDSI 命中的服务 id UUID 串，单命中语义——双命中官方同款取 ACI；未命中/未注册诚实降级 `{number, isRegistered:false}` 不炸整批——usernameLookup 同款降级语义） | 参数缺失/形状错（numbers 缺席·非数组·空批·超 20、条目非字符串）`-32603`；E.164 语法非法 `PHONE_INVALID`（`-1` + message）；未注册账号 `-32603`；CDSI 限速 `PHONE_RATE_LIMITED`（`-1` + message，data.retryAfterSeconds = 服务器 retry_after 秒数诚实透传，退避决策在调用方）；其余服务端/连接失败 `PHONE_SERVER_FAILED`（`-1` + message） | **2026-10-15 real（KT 扩展，按手机号查找批 E，engine-compat，§5 块）**：CDSI（Contact Discovery Service）官方通路——vendored directory.rs 自动取凭据（`GET /v2/directory/auth`）→ libsignal-net SGX attested WS 查询（presage `cdsi` feature 本批开启，零新增 crate）；出口走进程 ALL_PROXY 同源注入（vendor fork 登记项，vendor/README.md）；结果**只投影即弃**——不落引擎库、不发通知（AGENTS.md 联系人纪律，号码→账号本地映射归 connector contacts 同步链）；fake：逐条回显 `{number, isRegistered:false}`，不落调度日志（读面纪律） |
 | `usernameReserve` | `{account, username}`（全名 `nick.disc` 或裸昵称——缺 disc = 引擎生成 20 候选轮转；wire 界 38 字符 = connector `USERNAME_MAX_WIRE_CHARS` 同源镜像，帧界而非语法界，语法面归官方 usernames crate 硬语法） | `{username, usernameHash}`（username = 采纳候选全名；usernameHash = b64url 无 padding 32B，confirm 回传值） | 参数缺失/非字符串/空/超 38 `-32603`；crate 硬语法不符（单数字 disc、0 打头非恰两位、超位、非法字符）`-32603`；未注册账号 `-32603`；服务器 409（批内全占）`USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方两相写面前相——候选 + 批 hash（crate 权威原语）→ `PUT v1/accounts/username_hash/reserve` `{usernameHashes:[…]}`（URL-safe 无 padding；200 `{usernameHash}` 采纳位，官方 AccountController 同码位）；reserve 无正式副作用（不落 username，官方同语义）；fake：本地候选 + hash 桩（真实 crate 原语）不触网，不落调度日志（storage 状态面纪律） |
 | `usernameConfirm` | `{account, username, usernameHash}`（usernameHash = reserve 采纳值回传；引擎重验语法 + hash 失配 fail-closed——两相调用面被撕裂即拒） | `{username, usernameLink}`（完整 `https://signal.me/#eu/<b64url(entropy‖handle)>`；entropy 系本端新生成，仅此响应与 storage 35 字段两处落地） | 参数缺失/形状错（三参缺失·非字符串·空、语法不符、hash 失配）`-32603`；未注册账号 `-32603`；服务器 409 `USERNAME_RESERVATION_GONE`（预约过期/被占）、410 `USERNAME_TAKEN`、413/429 `USERNAME_RATE_LIMITED`、其余 `USERNAME_SERVER_FAILED`；服务器已确认而 storage 33/35 落盘失败 → STORAGE 族（诚实部分成功：服务器态已变更，调用方按 STORAGE 语义处置，getUsername/多设备 sync 收敛）（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方后相同序——`Username::proof`（ZK，随机 32B）+ `create_for_username`（新 entropy 加密负载）→ `PUT v1/accounts/username_hash/confirm` `{usernameHash, zkProof, encryptedUsername}`（200 `{usernameLinkHandle}` 重建完整链接）→ AccountRecord 33/35 storage 落盘（官方 confirm 落盘同位）；fake：本地 link 桩（随机 handle）不触网不落盘，不落调度日志 |
 | `usernameDelete` | `{account}` | `{}`（幂等：本就未设照走服务器删除 + storage 清除，无写分支成功同形状） | 参数缺失 `-32603`；未注册账号 `-32603`；413/429 `USERNAME_RATE_LIMITED`、其余服务器失败 `USERNAME_SERVER_FAILED`；storage 33/35 清除失败 STORAGE 族（均 `-1` + message） | **2026-10-08 real（KT 扩展，用户名写面批）**：官方同序 `DELETE v1/accounts/username_hash`（服务器清 hash 并连带清 link 负载）→ AccountRecord 33/35 清除读改写；fake：`{}` 桩，不落调度日志 |
@@ -584,7 +585,11 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
   contacts 同步/服务器面（P2+），未命中 `-32603`。
 - **getUserStatus**：P2 起 real——whoami 轻量探测；仅服务器 401 映射解绑态
   原文（`-32603`），网络等其他失败按 `-32603` "Internal error" 不误报解绑。
-  recipient 维度的注册态需 CDSI 查询，未做（保持 `isRegistered: true` 面）。
+  recipient 维度的注册态已实现（2026-10-15 起）：独立方法面 `phoneLookup`
+  （CDSI，§3 phone 块/§5 同日批）；getUserStatus 自身仍恒 `isRegistered:
+  true`（whoami 不附带查询），注册态需求由调用方显式走 phoneLookup——
+  CDSI 服务器限速阈值不公开（`PHONE_RATE_LIMITED` 附 retryAfterSeconds
+  诚实回传），匹配在 SGX enclave 内（官方隐私设计），结果不落引擎库。
 - **textStyles**：~~本引擎钉定的 presage proto 版本无该面，receive 不投影
   （connector 侧为可选富体字段，缺失即无该键）。~~（2026-10-06 勘误：钉定
   proto **有** BodyRange.Style——本仓当时只从 mention 维度看过 bodyRanges。
@@ -1275,7 +1280,9 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   master key；三者皆不中 fail-closed `-32603`）。下行 = presage 官方头像
   API：1:1 `retrieve_profile_avatar_by_uuid`（profileKey 取 presage store
   `profile_key(service_id)`——contacts 同步随行落库，未同步过 → 诚实
-  `AVATAR_UNAVAILABLE`「无头像」，不做 CDSI 反查）、群
+  `AVATAR_UNAVAILABLE`「无头像」；getAvatar 自身不做隐式 CDSI 反查（注册
+  态反查已实现为独立方法面 `phoneLookup`，2026-10-15 批，§3 phone 块——
+  读面按需显式调用，不在头像下载路径附带查询）、群
   `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密，
   master key 与 listGroups id 同源）。403/404 = 无头像（官方 1:1
   未 accept 会话不下载头像同语义）折叠 `AVATAR_UNAVAILABLE`；其余错误
@@ -1788,8 +1795,10 @@ receive 面债务批）：
   ACI（UUID 串，与 sourceUuid 同值，连接器免二次解析；不投 key 字节，
   密钥材料不出引擎存储面）。存储失败（store 错误）静默忽略不炸投影
   （receive 面零 stderr 纪律，下次消息重试自然收敛）。
-- **边界（本批红线）**：不动 setProfile 写面；不做 CDSI 号码反查（与
-  getAvatar 同口径）；不做 profile 主动重取调度器（presage 栈无后台
+- **边界（本批红线）**：不动 setProfile 写面；getAvatar/contactProfileUpdated
+  自身不做隐式 CDSI 号码反查（与 getAvatar 同口径；注册态反查已实现为
+  独立方法面 `phoneLookup`，2026-10-15 批，调用方显式调用）；不做 profile
+  主动重取调度器（presage 栈无后台
   profile 刷新任务面，消费方按需拉取）；不动 vendored proto。协议栈无
   读写面的能力不顺手做。
 
@@ -5493,6 +5502,39 @@ oneof 字段 19），各设备会话据此落通话记录条。引擎此前只�
   hex 腿）/群（32B 闸 + callId 必带）两腿、参数闸 fail-closed 全臂、
   出向构造 ↔ 入向投影互逆往返；契约测试 fake 形状 + 25 形状拒绝 +
   调度日志纪律。真机回归归 connector/desktop 接线批。
+
+### 按手机号查找批（2026-10-15，CDSI，phoneLookup，wire additive【engine-compat】）
+
+- **定位**：KT 扩展方法 `phoneLookup`：号码批 → CDSI（Contact Discovery
+  Service）→ `[{number, aci?, pni?, isRegistered}]` 输入序逐条投影。
+  官方通路全在 vendored/上游原生面：directory.rs `GET /v2/directory/auth`
+  自动取凭据 → libsignal-net SGX attested WS 查询（presage
+  `Manager::discover_contacts_by_phone_number`，本批随 presage `cdsi`
+  feature 开启启用；该 feature 只把 libsignal-net/net-infra 从 optional
+  转必选——两者已在依赖图，Cargo.lock 零新增 crate；不触碰 sqlcipher，
+  store-sqlite 的同名 feature 已在 P12/R2 批移除）。
+- **出口代理（vendor fork 登记项）**：CDSI 建连原走 directory.rs 硬编码
+  `DirectOrProxyProvider::direct()`，绕过进程 ALL_PROXY(socks5h) 出口
+  直连；本批改 `DirectOrProxyMode::maybe_proxy` + `ALL_PROXY`/`all_proxy`
+  环境读（大写优先，reqwest/hyper-util 同序；socks/socks5/socks5h/
+  http/https 受支持，值缺失/畸形降级直连；`NO_PROXY` 不参与判定——进程
+  出口策略是单全局变量，main.rs `setup_proxy_env` 统一落位）。
+  vendor/README.md fork 清单登记在案。
+- **参数与错误面**：`{account, numbers[1..20]}`（帧界 20 =
+  usernameLookup 同源镜像）；E.164 语法闸 `^\+\d{7,15}$` fail-closed →
+  `PHONE_INVALID`；批级失败两臂：CDSI 限速（服务器 `retry_after` 秒数
+  诚实回传 `PHONE_RATE_LIMITED` + `data.retryAfterSeconds`，退避决策在
+  调用方）与其余服务端/连接失败（`PHONE_SERVER_FAILED`，细节不外泄）；
+  未注册账号 -32603（一切 account 参数面同口径）。
+- **降级语义**：未命中/未注册条目 `{number, isRegistered: false}` 不炸
+  整批（usernameLookup 同款）；aci/pni 单命中语义（官方 directory.rs
+  双命中取 ACI + warn 同口径）。
+- **隐私纪律（AGENTS.md 联系人红线）**：查询结果只做内存投影即弃——
+  不写引擎库、不发 receive/联系人通知；号码→账号的本地映射仍归
+  connector contacts 同步链。CDSI 匹配在服务器 SGX enclave 内进行
+  （官方隐私设计），引擎侧不落任何查询痕迹。
+- **fake**：逐条回显 `{number, isRegistered:false}`（参数面同闸，
+  `KT_ENGINE_FAKE_SERVICE` 早退），不触网不落调度日志（读面纪律）。
 
 ## 6. fake 服务模式（仅测试）
 

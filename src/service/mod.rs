@@ -60,6 +60,9 @@ pub(crate) mod identity;
 /// S2a 性能基线打点层（只测不改）：进程内有界指标注册表 + `engine.perfMetrics`
 /// 只读投影。零 stderr、零行为语义、词表封闭（模块头注载纪律）。
 pub(crate) mod perf_metrics;
+/// 按手机号查找面（phoneLookup，KT 扩展方法，CDSI）：模块头注载语义/
+/// 纪律（结果只投影即弃，不落库）。
+pub(crate) mod phone;
 pub(crate) mod prekey;
 pub(crate) mod profile;
 pub(crate) mod report;
@@ -4458,6 +4461,52 @@ impl Service {
             rows.push(serde_json::Value::Object(row));
         }
         Ok(json!(rows))
+    }
+
+    /// phoneLookup（按手机号查找读面，KT 扩展方法，CDSI）：号码批 →
+    /// CDSI（SGX attested 通路，vendored directory.rs ALL_PROXY 同源出口）
+    /// → 逐条投影 `{number, aci?, pni?, isRegistered}`（输入序，未命中
+    /// 诚实降级 isRegistered:false，usernameLookup 同款降级语义）。账号
+    /// 参数走 open_registered 解析梯（未注册 -32603）。**结果只投影即
+    /// 弃**：不落引擎库、不发通知（AGENTS.md 联系人纪律；号码→账号本地
+    /// 映射归 connector contacts 同步链）。fake 模式形状桩（逐条回显
+    /// `{number, isRegistered:false}`，不触网）。
+    pub(crate) async fn phone_lookup(
+        self: &Arc<Self>,
+        account: &str,
+        numbers: &[String],
+    ) -> Result<serde_json::Value, phone::PhoneLookupError> {
+        if !self.real {
+            return Ok(json!(numbers
+                .iter()
+                .map(|number| json!({ "number": number, "isRegistered": false }))
+                .collect::<Vec<_>>()));
+        }
+        // 账号解析梯（未注册账号 UnknownAccount → -32603，与一切 account
+        // 参数面同口径）。常驻管理器缓存复用（C 批提速先例）；lookup 非
+        // 发送面，不做 prekey send-gate，只取互斥。
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(phone::PhoneLookupError::UnknownAccount)?;
+        let mut manager = shared.lock().await;
+        let rows = phone::lookup(&mut manager, numbers).await?;
+        let mut projected = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut entry = serde_json::Map::new();
+            entry.insert("number".to_owned(), json!(row.number));
+            match row.service_id {
+                Some(ServiceId::Aci(aci)) => {
+                    entry.insert("aci".to_owned(), json!(aci.service_id_string()));
+                }
+                Some(ServiceId::Pni(pni)) => {
+                    entry.insert("pni".to_owned(), json!(pni.service_id_string()));
+                }
+                None => {}
+            }
+            entry.insert("isRegistered".to_owned(), json!(row.service_id.is_some()));
+            projected.push(serde_json::Value::Object(entry));
+        }
+        Ok(json!(projected))
     }
 
     /// usernameReserve（用户名写面一，KT 扩展方法）：候选生成 + 批 hash

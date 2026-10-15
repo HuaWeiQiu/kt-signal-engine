@@ -2651,6 +2651,45 @@ async fn dispatch(
                 Err(error) => storage_error(id, &error),
             }
         }
+        // phoneLookup（按手机号查找读面，KT 扩展方法，compat §3 phone
+        // 块）：CDSI 号码批 → 逐条投影（输入序）。参数面 fail-closed：
+        // numbers 非数组/空批/超 20/条目非字符串 -32603；E.164 语法非法
+        // （非 + 打头、位数越界、非数字）PHONE_INVALID；未注册账号
+        // -32603；CDSI 限速 PHONE_RATE_LIMITED 附 retryAfterSeconds；
+        // 其余服务端/连接失败 PHONE_SERVER_FAILED。
+        "phoneLookup" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let numbers = match params.get("numbers") {
+                Some(Value::Array(items)) => {
+                    let mut numbers = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item.as_str() {
+                            Some(number) => numbers.push(number.to_owned()),
+                            None => return internal_error(id),
+                        }
+                    }
+                    if numbers.is_empty()
+                        || numbers.len() > crate::service::phone::PHONE_LOOKUP_MAX_ENTRIES
+                    {
+                        return internal_error(id);
+                    }
+                    numbers
+                }
+                _ => return internal_error(id),
+            };
+            if numbers
+                .iter()
+                .any(|number| !crate::service::phone::is_valid_e164(number))
+            {
+                return jsonrpc::error_response(id, &jsonrpc::RpcError::new(-1, "PHONE_INVALID"));
+            }
+            match service.phone_lookup(account, &numbers).await {
+                Ok(rows) => jsonrpc::success_response(id, rows),
+                Err(error) => phone_lookup_error(id, &error),
+            }
+        }
         // ---- 用户名写面（KT 扩展方法）----
         // usernameReserve：候选生成 + 批 hash → 服务端 reserve → 采纳候选
         // `{username, usernameHash}`。参数面（语法闸）-32603；服务器态四码
@@ -4669,6 +4708,31 @@ fn username_write_error(id: &Value, error: &crate::service::username::UsernameWr
         }
     };
     jsonrpc::error_response(id, &RpcError::new(code, message))
+}
+
+/// phoneLookup 错误折叠（compat §3 phone 块同表）：未注册账号 → -32603
+/// （细节不外泄，usernameLookup 同款）；CDSI 限速 → `-1` +
+/// `PHONE_RATE_LIMITED` + data.retryAfterSeconds（服务器 retry_after 秒数
+/// 诚实透传，退避决策在调用方）；其余服务端/连接失败 → `-1` +
+/// `PHONE_SERVER_FAILED`（细节不外泄）。
+fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupError) -> Value {
+    use crate::service::phone::PhoneLookupError as Error;
+    match error {
+        Error::UnknownAccount => internal_error(id),
+        Error::RateLimited {
+            retry_after_seconds,
+        } => jsonrpc::error_response(
+            id,
+            &RpcError::with_data(
+                -1,
+                "PHONE_RATE_LIMITED",
+                json!({ "retryAfterSeconds": retry_after_seconds }),
+            ),
+        ),
+        Error::ServerFailed => {
+            jsonrpc::error_response(id, &RpcError::new(-1, "PHONE_SERVER_FAILED"))
+        }
+    }
 }
 
 /// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation

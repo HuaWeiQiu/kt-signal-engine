@@ -2552,6 +2552,8 @@ dependencies = [
  "hmac",
  "libsignal-account-keys",
  "libsignal-core",
+ "libsignal-net",
+ "libsignal-net-infra",
  "libsignal-protocol",
  "phonenumber",
  "prost",

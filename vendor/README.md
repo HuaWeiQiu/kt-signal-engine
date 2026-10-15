@@ -161,6 +161,17 @@
   同步这两位、按未知字段跳过并本地重算显示波形；引擎发送面按官方算法
   生成、收投影如实透传，engine 侧消费见 docs/jsonrpc-compat.md §5 同日
   批）。wire additive-only，不与既有 1-20 位冲突。
+- `src/websocket/directory.rs`（2026-10-15 phoneLookup CDSI 批）—
+  `discover_contacts` 的 CDSI 建连 RouteProvider 从硬编码
+  `DirectOrProxyProvider::direct()` 改为 `DirectOrProxyMode::maybe_proxy`
+  + 新私有 `proxy_from_environment()`：读 `ALL_PROXY`/`all_proxy`（大写
+  优先，reqwest/hyper-util `get_first_env` 同序）经
+  `ConnectionProxyConfig::from_parts` 构造代理路（socks/socks5/socks5h/
+  http/https 均受支持，port 0 视为畸形），值缺失/畸形降级直连；
+  `NO_PROXY` 不参与判定（进程出口策略是单全局变量，main.rs
+  `setup_proxy_env` 统一落位）。背景：reqwest 传输面缺省读 ALL_PROXY，
+  CDSI 建连走 libsignal-net 自有栈不吃该面，不改则 CDSI 流量绕过
+  socks5 出口直连。
 
 `vendor/presage/`（rev 33dd149）：
 

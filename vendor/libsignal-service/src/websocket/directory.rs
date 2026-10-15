@@ -9,6 +9,7 @@ use libsignal_net::connect_state::{
     ConnectState, ConnectionResources, SUGGESTED_CONNECT_CONFIG,
 };
 use libsignal_net_infra::dns::DnsResolver;
+use libsignal_net_infra::route::ConnectionProxyConfig;
 use libsignal_net_infra::utils::no_network_change_events;
 use reqwest::Method;
 use serde::Deserialize;
@@ -93,16 +94,21 @@ impl SignalWebSocket<Identified> {
             confirmation_header_name: None,
         };
 
-        // 3. Connect to CDSI using DirectOrProxyProvider::direct() wrapper
+        // 3. Connect to CDSI, honoring the process-level ALL_PROXY egress
+        // when one is configured (KT: same source the reqwest transport
+        // reads); direct routes otherwise.
         let cdsi_endpoint = &env.cdsi;
         let cdsi_connection = CdsiConnection::connect_with(
             connection_resources,
             env.cdsi.domain_config.connect.service,
-            libsignal_net_infra::route::DirectOrProxyProvider::direct(
-                cdsi_endpoint.enclave_websocket_provider(
+            libsignal_net_infra::route::DirectOrProxyProvider {
+                inner: cdsi_endpoint.enclave_websocket_provider(
                     libsignal_net_infra::EnableDomainFronting::No,
                 ),
-            ),
+                mode: libsignal_net_infra::route::DirectOrProxyMode::maybe_proxy(
+                    proxy_from_environment(),
+                ),
+            },
             cdsi_endpoint.ws_config,
             &cdsi_endpoint.params,
             &auth,
@@ -151,4 +157,32 @@ impl SignalWebSocket<Identified> {
             .next()
             .and_then(|(_, service_id)| service_id))
     }
+}
+
+/// Resolve the process-level proxy egress for the CDSI connection.
+///
+/// Reads `ALL_PROXY`/`all_proxy` (uppercase first, matching the
+/// reqwest/hyper-util lookup order) so CDSI traffic follows the same egress
+/// as every other transport in the process. A missing or malformed value
+/// degrades to direct routes; `NO_PROXY` is not consulted (the process
+/// configures a single global egress variable).
+fn proxy_from_environment() -> Option<ConnectionProxyConfig> {
+    let value = std::env::var("ALL_PROXY")
+        .or_else(|_| std::env::var("all_proxy"))
+        .ok()?;
+    let url: url::Url = value.parse().ok()?;
+    if url.port() == Some(0) {
+        return None;
+    }
+    let auth = match (url.username(), url.password()) {
+        ("", None) => None,
+        (user, password) => Some((user.to_owned(), password.unwrap_or_default().to_owned())),
+    };
+    ConnectionProxyConfig::from_parts(
+        url.scheme(),
+        url.host_str()?,
+        url.port().and_then(|port| port.try_into().ok()),
+        auth,
+    )
+    .ok()
 }

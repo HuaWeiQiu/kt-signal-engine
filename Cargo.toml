@@ -12,8 +12,14 @@ serde_json = "1"
 
 # presage 全家桶按 rev 钉定（ADR 0003：服务层 = presage + libsignal-service，
 # 传递钉 libsignal tag v0.99.0）。许可：两者均 AGPL-3.0-only，与本仓一致。
-# default-features=false：不引 cdsi（联系方式发现）与 sqlcipher 捆绑构建。
-presage = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false }
+# default-features=false + cdsi：开启按手机号查找（CDSI，E 批）——cdsi 只把
+# libsignal-net/net-infra 从 optional 转必选（两者已在依赖图，零新增 crate）；
+# sqlcipher 捆绑面在 presage-store-sqlite（store-sqlite 的 cdsi feature 已在
+# P12/R2 批移除），本 feature 不触碰 sqlcipher。store-sqlite 维持
+# default-features=false。
+presage = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false, features = [
+    "cdsi",
+] }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false }
 
 # 接收管线（Stream 组合）与异步运行时；io-std/io-util 供 stdout writer。
