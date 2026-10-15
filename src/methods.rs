@@ -4768,6 +4768,10 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// 失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     let (code, message) = send_error_face(&error);
+    // 每次 send 失败落一行引擎日志（warn 级进 engine-stderr.log）：code 与
+    // message 均为固定字面量（构造上无用户内容），覆盖未归类族（如引擎
+    // 未就绪期 Unbound 发送）——此前这类失败在引擎侧零痕迹，现场无法归因。
+    tracing::warn!(code, message, "send rpc failed");
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
