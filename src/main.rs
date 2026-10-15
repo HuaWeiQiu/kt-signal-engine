@@ -33,6 +33,7 @@
 
 mod history;
 mod jsonrpc;
+mod logfile;
 mod methods;
 mod proto;
 mod service;
@@ -370,6 +371,9 @@ async fn amain() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // 引擎自身滚动文件日志（send 可观测批 2026-10-16，compat §1）：先于
+    // 任何服务活动安装；失败静默降级（无 stderr 输出，IPC 服务不受影响）。
+    logfile::init(&args.data_dir);
     let state = match EngineState::load(&args.data_dir) {
         Ok(state) => Arc::new(AsyncMutex::new(state)),
         Err(_) => return ExitCode::from(1),
