@@ -15,9 +15,13 @@
 //!
 //! 失败显形（官方行为基准：失败带错误与重试，不静默傻等）：下载任务任何
 //! 一步失败在快照上保留 `failed` 终态（短错误码，`transfer.downloadStatus`
-//! 观测），「手机端没传历史」（204 重试耗尽）= `no_archive` 独立信息态。
-//! 终态清除触发器恰三：下次 begin（新会话）、`history.importCancel` 取消、
-//! 账号重链（finish_link）。快照缺席语义不变 = 无在途任务/无终态。
+//! 观测），「手机端没传历史」（204 重试耗尽）= `no_archive` 独立信息态；
+//! 200 体官方契约还内嵌手机端主动通知两态（`{error:"RELINK_REQUESTED"}`
+//! 要求重新扫码 / `{error:"CONTINUE_WITHOUT_UPLOAD"}` 放弃迁移继续使用），
+//! 分别 = `relink_requested`/`continue_without_upload` 独立信息态，同型
+//! 终态保留。终态清除触发器恰三：下次 begin（新会话）、
+//! `history.importCancel` 取消、账号重链（finish_link）。快照缺席语义
+//! 不变 = 无在途任务/无终态。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,10 +40,20 @@ pub(crate) mod failure {
     pub(crate) const NETWORK: &str = "network";
     /// CDN 下载段失败（请求构建/发送错误、非 2xx 状态、流中断）。
     pub(crate) const CDN_UNREACHABLE: &str = "cdn_unreachable";
-    /// 档案解不开：manifest 非法 JSON/缺 cdn+key、解密/分帧导出失败。
+    /// 档案解不开：manifest 非法 JSON/形状不符（无 cdn+key 且 error 非官方
+    /// 已知码）、解密/分帧导出失败。
     pub(crate) const DECODE_FAILED: &str = "decode_failed";
     /// 本地文件面失败（档案落盘/NDJSON 建文件）。
     pub(crate) const IO: &str = "io";
+    /// 手机端主动要求重新扫码迁移（200 体 `{error:"RELINK_REQUESTED"}`，原
+    /// 链接作废）：独立信息态非故障，终态保留供桌面诚实呈现（同 no_archive
+    /// 型）。官方契约：Signal-Desktop WebAPI.preload.ts TransferArchiveSchema
+    /// union，消费见 backups/index.preload.ts（RelinkRequestedError）。
+    pub(crate) const RELINK_REQUESTED: &str = "relink_requested";
+    /// 手机端主动放弃迁移继续使用（200 体
+    /// `{error:"CONTINUE_WITHOUT_UPLOAD"}`，无档案可拉）：独立信息态非故障，
+    /// 终态保留供桌面诚实呈现（同 no_archive 型）。官方契约同上。
+    pub(crate) const CONTINUE_WITHOUT_UPLOAD: &str = "continue_without_upload";
 }
 
 /// 单账号下载快照：相位 + 累计读数字节 + 可选总字节 + 终态失败短码。

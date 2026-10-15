@@ -8857,6 +8857,77 @@ const TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS: u64 = 60;
 /// 见 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]（总预算 ≈1h 的轮数臂）。
 const TRANSFER_ARCHIVE_MAX_POLLS: u32 = 60;
 
+/// transfer_archive 200 响应体四分类。官方契约是 union（Signal-Desktop
+/// WebAPI.preload.ts `TransferArchiveSchema`，行为对齐零拷贝）：既有
+/// `{cdn,key}` 档案就绪分支之外，还有 `{error:"RELINK_REQUESTED"}`
+/// （手机端要求重新扫码，原迁移作废）与 `{error:"CONTINUE_WITHOUT_UPLOAD"}`
+/// （手机端放弃迁移继续使用）——消费语义见 backups/index.preload.ts
+/// （RelinkRequestedError / 记日志后按无档案收尾）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TransferArchiveBody {
+    /// 手机端档案已就绪：去 CDN 拉。
+    Ready { cdn: u32, key: String },
+    /// 手机端要求重新扫码迁移。
+    RelinkRequested,
+    /// 手机端放弃迁移继续使用（无档案可拉）。
+    ContinueWithoutUpload,
+    /// 官方 union 两分支均不匹配（非法 JSON/未知 error 码/形状不符）。
+    Malformed,
+}
+
+/// 200 体解析纯函数（零 I/O 单测面）：分支序对齐官方 zod union——先试
+/// `{cdn,key}` 分支（齐且型对即 `Ready`，多余字段官方 strip 掉不碍事），
+/// 再试 `{error}` 分支（恰为官方两字面量之一），都不匹配落 `Malformed`
+/// （含非法 JSON、error 非 String/未知值、cdn 非 u64、key 非 String）。
+fn parse_transfer_archive_body(body: &[u8]) -> TransferArchiveBody {
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return TransferArchiveBody::Malformed,
+    };
+    if let (Some(cdn), Some(key)) = (
+        value["cdn"]
+            .as_u64()
+            .and_then(|cdn| u32::try_from(cdn).ok()),
+        value["key"].as_str().map(str::to_owned),
+    ) {
+        return TransferArchiveBody::Ready { cdn, key };
+    }
+    match value["error"].as_str() {
+        Some("RELINK_REQUESTED") => TransferArchiveBody::RelinkRequested,
+        Some("CONTINUE_WITHOUT_UPLOAD") => TransferArchiveBody::ContinueWithoutUpload,
+        _ => TransferArchiveBody::Malformed,
+    }
+}
+
+/// 轮询循环 200 体处置：`Ready` 放行 (cdn, key) 进 CDN 段；两 error 变体
+/// 各落 `relink_requested`/`continue_without_upload` 终态，`Malformed`
+/// 维持 `decode_failed`（此前无 cdn/key 的 200 一律误报 decode_failed，
+/// 含官方契约内的手机端主动通知两态）。快照纪律与 `no_archive` 同型：
+/// failed 终态保留供桌面诚实呈现，清除触发器不变（begin/importCancel/
+/// 重链）。
+fn handle_transfer_archive_body(
+    transfer_progress: &transfer_progress::TransferProgress,
+    account: &str,
+    body: TransferArchiveBody,
+) -> Option<(u32, String)> {
+    use transfer_progress::failure;
+    match body {
+        TransferArchiveBody::Ready { cdn, key } => Some((cdn, key)),
+        TransferArchiveBody::RelinkRequested => {
+            transfer_progress.fail(account, failure::RELINK_REQUESTED);
+            None
+        }
+        TransferArchiveBody::ContinueWithoutUpload => {
+            transfer_progress.fail(account, failure::CONTINUE_WITHOUT_UPLOAD);
+            None
+        }
+        TransferArchiveBody::Malformed => {
+            transfer_progress.fail(account, failure::DECODE_FAILED);
+            None
+        }
+    }
+}
+
 /// 存量历史迁移下载（best-effort）：`transfer_archive` 长轮询等手机上传
 /// 就绪（204 重试上限 [`TRANSFER_ARCHIVE_MAX_POLLS`] 轮、间隔 3s、服务端
 /// 单次挂起 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]s，总预算对齐官方
@@ -8866,7 +8937,9 @@ const TRANSFER_ARCHIVE_MAX_POLLS: u32 = 60;
 /// 失败不再静默（官方行为基准：失败显形带错误与重试，桌面 UI 不傻等）：
 /// 任何一步失败在进度快照上保留 `failed` 终态（短错误码，
 /// `transfer.downloadStatus` 观测）——`no_archive`（204 耗尽 = 手机端没有
-/// 可传档案，独立信息态非故障）、`network`（长轮询面传输失败）、
+/// 可传档案，独立信息态非故障）、`relink_requested`/`continue_without_upload`
+/// （200 体官方契约内嵌的手机端主动通知两态：要求重新扫码 / 放弃迁移
+/// 继续使用——此前一律误报 decode_failed）、`network`（长轮询面传输失败）、
 /// `cdn_unreachable`（CDN 段失败）、`decode_failed`（manifest/档案解不开）、
 /// `io`（本地文件面失败）；半成品清理纪律不变。本任务仍是 best-effort、
 /// 不影响链接成功，且不产生 stderr（compat §1）。
@@ -8893,7 +8966,7 @@ async fn download_transfer_archive(
     transfer_progress.begin(&account, None);
     let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
 
-    let manifest: Value = {
+    let (cdn, key) = {
         let mut polls = 0u32;
         loop {
             let path =
@@ -8925,12 +8998,16 @@ async fn download_transfer_archive(
                             return;
                         }
                     };
-                    match serde_json::from_slice(&bytes) {
-                        Ok(value) => break value,
-                        Err(_) => {
-                            transfer_progress.fail(&account, failure::DECODE_FAILED);
-                            return;
-                        }
+                    // 200 体官方契约除 {cdn,key} 外还有手机端主动通知两态
+                    // （要求重扫码/放弃迁移）：分类后各落其位，不再一律
+                    // 误报 decode_failed。
+                    match handle_transfer_archive_body(
+                        &transfer_progress,
+                        &account,
+                        parse_transfer_archive_body(&bytes),
+                    ) {
+                        Some(pair) => break pair,
+                        None => return,
                     }
                 }
                 204 if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS => {
@@ -8949,13 +9026,6 @@ async fn download_transfer_archive(
                 }
             }
         }
-    };
-    let (Some(cdn), Some(key)) = (
-        manifest["cdn"].as_u64().map(|value| value as u32),
-        manifest["key"].as_str().map(str::to_owned),
-    ) else {
-        transfer_progress.fail(&account, failure::DECODE_FAILED);
-        return;
     };
 
     // CDN 拉档案（下载面 download_request：档案体可达 GB 级，无总超时 +
@@ -18839,6 +18909,113 @@ mod tests {
         assert!(
             hang_seconds + sleep_seconds < 2 * 3600,
             "预算放宽到官方同级，但不破 2h"
+        );
+    }
+
+    /// 200 体四分类钉形（官方 TransferArchiveSchema union 对齐，行为对齐
+    /// 零拷贝）：{cdn,key} 即 Ready（两分支字段并存时官方 zod union 先试
+    /// {cdn,key} 分支，多余字段 strip——同形序）；error 恰为官方两字面量
+    /// 之一对应对应变体；其余（非法 JSON/未知 error/cdn·key 缺失或型不对）
+    /// 一律 Malformed。
+    #[test]
+    fn transfer_archive_body_classification() {
+        assert_eq!(
+            parse_transfer_archive_body(br#"{"cdn":3,"key":"manifold://cb#k"}"#),
+            TransferArchiveBody::Ready {
+                cdn: 3,
+                key: "manifold://cb#k".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_transfer_archive_body(br#"{"cdn":0,"key":"k","error":"RELINK_REQUESTED"}"#),
+            TransferArchiveBody::Ready {
+                cdn: 0,
+                key: "k".to_owned()
+            },
+            "官方 zod union 分支序：{{cdn,key}} 齐 = Ready 赢"
+        );
+        assert_eq!(
+            parse_transfer_archive_body(br#"{"error":"RELINK_REQUESTED"}"#),
+            TransferArchiveBody::RelinkRequested
+        );
+        assert_eq!(
+            parse_transfer_archive_body(br#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#),
+            TransferArchiveBody::ContinueWithoutUpload
+        );
+        let malformed_bodies: [&[u8]; 9] = [
+            b"not json",
+            br#"{}"#,
+            br#"{"cdn":3}"#,
+            br#"{"key":"k"}"#,
+            br#"{"cdn":"3","key":"k"}"#,
+            br#"{"cdn":3.5,"key":"k"}"#,
+            br#"{"error":"SOMETHING_ELSE"}"#,
+            br#"{"error":123}"#,
+            br#"{"error":"relink_requested"}"#,
+        ];
+        for body in malformed_bodies {
+            assert_eq!(
+                parse_transfer_archive_body(body),
+                TransferArchiveBody::Malformed,
+                "「{}」应判 Malformed",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// 轮询循环 200 体处置终态路径：两 error 变体各落 `relink_requested`/
+    /// `continue_without_upload` 终态（不再误报 decode_failed），`Malformed`
+    /// 维持 `decode_failed`，`Ready` 放行 (cdn,key) 且快照不受扰——快照
+    /// 纪律与 `no_archive` 同型（failed 终态保留供桌面诚实呈现）。
+    #[test]
+    fn transfer_archive_body_terminal_paths() {
+        for (body, expected) in [
+            (
+                TransferArchiveBody::RelinkRequested,
+                transfer_progress::failure::RELINK_REQUESTED,
+            ),
+            (
+                TransferArchiveBody::ContinueWithoutUpload,
+                transfer_progress::failure::CONTINUE_WITHOUT_UPLOAD,
+            ),
+            (
+                TransferArchiveBody::Malformed,
+                transfer_progress::failure::DECODE_FAILED,
+            ),
+        ] {
+            let progress = transfer_progress::TransferProgress::new();
+            progress.begin("lk-a", None);
+            progress.add("lk-a", 7);
+            assert_eq!(handle_transfer_archive_body(&progress, "lk-a", body), None);
+            assert_eq!(
+                progress.snapshot("lk-a"),
+                Some(transfer_progress::TransferSnapshot {
+                    phase: transfer_progress::PHASE_FAILED,
+                    bytes_read: 7,
+                    bytes_total: None,
+                    error_code: Some(expected),
+                }),
+                "终态短码应恰为 {expected}"
+            );
+        }
+
+        // Ready：放行 (cdn, key) 进 CDN 段，快照保持在途不受扰。
+        let progress = transfer_progress::TransferProgress::new();
+        progress.begin("lk-a", Some(10));
+        assert_eq!(
+            handle_transfer_archive_body(
+                &progress,
+                "lk-a",
+                TransferArchiveBody::Ready {
+                    cdn: 3,
+                    key: "k".to_owned()
+                },
+            ),
+            Some((3, "k".to_owned()))
+        );
+        assert_eq!(
+            progress.snapshot("lk-a").map(|snapshot| snapshot.phase),
+            Some(transfer_progress::PHASE_DOWNLOADING)
         );
     }
 }
