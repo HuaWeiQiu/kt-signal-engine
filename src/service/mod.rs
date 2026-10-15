@@ -65,6 +65,9 @@ pub(crate) mod perf_metrics;
 pub(crate) mod phone;
 pub(crate) mod prekey;
 pub(crate) mod profile;
+/// 联系人 profile 名字材料刷新读路径（profiles.refreshContacts + 登录期
+/// 自动批，2026-10-16 批，模块头注载语义/纪律/落表查证结论）。
+pub(crate) mod profile_refresh;
 pub(crate) mod report;
 pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
@@ -881,6 +884,14 @@ pub(crate) enum SendError {
     /// 风险）。快速重试 1 次；错误面 -32603 + 固定原文（锚词
     /// AttachmentUploadException）。
     AttachmentUpload,
+    /// 群腿零收件人（群成员过滤自身后目标集为空——独群/全成员即自身的
+    /// 群态）：请求从未构造收件人面，确定未送达（2026-10-16 群腿零收件人
+    /// 防御批，杜绝 vendored 空循环 → Ok 空 outcomes → send 应答整体成功
+    /// 的真空成功洞，三层防御点见 group_mrm/dispatch/failover，compat
+    /// §3/§5）。错误面 -32603 + 固定原文（锚词 NoRecipientsException）。
+    /// 群腿无整体自动重试（既有裁定），is_definite_failure=true 只补结局
+    /// 类完备性（语义 = 确定未送达）。
+    NoRecipients,
     Internal,
 }
 
@@ -888,7 +899,8 @@ impl SendError {
     /// 结局类判定（§5 快速重试硬边界，纯函数）：`true` = 确定未送达——
     /// 请求未离开引擎（WsTransport）、服务器显式拒绝未入队（WsRejected）、
     /// 先于 wire 的本地面失败（PreKey/SessionBuild）、消息未离站
-    /// （AttachmentUpload）——允许同调用内快速重试 1 次；`false` = 未知
+    /// （AttachmentUpload）、从未构造收件人面（NoRecipients）——允许同
+    /// 调用内快速重试 1 次；`false` = 未知
     /// 结局或确定性失败，绝不自动重试（WsTimeout 响应缺失可能已落地、
     /// Unbound/RateLimited/ProofRequired/IdentityUnverified 确定性失败、
     /// ServerUnavailable 决策归 connector/desktop、Internal 本地面）。
@@ -900,6 +912,7 @@ impl SendError {
                 | SendError::PreKey
                 | SendError::SessionBuild
                 | SendError::AttachmentUpload
+                | SendError::NoRecipients
         )
     }
 }
@@ -3295,7 +3308,11 @@ impl Service {
     }
 
     /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
-    /// profile 拆名面（givenName/familyName）presage Contact 未建模，P2+ 补。
+    /// profile 拆名面（2026-10-16 profile 名字刷新批，wire additive，§5 块）：
+    /// 条目 additive `profile:{givenName?, familyName?}`——数据源 = profiles
+    /// 表（`profiles.refreshContacts` 拉取落库面；键形状与 signal-cli 同形，
+    /// connector supervisor 消费腿同形状）；名字键缺席纪律见
+    /// `project_contact_entry`（no-null：非空才出现）。
     pub(crate) async fn list_contacts(
         self: &Arc<Self>,
         account: &str,
@@ -3319,11 +3336,11 @@ impl Service {
                 .as_ref()
                 .map(e164_string)
                 .unwrap_or_else(|| contact.uuid.to_string());
-            let mut entry = json!({ "number": number });
-            if !contact.name.is_empty() {
-                entry["name"] = json!(contact.name);
-            }
-            out.push(entry);
+            let profile = profile_name_material(manager.store(), contact.uuid).await;
+            let profile = profile
+                .as_ref()
+                .map(|(given, family)| (given.as_str(), family.as_deref()));
+            out.push(project_contact_entry(&number, &contact.name, profile));
         }
         Ok(out)
     }
@@ -3501,19 +3518,29 @@ impl Service {
         account: &str,
         group_id: &str,
         stop: bool,
-    ) -> Result<(), SendError> {
+    ) -> Result<TypingGroupSendOutcome, SendError> {
         if !self.real {
-            return Ok(());
+            // fake 形状桩：成功面（compat §6；无 store 无群态，失败显形
+            // 面只在 real 生效）。
+            return Ok(TypingGroupSendOutcome::Ok);
         }
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
         let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
         let body = ContentBody::TypingMessage(typing_group_body(&master_key, timestamp, stop));
-        manager
+        // 失败显形批（2026-10-16，compat §3/§5）：不再丢弃逐收件人
+        // outcomes（此前 `.map(|_| ())` 整体丢弃——成员全失败也回 `{}` 静默
+        // 成功）；空 outcomes = 零收件人（群成员过滤自身后为空）同转
+        // NoRecipients 确定性失败；其余分类归 classify 单点（全败 =
+        // AllFailed 失败面；部分失败 warn 计数后按成功面应答）。
+        let outcomes = manager
             .send_message_to_group(&master_key, body, timestamp)
             .await
-            .map_err(send_error_of)
-            .map(|_| ())
+            .map_err(send_error_of)?;
+        if outcomes.is_empty() {
+            return Err(SendError::NoRecipients);
+        }
+        Ok(classify_typing_group_outcomes(outcomes))
     }
 
     /// 群组发送公共头：账号/群可解校验 + 终止面硬拒（官方
@@ -5934,6 +5961,26 @@ async fn serve_account_stream(
                         perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
                     )
                     .await;
+                    // profile 名字材料自动批（2026-10-16 profile 名字刷新
+                    // 批，compat §5）：contacts sync / manifest 异步回传，
+                    // +10s 沉降后跑刷新单点（`profiles.refreshContacts`
+                    // 同一函数面）。spawn_local 独立任务不阻塞收流循环；
+                    // best-effort 失败静默（零 stderr 纪律，显式方法/下次
+                    // 链路建立重补；读面幂等）。触发面继承 60s 一次性纪律
+                    // （重连风暴不重复），每窗至多一批。
+                    let refresh_service = Arc::clone(service);
+                    let refresh_account = number.to_owned();
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(Duration::from_millis(
+                            profile_refresh::AUTO_REFRESH_SETTLE_MS,
+                        ))
+                        .await;
+                        let _ = profile_refresh::refresh_contact_profiles(
+                            &refresh_service,
+                            &refresh_account,
+                        )
+                        .await;
+                    });
                     *last_contacts_sync = Some(std::time::Instant::now());
                 }
             }, if sync_pending.is_some() => {
@@ -9603,6 +9650,54 @@ fn group_send_failure_word(
     }
 }
 
+/// sendTyping 群腿结局两态（失败显形批，2026-10-16，wire additive，compat
+/// §3/§5）：零收件人在服务层已转 `SendError::NoRecipients` 不经此处；
+/// 全部收件人失败 = 失败面（失败词条计数，词表 = `group_send_failure_word`
+/// 同一单点，只计词条与次数无身份）；部分失败/全成功 = 成功面（`{}`；
+/// 部分失败计数只落引擎日志——typing 非投递承诺，部分成员收到即达标）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypingGroupSendOutcome {
+    /// 成功面（`{}`）：全部送达，或部分失败（计数只进引擎日志）。
+    Ok,
+    /// 全部收件人失败（零送达）：失败词条计数（首现序，确定性）。
+    AllFailed(Vec<(&'static str, u32)>),
+}
+
+/// 部分失败可观测计数（纯函数）：`(failed, delivered)`——引擎日志 warn 面
+/// 与单测共用单点（固定字面量 + 数值计数，无身份）。
+fn typing_failure_counts(outcomes: &GroupSendOutcomes) -> (usize, usize) {
+    let failed = outcomes.iter().filter(|(_, error)| error.is_some()).count();
+    (failed, outcomes.len() - failed)
+}
+
+/// 群 typing outcomes 分类（纯函数，失败显形批）：全部失败 → `AllFailed`
+/// （词条计数聚合，首现序）；有任一成功 → `Ok` + 部分失败 warn（engine-
+/// stderr.log 可见面，send 链日志纪律同向）。
+pub(crate) fn classify_typing_group_outcomes(
+    outcomes: GroupSendOutcomes,
+) -> TypingGroupSendOutcome {
+    let (failed_count, delivered) = typing_failure_counts(&outcomes);
+    if failed_count == outcomes.len() && !outcomes.is_empty() {
+        let mut words: Vec<(&'static str, u32)> = Vec::new();
+        for (_, error) in &outcomes {
+            let word = group_send_failure_word(error.as_ref().expect("failed arm"));
+            match words.iter_mut().find(|(existing, _)| *existing == word) {
+                Some((_, count)) => *count += 1,
+                None => words.push((word, 1)),
+            }
+        }
+        return TypingGroupSendOutcome::AllFailed(words);
+    }
+    if failed_count > 0 {
+        tracing::warn!(
+            failed = failed_count,
+            delivered,
+            "send typing group partial failures"
+        );
+    }
+    TypingGroupSendOutcome::Ok
+}
+
 /// 群发送结果条目组装（send 群形态 `results` 数组 additive 面，条目形状
 /// 与直聊同构：成功 `{recipientNumber, success:{timestamp}}`，失败
 /// `{recipientNumber, failure:{type}}`；号码经 contacts 映射，未命中回退
@@ -9662,6 +9757,57 @@ async fn contacts_number_map(store: &SqliteStore) -> HashMap<String, String> {
             Some((contact.uuid.to_string(), number))
         })
         .collect()
+}
+
+/// 联系人 profile 名字材料读面（profile 名字刷新批，2026-10-16，§5 块）：
+/// profiles 表（`profiles.refreshContacts` 拉取落库面）——profile_key 权威
+/// 读（join 键同源）→ `store.profile` → (givenName, familyName) 对；材料
+/// 不在（未刷新过 / 服务器侧名字空 / 键或读面失败）= None（旧宿主零变化：
+/// 未刷新库应答逐字节同形）。listContacts 投影专用，不写 contacts.name
+/// （名字权威 = 手机 contacts sync）。
+async fn profile_name_material(
+    store: &SqliteStore,
+    uuid: presage::libsignal_service::prelude::Uuid,
+) -> Option<(String, Option<String>)> {
+    use presage::libsignal_service::protocol::Aci;
+    let key = store
+        .profile_key(&ServiceId::Aci(Aci::from(uuid)))
+        .await
+        .ok()
+        .flatten()?;
+    let profile = store.profile(uuid, key).await.ok().flatten()?;
+    // 材料判定与拆对走 profile_refresh 单点（given/family 有一件非空才算
+    // 材料），与刷新目标选择同一语义源。
+    let name = profile.name?;
+    profile_refresh::profile_name_pair(&name)
+        .map(|(given, family)| (given.to_owned(), family.map(str::to_owned)))
+}
+
+/// listContacts 条目投影（纯函数，profile 名字刷新批 additive 面）：`name`
+/// 键语义不变（contacts 同步名，非空才出现）；additive `profile` 键 =
+/// `{givenName?, familyName?}`——两件全空 = 整键不在，单件空 = 该键不在
+/// （no-null 纪律，缺席与 null 折叠同一无键态）；键名与 signal-cli 同形
+/// （connector supervisor 消费腿 profile.givenName/familyName 同形状）。
+fn project_contact_entry(number: &str, name: &str, profile: Option<(&str, Option<&str>)>) -> Value {
+    let mut entry = json!({ "number": number });
+    if !name.is_empty() {
+        entry["name"] = json!(name);
+    }
+    if let Some((given, family)) = profile {
+        let given_non_empty = !given.is_empty();
+        let family_non_empty = family.is_some_and(|f| !f.is_empty());
+        if given_non_empty || family_non_empty {
+            let mut face = serde_json::Map::new();
+            if given_non_empty {
+                face.insert("givenName".to_owned(), json!(given));
+            }
+            if family_non_empty {
+                face.insert("familyName".to_owned(), json!(family.unwrap_or_default()));
+            }
+            entry["profile"] = Value::Object(face);
+        }
+    }
+    entry
 }
 
 /// 回应/群内作者号 → ACI 字符串。解析顺序：UUID 形状直通 → 本机注册数据
@@ -19394,6 +19540,147 @@ mod tests {
         assert_eq!(
             progress.snapshot("lk-a").map(|snapshot| snapshot.phase),
             Some(transfer_progress::PHASE_DOWNLOADING)
+        );
+    }
+
+    /// sendTyping 群腿结局两态分类（失败显形批，2026-10-16）：全部失败 →
+    /// AllFailed（词条计数首现序、词表单点）；部分失败/全成功 → Ok 成功面；
+    /// 零收件人（空表）不经本单点（服务层已转 NoRecipients，空表落 Ok 臂
+    /// 由调用方前置拦截）。失败计数单点（typing_failure_counts）逐臂钉形。
+    #[test]
+    fn classify_typing_group_outcomes_arms() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError;
+
+        fn failed(
+            service_id: ServiceId,
+            error: MessageSenderError,
+        ) -> (ServiceId, Option<MessageSenderError>) {
+            (service_id, Some(error))
+        }
+        fn ok(service_id: ServiceId) -> (ServiceId, Option<MessageSenderError>) {
+            (service_id, None)
+        }
+
+        let a = ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+            uuid::Uuid::from_u128(1),
+        ));
+        let b = ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+            uuid::Uuid::from_u128(2),
+        ));
+        let c = ServiceId::from(presage::libsignal_service::protocol::Aci::from(
+            uuid::Uuid::from_u128(3),
+        ));
+
+        // 全部失败：词条计数聚合（NotFound 两例 + Unauthorized 一例），
+        // 首现序钉定（确定性 wire 面）。
+        let outcomes = vec![
+            failed(a, MessageSenderError::NotFound { service_id: a }),
+            failed(
+                b,
+                MessageSenderError::ServiceError(ServiceError::Unauthorized),
+            ),
+            failed(c, MessageSenderError::NotFound { service_id: c }),
+        ];
+        assert_eq!(typing_failure_counts(&outcomes), (3, 0));
+        match classify_typing_group_outcomes(outcomes) {
+            TypingGroupSendOutcome::AllFailed(words) => assert_eq!(
+                words,
+                vec![
+                    ("UnregisteredFailure", 2),
+                    ("AuthorizationFailedFailure", 1)
+                ]
+            ),
+            TypingGroupSendOutcome::Ok => panic!("all-failed must classify AllFailed"),
+        }
+
+        // 全部失败（未知网络族）：同词折叠单条。
+        let outcomes = vec![
+            failed(a, MessageSenderError::NoMessagesToSend),
+            failed(b, MessageSenderError::NoMessagesToSend),
+        ];
+        match classify_typing_group_outcomes(outcomes) {
+            TypingGroupSendOutcome::AllFailed(words) => {
+                assert_eq!(words, vec![("NetworkFailure", 2)])
+            }
+            TypingGroupSendOutcome::Ok => panic!("all-failed must classify AllFailed"),
+        }
+
+        // 部分失败：成功面（计数单点 (1, 1)——warn 面同源）。
+        let outcomes = vec![
+            ok(a),
+            failed(b, MessageSenderError::NotFound { service_id: b }),
+        ];
+        assert_eq!(typing_failure_counts(&outcomes), (1, 1));
+        assert_eq!(
+            classify_typing_group_outcomes(outcomes),
+            TypingGroupSendOutcome::Ok
+        );
+
+        // 全成功：成功面计数 (0, 2)。
+        let outcomes = vec![ok(a), ok(b)];
+        assert_eq!(typing_failure_counts(&outcomes), (0, 2));
+        assert_eq!(
+            classify_typing_group_outcomes(outcomes),
+            TypingGroupSendOutcome::Ok
+        );
+    }
+
+    /// listContacts 条目投影（profile 名字刷新批 additive 面，纯函数）：
+    /// number 恒在；name/profile 两键非空才出现（no-null）；profile 内
+    /// givenName/familyName 单件空 = 该键不在；两件全空 = profile 整键
+    /// 不在；键集形状钉定（不得发明）。
+    #[test]
+    fn project_contact_entry_shapes() {
+        // 仅 number（未刷新库零变化：应答逐字节同形）。
+        assert_eq!(
+            project_contact_entry("+15551234567", "", None),
+            json!({
+                "number": "+15551234567",
+            })
+        );
+
+        // contacts 名照旧；profile 材料在 → givenName/familyName 全出。
+        assert_eq!(
+            project_contact_entry("+15551234567", "Alice", Some(("Ada", Some("Lee")))),
+            json!({
+                "number": "+15551234567",
+                "name": "Alice",
+                "profile": { "givenName": "Ada", "familyName": "Lee" },
+            })
+        );
+
+        // 单件空：given 缺 / family 缺（no-null，缺席键不在）。
+        assert_eq!(
+            project_contact_entry("+15551234567", "", Some(("", Some("Lee")))),
+            json!({
+                "number": "+15551234567",
+                "profile": { "familyName": "Lee" },
+            })
+        );
+        assert_eq!(
+            project_contact_entry("+15551234567", "", Some(("Ada", None))),
+            json!({
+                "number": "+15551234567",
+                "profile": { "givenName": "Ada" },
+            })
+        );
+        assert_eq!(
+            project_contact_entry("+15551234567", "", Some(("Ada", Some("")))),
+            json!({
+                "number": "+15551234567",
+                "profile": { "givenName": "Ada" },
+            })
+        );
+
+        // 两件全空 = profile 整键不在（服务器侧空 profile 名不算材料）。
+        assert_eq!(
+            project_contact_entry("+15551234567", "", Some(("", None))),
+            json!({ "number": "+15551234567" })
+        );
+        assert_eq!(
+            project_contact_entry("+15551234567", "", Some(("", Some("")))),
+            json!({ "number": "+15551234567" })
         );
     }
 }

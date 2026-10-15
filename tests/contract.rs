@@ -5171,6 +5171,48 @@ fn read_only_stubs_and_user_status_shapes() {
     assert_eq!(status["result"], json!({ "isRegistered": true }));
 }
 
+/// profiles.refreshContacts（profile 名字刷新批，wire additive）：fake 面
+/// 形状桩 = 三计数零值（键集钉定，无身份/名字内容）；account 缺席
+/// fail-closed -32603；real 模式未注册账号折叠 -32603（不触网）。
+#[test]
+fn profiles_refresh_contacts_param_and_stub_faces() {
+    let dir = temp_dir("profiles-refresh");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 形状桩：恰三计数键（u32 零值）。
+    assert_eq!(
+        engine.request(
+            "profiles.refreshContacts",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({ "refreshed": 0, "failed": 0, "skipped": 0 })
+    );
+    // 参数面：account 缺席/非字符串 fail-closed。
+    for params in [
+        json!({}),
+        json!({ "account": 42 }),
+        json!({ "account": null }),
+    ] {
+        let response = engine.request("profiles.refreshContacts", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "profiles.refreshContacts rejects {params}"
+        );
+    }
+}
+
+/// real 模式（无 KT_ENGINE_FAKE_SERVICE）未注册账号：刷新面走注册表
+/// UnknownAccount 折叠 -32603，不触网（与 listContacts 同折叠纪律）。
+#[test]
+fn profiles_refresh_contacts_unknown_account_folds_internal() {
+    let dir = temp_dir("profiles-refresh-real");
+    let mut engine = Engine::spawn(&dir);
+    let (code, message) = engine.error_of(
+        "profiles.refreshContacts",
+        json!({ "account": "+15559990000" }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// listGroups 可选 groupId 过滤（P15b 审计项5 单群读投影，wire additive）：
 /// 缺席/null = 全表（fake 恒空表）；well-formed 过滤过参数闸（fake 空
 /// store 回空表）；坏形状 fail-closed -32603（fake 面同口径）——空数组/

@@ -235,6 +235,14 @@ pub(crate) async fn dispatch_group_message(
     targets.sort();
     targets.dedup();
 
+    // 群腿零收件人防御（2026-10-16 批，compat §3/§5）：成员过滤自身后
+    // 目标集为空 → 确定性失败。此前掉进下方 fallback → vendored 空循环
+    // → Ok 空 outcomes → send 应答 Ok((ts, [])) 整体成功（静默真空成功，
+    // 三层无防御）。NoRecipients = 确定未送达（请求从未构造收件人面）。
+    if targets.is_empty() {
+        return Err(SendError::NoRecipients);
+    }
+
     // 官方 fallback：目标 < 2 走逐收件人（Desktop sendToGroup 同语义）。
     if targets.len() < 2 {
         return failover(manager, &master_key, body, timestamp).await;
@@ -539,10 +547,19 @@ async fn failover(
 ) -> Result<GroupSendOutcomes, SendError> {
     // S2a 打点：vendored 逐收件人 failover 路径计数（官方合法 fallback）。
     super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_FAILOVER, 1);
-    manager
+    let outcomes = manager
         .send_message_to_group(master_key, ContentBody::DataMessage(body), timestamp)
         .await
-        .map_err(super::send_error_of)
+        .map_err(super::send_error_of)?;
+    // 群腿零收件人防御第二点（2026-10-16 批，compat §5）：vendored 路径
+    // 空 outcomes ⟺ 群成员过滤自身后为空（群态取不到回退路径与逐收件人
+    // 路径的全部零收件人面）——同转确定性失败，真空成功关闭。vendored
+    // 内部已落的本地 transcript 副本为无 wire 影响的本地副作用（vendored
+    // 行为不回改），引擎对 connector 的结局从 Ok([]) 翻转为失败面。
+    if outcomes.is_empty() {
+        return Err(SendError::NoRecipients);
+    }
+    Ok(outcomes)
 }
 
 /// GSE 验签出 token：endorsements 含 self（服务器签发口径），combine 时

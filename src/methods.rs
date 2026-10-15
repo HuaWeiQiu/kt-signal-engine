@@ -70,6 +70,11 @@ const SESSION_BUILD_MESSAGE: &str =
 /// 附件/贴纸图/预览图上行失败——上传先于发送，消息未离站。
 const ATTACHMENT_UPLOAD_MESSAGE: &str =
     "Failed to send message: Attachment upload failed. (AttachmentUploadException)";
+/// 群腿零收件人（群成员过滤自身后目标集为空）——请求从未构造收件人面，
+/// 确定未送达（2026-10-16 群腿零收件人防御批，wire 字面量与锚词
+/// `(NoRecipientsException)`；群发送系与群 typing 共用，compat §3/§5）。
+const NO_RECIPIENTS_MESSAGE: &str =
+    "Failed to send message: No recipients in group. (NoRecipientsException)";
 
 pub(crate) enum Inbound {
     Line(String),
@@ -1142,8 +1147,17 @@ async fn dispatch(
             let group = params.get("groupId").and_then(Value::as_str);
             match (account, stop, group, recipients_of(params)) {
                 (Some(account), Some(stop), Some(group), _) => {
+                    // 失败显形批（2026-10-16，wire additive，compat §3/§5）：
+                    // 三态 1:1 投影——全败 = 失败面（词条计数）；零收件人
+                    // 已在服务层转 NoRecipients 错误；部分失败/全成功 =
+                    // `{}`（部分失败计数只进引擎日志）。
                     match service.send_typing_group(account, group, stop).await {
-                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Ok(crate::service::TypingGroupSendOutcome::Ok) => {
+                            jsonrpc::success_response(id, json!({}))
+                        }
+                        Ok(crate::service::TypingGroupSendOutcome::AllFailed(words)) => {
+                            typing_group_all_failed(id, &words)
+                        }
                         Err(error) => send_error(id, error),
                     }
                 }
@@ -2711,6 +2725,32 @@ async fn dispatch(
             match service.phone_lookup(account, &numbers).await {
                 Ok(rows) => jsonrpc::success_response(id, rows),
                 Err(error) => phone_lookup_error(id, &error),
+            }
+        }
+        // profiles.refreshContacts（联系人 profile 名字材料刷新，KT 扩展
+        // 方法，2026-10-16 profile 名字刷新批，wire additive，engine-compat，
+        // §5 块）：params `{account}`（无逐联系人物品参数——目标集恒由
+        // store 推导：profile_key 在库且名字材料空者，调用方无法借它探测
+        // 任意 uuid 的 profile）。返回 `{refreshed, failed, skipped}` 三计
+        // 数，只计数不含任何身份/号码/名字内容。未注册账号 `-32603`；
+        // fake：形状桩零计数（不落调度日志，读面纪律）。
+        "profiles.refreshContacts" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match crate::service::profile_refresh::refresh_contact_profiles(&service, account).await
+            {
+                Ok(counts) => jsonrpc::success_response(
+                    id,
+                    json!({
+                        "refreshed": counts.refreshed,
+                        "failed": counts.failed,
+                        "skipped": counts.skipped,
+                    }),
+                ),
+                Err(crate::service::profile_refresh::RefreshError::UnknownAccount) => {
+                    internal_error(id)
+                }
             }
         }
         // ---- 用户名写面（KT 扩展方法）----
@@ -4775,6 +4815,26 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
+/// sendTyping 群腿全部收件人失败的错误面（失败显形批，2026-10-16，wire
+/// additive，compat §3/§5）：`-1` + `SEND_TYPING_GROUP_FAILED` +
+/// `data.failures` 失败词条计数（`{"UnregisteredFailure": 2}` 形，词表 =
+/// 群发送 per-recipient 失败词表单点 `group_send_failure_word`）——只计
+/// 词条与次数，无收件人身份/顺序（引擎零联系人外传纪律同向）。
+fn typing_group_all_failed(id: &Value, failures: &[(&'static str, u32)]) -> Value {
+    let mut counts = serde_json::Map::new();
+    for (word, count) in failures {
+        counts.insert((*word).to_owned(), json!(count));
+    }
+    jsonrpc::error_response(
+        id,
+        &RpcError::with_data(
+            -1,
+            "SEND_TYPING_GROUP_FAILED",
+            json!({ "failures": Value::Object(counts) }),
+        ),
+    )
+}
+
 /// sendStory 应答体组装单点（媒体 story 指针回传批，2026-10-15）：
 /// timestamp/results 恒在；group（群腿应答面，2026-10-15 批）与
 /// fileAttachment（媒体 story 上传指针全脸，本批 additive——名单腿指针
@@ -4819,6 +4879,7 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::PreKey => (-32603, PRE_KEY_MESSAGE),
         SendError::SessionBuild => (-32603, SESSION_BUILD_MESSAGE),
         SendError::AttachmentUpload => (-32603, ATTACHMENT_UPLOAD_MESSAGE),
+        SendError::NoRecipients => (-32603, NO_RECIPIENTS_MESSAGE),
         SendError::UnknownAccount | SendError::Internal => (-32603, "Internal error"),
     }
 }
@@ -4866,6 +4927,7 @@ mod tests {
             SendError::PreKey,
             SendError::SessionBuild,
             SendError::AttachmentUpload,
+            SendError::NoRecipients,
             SendError::Internal,
         ];
         for error in cases {
@@ -4875,6 +4937,40 @@ mod tests {
             assert_eq!(face.get("code").and_then(Value::as_i64), Some(code));
             assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
         }
+    }
+
+    /// 群腿零收件人防御面（2026-10-16 批）：`NoRecipients` 错误面 =
+    /// `-32603` + 固定原文（锚词 `(NoRecipientsException)` 全词在——
+    /// connector 分类器后续批认领面）；结局类 = 确定未送达
+    /// （is_definite_failure=true）。
+    #[test]
+    fn no_recipients_face_shape_and_definite_outcome() {
+        let (code, message) = send_error_face(&crate::service::SendError::NoRecipients);
+        assert_eq!(code, -32603);
+        assert_eq!(message, NO_RECIPIENTS_MESSAGE);
+        assert!(message.contains("(NoRecipientsException)"));
+        assert!(message.starts_with("Failed to send message: "));
+        assert!(crate::service::SendError::NoRecipients.is_definite_failure());
+    }
+
+    /// sendTyping 群腿全败错误面（失败显形批）：`-1` + SEND_TYPING_GROUP_
+    /// FAILED + data.failures 词条计数（词表单点聚合、无身份键）；空计
+    /// 数不可达（全败至少一条），形状面以非空钉定。
+    #[test]
+    fn typing_group_all_failed_face_carries_word_counts() {
+        let failures = vec![("UnregisteredFailure", 2), ("NetworkFailure", 1)];
+        let response = typing_group_all_failed(&Value::from(9), &failures);
+        assert_eq!(response.get("id").and_then(Value::as_i64), Some(9));
+        let error = response.get("error").expect("error face");
+        assert_eq!(error.get("code").and_then(Value::as_i64), Some(-1));
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("SEND_TYPING_GROUP_FAILED")
+        );
+        let counts = error["data"]["failures"].as_object().expect("failures");
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts["UnregisteredFailure"], json!(2));
+        assert_eq!(counts["NetworkFailure"], json!(1));
     }
 
     /// version 元方法应答体形状面：恰 `{name, version}` 双字符串键（上游
