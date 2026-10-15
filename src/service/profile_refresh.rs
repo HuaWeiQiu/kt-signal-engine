@@ -16,9 +16,11 @@
 //! 读（见 super::list_contacts / project_contact_entry）。
 //!
 //! 纪律：
-//! - 并发有界 ≤3（独立 `Manager::load_registered` 各持 websocket 槽，
-//!   不与发送常驻管理器争锁）；单联系人失败不中断批次；整批时限
-//!   [`REFRESH_BATCH_DEADLINE_MS`]（到期未尝试计 failed——诚实语义）。
+//! - 并发有界 ≤3（独立 `Manager::load_registered` 仅为 store 连接隔离与
+//!   读并发；websocket 槽自 2026-10-16 单连接纪律批起由 libsignal-service
+//!   进程级 slot 注册表归一——同账号全引擎共享一条 identified 连接，不再
+//!   各持独立槽；单联系人失败不中断批次；整批时限
+//!   [`REFRESH_BATCH_DEADLINE_MS`]（到期未尝试计 failed——诚实语义））。
 //! - wire 返回 `{refreshed, failed, skipped}` 三计数，**只计数不含任何
 //!   身份/号码/名字内容**（引擎零联系人外传纪律同向）。
 //! - presage 侧 profile 缓存（查到即回、零网络）使重复刷新幂等。
@@ -45,7 +47,8 @@ pub(crate) const REFRESH_BATCH_DEADLINE_MS: u64 = 20_000;
 /// 单次拉取超时（毫秒，服务器往返面）：超时计 failed，防单点网络悬挂拖垮
 /// 整批（worst case 批尾 = 时限 + 单条超时）。
 pub(crate) const REFRESH_FETCH_TIMEOUT_MS: u64 = 10_000;
-/// 并发上界（独立 manager 数，各持 identified websocket 槽）。
+/// 并发上界（独立 manager 数 = store 连接数；websocket 槽进程级归一，
+/// 见 [`profile_refresh`] 模块纪律注）。
 pub(crate) const REFRESH_CONCURRENCY: usize = 3;
 /// 登录期自动批沉降（毫秒）：sync 臂 contacts/manifest 异步落库等待，之后
 /// 跑刷新单点（材料没落库就跑只会空转，幂等无害）。
@@ -182,9 +185,9 @@ pub(crate) async fn refresh_contact_profiles(
     }
     drop(store);
 
-    // —— 有界并发执行：round-robin ≤3 块，每块独立 manager（独立
-    // websocket 槽，不与发送常驻管理器争锁）；逐条尝试前查时限，到期未
-    // 尝试计 failed。
+    // —— 有界并发执行：round-robin ≤3 块，每块独立 manager（store 连接
+    // 隔离；websocket 槽由进程级 slot 注册表归一共享，不新增连接）；逐条
+    // 尝试前查时限，到期未尝试计 failed。
     let deadline = tokio::time::Instant::now() + Duration::from_millis(REFRESH_BATCH_DEADLINE_MS);
     let chunks = chunk_targets(targets, REFRESH_CONCURRENCY);
     let partials = futures::future::join_all(chunks.iter().map(|chunk| async {
@@ -200,9 +203,10 @@ pub(crate) async fn refresh_contact_profiles(
     Ok(counts)
 }
 
-/// 单块执行：独立 store 连接 + manager，逐联系人 presage 拉取（超时/失败
-/// 计 failed，不中断块内后续目标）。块级基础设施失败（store 打不开/
-/// 注册数据不可读）= 该块全部目标计 failed（诚实：未刷新成功）。
+/// 单块执行：独立 store 连接 + manager（websocket 已由进程级 slot 注册表
+/// 归一共享，见模块纪律注），逐联系人 presage 拉取（超时/失败计 failed，
+/// 不中断块内后续目标）。块级基础设施失败（store 打不开/注册数据不可读）
+/// = 该块全部目标计 failed（诚实：未刷新成功）。
 async fn refresh_chunk(
     dir: &Path,
     targets: &[(Uuid, ProfileKey)],

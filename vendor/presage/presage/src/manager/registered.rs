@@ -79,8 +79,10 @@ pub enum RegistrationType {
 pub struct Registered {
     pub(crate) identified_push_service: OnceLock<PushService>,
     pub(crate) unidentified_push_service: OnceLock<PushService>,
-    pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
-    pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
+    // KT (single-connection): the per-manager identified/unidentified
+    // websocket slots were removed — websockets now live in the process-global
+    // per-account registry (libsignal-service websocket::slot), shared by
+    // every Manager of the same account.
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
     // KT (group credentials reuse): GroupsManager slot so the credentials
     // cache survives across group operations on this manager (official
@@ -103,8 +105,6 @@ impl Registered {
         Self {
             identified_push_service: Default::default(),
             unidentified_push_service: Default::default(),
-            identified_websocket: Default::default(),
-            unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
             groups_manager_cache: Default::default(),
             data: Arc::new(data),
@@ -232,56 +232,67 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns the current identified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.
+    ///
+    /// KT (single-connection): the slot is process-global per account (keyed
+    /// by credentials login), shared by every Manager instance of the same
+    /// account; a dial terminates the previous connection first (see
+    /// `websocket::slot`).
     async fn identified_websocket(
         &self,
         require_unused: bool,
     ) -> Result<SignalWebSocket<websocket::Identified>, Error<S::Error>> {
-        let mut identified_ws = self.state.identified_websocket.lock().await;
-        match identified_ws
-            .as_ref()
-            .filter(|ws| !ws.is_closed())
-            .filter(|ws| !(require_unused && ws.is_used()))
-        {
-            Some(ws) => Ok(ws.clone()),
-            None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
-                let ws = self
-                    .identified_push_service()
-                    .ws(
-                        "/v1/websocket/",
-                        "/v1/keepalive",
-                        headers,
-                        Some(self.credentials()),
-                    )
-                    .await?;
-                identified_ws.replace(ws.clone());
-                debug!("initialized identified websocket");
-
-                Ok(ws)
-            }
-        }
+        let credentials = self.credentials();
+        let key = credentials.login();
+        websocket::slot::acquire_identified(&key, require_unused, async {
+            let headers = &[("X-Signal-Receive-Stories", "false")];
+            let mut push_service = self.identified_push_service();
+            push_service
+                .ws(
+                    "/v1/websocket/",
+                    "/v1/keepalive",
+                    headers,
+                    Some(credentials),
+                )
+                .await
+        })
+        .await
+        .map_err(Error::ServiceError)
     }
 
     /// Returns the current unidentified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.
+    ///
+    /// KT (single-connection): process-global slot per account, see
+    /// `identified_websocket`.
     async fn unidentified_websocket(
         &self,
     ) -> Result<SignalWebSocket<websocket::Unidentified>, Error<S::Error>> {
-        let mut unidentified_ws = self.state.unidentified_websocket.lock().await;
-        match unidentified_ws.as_ref().filter(|ws| !ws.is_closed()) {
-            Some(ws) => Ok(ws.clone()),
-            None => {
-                let ws = self
-                    .unidentified_push_service()
-                    .ws("/v1/websocket/", "/v1/keepalive", &[], None)
-                    .await?;
-                unidentified_ws.replace(ws.clone());
-                debug!("initialized unidentified websocket");
+        let key = self.credentials().login();
+        websocket::slot::acquire_unidentified(&key, async {
+            let mut push_service = self.unidentified_push_service();
+            push_service
+                .ws("/v1/websocket/", "/v1/keepalive", &[], None)
+                .await
+        })
+        .await
+        .map_err(Error::ServiceError)
+    }
 
-                Ok(ws)
-            }
-        }
+    /// KT (single-connection): close code observed on the account's shared
+    /// identified websocket (last server close frame), if a websocket exists.
+    /// Lets the application branch on 4409 (connected elsewhere) after the
+    /// receive pipe ended.
+    pub async fn identified_websocket_close_code(&self) -> Option<u16> {
+        websocket::slot::identified_close_code(&self.credentials().login()).await
+    }
+
+    /// KT (single-connection): whether the account currently has a live
+    /// shared identified websocket. After the receive pipe ended with 4409,
+    /// a live websocket means another engine-internal connection took over
+    /// (self conflict); none means an external client displaced us.
+    pub async fn has_open_identified_websocket(&self) -> bool {
+        websocket::slot::identified_open_count(&self.credentials().login()).await > 0
     }
 
     /// Request the primary device to encrypt & send all of its contacts.

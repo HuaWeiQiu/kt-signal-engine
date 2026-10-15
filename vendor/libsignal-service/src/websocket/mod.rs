@@ -12,6 +12,7 @@ use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use reqwest::Method;
 use reqwest_websocket::WebSocket;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -32,8 +33,14 @@ pub mod profile;
 pub mod registration;
 mod request;
 mod sender;
+pub mod slot;
 pub mod stickers;
 mod usernames;
+
+/// Close code the Signal server sends when it drops a device websocket
+/// because another connection for the same device was established.
+/// KT (single-connection): the 4409 branch decision consumes this literal.
+pub const CLOSE_CODE_CONNECTED_ELSEWHERE: u16 = 4409;
 
 pub use request::WebSocketRequestMessageBuilder;
 
@@ -75,7 +82,6 @@ impl WebSocketType for Unidentified {}
 ///
 /// This structure can be freely cloned, since this acts as a *facade* for multiple entry and exit
 /// points.
-#[derive(Clone)]
 pub struct SignalWebSocket<C: WebSocketType> {
     _type: PhantomData<C>,
     // XXX: at the end of the migration, this should be CDN operations only
@@ -85,10 +91,28 @@ pub struct SignalWebSocket<C: WebSocketType> {
         WebSocketRequestMessage,
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
     )>,
+    kill: Arc<Notify>,
+}
+
+// Manual impl (no `C: Clone` bound): every field is cloneable for any `C`.
+// KT (single-connection): the generic slot registry clones through `C`.
+impl<C: WebSocketType> Clone for SignalWebSocket<C> {
+    fn clone(&self) -> Self {
+        Self {
+            _type: PhantomData,
+            unidentified_push_service: self.unidentified_push_service.clone(),
+            inner: Arc::clone(&self.inner),
+            request_sink: self.request_sink.clone(),
+            kill: Arc::clone(&self.kill),
+        }
+    }
 }
 
 struct SignalWebSocketInner {
     stream: Option<SignalRequestStream>,
+    // KT (single-connection): close code of the last server close frame, for
+    // the application-side 4409 branch decision.
+    last_close_code: Option<u16>,
 }
 
 struct SignalWebSocketProcess {
@@ -115,6 +139,11 @@ struct SignalWebSocketProcess {
     >,
 
     ws: WebSocket,
+
+    // KT (single-connection): shared facade state (close-code bookkeeping)
+    // and the termination signal for the kill-before-create handover.
+    shared: Arc<Mutex<SignalWebSocketInner>>,
+    kill: Arc<Notify>,
 }
 
 impl SignalWebSocketProcess {
@@ -306,12 +335,26 @@ impl SignalWebSocketProcess {
                         }
                     }
                 }
+                // KT (single-connection): discipline handover — a dial for the
+                // same account replaced this connection; close frame then exit.
+                _ = self.kill.notified().fuse() => {
+                    tracing::warn!("websocket terminating: close requested by local single-connection discipline");
+                    if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, None).await {
+                        tracing::debug!("Could not close WebSocket: {:?}", e);
+                    }
+                    break;
+                }
                 // Incoming websocket message
                 web_socket_item = self.ws.next().fuse() => {
                     use reqwest_websocket::Message;
                     match web_socket_item {
                         Some(Ok(Message::Close { code, reason })) => {
+                            let code = u16::from(code);
                             tracing::warn!(%code, reason, "websocket closed");
+                            if code == CLOSE_CODE_CONNECTED_ELSEWHERE {
+                                tracing::warn!("websocket closed with 4409 (connected elsewhere): another client took over this device connection"); // KT (single-connection)
+                            }
+                            self.shared.lock().unwrap().last_close_code = Some(code);
                             tracing::warn!("ka_diag task exiting: websocket close frame"); // KA-DIAG
                             break;
                         },
@@ -382,6 +425,14 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             mpsc::unbounded();
         let (outgoing_request_sink, outgoing_requests) = mpsc::channel(1);
 
+        let inner = Arc::new(Mutex::new(SignalWebSocketInner {
+            stream: Some(SignalRequestStream {
+                inner: incoming_request_stream,
+            }),
+            last_close_code: None,
+        }));
+        let kill = Arc::new(Notify::new());
+
         let process = SignalWebSocketProcess {
             keep_alive_path,
             requests: outgoing_requests,
@@ -396,6 +447,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             .into_iter()
             .collect(),
             ws,
+            shared: Arc::clone(&inner),
+            kill: Arc::clone(&kill),
         };
         let process = process.run().map(|x| match x {
             Ok(()) => (),
@@ -409,11 +462,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 _type: PhantomData,
                 request_sink: outgoing_request_sink,
                 unidentified_push_service,
-                inner: Arc::new(Mutex::new(SignalWebSocketInner {
-                    stream: Some(SignalRequestStream {
-                        inner: incoming_request_stream,
-                    }),
-                })),
+                inner,
+                kill,
             },
             process,
         )
@@ -429,6 +479,21 @@ impl<C: WebSocketType> SignalWebSocket<C> {
 
     pub fn is_used(&self) -> bool {
         self.inner_locked().stream.is_none()
+    }
+
+    /// Close code of the last server close frame observed by this
+    /// connection's background process, if any.
+    /// KT (single-connection): feeds the application-side 4409 branch.
+    pub fn close_code(&self) -> Option<u16> {
+        self.inner_locked().last_close_code
+    }
+
+    /// Ask the background process to send a close frame and exit. The next
+    /// dial for the same account replaces this connection (kill-before-create
+    /// handover, see [`slot`]).
+    /// KT (single-connection).
+    pub fn terminate(&self) {
+        self.kill.notify_one();
     }
 
     pub(crate) fn take_request_stream(

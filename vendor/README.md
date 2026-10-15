@@ -195,6 +195,18 @@
   `SignalWebSocket: {}` error 行覆盖）。背景：WS 管道服务器侧 1001
   idle timeout 与保活任务静默死亡无第一手证据（"sending keep-alive"
   为 debug 级不落 engine-stderr.log）。
+- `src/websocket/slot.rs`（2026-10-16 单连接纪律批，新文件）— 进程级
+  per-account websocket 槽位注册表（键 = credentials login）：每账号
+  identified/unidentified 各至多一条活连接；重拨前先 terminate 旧连接
+  （kill-before-create）；同账号重拨由槽级 dial_lock 串行（单飞）。
+- `src/websocket/mod.rs`（同批）— ①`SignalWebSocketInner` 加
+  `last_close_code`（服务器 close frame 记账）+ pub `close_code()`；
+  ②`SignalWebSocket` 加 `kill: Arc<Notify>` + pub `terminate()`，
+  `SignalWebSocketProcess::run` 加 kill 臂（close frame Away + 退出）与
+  close-frame 4409 warn 字面量；③`Clone` 改手工 impl（去掉 derive 的
+  `C: Clone` 界，泛型槽位克隆面）；④`pub mod slot` 挂载 + pub const
+  `CLOSE_CODE_CONNECTED_ELSEWHERE = 4409`。
+- `Cargo.toml`（同批）— tokio features 加 `"sync"`（Notify kill 开关）。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -406,6 +418,16 @@
   query（save_pre_key 先例，`.sqlx/` 离线缓存不动）；新增
   `save_identity_same_key_not_reported_as_replacement` 回归单测（同钥
   两存 NewOrUnchanged+单行+零事件、异钥 ReplacedExisting+行更新+单事件）。
+- `src/manager/registered.rs`（2026-10-16 单连接纪律批）— ①删除
+  `Registered` 的 per-manager `identified_websocket`/
+  `unidentified_websocket` 槽字段（多 Manager 各持槽 = 同账号多并行
+  identified 连接、服务器 4409 互搏的根因）；②`identified_websocket()`/
+  `unidentified_websocket()` 改走 libsignal-service 进程级
+  `websocket::slot` 注册表（键 = credentials login，全 Manager 共享同
+  账号单连接，kill-before-create + dial 串行）；③新增 pub
+  `identified_websocket_close_code()` /
+  `has_open_identified_websocket()`（引擎 4409 分支判定读数面，
+  `docs/websocket-connection-ledger.md` §3）。
 
 ## 更新纪律
 

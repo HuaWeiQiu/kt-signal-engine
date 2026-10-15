@@ -1551,8 +1551,8 @@ pub(crate) struct Service {
     /// 防回声纪律见模块头注）。delete_account 摘除。
     conversation_state_books: StdMutex<HashMap<String, storage_watch::ConversationStateBook>>,
     /// 账号级常驻发送管理器（C 批提速）：号码 → 共享互斥管理器。发送取用
-    /// 命中即复用（presage Manager 内部 identified/unidentified websocket
-    /// 同生命周期常驻），死亡自愈重建在 vendor 侧（closed → 重开）；惰性
+    /// 命中即复用（websocket 由进程级 slot 注册表归一——同账号全引擎共享
+    /// 单连接，closed → 重开并先拆旧，死亡自愈在 vendor 侧）；惰性
     /// 建连 + 空闲保留，不逐消息冷启动。同账号取用互斥串行（Manager 方法
     /// 需 &mut 且跨 await 持有），跨账号互不阻塞；delete/relink 摘除。
     send_managers: AsyncMutex<SendManagerCache>,
@@ -5400,7 +5400,7 @@ fn receive_stream_unbound(error: &presage::Error<<SqliteStore as Store>::Error>)
 /// serve 流结局（B4 Unbound 停环）：Connected = 建流成功后结束（对端断/
 /// 关停/流排空）→ 退避 reset；Recoverable = 建流失败（store/manager/
 /// websocket 初始化）→ 退避步进；Unbound = 服务端凭据拒绝 → 停环等重链。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StreamOutcome {
     Connected,
     Recoverable,
@@ -5408,6 +5408,43 @@ enum StreamOutcome {
     /// 时序审计 G1：stdout 出口死亡（flush 栅栏不可解）。停环等连接器
     /// 重启引擎，不退避重连（重连 = 重投信封被 Duplicate 就地 ack 吞）。
     StdioDead,
+}
+
+/// 服务器侧「同设备他处已连接」close code（Signal 服务端 WebSocket 语义；
+/// 官方 Signal-Desktop SocketManager.preload.ts:391-394 对 4409 不重连）。
+const WS_CLOSE_CONNECTED_ELSEWHERE: u16 = 4409;
+
+/// 4409 关闭后的重连裁定（单连接纪律批，纯函数测试钉形）。入参 =
+/// 流结束所涉 identified 连接的服务器 close code + 此刻进程内**另一条**
+/// 活 identified 连接数（共享槽位注册表读数；槽内连接已死/被换则 0）。
+/// - `Some(4409)` + 零其它活连接 = 外部客户端夺走本设备连接（用户手机
+///   重连等）→ [`CloseConflictResolution::ExternalKickReconnect`]，按既有
+///   Fibonacci 退避重连（官方不重连；引擎为连接器托管在线面，偏差记档
+///   docs/websocket-connection-ledger.md）。
+/// - `Some(4409)` + 仍有其它活连接 = 自家互搏残影（新连接已在槽，多半是
+///   本引擎另一任务刚补位）→ [`CloseConflictResolution::SelfConflictStandDown`]
+///   不立刻重拨（Recoverable 语义：退避步进，清账先行——重拨会撞刚建好
+///   的自家连接重启振荡）。
+/// - 非 4409（正常关停/网络断/无 close code）= None，不进本裁定，走既有
+///   流结局语义。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseConflictResolution {
+    ExternalKickReconnect,
+    SelfConflictStandDown,
+}
+
+fn resolve_identified_close(
+    close_code: Option<u16>,
+    other_open_identified: usize,
+) -> Option<CloseConflictResolution> {
+    if close_code != Some(WS_CLOSE_CONNECTED_ELSEWHERE) {
+        return None;
+    }
+    if other_open_identified == 0 {
+        Some(CloseConflictResolution::ExternalKickReconnect)
+    } else {
+        Some(CloseConflictResolution::SelfConflictStandDown)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6247,7 +6284,35 @@ async fn serve_account_stream(
                     );
                     ack.ack();
                 }
-                    None => return StreamOutcome::Connected,
+                    None => {
+                        // 4409 分支语义（单连接纪律批）：流结束若源于服务器
+                        // 4409（connected elsewhere），按「进程内是否还有别的
+                        // 活 identified 连接」二分——无 = 外部夺走，退避重连
+                        // （Connected 语义）；有 = 自家互搏残影，不立刻重拨
+                        // （Recoverable 语义，共享槽位注册表已保证任何重拨
+                        // 先拆旧连接）。判定单点 resolve_identified_close。
+                        let close_code = manager.identified_websocket_close_code().await;
+                        let other_open =
+                            usize::from(manager.has_open_identified_websocket().await);
+                        let outcome = match resolve_identified_close(close_code, other_open) {
+                            Some(CloseConflictResolution::ExternalKickReconnect) => {
+                                perf_metrics::add(
+                                    perf_metrics::keys::STREAM_CLOSE_4409_EXTERNAL,
+                                    1,
+                                );
+                                StreamOutcome::Connected
+                            }
+                            Some(CloseConflictResolution::SelfConflictStandDown) => {
+                                perf_metrics::add(
+                                    perf_metrics::keys::STREAM_CLOSE_4409_SELF,
+                                    1,
+                                );
+                                StreamOutcome::Recoverable
+                            }
+                            None => StreamOutcome::Connected,
+                        };
+                        return outcome;
+                    }
                 }
                 // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
                 // 一次，计数与时间臂计时器同复位（含解密失败/重复投递——
@@ -17980,6 +18045,61 @@ mod tests {
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 4409 分支判定（单连接纪律批，判定单点钉形）：非 4409 不进裁定
+    /// （None，走既有流结局语义）；4409 × 零其它活 identified = 外部夺走
+    /// （重连）；4409 × 有其它活 identified = 自家互搏残影（不立刻重拨）。
+    #[test]
+    fn resolve_identified_close_arms() {
+        use CloseConflictResolution as R;
+        // 非 4409（正常关停 1000/服务器走开 1001/异常断 1006/无 close code）
+        // 一律不进裁定。
+        assert_eq!(resolve_identified_close(None, 0), None);
+        assert_eq!(resolve_identified_close(Some(1000), 0), None);
+        assert_eq!(resolve_identified_close(Some(1001), 0), None);
+        assert_eq!(resolve_identified_close(Some(1006), 3), None);
+        assert_eq!(resolve_identified_close(Some(4408), 0), None);
+        assert_eq!(resolve_identified_close(Some(4410), 0), None);
+        // 4409 × 无其它活 identified 连接 = 外部客户端夺走（用户手机重连等）
+        // → 按退避重连。
+        assert_eq!(
+            resolve_identified_close(Some(4409), 0),
+            Some(R::ExternalKickReconnect)
+        );
+        // 4409 × 仍有其它活 identified 连接 = 自家互搏（槽内新连接在位）
+        // → 不立刻重拨，清账先行。
+        assert_eq!(
+            resolve_identified_close(Some(4409), 1),
+            Some(R::SelfConflictStandDown)
+        );
+        assert_eq!(
+            resolve_identified_close(Some(4409), 3),
+            Some(R::SelfConflictStandDown)
+        );
+    }
+
+    /// 4409 裁定 → 流结局映射钉形：外部夺走 = Connected（退避 reset，按
+    /// 既有 Fibonacci 序列重连）；自家互搏 = Recoverable（退避步进，不
+    /// reset，重复冲突逐级爬升——不与自家新连接互搏）。
+    #[test]
+    fn close_conflict_resolution_maps_to_stream_outcome() {
+        let outcome_of = |resolution| match resolution {
+            CloseConflictResolution::ExternalKickReconnect => StreamOutcome::Connected,
+            CloseConflictResolution::SelfConflictStandDown => StreamOutcome::Recoverable,
+        };
+        assert_eq!(
+            outcome_of(resolve_identified_close(Some(4409), 0).unwrap()),
+            StreamOutcome::Connected
+        );
+        assert_eq!(
+            outcome_of(resolve_identified_close(Some(4409), 2).unwrap()),
+            StreamOutcome::Recoverable
+        );
+        // 重连节奏均由既有 Fibonacci 退避链承载（1s 首拍，逐级 55s 封顶），
+        // 两臂共享同一链（reconnect_backoff_follows_official_fibonacci_
+        // sequence 已钉序列形状）。
+        assert_eq!(reconnect_backoff_delay(0), Duration::from_millis(1_000));
     }
 
     /// 重连退避序列（止血批②，官方 Desktop ts/backoff/BackOff.std.ts 同

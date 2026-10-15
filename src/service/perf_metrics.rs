@@ -85,6 +85,12 @@ pub(crate) mod keys {
     pub const STREAM_CONNECTED: &str = "stream_outcome_connected";
     pub const STREAM_UNBOUND: &str = "stream_outcome_unbound";
     pub const STREAM_STDIO_DEAD: &str = "stream_outcome_stdio_dead";
+    /// 4409（connected elsewhere）外部夺走臂（单连接纪律批）：进程内无其它
+    /// 活 identified 连接 → 按退避重连。
+    pub const STREAM_CLOSE_4409_EXTERNAL: &str = "stream_close_4409_external";
+    /// 4409 自家互搏残影臂（单连接纪律批）：进程内仍有其它活 identified
+    /// 连接 → 不立刻重拨，退避步进清账先行。
+    pub const STREAM_CLOSE_4409_SELF: &str = "stream_close_4409_self";
 }
 
 /// 词表全集（计时 + 计数同表校验；快照只透出登记过的键）。
@@ -123,6 +129,8 @@ const KNOWN_KEYS: &[&str] = &[
     keys::STREAM_CONNECTED,
     keys::STREAM_UNBOUND,
     keys::STREAM_STDIO_DEAD,
+    keys::STREAM_CLOSE_4409_EXTERNAL,
+    keys::STREAM_CLOSE_4409_SELF,
 ];
 
 #[derive(Default)]
