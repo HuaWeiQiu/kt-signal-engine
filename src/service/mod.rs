@@ -1322,8 +1322,13 @@ pub(crate) enum CallingRelaysError {
 
 /// 链接结果共享槽：finishLink 可被连接器超时重试（connector service.rs 语义），
 /// 多个等待者共享同一次结果。
+/// 链接成功行囊：号码 + 迁移下载凭据（可选）。transfer 腿不在 link_flow
+/// 启动——收口清理（finish_link 同号旧任务 cancel + 进度清缺）必须先行，
+/// 凭据经本槽后移，语句序结构性锁死「先清旧、后启新」。
+type LinkOutcome = (String, Option<PendingTransferDownload>);
+
 struct LinkResultSlot {
-    outcome: StdMutex<Option<Result<String, ()>>>,
+    outcome: StdMutex<Option<Result<LinkOutcome, ()>>>,
     resolved: Notify,
 }
 
@@ -1335,12 +1340,12 @@ impl LinkResultSlot {
         }
     }
 
-    fn complete(&self, outcome: Result<String, ()>) {
+    fn complete(&self, outcome: Result<LinkOutcome, ()>) {
         *self.outcome.lock().expect("outcome lock") = Some(outcome);
         self.resolved.notify_waiters();
     }
 
-    async fn wait(&self) -> Result<String, ()> {
+    async fn wait(&self) -> Result<LinkOutcome, ()> {
         loop {
             if let Some(outcome) = self.outcome.lock().expect("outcome lock").clone() {
                 return outcome;
@@ -1354,6 +1359,15 @@ struct PendingLink {
     uri: String,
     store_dir: PathBuf,
     result: Arc<LinkResultSlot>,
+}
+
+/// provisioning 一次性迁移密钥的收口前行囊：link_flow 解构后原样暂存，
+/// finish_link 清理旧任务后据此启动 transfer 下载腿。
+#[derive(Clone)]
+struct PendingTransferDownload {
+    aci: presage::libsignal_service::prelude::Uuid,
+    credentials: ServiceCredentials,
+    backup_key: [u8; 32],
 }
 
 /// transfer_archive 下载进度快照注册表（契约 1.53 §4.38 扩展）。
@@ -1558,13 +1572,10 @@ impl Service {
 
         // 链接流程 future 同样非 Send：spawn_local 承载（见 spawn_pipeline）。
         // start_link 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
-        let task_dir = store_dir.clone();
         let task_slot = Arc::clone(&slot);
-        let task_progress = self.transfer_progress.clone();
-        let task_downloads = self.transfer_downloads.clone();
         tokio::task::spawn_local(async move {
-            match link_flow(store, url_tx, task_dir, task_progress, task_downloads).await {
-                Ok(number) => task_slot.complete(Ok(number)),
+            match link_flow(store, url_tx).await {
+                Ok(outcome) => task_slot.complete(Ok(outcome)),
                 Err(()) => task_slot.complete(Err(())),
             }
         });
@@ -1618,7 +1629,7 @@ impl Service {
             }
             Arc::clone(&pending.result)
         };
-        let number = slot.wait().await.map_err(|_| LinkError::Internal)?;
+        let (number, pending_transfer) = slot.wait().await.map_err(|_| LinkError::Internal)?;
 
         // 成功：会话收口。设备名（ADR 0004）：改写 store 注册数据后启动接收
         // 管线；名字只落本地注册数据，管线不回写服务器（B4 起停发
@@ -1668,6 +1679,31 @@ impl Service {
         // 触发器之三）——旧任务若继续跑会写旧目录、复活旧账号名下的快照面。
         let _ = self.transfer_downloads.cancel(&number);
         self.transfer_progress.clear(&number);
+        // transfer 腿启动：严格在上一行清理之后（语句序结构性锁死）——spawn
+        // 曾留在 link_flow（先于本清理执行），新任务每次被同号清理确定性误杀
+        // （abort 命中），真机四连「链接成功但永久同步中」即此。注册表语义
+        // 不变：`history.importCancel` 按账号中止在途下载（transfer 腿）。
+        if let Some(transfer) = pending_transfer {
+            let handle = tokio::task::spawn_local(download_transfer_archive(
+                pending.store_dir.clone(),
+                transfer.aci,
+                transfer.backup_key,
+                transfer.credentials,
+                number.clone(),
+                self.transfer_progress.clone(),
+            ));
+            self.transfer_downloads.register(&number, handle);
+            if std::env::var("KT_ENGINE_LINK_DEBUG").is_ok() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/kt-engine-link-debug.log")
+                {
+                    let _ = writeln!(f, "link_debug: transfer download spawned account={number}");
+                }
+            }
+        }
         // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
         // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
         let aci = account_aci(&pending.store_dir).await;
@@ -8707,18 +8743,20 @@ fn qr_link_url(mut url: url::Url) -> url::Url {
 /// Provisioner 语义：手机读到声明才发起存量历史迁移上传；URL 文本层变换，
 /// connector 展示面零改动）。拿到
 /// `NewDeviceRegistration` 后按官方 store 落库格式经 serde 数据面构造
-/// `RegistrationData`，回归既有 `load_registered` 收发管线。key 命中时后台
-/// best-effort 下载迁移档案，不阻塞链接成功（ADR 0005 §S2 定案）。
+/// `RegistrationData`，回归既有 `load_registered` 收发管线。key 命中时移交
+/// finish_link 后台 best-effort 下载迁移档案，不阻塞链接成功（ADR 0005 §S2
+/// 定案）。
 ///
 /// 纪律：失败即整会话作废（删目录 + Err）——provisioning WS 约 90s 服务端
 /// 空闲超时，旧 QR 不可复用，重试由 connector 重新 startLink。
+///
+/// 一次性迁移密钥不在此启动下载：transfer 腿移交 finish_link（见
+/// PendingTransferDownload）——本函数返回早于收口清理，spawn 留在这里会被
+/// 同号清理确定性误杀（真机四连「永久同步中」的根因）。
 async fn link_flow(
     mut store: SqliteStore,
     url_tx: futures::channel::oneshot::Sender<url::Url>,
-    store_dir: PathBuf,
-    transfer_progress: transfer_progress::TransferProgress,
-    transfer_downloads: transfer_progress::TransferDownloadRegistry,
-) -> Result<String, ()> {
+) -> Result<LinkOutcome, ()> {
     let mut rng = rng();
     let password = Alphanumeric.sample_string(&mut rng, 24);
     let push_service = PushService::new(SignalServers::Production, None, USER_AGENT);
@@ -8842,28 +8880,22 @@ async fn link_flow(
     // 接收管线在 finish_link 后由 spawn_pipeline 自行 load）。
     Manager::load_registered(store).await.map_err(|_| ())?;
 
-    if let Some(backup_key) = ephemeral_backup_key {
-        let credentials = ServiceCredentials {
+    // 一次性迁移密钥：原样装入行囊移交 finish_link——收口清理（同号旧
+    // 任务 cancel + 进度清缺）必须先于新任务启动，spawn 留在本函数会被
+    // finish_link 确定性误杀（真机四连「永久同步中」根因）。导出面 future
+    // 非 Send（上游 FramesReader 持 Rc 状态），spawn 仍在 LocalSet 承载。
+    let pending_transfer = ephemeral_backup_key.map(|backup_key| PendingTransferDownload {
+        aci: service_ids.aci,
+        credentials: ServiceCredentials {
             aci: Some(service_ids.aci),
             pni: Some(service_ids.pni),
             phonenumber: phone_number,
             password: Some(password),
             device_id: Some(device_id),
-        };
-        // 导出面 future 非 Send（上游 FramesReader 持 Rc 状态）：与链接/
-        // 接收任务同策略，LocalSet 承载（main 装配提供上下文）。句柄入
-        // 注册表——`history.importCancel` 按账号中止在途下载（transfer 腿）。
-        let handle = tokio::task::spawn_local(download_transfer_archive(
-            store_dir,
-            service_ids.aci,
-            backup_key,
-            credentials,
-            number.clone(),
-            transfer_progress,
-        ));
-        transfer_downloads.register(&number, handle);
-    }
-    Ok(number)
+        },
+        backup_key,
+    });
+    Ok((number, pending_transfer))
 }
 
 /// transfer_archive 长轮询预算（对齐官方）：单轮服务端挂起
