@@ -1911,6 +1911,10 @@ impl Service {
     /// 官方同构（混合受众 = 两 job 两 sync：名单腿先行，群腿 ts+1 官方
     /// +index+1 同款；recipients 空 = 群单腿），返回值第三位 = 群腿应答面
     /// `{groupId, timestamp}`（缺席 = None）。
+    /// 应答指针脸（媒体 story 指针回传批，2026-10-15）：返回值第四位 =
+    /// 名单腿媒体 story 上传指针全脸（投影与收投影同一点，严格互逆；
+    /// text 腿/失败 = None 键缺席）；群腿指针经第三位 group face 内
+    /// `fileAttachment` 键上抛（混合受众两腿独立上传指针互异，分键 §5）。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_story(
         self: &Arc<Self>,
@@ -1928,11 +1932,11 @@ impl Service {
         preview_title: Option<String>,
         preview_date: Option<u64>,
         group: Option<&str>,
-    ) -> Result<(u64, Vec<Value>, Option<Value>), SendError> {
+    ) -> Result<(u64, Vec<Value>, Option<Value>, Option<Value>), SendError> {
         // 名单受众腿（recipients 空 = 群单腿跳过名单腿；群缺席时空批由
         // methods 参数闸整拒，不达此处——现状口径零变化）。
-        let (timestamp, results) = if recipients.is_empty() {
-            (now_ms(), Vec::new())
+        let (timestamp, results, pointer_face) = if recipients.is_empty() {
+            (now_ms(), Vec::new(), None)
         } else {
             stories::send_story(
                 self,
@@ -1981,7 +1985,7 @@ impl Service {
             }
             None => None,
         };
-        Ok((timestamp, results, group_face))
+        Ok((timestamp, results, group_face, pointer_face))
     }
 
     /// deleteStoryForEveryone（story 删除扇出批 S5，KT 扩展方法）：官方

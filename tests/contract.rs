@@ -3213,6 +3213,150 @@ fn send_story_caption_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// 媒体 story 指针回传批 fake 契约（2026-10-15，compat §5 同名批）：fake
+/// 镜像文档形状——媒体腿应答顶层 `fileAttachment` 指针全脸（合成桩 face =
+/// 元数据脸 + locator{cdnKey, cdnNumber, uploadTimestamp}，不发明 key/
+/// digest 加密材料；caption 入参在-cap-out）；text 腿键缺席（缺席绝不序
+/// 列化，pre-批应答逐字节同形）；群单腿 media = group.fileAttachment 在、
+/// 顶层缺席；混合 media = 双面在（两腿独立上传指针互异分键）；群腿 text
+/// 无 group.fileAttachment。
+#[test]
+fn send_story_pointer_fake_face_mirrors_doc() {
+    let dir = temp_dir("send-story-pointer-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let attachment = json!("data:image/jpeg;base64,iVBORw0KGgo=");
+
+    // 名单媒体腿：顶层 fileAttachment 全脸（文档形状镜像）。
+    let media = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": attachment
+        }),
+    );
+    assert!(
+        media["result"]["fileAttachment"].is_object(),
+        "媒体腿顶层 fileAttachment 在场"
+    );
+    let face = &media["result"]["fileAttachment"];
+    assert_eq!(face["id"], json!(""), "桩无 client_uuid 恒空串投");
+    assert_eq!(face["contentType"], json!("application/octet-stream"));
+    assert_eq!(face["isVoiceNote"], json!(false));
+    assert_eq!(face["isBorderless"], json!(false));
+    assert_eq!(face["isGif"], json!(false));
+    assert_eq!(face["locator"]["cdnKey"], json!("fake-story-attachment"));
+    assert_eq!(face["locator"]["cdnNumber"], json!(3));
+    assert!(face["locator"]["uploadTimestamp"].is_u64(), "桩时刻");
+    assert!(
+        face["locator"].get("key").is_none() && face["locator"].get("digest").is_none(),
+        "fake 不发明加密材料（locator 缺席键不在）"
+    );
+    assert!(face.get("caption").is_none(), "无入参不发明 caption");
+
+    // caption 媒体腿：入参在-cap-out（镜像官方「caption 随上传面进出指针」
+    // 形状——fake 无真实上传材料仅此一位如实）。
+    let captioned = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": attachment,
+            "caption": "story caption"
+        }),
+    );
+    assert_eq!(
+        captioned["result"]["fileAttachment"]["caption"],
+        json!("story caption"),
+        "caption 入参在-cap-out"
+    );
+
+    // text 腿：键缺席（缺席绝不序列化——pre-批应答逐字节同形面）。
+    let text = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "story",
+            "recipients": ["+15555550101"]
+        }),
+    );
+    assert!(
+        text["result"].get("fileAttachment").is_none(),
+        "text 腿指针键缺席"
+    );
+
+    // 群单腿 media（recipients 空批 + group 在场）：顶层缺席、
+    // group.fileAttachment 在场。
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+    let group_media = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": [],
+            "attachment": attachment,
+            "group": group_id
+        }),
+    );
+    assert!(
+        group_media["result"].get("fileAttachment").is_none(),
+        "群单腿无名单腿指针（顶层键缺席）"
+    );
+    assert_eq!(
+        group_media["result"]["group"]["fileAttachment"]["locator"]["cdnKey"],
+        json!("fake-story-attachment"),
+        "群腿指针位在 group.face 内"
+    );
+
+    // 混合受众 media：双面在（名单腿顶层 + 群腿 group.face，两腿独立上传
+    // 指针互异故分键——真实面两次 CDN 上传 key 必异，fake 桩同形状）。
+    let mixed = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "attachment": attachment,
+            "group": group_id
+        }),
+    );
+    assert!(
+        mixed["result"]["fileAttachment"].is_object(),
+        "混合受众名单腿顶层指针在场"
+    );
+    assert_eq!(
+        mixed["result"]["group"]["fileAttachment"]["locator"]["cdnNumber"],
+        json!(3),
+        "混合受众群腿指针在场"
+    );
+
+    // 群腿 text：group.face 无 fileAttachment（text 群腿无正文附件上传）。
+    let group_text = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "group story",
+            "recipients": [],
+            "group": group_id
+        }),
+    );
+    assert!(
+        group_text["result"]["group"]
+            .get("fileAttachment")
+            .is_none(),
+        "text 群腿无指针键"
+    );
+    // 缺席回归：group 缺席 text 批现状零变化（顶层无 group/fileAttachment）。
+    let no_group = engine.request(
+        "sendStory",
+        json!({
+            "account": "+15550000000",
+            "message": "plain",
+            "recipients": ["+15555550101"]
+        }),
+    );
+    assert!(no_group["result"].get("group").is_none(), "缺席键不在");
+    assert!(no_group["result"].get("fileAttachment").is_none());
+}
+
 /// S4 story 反应发送批 fake 契约：合法批应答 `{}`（单收件人直聊腿，无
 /// results 面——sendStoryReaction 无收件人批）；参数闸 fail-closed 全量
 /// 生效（account/storyAuthor/storyTimestamp/emoji 四参，缺一/空串/0/非数

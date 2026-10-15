@@ -1741,11 +1741,13 @@ async fn dispatch(
                         )
                         .await
                     {
-                        Ok((timestamp, results, group_face)) => {
-                            let mut body = json!({ "timestamp": timestamp, "results": results });
-                            if let Some(face) = group_face {
-                                body["group"] = face;
-                            }
+                        Ok((timestamp, results, group_face, pointer_face)) => {
+                            let body = send_story_success_body(
+                                timestamp,
+                                results,
+                                group_face,
+                                pointer_face,
+                            );
                             jsonrpc::success_response(id, body)
                         }
                         // 群腿在场 = 结构化错误面（TargetTerminated/
@@ -1761,7 +1763,13 @@ async fn dispatch(
                 // 附件 spec 上行直通返回指针（2026-10-15 批，官方
                 // uploadAttachment caption 进指针同构）；文本腿专属参数已在
                 // 上方闸禁入，此处传缺省值。group 正交透传（官方群 story
-                // media 臂同源 getStoryMessage）。
+                // media 臂同源 getStoryMessage）。应答指针脸（媒体 story
+                // 指针回传批，2026-10-15）：媒体腿上传成功 = 顶层
+                // fileAttachment 指针全脸（官方发送端持有指针同事实面——
+                // KT 无盘字节面下 own story 本机回看的必要充分路径），
+                // 群腿指针在 group.fileAttachment（混合受众两腿独立上传
+                // 指针互异分键）；text 腿/发送失败键缺席（组装单点
+                // send_story_success_body，缺席绝不序列化）。
                 (Some(account), None, Some(attachment)) => {
                     match service
                         .send_story(
@@ -1782,11 +1790,13 @@ async fn dispatch(
                         )
                         .await
                     {
-                        Ok((timestamp, results, group_face)) => {
-                            let mut body = json!({ "timestamp": timestamp, "results": results });
-                            if let Some(face) = group_face {
-                                body["group"] = face;
-                            }
+                        Ok((timestamp, results, group_face, pointer_face)) => {
+                            let body = send_story_success_body(
+                                timestamp,
+                                results,
+                                group_face,
+                                pointer_face,
+                            );
                             jsonrpc::success_response(id, body)
                         }
                         Err(error) if group.is_some() => send_error(id, error),
@@ -4674,6 +4684,29 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
+/// sendStory 应答体组装单点（媒体 story 指针回传批，2026-10-15）：
+/// timestamp/results 恒在；group（群腿应答面，2026-10-15 批）与
+/// fileAttachment（媒体 story 上传指针全脸，本批 additive——名单腿指针
+/// 在顶层、群腿指针在 group.fileAttachment，混合受众两腿独立上传指针互
+/// 异故分键 §5）缺席键不在——no-null 纪律（缺席与 null 折叠同一无键态，
+/// 缺席绝不序列化），text 腿/发送失败/群单腿名单面各缺席位 = pre-批应答
+/// 逐字节同形。两分发臂（text/媒体）共用单点。
+fn send_story_success_body(
+    timestamp: u64,
+    results: Vec<Value>,
+    group_face: Option<Value>,
+    pointer_face: Option<Value>,
+) -> Value {
+    let mut body = json!({ "timestamp": timestamp, "results": results });
+    if let Some(face) = group_face {
+        body["group"] = face;
+    }
+    if let Some(face) = pointer_face {
+        body["fileAttachment"] = face;
+    }
+    body
+}
+
 /// SendError → (code, message) 分类单点：send 的整批错误面（send_error）
 /// 与 per-recipient 失败条目（send failures additive 面）共用，同一错误
 /// 两处分类逐字一致（connector 分类器按 message 命中，形状即识别面）。
@@ -4821,5 +4854,62 @@ mod tests {
         let decoded =
             crate::service::decode_group_id("q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=");
         assert_eq!(decoded.map(|key| key.len()), Some(32));
+    }
+
+    /// sendStory 应答组装缺席矩阵（媒体 story 指针回传批，2026-10-15，
+    /// compat §5 同名批）：组装单点 send_story_success_body 的缺席纪律——
+    /// ①text 腿（指针/群腿双缺席）= pre-批应答逐字节同形（serde 文本层
+    /// 恒等）；②群腿在场指针缺席（text 群受众）= group 键在、
+    /// fileAttachment 不在；③媒体名单腿 = 顶层 fileAttachment 在场；④
+    /// 媒体群单腿 = 顶层缺席、group.fileAttachment 在场（分键面：混合受
+    /// 众两腿独立上传指针互异）；⑤no-null：缺席位绝不序列化 null 键。
+    #[test]
+    fn send_story_success_body_absent_keys_same_shape() {
+        let pointer_face = json!({ "contentType": "video/mp4" });
+
+        // ①双缺席 = pre-批逐字节同形。
+        let bare = send_story_success_body(7, Vec::new(), None, None);
+        assert_eq!(
+            serde_json::to_string(&bare).expect("serialize"),
+            serde_json::to_string(&json!({ "timestamp": 7, "results": [] })).expect("serialize"),
+            "text 腿缺席位 = pre-批应答逐字节同形"
+        );
+
+        // ②群腿 face 在 + 指针缺席（text 群受众）。
+        let body = send_story_success_body(
+            7,
+            vec![json!({ "recipientNumber": "+15555550101", "success": { "timestamp": 7 } })],
+            Some(json!({ "groupId": "g", "timestamp": 8 })),
+            None,
+        );
+        assert_eq!(body["group"]["groupId"], json!("g"));
+        assert!(
+            body.get("fileAttachment").is_none(),
+            "text 腿指针键缺席（缺席绝不序列化）"
+        );
+
+        // ③媒体名单腿：顶层 fileAttachment 在场。
+        let body = send_story_success_body(7, Vec::new(), None, Some(pointer_face.clone()));
+        assert_eq!(body["fileAttachment"], pointer_face);
+
+        // ④媒体群单腿：顶层缺席（无名单腿）、group.fileAttachment 在场
+        //（群腿指针位由群腿编排注入 group face）。
+        let group_media_face =
+            json!({ "groupId": "g", "timestamp": 8, "fileAttachment": pointer_face });
+        let body = send_story_success_body(7, Vec::new(), Some(group_media_face), None);
+        assert!(
+            body.get("fileAttachment").is_none(),
+            "群单腿无名单腿指针（顶层键缺席）"
+        );
+        assert_eq!(
+            body["group"]["fileAttachment"],
+            json!({ "contentType": "video/mp4" }),
+            "群腿指针位在 group.face 内"
+        );
+
+        // ⑤no-null：全缺席序列化文本无 "null" 字面（缺席与 null 折叠同一
+        // 无键态）。
+        let text = serde_json::to_string(&bare).expect("serialize");
+        assert!(!text.contains("null"), "no-null：{text}");
     }
 }

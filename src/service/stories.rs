@@ -285,6 +285,13 @@ fn dedup_resolved(recipients: Vec<(ServiceId, String)>) -> Vec<(ServiceId, Strin
 /// 附件 spec 上行直通返回指针（apply_outgoing_caption，官方
 /// uploadAttachment caption 进指针同构），text 腿恒 None（官方
 /// textAttachment 无 caption 位）。
+/// 应答指针脸（媒体 story 指针回传批，2026-10-15）：媒体腿上传成功时该
+/// 次上传的 AttachmentPointer 全脸经 `project_attachment_pointer`（与收
+/// 投影同一函数，严格互逆字面保证）作为第三返回值上抛——官方发送端持有
+/// 上传指针（uploadAttachment.preload.ts 返回值即发送态指针），KT 无盘
+/// 字节面下该指针是 own story 本机回看的必要充分路径；text 腿 = None
+/// （键缺席）。单次上传单指针，全体收件人共享（story.clone() 同一
+/// fileAttachment）；混合受众两腿独立上传指针互异，分键记档 §5。
 /// 本函数 = 名单受众腿（2026-10-15 批拆分）：群受众腿独立编排于
 /// `send_story_group`（混合受众官方 = 两 job 两 sync，sendStoryMessage
 /// .preload.ts:327-332 名单 job / :337-378 群 job 各自带收尾 sync——引擎
@@ -306,9 +313,14 @@ pub(crate) async fn send_story(
     preview_url: Option<String>,
     preview_title: Option<String>,
     preview_date: Option<u64>,
-) -> Result<(u64, Vec<Value>), SendError> {
+) -> Result<(u64, Vec<Value>, Option<Value>), SendError> {
     if !service.real {
-        return Ok((super::now_ms(), Vec::new()));
+        // fake 桩（send 系 fake 纪律：参数闸全量生效后成功桩）：媒体腿合
+        // 成指针脸镜像文档形状（fake_story_pointer 单点），text 腿键缺席
+        //（None 不序列化，pre-批应答逐字节同形）。
+        let face =
+            attachment.map(|_| super::project_attachment_pointer(&fake_story_pointer(caption)));
+        return Ok((super::now_ms(), Vec::new(), face));
     }
     let shared = open_registered(service, account)
         .await
@@ -318,20 +330,23 @@ pub(crate) async fn send_story(
 
     // 上传面：媒体腿 = 正文附件单条（官方正文附件随批 CDN 上行同构）；
     // 文本腿 = previewImage 随批上行（官方 preview.image 同批 CDN 上行
-    // 同构）。两腿互斥（methods 参数闸），fail-closed 整批早退。
-    let story = match attachment {
+    // 同构）。两腿互斥（methods 参数闸），fail-closed 整批早退。媒体腿
+    // 上传成功 = 指针投影进应答（move 进 story 前产脸，与收投影同一函数）。
+    let (story, pointer_face) = match attachment {
         Some(uri) => {
             let (pointers, _) =
                 upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
-            build_media_story_message(allows_replies, body_ranges, file_pointer, None)?
+            let face = super::project_attachment_pointer(&file_pointer);
+            let story = build_media_story_message(allows_replies, body_ranges, file_pointer, None)?;
+            (story, Some(face))
         }
         None => {
             let (_, preview_pointer) = match preview_image {
                 Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri), None).await?,
                 None => (Vec::new(), None),
             };
-            build_story_message(
+            let story = build_story_message(
                 text,
                 text_style,
                 allows_replies,
@@ -341,7 +356,8 @@ pub(crate) async fn send_story(
                 preview_title,
                 preview_date,
                 None,
-            )?
+            )?;
+            (story, None)
         }
     };
 
@@ -403,7 +419,7 @@ pub(crate) async fn send_story(
             .await;
     }
 
-    Ok((timestamp, results))
+    Ok((timestamp, results, pointer_face))
 }
 
 /// sendStory 群受众腿（2026-10-15 批，compat §3 sendStory 行 + §5 群 story
@@ -431,6 +447,11 @@ pub(crate) async fn send_story(
 /// - `caption`（媒体 story caption 批，2026-10-15）：媒体腿专属，随正文
 ///   附件 spec 上行直通返回指针（名单腿同构；官方群 story media 臂同源
 ///   getStoryMessage），text 腿恒 None。
+/// - **应答指针脸**（媒体 story 指针回传批，2026-10-15）：媒体腿上传成功
+///   时该次上传的 AttachmentPointer 全脸加性进群腿应答面
+///   `group.fileAttachment`（与名单腿指针分键——混合受众两腿独立上传指
+///   针互异，§5 记档）；投影函数与收投影同一点（严格互逆），text 腿键
+///   缺席。
 /// - **自同步**（官方群 story sync 形状，恰好一次）：≥1 成员发送成功才发
 ///   `SyncMessage.Sent{timestamp, story_message（载 group）,
 ///   story_message_recipients = group_story_sync_recipients（空名单位 +
@@ -458,8 +479,14 @@ pub(crate) async fn send_story_group(
     preview_title: Option<String>,
     preview_date: Option<u64>,
 ) -> Result<(u64, Value), SendError> {
-    let group_face = json!({ "groupId": group_id, "timestamp": timestamp });
+    let mut group_face = json!({ "groupId": group_id, "timestamp": timestamp });
     if !service.real {
+        // fake 桩（名单腿同纪律）：媒体腿合成指针脸加性进群腿应答面，
+        // text 腿键缺席（pre-批应答逐字节同形）。
+        if attachment.is_some() {
+            group_face["fileAttachment"] =
+                super::project_attachment_pointer(&fake_story_pointer(caption));
+        }
         return Ok((timestamp, group_face));
     }
     let shared = open_registered(service, account)
@@ -517,12 +544,14 @@ pub(crate) async fn send_story_group(
     targets.dedup();
 
     // 载荷构造（两内容腿与名单腿同构正交；群上下文进 StoryMessage.group，
-    // 群腿 allowsReplies 恒 true 官方同位）。
+    // 群腿 allowsReplies 恒 true 官方同位）。媒体腿上传成功 = 指针投影进
+    // 群腿应答面（move 进 story 前产脸，名单腿同构）。
     let story = match attachment {
         Some(uri) => {
             let (pointers, _) =
                 upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
+            group_face["fileAttachment"] = super::project_attachment_pointer(&file_pointer);
             build_media_story_message(
                 true,
                 body_ranges,
@@ -586,6 +615,27 @@ pub(crate) async fn send_story_group(
     }
 
     Ok((timestamp, group_face))
+}
+
+/// fake 面合成 story 指针（媒体 story 指针回传批，2026-10-15，contract
+/// 桩单点）：fake 无 CDN 上行面，钉定形状合成——不发明 key/digest 加密
+/// 材料（locator 缺席键不在，宁缺勿错），contentType 钉定通用词、
+/// cdnNumber 钉定 3、cdnKey 钉定桩词、uploadTimestamp = 桩时刻；caption
+/// 入参在-cap-out（fake 镜像文档「caption 随上传面进出指针」形状，无真
+/// 实上传材料仅此一位如实）。形状由 contract 测试钉定。
+fn fake_story_pointer(caption: Option<&str>) -> presage::proto::AttachmentPointer {
+    presage::proto::AttachmentPointer {
+        content_type: Some("application/octet-stream".to_owned()),
+        cdn_number: Some(3),
+        upload_timestamp: Some(super::now_ms()),
+        attachment_identifier: Some(
+            presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                "fake-story-attachment".to_owned(),
+            ),
+        ),
+        caption: caption.map(str::to_owned),
+        ..Default::default()
+    }
 }
 
 /// story 删除扇出条目（S5，wire `SyncMessage.Sent.storyMessageRecipients`
@@ -1173,5 +1223,119 @@ mod tests {
             }
             other => panic!("unexpected attachment: {other:?}"),
         }
+    }
+
+    /// 应答指针脸互逆往返 + fake 桩脸形状（媒体 story 指针回传批，
+    /// 2026-10-15，compat §5 同名批）：应答脸 = 发送路径单点
+    /// project_attachment_pointer 产出（构造→投影→应答脸），与接收投影
+    /// （project_story_message fileAttachment 臂——同一投影函数）对同一
+    /// 指针严格整对象恒等（互逆字面保证）；全脸字段族逐字段钉定（locator
+    /// key/cdnKey/cdnNumber/uploadTimestamp/digest + 元数据
+    /// filename/size/caption/blurHash/incrementalMac/chunkSize/voice 族）。
+    /// fake 桩脸（fake_story_pointer 投影）同测钉定——contract 镜像文档
+    /// 形状的引擎侧锚：元数据脸 + locator{cdnKey, cdnNumber,
+    /// uploadTimestamp}，不发明 key/digest 加密材料，caption 入参在-cap-out。
+    #[test]
+    fn send_story_response_pointer_face_round_trip() {
+        use base64::Engine as _;
+        use presage::proto::attachment_pointer::Flags;
+        let key: Vec<u8> = (0..64).collect();
+        let digest: Vec<u8> = (0..32).map(|byte| byte * 3 + 1).collect();
+        let mac: Vec<u8> = (0..16).map(|byte| byte * 7 + 3).collect();
+        let waveform: Vec<u8> = (0..10).collect();
+        let pointer = presage::proto::AttachmentPointer {
+            content_type: Some("video/mp4".to_owned()),
+            key: Some(key.clone()),
+            size: Some(123_456),
+            digest: Some(digest.clone()),
+            file_name: Some("clip.mp4".to_owned()),
+            upload_timestamp: Some(1_700_000_000_000),
+            cdn_number: Some(3),
+            attachment_identifier: Some(
+                presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                    "AWESOME-CDN-KEY".to_owned(),
+                ),
+            ),
+            caption: Some("a caption".to_owned()),
+            blur_hash: Some("blurred".to_owned()),
+            incremental_mac: Some(mac.clone()),
+            chunk_size: Some(8192),
+            flags: Some((Flags::VoiceMessage as u32) | (Flags::Gif as u32)),
+            audio_waveform: Some(waveform.clone()),
+            audio_duration_seconds: Some(4.5),
+            ..Default::default()
+        };
+        // 应答脸（发送路径产脸同函数）。
+        let response_face = crate::service::project_attachment_pointer(&pointer);
+        // 收投影还原（同一指针进 StoryMessage.fileAttachment）。
+        let story = build_media_story_message(true, &[], pointer, None).expect("shape");
+        let out = crate::service::project_story_message(&story, &std::collections::HashMap::new())
+            .expect("story projection");
+        assert_eq!(
+            response_face, out["fileAttachment"],
+            "应答脸 ≡ 收投影脸（互逆：同一指针同一投影单点）"
+        );
+        // 全脸关键字段抽验（locator 五件 + 元数据族）。
+        assert_eq!(response_face["contentType"], json!("video/mp4"));
+        assert_eq!(response_face["filename"], json!("clip.mp4"));
+        assert_eq!(response_face["size"], json!(123_456));
+        assert_eq!(response_face["caption"], json!("a caption"));
+        assert_eq!(response_face["blurHash"], json!("blurred"));
+        assert_eq!(
+            response_face["incrementalMac"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&mac))
+        );
+        assert_eq!(response_face["chunkSize"], json!(8192));
+        assert_eq!(response_face["isVoiceNote"], json!(true));
+        assert_eq!(response_face["isGif"], json!(true));
+        assert_eq!(
+            response_face["waveform"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&waveform))
+        );
+        assert_eq!(response_face["duration"], json!(4.5));
+        assert_eq!(
+            response_face["locator"]["key"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&key))
+        );
+        assert_eq!(response_face["locator"]["cdnKey"], json!("AWESOME-CDN-KEY"));
+        assert_eq!(response_face["locator"]["cdnNumber"], json!(3));
+        assert_eq!(
+            response_face["locator"]["uploadTimestamp"],
+            json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(
+            response_face["locator"]["digest"],
+            json!(base64::engine::general_purpose::STANDARD.encode(&digest))
+        );
+
+        // fake 桩脸形状（contract 镜像锚）：无 caption 入参 = 键缺席；
+        // locator 无 key/digest（不发明加密材料）；caption 入参在-cap-out。
+        let bare_face =
+            crate::service::project_attachment_pointer(&super::fake_story_pointer(None));
+        assert_eq!(bare_face["id"], json!(""), "fake 无 client_uuid 恒空串投");
+        assert_eq!(bare_face["contentType"], json!("application/octet-stream"));
+        assert_eq!(bare_face["isVoiceNote"], json!(false));
+        assert_eq!(bare_face["isBorderless"], json!(false));
+        assert_eq!(bare_face["isGif"], json!(false));
+        assert_eq!(
+            bare_face["locator"]["cdnKey"],
+            json!("fake-story-attachment")
+        );
+        assert_eq!(bare_face["locator"]["cdnNumber"], json!(3));
+        assert!(bare_face["locator"]["uploadTimestamp"].is_u64(), "桩时刻");
+        assert!(
+            bare_face["locator"].get("key").is_none()
+                && bare_face["locator"].get("digest").is_none(),
+            "fake 不发明加密材料（locator 缺席键不在）"
+        );
+        assert!(bare_face.get("caption").is_none(), "无入参不发明 caption");
+        let captioned_face = crate::service::project_attachment_pointer(
+            &super::fake_story_pointer(Some("fake caption")),
+        );
+        assert_eq!(
+            captioned_face["caption"],
+            json!("fake caption"),
+            "caption 入参在-cap-out（镜像文档「caption 随上传面进出指针」形状）"
+        );
     }
 }
