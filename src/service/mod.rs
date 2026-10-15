@@ -8811,10 +8811,22 @@ async fn link_flow(
     Ok(number)
 }
 
+/// transfer_archive 长轮询预算（对齐官方）：单轮服务端挂起
+/// `?timeout={TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS}`，204 重试上限
+/// [`TRANSFER_ARCHIVE_MAX_POLLS`] 轮 → 总预算 ≈1h，与官方
+/// `getTransferArchive` 同级（Signal-Desktop WebAPI.preload.ts:2391
+/// `timeout = HOUR`；2397-2437 收到 204 即在预算内继续长轮询，直到预算
+/// 耗尽）。此前 10 轮 ≈10min 即落 `no_archive` 终态——弱网/大档案的手机
+/// 端上传常常还没就绪，被提前误判「无可迁移」。
+const TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS: u64 = 60;
+/// 见 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]（总预算 ≈1h 的轮数臂）。
+const TRANSFER_ARCHIVE_MAX_POLLS: u32 = 60;
+
 /// 存量历史迁移下载（best-effort）：`transfer_archive` 长轮询等手机上传
-/// 就绪（204 重试上限 10 次、间隔 3s、服务端单次挂起 60s），200 后从 CDN
-/// 拉档案，`history::export_archive` 解密逐帧导出 NDJSON 到账号 store 目录
-/// （`history-import.ndjson`，S3 connector 消费）。
+/// 就绪（204 重试上限 [`TRANSFER_ARCHIVE_MAX_POLLS`] 轮、间隔 3s、服务端
+/// 单次挂起 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]s，总预算对齐官方
+/// 1h），200 后从 CDN 拉档案，`history::export_archive` 解密逐帧导出
+/// NDJSON 到账号 store 目录（`history-import.ndjson`，S3 connector 消费）。
 ///
 /// 失败不再静默（官方行为基准：失败显形带错误与重试，桌面 UI 不傻等）：
 /// 任何一步失败在进度快照上保留 `failed` 终态（短错误码，
@@ -8849,9 +8861,11 @@ async fn download_transfer_archive(
     let manifest: Value = {
         let mut polls = 0u32;
         loop {
+            let path =
+                format!("v1/devices/transfer_archive?timeout={TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS}");
             let response = match push.request(
                 Method::GET,
-                Endpoint::service("v1/devices/transfer_archive?timeout=60"),
+                Endpoint::service(&path),
                 HttpAuthOverride::NoOverride,
             ) {
                 Ok(builder) => builder,
@@ -8884,7 +8898,7 @@ async fn download_transfer_archive(
                         }
                     }
                 }
-                204 if polls >= 9 => {
+                204 if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS => {
                     // 手机端没有可传档案：独立信息态（官方行为基准，非故障），
                     // 快照同样终态保留供桌面诚实呈现。
                     transfer_progress.fail(&account, failure::NO_ARCHIVE);
@@ -8909,7 +8923,9 @@ async fn download_transfer_archive(
         return;
     };
 
-    let response = match push.request(
+    // CDN 拉档案（下载面 download_request：档案体可达 GB 级，无总超时 +
+    // 读停滞判死——65s 控制面预算会把健康慢流掐断误报 cdn_unreachable）。
+    let response = match push.download_request(
         Method::GET,
         Endpoint::cdn(cdn, format!("attachments/{key}")),
         HttpAuthOverride::NoOverride,
@@ -18710,6 +18726,24 @@ mod tests {
         assert!(
             !group_key_passes_filter(&[0x53u8; 32], Some(&both)),
             "store 实有但不在过滤集 → 掉出"
+        );
+    }
+
+    /// 迁移预算常量对齐官方 1h（Signal-Desktop WebAPI.getTransferArchive
+    /// `timeout = HOUR`，WebAPI.preload.ts:2391/2397-2437）：60 轮长轮询 ×
+    /// 60s 服务端挂起 ≥ 1h；叠加轮间 3s 空转后总预算仍 < 2h（预算放宽但
+    /// 不放飞——此前 10 轮 ≈10min 会把弱网/大档案误判「无可迁移」）。
+    #[test]
+    fn transfer_archive_poll_budget_matches_official_hour() {
+        assert_eq!(TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS, 60);
+        assert_eq!(TRANSFER_ARCHIVE_MAX_POLLS, 60);
+        let hang_seconds =
+            u64::from(TRANSFER_ARCHIVE_MAX_POLLS) * TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS;
+        assert!(hang_seconds >= 3600, "总预算不得低于官方 1h");
+        let sleep_seconds = u64::from(TRANSFER_ARCHIVE_MAX_POLLS - 1) * 3;
+        assert!(
+            hang_seconds + sleep_seconds < 2 * 3600,
+            "预算放宽到官方同级，但不破 2h"
         );
     }
 }

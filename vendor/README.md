@@ -172,6 +172,20 @@
   `setup_proxy_env` 统一落位）。背景：reqwest 传输面缺省读 ALL_PROXY，
   CDSI 建连走 libsignal-net 自有栈不吃该面，不改则 CDSI 流量绕过
   socks5 出口直连。
+- `src/push_service/mod.rs`（2026-10-15 云备份/迁移下载面超时分档批）—
+  request 预算按面分档：新增 pub 常量
+  `CONTROL_PLANE_CONNECT_TIMEOUT`/`CONTROL_PLANE_TOTAL_TIMEOUT`
+  （10s/65s，上游现值）与 `DOWNLOAD_CONNECT_TIMEOUT`/
+  `DOWNLOAD_READ_STALL_TIMEOUT`（10s/45s）；`PushService` 增
+  `download_client`（同 CA pin/UA/http1_only，**无总超时** + reqwest
+  `read_timeout` 45s 读停滞判死——每次成功读即重置，健康慢流不触发）
+  与 pub `download_request`（镜像 `request`，绑 download client；
+  `request`/`ws` 控制面维持现预算不动）。背景：大备份/大附件流式 GET
+  被一刀切 65s 总超时掐断，健康慢流被误报 cdn_unreachable。
+  `request_budget_tests` 单测（控制面现预算钉形 + 下载面无总超时/
+  停滞 30-60s 判死带）。
+- `src/push_service/cdn.rs`（同批）— `get_from_cdn`（附件/头像/贴纸
+  CDN GET 流式下载面）改走 `download_request`；上传/resume 面不动。
 
 `vendor/presage/`（rev 33dd149）：
 

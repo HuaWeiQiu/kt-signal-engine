@@ -153,6 +153,57 @@ mod tests {
         assert!(!is_backup_id_missing_status(500));
     }
 
+    /// 建连代理模式选择（修复挂载点）：合法代理值 → maybe_proxy = ProxyOnly
+    /// （代理路独占，直连不参与路由——fake-IP/TUN 下硬直连路径本就不通）；
+    /// 值缺失/畸形 → None → DirectOnly（无代理机器行为兜底不回退）。
+    #[test]
+    fn cloud_backup_proxy_mode_selection() {
+        use libsignal_net::infra::route::DirectOrProxyMode;
+
+        // connector KT_SIGNAL_SOCKS_PROXY 经启动面折算后的 socks5h 形态。
+        let socks = proxy_config_from_env_value("socks5h://relay.local:1080");
+        assert!(socks.is_some(), "合法 socks5h 产出代理路");
+        assert!(
+            DirectOrProxyMode::maybe_proxy(socks)
+                .proxy_config()
+                .is_some(),
+            "有代理 → ProxyOnly"
+        );
+        // scutil 系统代理折算形态（http 路）同受支持。
+        assert!(proxy_config_from_env_value("http://127.0.0.1:7890").is_some());
+
+        for bad in ["", "host:port", "socks5://h:0", "ftp://h:21", "socks5://"] {
+            let none = proxy_config_from_env_value(bad);
+            assert!(none.is_none(), "畸形值 {bad:?} 降级直连");
+            assert!(
+                DirectOrProxyMode::maybe_proxy(none)
+                    .proxy_config()
+                    .is_none(),
+                "无代理 → DirectOnly 兜底"
+            );
+        }
+    }
+
+    /// 下载面超时分档（云备份体/附件体走 download_request）：下载面无总
+    /// 超时 + 读停滞判死（30-60s 判死带），控制面维持 10s+65s 现预算——
+    /// 大备份/大附件流式 GET 不再被 65s 总超时掐断误报 cdn_unreachable。
+    /// 常量权威定义在 vendored push_service（vendor 侧 request_budget_tests
+    /// 同钉），此处经 presage 重导出钉引擎消费面。
+    #[test]
+    fn download_face_budget_is_stall_judged_not_total_deadlined() {
+        use presage::libsignal_service::push_service::{
+            CONTROL_PLANE_CONNECT_TIMEOUT, CONTROL_PLANE_TOTAL_TIMEOUT, DOWNLOAD_CONNECT_TIMEOUT,
+            DOWNLOAD_READ_STALL_TIMEOUT,
+        };
+        use std::time::Duration;
+
+        assert_eq!(CONTROL_PLANE_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(CONTROL_PLANE_TOTAL_TIMEOUT, Duration::from_secs(65));
+        assert_eq!(DOWNLOAD_CONNECT_TIMEOUT, CONTROL_PLANE_CONNECT_TIMEOUT);
+        assert!(DOWNLOAD_READ_STALL_TIMEOUT >= Duration::from_secs(30));
+        assert!(DOWNLOAD_READ_STALL_TIMEOUT <= Duration::from_secs(60));
+    }
+
     // —— 契约 §4 单测三链 ——
 
     fn entry(day: u64) -> BackupCredentialEntry {
@@ -481,12 +532,16 @@ use libsignal_net::connect_state::{
 use libsignal_net::env::constants::CHAT_WEBSOCKET_PATH;
 use libsignal_net::env::{StaticIpOrder, UserAgent};
 use libsignal_net::infra::dns::DnsResolver;
-use libsignal_net::infra::route::{DirectOrProxyMode, DirectOrProxyProvider};
+use libsignal_net::infra::route::{
+    ConnectionProxyConfig, DirectOrProxyMode, DirectOrProxyProvider,
+};
 use libsignal_net::infra::utils::no_network_change_events;
 use libsignal_net::infra::{EnableDomainFronting, OverrideNagleAlgorithm};
 
 /// 生产 chat WS 连接（官方 simple_chat_connection 逐行复刻，chat.rs:510-573：
-/// env::PROD 直连、无域前端、无代理、headers=None=未鉴权）。
+/// env::PROD、无域前端、headers=None=未鉴权）。代理随 `ALL_PROXY`——
+/// `proxy_from_environment`（fake-IP/TUN 机器上静态 fallback IP 硬直连路径
+/// 不通，云备份 Transport 族曾整族失败；无代理 = 直连兜底不回退）。
 ///
 /// # Errors
 /// 连接失败（DNS/TLS/WS 握手）原样映射，调用方按 CONNECT 族呈现。
@@ -501,7 +556,7 @@ pub async fn connect_production_chat() -> Result<ChatConnection, ConnectError> {
             EnableDomainFronting::No,
             OverrideNagleAlgorithm::UseSystemDefault,
         ),
-        mode: DirectOrProxyMode::DirectOnly,
+        mode: DirectOrProxyMode::maybe_proxy(proxy_from_environment()),
     };
     let connect = ConnectState::new_with_transport_connector(
         SUGGESTED_CONNECT_CONFIG,
@@ -548,6 +603,40 @@ pub async fn connect_production_chat() -> Result<ChatConnection, ConnectError> {
         Default::default(),
         listener,
     ))
+}
+
+/// 云备份 chat 建连的代理路：读 `ALL_PROXY`/`all_proxy`（大写优先，与
+/// reqwest/hyper-util `get_first_env` 同序）。进程出口策略由启动面
+/// main::setup_proxy_env 统一折算进 ALL_PROXY（KT_SIGNAL_SOCKS_PROXY 与
+/// 系统代理同源落位），此处只读标准变量即覆盖全链——与 vendored
+/// directory.rs CDSI 建连（2026-10-15 phoneLookup 批）同口径：NO_PROXY
+/// 不参与判定（单全局出口变量），值缺失/畸形降级直连。
+fn proxy_from_environment() -> Option<ConnectionProxyConfig> {
+    let value = std::env::var("ALL_PROXY")
+        .or_else(|_| std::env::var("all_proxy"))
+        .ok()?;
+    proxy_config_from_env_value(&value)
+}
+
+/// 代理环境值 → 代理路（纯函数单测面）：URL 解不开、port 0、scheme 不受
+/// libsignal 支持或 host 缺席一律 None（= DirectOnly 直连兜底），不猜不
+/// panic。socks5h 语义下目标域名由代理侧远端解析，本地假 IP 不再进路由。
+fn proxy_config_from_env_value(value: &str) -> Option<ConnectionProxyConfig> {
+    let url: url::Url = value.parse().ok()?;
+    if url.port() == Some(0) {
+        return None;
+    }
+    let auth = match (url.username(), url.password()) {
+        ("", None) => None,
+        (user, password) => Some((user.to_owned(), password.unwrap_or_default().to_owned())),
+    };
+    ConnectionProxyConfig::from_parts(
+        url.scheme(),
+        url.host_str()?,
+        url.port().and_then(|port| port.try_into().ok()),
+        auth,
+    )
+    .ok()
 }
 
 // —— 3B：云备份 restore 全流程编排（契约 §1.4-§1.6；官方 credentials.preload.ts
@@ -794,10 +883,11 @@ pub async fn restore_from_cloud(
         .await
         .map_err(|_| CloudRestoreError::Transport("cdn credentials".into()))?;
 
-    // CDN 下载（presage cdn 主机映射 + 凭据头直附）。
+    // CDN 下载（presage cdn 主机映射 + 凭据头直附；下载面走 download_request
+    // ——无总超时 + 读停滞判死，大备份体不再被 65s 控制面预算掐断误报）。
     let cdn_path = format!("backups/{}/{}", info.backup_dir, info.backup_name);
     let mut request = push
-        .request(
+        .download_request(
             http::Method::GET,
             Endpoint::cdn(info.cdn, &cdn_path),
             HttpAuthOverride::NoOverride,

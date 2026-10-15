@@ -102,8 +102,10 @@ impl PushService {
         AttachmentDownload<impl futures::io::AsyncRead + Send + Unpin>,
         ServiceError,
     > {
+        // Download face: large bodies stream past any fixed total deadline
+        // (KT: stall-judged client, see push_service::DOWNLOAD_READ_STALL_TIMEOUT).
         let response = self
-            .request(
+            .download_request(
                 Method::GET,
                 Endpoint::cdn(cdn_id, path),
                 HttpAuthOverride::Unidentified, // CDN requests are always without authentication

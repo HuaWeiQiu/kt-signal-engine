@@ -21,6 +21,21 @@ use tracing::{debug_span, Instrument};
 // KEEPALIVE_TIMEOUT_MS = 30s).
 pub const KEEPALIVE_TIMEOUT_SECONDS: Duration = Duration::from_secs(30);
 
+// KT (2026-10-15 cloud-restore transport batch): request budgets are split
+// per face. Control-plane API keeps the upstream 10s connect + 65s total
+// deadline. Large CDN GET bodies (attachment/backup archives) legitimately
+// stream longer than any fixed total deadline — a total timeout kills
+// healthy slow streams mid-flight (surfacing as cdn_unreachable) — so the
+// download client drops the total deadline and judges death by read stall
+// instead (reqwest read_timeout resets after every successful read).
+pub const CONTROL_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const CONTROL_PLANE_TOTAL_TIMEOUT: Duration = Duration::from_secs(65);
+pub const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read-stall judge for the download face: 45s without a single arriving
+/// byte kills the stream. A healthy (if slow) transfer never trips it;
+/// a dead link surfaces in under a minute.
+pub const DOWNLOAD_READ_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
 pub static DEFAULT_DEVICE_ID: LazyLock<libsignal_core::DeviceId> =
     LazyLock::new(|| libsignal_core::DeviceId::try_from(1).unwrap());
 
@@ -84,6 +99,14 @@ pub struct PushService {
     cfg: ServiceConfiguration,
     credentials: Option<HttpAuth>,
     client: reqwest::Client,
+    download_client: reqwest::Client,
+}
+
+fn pinned_client_builder(ca_pem: &str, user_agent: &str) -> reqwest::ClientBuilder {
+    reqwest::ClientBuilder::new()
+        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()])
+        .user_agent(user_agent)
+        .http1_only()
 }
 
 impl PushService {
@@ -99,23 +122,24 @@ impl PushService {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
 
-        let client = reqwest::ClientBuilder::new()
-            .tls_certs_only([reqwest::Certificate::from_pem(
-                cfg.certificate_authority.as_bytes(),
-            )
-            .unwrap()])
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(65))
-            .user_agent(user_agent.as_ref())
-            .http1_only()
+        let client = pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
+            .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
+            .timeout(CONTROL_PLANE_TOTAL_TIMEOUT)
             .build()
             .unwrap();
+        let download_client =
+            pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
+                .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+                .read_timeout(DOWNLOAD_READ_STALL_TIMEOUT)
+                .build()
+                .unwrap();
 
         Self {
             servers: env,
             cfg,
             credentials: credentials.and_then(|c| c.authorization()),
             client,
+            download_client,
         }
     }
 
@@ -126,8 +150,31 @@ impl PushService {
         endpoint: Endpoint,
         auth_override: HttpAuthOverride,
     ) -> Result<RequestBuilder, ServiceError> {
+        self.request_on(&self.client, method, endpoint, auth_override)
+    }
+
+    /// Download-face request (large CDN GET bodies): no total deadline,
+    /// death judged by [`DOWNLOAD_READ_STALL_TIMEOUT`]. Control-plane
+    /// budgets live in [`PushService::request`].
+    #[tracing::instrument(skip(self), fields(endpoint = %endpoint))]
+    pub fn download_request(
+        &self,
+        method: Method,
+        endpoint: Endpoint,
+        auth_override: HttpAuthOverride,
+    ) -> Result<RequestBuilder, ServiceError> {
+        self.request_on(&self.download_client, method, endpoint, auth_override)
+    }
+
+    fn request_on(
+        &self,
+        client: &reqwest::Client,
+        method: Method,
+        endpoint: Endpoint,
+        auth_override: HttpAuthOverride,
+    ) -> Result<RequestBuilder, ServiceError> {
         let url = endpoint.into_url(&self.cfg)?;
-        let mut builder = self.client.request(method, url);
+        let mut builder = client.request(method, url);
 
         builder = match auth_override {
             HttpAuthOverride::NoOverride => {
@@ -179,6 +226,7 @@ impl PushService {
             cfg: self.cfg.clone(),
             credentials: None,
             client: self.client.clone(),
+            download_client: self.download_client.clone(),
         };
         let (ws, task) = SignalWebSocket::new(
             ws,
@@ -322,6 +370,34 @@ mod keepalive_timeout_tests {
             KEEPALIVE_TIMEOUT_SECONDS,
             std::time::Duration::from_secs(30)
         );
+    }
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::{
+        CONTROL_PLANE_CONNECT_TIMEOUT, CONTROL_PLANE_TOTAL_TIMEOUT,
+        DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_STALL_TIMEOUT,
+    };
+    use std::time::Duration;
+
+    // KT: control-plane API keeps the upstream budget; regressions here
+    // would silently change every non-download call in the engine.
+    #[test]
+    fn control_plane_keeps_upstream_budget() {
+        assert_eq!(CONTROL_PLANE_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(CONTROL_PLANE_TOTAL_TIMEOUT, Duration::from_secs(65));
+    }
+
+    // KT: the download face must never carry a total deadline again (large
+    // CDN bodies get killed mid-stream) and its stall judge must stay
+    // inside the 30-60s band: long enough to ride out transient stalls,
+    // short enough that a dead link surfaces quickly.
+    #[test]
+    fn download_face_is_stall_judged_without_total_deadline() {
+        assert_eq!(DOWNLOAD_CONNECT_TIMEOUT, CONTROL_PLANE_CONNECT_TIMEOUT);
+        assert!(DOWNLOAD_READ_STALL_TIMEOUT >= Duration::from_secs(30));
+        assert!(DOWNLOAD_READ_STALL_TIMEOUT <= Duration::from_secs(60));
     }
 }
 
