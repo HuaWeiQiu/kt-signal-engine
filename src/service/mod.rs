@@ -8764,6 +8764,26 @@ async fn link_flow(
         ephemeral_backup_key,
     } = registration.map_err(|_| ())?;
 
+    // dev 诊断（`KT_ENGINE_LINK_DEBUG=1` 时向 /tmp/kt-engine-link-debug.log
+    // 追加一行；生产 env 缺席零输出零文件，compat §1 不破）：直接记录手机
+    // provisioning 消息是否携带一次性迁移密钥——真机「链接成功但 transfer
+    // 任务从未启动」之谜的证据面（字段链 proto/vendor/link_flow 三方核对
+    // 一致后，唯一未知量剩消息本体）。
+    if std::env::var("KT_ENGINE_LINK_DEBUG").is_ok() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/kt-engine-link-debug.log")
+        {
+            let _ = writeln!(
+                f,
+                "link_debug: provisioning ephemeral_backup_key_present={} device_id={device_id:?}",
+                ephemeral_backup_key.is_some()
+            );
+        }
+    }
+
     // serde 数据面构造（官方 store 落库格式）：pub(crate) 字段的唯一合法
     // 构造路径；键面与序列化形态由往返单测锁死。
     let number = e164_string(&phonenumber_from_signal(&phone_number));
