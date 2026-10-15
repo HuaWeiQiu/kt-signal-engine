@@ -845,7 +845,63 @@ pub(crate) enum SendError {
     /// `pending` 闸命中（接收侧换钥后未获 trust 确认）。确定性失败不
     /// 重试；错误面 -32603 + 固定原文（锚词 UntrustedIdentityException）。
     IdentityUnverified,
+    /// WS 请求被服务器明确拒绝（508 request rejected/499 客户端过旧/send
+    /// 面 413 超限/404 未注册收件人/其余 4xx UnhandledResponseCode）：
+    /// 服务器应答拒绝即未入队，确定未送达。同调用内快速重试 1 次；错误面
+    /// -32603 + 固定原文（锚词 WsRejectedException；cause 类全覆盖批
+    /// 2026-10-16，compat §3/§5）。
+    WsRejected,
+    /// WS 请求响应未达/等响应期断流（`ServiceError::Timeout`、等响应相
+    /// `WsClosing`、`WsError`、presage Elapsed 超时）：请求可能已写入
+    /// 服务器，结局未知——connector 契约「An unknown send outcome must
+    /// not be retried automatically」同源纪律，**绝不自动重试**（可能已
+    /// 在服务器落地，重试会重复投递）；错误面 -32603 + 固定原文（锚词
+    /// WsTimeoutException）。
+    WsTimeout,
+    /// 请求写出前传输已断（`WsClosing{reason="WebSocket closing while
+    /// sending request"}`——vendored websocket/mod.rs 写出相 reason 字面量
+    /// 与等响应相区分；`ServiceError::SendError` 请求发送失败同相）：
+    /// 请求未离开引擎，确定未送达。快速重试 1 次；错误面 -32603 + 固定
+    /// 原文（锚词 WsTransportException）。
+    WsTransport,
+    /// prekey 拉取失败（send 链 404 取钥面 `ServiceError::NotFoundError`；
+    /// 近似归类记档：vendored 错误不携带阶段信息，按 send 链 404 主导成因
+    /// 归族，§5）：会话建立前置失败，先于 wire，确定未送达。快速重试 1
+    /// 次；错误面 -32603 + 固定原文（锚词 PreKeyFetchException）。
+    PreKey,
+    /// 会话建立/加密面失败（vendored 409/410 修复环耗尽
+    /// MaximumRetriesLimitExceeded、非 UntrustedIdentity 的协议错误、
+    /// Curve/私钥面、MismatchedDevices/StaleDevices 漏出）：全部先于
+    /// wire，确定未送达。快速重试 1 次；错误面 -32603 + 固定原文（锚词
+    /// SessionBuildException）。
+    SessionBuild,
+    /// 附件/贴纸图/预览图上行失败（`AttachmentUploadError` 外层 sender
+    /// 构建与内层逐条两面，`upload_error_of` 单点归型）：上传先于任何
+    /// 收件人发送，消息确定未投递（上传请求自身结局歧义不构成重复投递
+    /// 风险）。快速重试 1 次；错误面 -32603 + 固定原文（锚词
+    /// AttachmentUploadException）。
+    AttachmentUpload,
     Internal,
+}
+
+impl SendError {
+    /// 结局类判定（§5 快速重试硬边界，纯函数）：`true` = 确定未送达——
+    /// 请求未离开引擎（WsTransport）、服务器显式拒绝未入队（WsRejected）、
+    /// 先于 wire 的本地面失败（PreKey/SessionBuild）、消息未离站
+    /// （AttachmentUpload）——允许同调用内快速重试 1 次；`false` = 未知
+    /// 结局或确定性失败，绝不自动重试（WsTimeout 响应缺失可能已落地、
+    /// Unbound/RateLimited/ProofRequired/IdentityUnverified 确定性失败、
+    /// ServerUnavailable 决策归 connector/desktop、Internal 本地面）。
+    pub(crate) fn is_definite_failure(&self) -> bool {
+        matches!(
+            self,
+            SendError::WsRejected
+                | SendError::WsTransport
+                | SendError::PreKey
+                | SendError::SessionBuild
+                | SendError::AttachmentUpload
+        )
+    }
 }
 
 /// presage 发送/上行面错误归型：服务端 401/403（凭据吊销/解绑）同归
@@ -853,15 +909,22 @@ pub(crate) enum SendError {
 /// 与 MessageSenderError 面（send_message 内 sender 上行同源再包一层）
 /// 两处归型点都覆盖；限流（429/413 → RateLimited）、人机验证（428 →
 /// ProofRequired）、服务端 5xx 不可用（→ ServerUnavailable）同以
-/// ServiceError 面单点归型（compat §3 结构化三分类）；其余（网络/协议/
-/// 存储）折叠 `SendError::Internal`。
+/// ServiceError 面单点归型（compat §3 结构化三分类）；cause 类全覆盖批
+/// （2026-10-16，§5）再扩六族：服务器明确拒绝（4xx/499/508/send 面
+/// 413/404 未注册）→ WsRejected、响应未知结局（Timeout/等响应相
+/// WsClosing/WsError/Elapsed）→ WsTimeout、写出前断（写出相 WsClosing
+/// reason 字面量/ServiceError::SendError）→ WsTransport、取钥 404 →
+/// PreKey、修复环耗尽/协议面 → SessionBuild、附件上行 → AttachmentUpload
+/// （`upload_error_of`）；其余（网络/协议/存储本地失败）折叠
+/// `SendError::Internal`。
 /// send 链各触网点单点共用（getUserStatus 的 whoami 面同归型先行）。
 pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
     use presage::libsignal_service::prelude::ServiceError;
     use presage::libsignal_service::sender::MessageSenderError;
 
     /// ServiceError 面单点归型（直接推送服务调用与 sender 再包层两触点
-    /// 共用；vendored push_service/response.rs 归型路径）。
+    /// 共用；vendored push_service/response.rs 归型路径 + websocket/mod.rs
+    /// 写出相/等响应相 WsClosing reason 字面量区分）。
     fn service_error_face(error: ServiceError) -> SendError {
         match error {
             ServiceError::Unauthorized => SendError::Unbound,
@@ -870,6 +933,30 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
             }
+            // —— cause 类全覆盖批（2026-10-16，§5）：服务器显式应答拒绝
+            // 族（应答即未入队，确定未送达）——
+            ServiceError::UnhandledResponseCode { .. } => SendError::WsRejected,
+            ServiceError::ServerRejected | ServiceError::DeprecatedVersion => SendError::WsRejected,
+            ServiceError::MessageTooLarge | ServiceError::UnregisteredRecipient => {
+                SendError::WsRejected
+            }
+            // 响应未知结局族（请求可能已写入，绝不自动重试）。
+            ServiceError::Timeout { .. } => SendError::WsTimeout,
+            // 写出相 reason 字面量（vendored websocket/mod.rs）= 请求未
+            // 写出即断，确定未送达；其余 WsClosing = 等响应相，未知结局。
+            ServiceError::WsClosing {
+                reason: "WebSocket closing while sending request",
+            } => SendError::WsTransport,
+            ServiceError::WsClosing { .. } | ServiceError::WsError(_) => SendError::WsTimeout,
+            ServiceError::SendError { .. } => SendError::WsTransport,
+            // 会话前置取钥 404（近似归类记档 §5）。
+            ServiceError::NotFoundError => SendError::PreKey,
+            // 会话/加密面（先于 wire）。
+            ServiceError::MismatchedDevicesException(_) | ServiceError::StaleDevices(_) => {
+                SendError::SessionBuild
+            }
+            ServiceError::SignalProtocolError(_) => SendError::SessionBuild,
+            ServiceError::Curve(_) => SendError::SessionBuild,
             _ => SendError::Internal,
         }
     }
@@ -887,13 +974,44 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             MessageSenderError::ProtocolError(
                 presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_),
             ) => SendError::IdentityUnverified,
+            // cause 类全覆盖批（§5）：404 未注册收件人（vendored 修复环
+            // 归一面）确定未送达；修复环耗尽/协议/密钥面先于 wire；附件
+            // 上行（sender 内层）消息未离站。
+            MessageSenderError::NotFound { .. } => SendError::WsRejected,
+            MessageSenderError::MaximumRetriesLimitExceeded => SendError::SessionBuild,
+            MessageSenderError::ProtocolError(_) | MessageSenderError::InvalidPrivateKey(_) => {
+                SendError::SessionBuild
+            }
+            MessageSenderError::AttachmentUploadError(_) => SendError::AttachmentUpload,
             _ => SendError::Internal,
         },
         presage::Error::ServiceError(service_error) => service_error_face(service_error),
         presage::Error::ProtocolError(
             presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_),
         ) => SendError::IdentityUnverified,
+        presage::Error::ProtocolError(_) => SendError::SessionBuild,
+        presage::Error::Timeout(_) => SendError::WsTimeout,
         _ => SendError::Internal,
+    }
+}
+
+/// 附件上行面错误归型（cause 类全覆盖批 2026-10-16，§5 新增单点）：内层
+/// 逐条 `AttachmentUploadError`（此前被吞成 `Internal`）统一归
+/// `SendError::AttachmentUpload`——上传先于任何收件人发送，消息确定未
+/// 投递，上传请求自身的结局歧义（65s 控制面总超时内断流等）不构成重复
+/// 投递风险；外层错误（sender 构建/凭据面）沿 `send_error_of` 原语义
+/// （401 解绑等归型比笼统「上传失败」更诚实，且不进重试）。
+pub(crate) fn upload_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
+    match error {
+        presage::Error::MessageSenderError(boxed) => match *boxed {
+            presage::libsignal_service::sender::MessageSenderError::AttachmentUploadError(_) => {
+                SendError::AttachmentUpload
+            }
+            // 上行路径外层不该出现其他 sender 错误（防御臂）：仍按 send
+            // 链归型面分类，未知形状折叠 Internal（不重试）。
+            other => send_error_of(presage::Error::MessageSenderError(Box::new(other))),
+        },
+        _ => send_error_of(error),
     }
 }
 
@@ -1779,6 +1897,51 @@ impl Service {
         Ok(had_dir || !self.real)
     }
 
+    /// §5 快速重试上限：同调用内 1 次、零退避——官方管线层不重试传输
+    /// 失败、重试/退避归队列层（conversationJobQueue Fibonacci 分钟级
+    /// 退避），引擎只做确定未送达的单次快速重试，退避策略归
+    /// connector/desktop。
+    const SEND_FAST_RETRY_LIMIT: usize = 1;
+
+    /// 直聊单收件人投递 + 确定未送达快速重试（§5 cause 全覆盖 + 快速重试
+    /// 批）：逐收件人失败即该收件人确定未送达（vendored 应答/本地前置面
+    /// 唯一决定），重试无重复投递；未知结局（WsTimeout——请求可能已在
+    /// 服务器落地）绝不自动重试（connector 契约 An unknown send outcome
+    /// must not be retried automatically 同源纪律）。body 按次克隆（prost
+    /// 消息，各 attempt 间互不影响）。
+    async fn deliver_direct_message(
+        manager: &mut Manager<SqliteStore, Registered>,
+        service_id: ServiceId,
+        body: DataMessage,
+        timestamp: u64,
+        include_profile_key: bool,
+    ) -> Result<(), SendError> {
+        let mut attempt = 0usize;
+        loop {
+            match manager
+                .send_message_with_profile_sharing(
+                    service_id,
+                    body.clone(),
+                    timestamp,
+                    include_profile_key,
+                )
+                .await
+                .map_err(send_error_of)
+            {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < Self::SEND_FAST_RETRY_LIMIT && error.is_definite_failure() =>
+                {
+                    attempt += 1;
+                    // 日志纪律：只落固定字面量 cause 类（变体名），无收件
+                    // 人/号码/内容。
+                    tracing::warn!(cause = ?error, "send fast retry after definite failure");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_text(
         self: &Arc<Self>,
@@ -1806,16 +1969,47 @@ impl Service {
         let whitelist = profile_sharing_whitelist(self, account).await;
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
         // 同样多收件人共享指针。caption 位 = story 媒体腿专属（send 面无
-        // caption 参数，None 零变化）。
-        let (pointers, preview_image) = upload_attachments_for_send(
-            &manager,
-            attachments,
-            preview.and_then(|item| item.image.as_deref()),
-            None,
-        )
-        .await?;
+        // caption 参数，None 零变化）。上传失败整批确定未投递（先于全部
+        // 收件人），AttachmentUpload 族同调用内快速重试 1 次（§5）。
+        let (pointers, preview_image) = {
+            let mut attempt = 0usize;
+            loop {
+                match upload_attachments_for_send(
+                    &manager,
+                    attachments,
+                    preview.and_then(|item| item.image.as_deref()),
+                    None,
+                )
+                .await
+                {
+                    Ok(uploaded) => break uploaded,
+                    Err(error)
+                        if attempt < Self::SEND_FAST_RETRY_LIMIT && error.is_definite_failure() =>
+                    {
+                        attempt += 1;
+                        tracing::warn!(cause = ?error, "send fast retry after definite failure");
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         let sticker_pointer = match sticker {
-            Some(sticker) => Some(upload_sticker_image(&manager, sticker).await?),
+            Some(sticker) => {
+                let mut attempt = 0usize;
+                loop {
+                    match upload_sticker_image(&manager, sticker).await {
+                        Ok(pointer) => break Some(pointer),
+                        Err(error)
+                            if attempt < Self::SEND_FAST_RETRY_LIMIT
+                                && error.is_definite_failure() =>
+                        {
+                            attempt += 1;
+                            tracing::warn!(cause = ?error, "send fast retry after definite failure");
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             None => None,
         };
         // 时序审计组二#9：per-recipient 成败收集（不再 fail-fast 丢弃部分
@@ -1865,16 +2059,16 @@ impl Service {
                         .await?
                     }
                 };
-                manager
-                    .send_message_with_profile_sharing(
-                        service_id,
-                        body,
-                        timestamp,
-                        include_profile_key,
-                    )
-                    .await
-                    .map_err(send_error_of)?;
-                Ok(())
+                // 直聊投递 + 确定未送达快速重试 1 次（§5；逐收件人失败 =
+                // 该收件人确定未送达，重试无重复投递）。
+                Self::deliver_direct_message(
+                    &mut manager,
+                    service_id,
+                    body,
+                    timestamp,
+                    include_profile_key,
+                )
+                .await
             };
             match send_one.await {
                 Ok(()) => results.push(json!({
@@ -9537,12 +9731,14 @@ async fn upload_attachments_for_send(
     let uploads = manager
         .upload_attachments(batch)
         .await
-        .map_err(send_error_of)?;
-    let mut pointers = uploads
-        .into_iter()
-        .map(|result| result.ok())
-        .collect::<Option<Vec<_>>>()
-        .ok_or(SendError::Internal)?;
+        .map_err(upload_error_of)?;
+    // 逐条上行失败显形（cause 全覆盖批 §5）：任一条失败整批 fail-closed
+    //（半发的引用消息比拒绝更糟，既有纪律），错误归 AttachmentUpload
+    //（消息未离站，确定未投递，§5）。
+    let mut pointers = Vec::with_capacity(uploads.len());
+    for result in uploads {
+        pointers.push(result.map_err(|_| SendError::AttachmentUpload)?);
+    }
     for (pointer, (is_gif, voice_metadata)) in pointers.iter_mut().zip(outgoing_faces) {
         if is_gif {
             apply_outgoing_gif_flag(pointer);
@@ -9810,11 +10006,13 @@ async fn upload_sticker_image(
     let mut uploads = manager
         .upload_attachments(vec![(spec, parsed.bytes)])
         .await
-        .map_err(send_error_of)?;
+        .map_err(upload_error_of)?;
     uploads
         .pop()
         .and_then(|result| result.ok())
-        .ok_or(SendError::Internal)
+        // 上行失败/条目缺失归 AttachmentUpload（cause 全覆盖批 §5——此前
+        // 折叠 Internal 无锚词；本地 mediatype/形状闸仍归 Internal 不重试）。
+        .ok_or(SendError::AttachmentUpload)
 }
 
 /// 贴纸 dataMessage 构造（proto 面 = 线上 DataMessage.Sticker：packId/packKey
@@ -10199,11 +10397,12 @@ mod tests {
             SendError::Unbound
         ));
 
-        // 404 = 收件人面（官方 response.rs 注：recipient not registered），
-        // 与本账号凭据失效不同族，不得误报。
+        // 404 = 取钥端点面（send 链 NotFoundError 主导成因，cause 全覆盖
+        // 批归 PreKey——§5 近似归类记档），与本账号凭据失效不同族，不得
+        // 误报解绑。
         assert!(matches!(
             send_error_of(presage::Error::ServiceError(ServiceError::NotFoundError)),
-            SendError::Internal
+            SendError::PreKey
         ));
         assert!(matches!(
             send_error_of(presage::Error::MessageSenderError(Box::new(
@@ -10221,7 +10420,8 @@ mod tests {
     /// 验证 428（直接 ServiceError 臂 + sender 再包层臂，token/options
     /// 归型即弃不上 wire）、服务端 5xx 不可用（UnhandledResponseCode 兜底
     /// 臂，vendored 无独立 ServerError 变体）；<500 的 UnhandledResponseCode
-    /// 不算不可用，维持 Internal 折叠。
+    /// 算服务器明确拒绝（cause 全覆盖批 §5 归 WsRejected——应答即未入队），
+    /// 不算不可用。
     #[test]
     fn send_errors_classify_structured_server_faces() {
         use presage::libsignal_service::prelude::ServiceError;
@@ -10276,7 +10476,133 @@ mod tests {
         };
         assert!(matches!(unhandled(500), SendError::ServerUnavailable));
         assert!(matches!(unhandled(503), SendError::ServerUnavailable));
-        assert!(matches!(unhandled(400), SendError::Internal));
+        // <500（如 400）= 服务器明确拒绝（cause 全覆盖批 §5），非不可用。
+        assert!(matches!(unhandled(400), SendError::WsRejected));
+    }
+
+    /// send 链 cause 类全覆盖归型（2026-10-16 批，§5）：六族新变体的
+    /// vendored 错误形状 → SendError 映射逐臂钉死——服务器明确拒绝族
+    /// （508/499/413 send 面/404 未注册/4xx UnhandledResponseCode）、
+    /// 未知结局族（Timeout/等响应相 WsClosing/WsError）、写出前断族
+    /// （写出相 WsClosing reason 字面量）、取钥 404、修复环耗尽/协议面、
+    /// 附件上行内外两层。
+    #[test]
+    fn send_errors_classify_cause_families() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use presage::libsignal_service::sender::MessageSenderError;
+
+        // 服务器明确拒绝族 → WsRejected（确定未送达）。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::ServerRejected)),
+            SendError::WsRejected
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(
+                ServiceError::DeprecatedVersion
+            )),
+            SendError::WsRejected
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::MessageTooLarge)),
+            SendError::WsRejected
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(
+                ServiceError::UnregisteredRecipient
+            )),
+            SendError::WsRejected
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::NotFound {
+                    service_id: ServiceId::parse_from_service_id_string(
+                        "00000000-0000-0000-0000-000000000000",
+                    )
+                    .expect("aci"),
+                },
+            ))),
+            SendError::WsRejected
+        ));
+
+        // 未知结局族 → WsTimeout（绝不自动重试）。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::Timeout {
+                reason: "test",
+            })),
+            SendError::WsTimeout
+        ));
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::WsClosing {
+                reason: "WebSocket closing while waiting for a response",
+            })),
+            SendError::WsTimeout
+        ));
+
+        // 写出前断族 → WsTransport（确定未送达；等响应相 reason 字面量
+        // 区分单测）。
+        assert!(matches!(
+            send_error_of(presage::Error::ServiceError(ServiceError::WsClosing {
+                reason: "WebSocket closing while sending request",
+            })),
+            SendError::WsTransport
+        ));
+
+        // 修复环耗尽/协议面 → SessionBuild（先于 wire）。
+        assert!(matches!(
+            send_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::MaximumRetriesLimitExceeded
+            ))),
+            SendError::SessionBuild
+        ));
+
+        // 附件上行内层 → AttachmentUpload；上传面归类单点 upload_error_of。
+        assert!(matches!(
+            upload_error_of(presage::Error::MessageSenderError(Box::new(
+                MessageSenderError::AttachmentUploadError(
+                    presage::libsignal_service::sender::AttachmentUploadError::IoError(
+                        std::io::Error::other("test"),
+                    ),
+                )
+            ))),
+            SendError::AttachmentUpload
+        ));
+        // 上行外层沿 send_error_of 原语义（401 解绑归型比笼统「上传失败」
+        // 更诚实，§5）。
+        assert!(matches!(
+            upload_error_of(presage::Error::ServiceError(ServiceError::Unauthorized)),
+            SendError::Unbound
+        ));
+    }
+
+    /// 快速重试硬边界（§5）：is_definite_failure 全变体钉死——确定未送达
+    /// 五族为 true，未知结局（WsTimeout）与既有四族/本地面全部 false。
+    #[test]
+    fn send_fast_retry_boundary_is_definite_failure_only() {
+        let definite = [
+            SendError::WsRejected,
+            SendError::WsTransport,
+            SendError::PreKey,
+            SendError::SessionBuild,
+            SendError::AttachmentUpload,
+        ];
+        for error in definite {
+            assert!(error.is_definite_failure(), "{error:?} 应可快速重试");
+        }
+        let never = [
+            SendError::UnknownAccount,
+            SendError::TargetTerminated,
+            SendError::AnnouncementsOnly,
+            SendError::Unbound,
+            SendError::RateLimited,
+            SendError::ProofRequired,
+            SendError::ServerUnavailable,
+            SendError::IdentityUnverified,
+            SendError::WsTimeout,
+            SendError::Internal,
+        ];
+        for error in never {
+            assert!(!error.is_definite_failure(), "{error:?} 绝不自动重试");
+        }
     }
 
     /// project_content 现返通知向量：契约测试形状 = 恰一条投影，取首条

@@ -48,6 +48,29 @@ const SERVER_UNAVAILABLE_MESSAGE: &str =
 const IDENTITY_UNVERIFIED_MESSAGE: &str =
     "Failed to send message: Identity unverified. (UntrustedIdentityException)";
 
+/// —— send 链 cause 类全覆盖批（2026-10-16，compat §3/§5）六族新锚词
+/// ——（wire 字面量与 connector 侧分类器配套：锚词括注异常类名，引擎
+/// 契约逐字钉定 emit 面；connector 认领归 connector 侧批次，未认领前
+/// 无锚词面语义不变）。结局类与自动重试边界见 SendError 变体注。
+/// WS 请求被服务器明确拒绝——确定未送达（508/499/send 面 413/404 未注册/
+/// 其余 4xx 应答拒绝）。
+const WS_REJECTED_MESSAGE: &str = "Failed to send message: Request rejected. (WsRejectedException)";
+/// WS 响应未达/等响应期断流——未知结局，绝不自动重试（重试可能重复投递）。
+const WS_TIMEOUT_MESSAGE: &str =
+    "Failed to send message: Timed out waiting for the response. (WsTimeoutException)";
+/// 请求写出前传输已断——确定未送达。
+const WS_TRANSPORT_MESSAGE: &str =
+    "Failed to send message: Transport unavailable. (WsTransportException)";
+/// prekey 拉取失败——会话建立前置失败，先于 wire。
+const PRE_KEY_MESSAGE: &str =
+    "Failed to send message: Pre-key fetch failed. (PreKeyFetchException)";
+/// 会话建立/加密面失败——先于 wire（修复环耗尽/协议/密钥面）。
+const SESSION_BUILD_MESSAGE: &str =
+    "Failed to send message: Session establishment failed. (SessionBuildException)";
+/// 附件/贴纸图/预览图上行失败——上传先于发送，消息未离站。
+const ATTACHMENT_UPLOAD_MESSAGE: &str =
+    "Failed to send message: Attachment upload failed. (AttachmentUploadException)";
+
 pub(crate) enum Inbound {
     Line(String),
     Overlong,
@@ -4784,6 +4807,14 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::ProofRequired => (-32603, PROOF_REQUIRED_MESSAGE),
         SendError::ServerUnavailable => (-32603, SERVER_UNAVAILABLE_MESSAGE),
         SendError::IdentityUnverified => (-32603, IDENTITY_UNVERIFIED_MESSAGE),
+        // cause 类全覆盖批（2026-10-16，§5）六族：均 -32603 + 固定原文
+        //（锚词括注异常类名，connector 分类器按 message 命中）。
+        SendError::WsRejected => (-32603, WS_REJECTED_MESSAGE),
+        SendError::WsTimeout => (-32603, WS_TIMEOUT_MESSAGE),
+        SendError::WsTransport => (-32603, WS_TRANSPORT_MESSAGE),
+        SendError::PreKey => (-32603, PRE_KEY_MESSAGE),
+        SendError::SessionBuild => (-32603, SESSION_BUILD_MESSAGE),
+        SendError::AttachmentUpload => (-32603, ATTACHMENT_UPLOAD_MESSAGE),
         SendError::UnknownAccount | SendError::Internal => (-32603, "Internal error"),
     }
 }
@@ -4825,6 +4856,12 @@ mod tests {
             SendError::ProofRequired,
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
+            SendError::WsRejected,
+            SendError::WsTimeout,
+            SendError::WsTransport,
+            SendError::PreKey,
+            SendError::SessionBuild,
+            SendError::AttachmentUpload,
             SendError::Internal,
         ];
         for error in cases {
@@ -4891,6 +4928,70 @@ mod tests {
             assert_eq!(face.get("code").and_then(Value::as_i64), Some(-32603));
             assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
             assert!(message.contains(anchor));
+        }
+    }
+
+    /// send 链 cause 类全覆盖六面（2026-10-16 批，compat §3/§5）：均
+    /// `-32603` + 常量逐字 + 括注锚词在场（connector 分类器按锚词命中
+    /// ——message 形状即契约，改动即断）；另钉两点纪律：①六条新原文
+    /// 与既有五条原文互不包含锚词（substring 分类器无误命中空间）；
+    /// ②六族与「确定未送达」判定一致（WsTimeout 未知结局除外）。
+    #[test]
+    fn send_error_cause_family_faces_wire_shape() {
+        use crate::service::SendError;
+        let cases = [
+            (
+                SendError::WsRejected,
+                WS_REJECTED_MESSAGE,
+                "(WsRejectedException)",
+            ),
+            (
+                SendError::WsTimeout,
+                WS_TIMEOUT_MESSAGE,
+                "(WsTimeoutException)",
+            ),
+            (
+                SendError::WsTransport,
+                WS_TRANSPORT_MESSAGE,
+                "(WsTransportException)",
+            ),
+            (SendError::PreKey, PRE_KEY_MESSAGE, "(PreKeyFetchException)"),
+            (
+                SendError::SessionBuild,
+                SESSION_BUILD_MESSAGE,
+                "(SessionBuildException)",
+            ),
+            (
+                SendError::AttachmentUpload,
+                ATTACHMENT_UPLOAD_MESSAGE,
+                "(AttachmentUploadException)",
+            ),
+        ];
+        let all_anchors = [
+            "(RateLimitExceeded)",
+            "(ProofRequiredException)",
+            "(ServerUnavailableException)",
+            "(UntrustedIdentityException)",
+            "(WsRejectedException)",
+            "(WsTimeoutException)",
+            "(WsTransportException)",
+            "(PreKeyFetchException)",
+            "(SessionBuildException)",
+            "(AttachmentUploadException)",
+        ];
+        for (error, message, anchor) in cases {
+            let response = send_error(&Value::from(11), error);
+            assert_eq!(response.get("id").and_then(Value::as_i64), Some(11));
+            let face = response.get("error").expect("error face");
+            assert_eq!(face.get("code").and_then(Value::as_i64), Some(-32603));
+            assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
+            assert!(message.contains(anchor));
+            // substring 分类器无误命中空间：每条原文恰含自己的锚词。
+            let own_anchor_count = all_anchors
+                .iter()
+                .filter(|candidate| message.contains(*candidate))
+                .count();
+            assert_eq!(own_anchor_count, 1, "{message} 锚词恰一");
         }
     }
 

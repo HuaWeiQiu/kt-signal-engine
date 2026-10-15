@@ -5624,10 +5624,11 @@ oneof 字段 19），各设备会话据此落通话记录条。引擎此前只�
   近似归类；纯本地失败（store/JSON 解码/padding/MAC/`IoError`）维持
   `Internal` 无锚词折叠（不重试）。
 - **附件上行归类面（`upload_error_of` 新增）**：`upload_attachments_for_send`
-  的外层错误（sender 构建失败，走 `send_error_of`）与内层逐条
-  `AttachmentUploadError`（此前被吞成 `Internal`）统一归 `AttachmentUpload`
-  ——上传先于任何收件人发送，故整批确定未投递，上传请求自身的结局歧义
-  （65s 控制面总超时内断流等）不构成重复投递风险。
+  的内层逐条 `AttachmentUploadError`（此前被吞成 `Internal`）统一归
+  `AttachmentUpload`——上传先于任何收件人发送，故整批确定未投递，上传
+  请求自身的结局歧义（65s 控制面总超时内断流等）不构成重复投递风险；
+  外层错误（sender 构建/凭据面）沿 `send_error_of` 原语义（401 解绑等
+  归型比笼统「上传失败」更诚实，且不进快速重试）。
 - **快速重试纪律（硬边界，connector 契约原文「An unknown send outcome
   must not be retried automatically」引擎侧同源遵守）**：
   - **只重试确定未送达类**（`SendError::is_definite_failure`）：请求写出
