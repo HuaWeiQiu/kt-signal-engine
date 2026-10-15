@@ -126,6 +126,9 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 ——均 `-32603` + 「Failed to send message: …」同风格原文，结局类与
 自动重试边界见 §5 批块；锚词由引擎契约逐字钉定，connector 分类器认领
 归 connector 侧批次（未认领前无锚词面语义不变，仍泛化 upstream）。
+2026-10-16 起 send 系再增确定性失败锚词 `(NoRecipientsException)`（群腿
+零收件人——群成员过滤自身后为空，请求从未构造收件人面，确定未送达；
+`SendError::NoRecipients`，群发送系与群 typing 共用，§5 批块）。
 
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
@@ -133,7 +136,8 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number", "aci"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
-| `listContacts` | `{account}` | `[{number, name?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；profile 拆名 P2+ |
+| `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在） |
+| `profiles.refreshContacts` | `{account}`（字符串必需，缺席/非字符串 fail-closed `-32603`——phoneLookup 同款参数纪律；无逐联系人物品参数——本方法不接受目标清单，目标集恒由 store 推导，调用方无法借它探测任意 uuid 的 profile） | `{refreshed, failed, skipped}`（三计数恒在，u32 字面；只计数不含任何身份/号码/名字内容——引擎零联系人外传纪律同向）。refreshed = 本次实际发起 profile 拉取且成功；failed = 拉取失败**或**整批时限到期未尝试（含拉取成功但服务器侧名字材料仍空——计数语义是「刷新动作结局」而非「名字出现」）；skipped = 无需刷新（无 profile_key / 名字材料已在库 / contacts.name 非空） | 未注册账号 `-32603`；无账号库可达同折叠 | **2026-10-16 real（KT 扩展，profile 名字刷新批，wire additive，engine-compat，§5 块）**：登录绑定完成后的自动批（60s 一次性纪律同门，+10s 联系人沉降）与本显式方法共用同一刷新单点（`refresh_contact_profiles`）：目标集 = store contacts 中 profile_key 在库且名字材料为空者，presage `retrieve_profile_by_uuid` 同路径拉取（vendored registered.rs 同路：缓存查 → 服务器拉 → ProfileCipher 解密 → `save_profile` 落 **profiles 表**——落表查证结论：不是 contacts.name），并发 ≤3（独立 manager 各自持 websocket 槽）、单联系人失败不中断批次、整批时限 20s（到期未尝试计 failed）；presage 侧 profile 缓存（查到即回、无网络）使重复刷新零流量幂等；fake：`{refreshed:0, failed:0, skipped:0}`（形状桩，不落调度日志，读面纪律） |
 | `listGroups` | `{account, groupId?: [32B 标准 base64 群 master key…]（可选过滤，P15b 审计项5 单群读投影：数组非空、条目 decode_group_id 闸；坏形状——非数组/空数组/条目非字符串·坏 base64·≠32B——fail-closed `-32603`（fake 面同口径）；well-formed 但 store 不在 → 掉出结果不报错（结果可空，connector fold 侧 `first()` → 空集诚实降级）；缺席/null = 全表旧行为）}` | `[{id(base64), name, revision, description?(Some 时在场), announcementsOnly, expireTimerSeconds(0 = 关), isMember(计算值：own ACI ∈ members), members:[{number, role}], pendingMembers:[{number, addedBy, timestamp}], requestingMembers:[{number, timestamp}], bannedMembers:[{number, timestamp}], accessControl?{attributes, members, addFromInviteLink, memberLabel}(词表 UNKNOWN/ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE，Some 时在场), terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现）；**2026-10-11 real（群写面 P5 投影批，§5 块）**：投影族扩展（description/announcementsOnly/expireTimerSeconds/revision/members[].role/pending/requesting/banned 三成员面/accessControl 四族——vendored presage `Group` 补 `banned_members` 位，README fork 清单登记）；**isMember 诚实化修正**：改计算值（own ACI ∈ members）——早期「入库即成员恒 true」口径废止，被移出群的本地残留投影即 false（§5 登记偏差）；单群投影抽纯函数 `project_group_list_entry` 单测钉形；**2026-10-11 real（P15b 审计项5，§5 块）**：可选 `groupId` 过滤（单群读投影）——connector §4.53/§4.57/§4.62 三处 fold 读已派发 `listGroups {account, groupId: [id]}` 数组形并取 `first()` 当目标群，引擎此前忽略该参数返回全表，多群账号下 `first()` 读到任意群（requesting/pending 集合错群危害）；过滤判定抽纯函数 `group_key_passes_filter` 单测钉形 |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
 | `send` | `{account, recipient[]/groupId, message, quoteTimestamp?, quoteAuthor?, quoteType?("normal"\|"giftBadge" 缺省 normal——官方 isGiftBadge 同构；六问批 Q5), quoteBodyRanges?: [{number?, style?(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}] ≤64（mention/style 恰一；两键须挂 quote 键对——quote 对象缺席无处挂载；六问批 Q5）, previewUrl?, previewTitle?, previewDescription?, previewImage?, previewDate?(u64 毫秒发布时刻——P14 Preview.date 两端批；须挂 previewUrl 键对，0 归缺席，非整数 `-32603`), mentions?: [{number, start, length}], textStyle?: [{style(BOLD\|ITALIC\|SPOILER\|STRIKETHROUGH\|MONOSPACE), start(u32), length(u32)}], attachments?: [dataURI], sticker?: {packId(hex), packKey(base64), stickerId, emoji?, image(dataURI), width?, height?}, storyReplyAuthor?, storyReplyTimestamp?(u64 毫秒——P14 组 4 storyContext 发送面；**双参同进退**：同置=story 回复（author ACI/号码，服务层解析不可解析 `-32603`；timestamp ≤0·非整数 `-32603`），单边在场 `-32603`——官方 storyContext 同位 SendMessage.preload.ts:565-577), viewOnce?}` | `{timestamp, results:[]}` | 收件人未解析/群不可解/quote 半参/quote 在场但 author 不可解析（文本与贴纸分支同口径）/storyReply 双参单边在场·author 缺席或空串·timestamp 缺席·≤0·非整数/storyReplyAuthor 不可解析（服务层 resolve_author_aci）/quoteType 词表外（含 poll——官方 Quote.Type POLL 枚举在，KT quote 发送面未扩，窗D A7 批记档）·非字符串、quoteBodyRanges 条目 mention/style 同置或都缺·缺 start/length·start/length 超 u32·style 词表外·>64 条（cap 镜像整拒不截断）·非数组、quoteType/quoteBodyRanges 与 quote 键对脱挂/mentions 条目缺字段/textStyle 条目词表外（五值白名单；NONE 一并拒——官方 composer 永不发出的 no-op 标记）·缺字段·style 非字符串·start/length 超 u32·>64 条（cap 镜像整拒不截断）·非数组/附件条目非字符串/sticker 缺字段或与 message·attachments·preview·mentions 同发（官方互斥；quote 与 sticker 可共存）/viewOnce 非布尔，或 viewOnce:true 违反官方 isValidTapToView 同构（body 非空·附件≠1·附件 mediatype 非 image\|video·与 quote·preview·mentions·sticker 同发——mentions 亦禁发，比官方更严）`-32603`；群组形态目标已终止 `SEND_TARGET_TERMINATED`（`-1` + message，2026-10-06 群终止批，§5）；announcements-only 群非 admin 发送系整拒 `SEND_TARGET_ANNOUNCEMENTS_ONLY`（`-1` + message，2026-10-11 群发送语义批，§5）；账号解绑（服务端 401 凭据拒绝）`-32603` + getUserStatus 同款解绑原文（2026-10-10 凭据失效归一批，`SendError::Unbound`，确定性失败不重试，§5）；服务端限流（429/413）`-32603` + `Rate limited` 原文、人机验证（428）`-32603` + `Proof required` 原文（两者不自动重试）、服务端不可用（5xx）`-32603` + `Signal server unavailable` 原文（建议可重试——重试决策均在 connector/desktop；2026-10-11 错误码结构化批，§5）；对端身份钥变更未确认（身份拒发闸：协议层旧钥会话/换钥 bundle 拒加密 + 服务层 sidecar 挂起闸，直聊内容/撤回/回应/pin/unpin/直聊通话信令/回执面生效，typing/群发送/story 不在闸面）`-32603` + `Failed to send message: Identity unverified. (UntrustedIdentityException)` 原文（确定性失败不重试；确认钩子 = `trust` 写面，2026-10-11 P9 身份拒发批，§5）；**send 链 cause 类全覆盖批（2026-10-16，§5，engine-compat）六族新增**：WS 请求被服务器明确拒绝（4xx UnhandledResponseCode/499 过旧/508 明确拒绝/send 面 413 超限/404 未注册收件人）`-32603` + `Failed to send message: Request rejected. (WsRejectedException)`（确定未送达，同调用内快速重试 1 次）；WS 响应未达/等响应期断流（未知结局）`-32603` + `Failed to send message: Timed out waiting for the response. (WsTimeoutException)`（**绝不自动重试**）；请求写出前传输已断 `-32603` + `Failed to send message: Transport unavailable. (WsTransportException)`（确定未送达，重试 1 次）；prekey 拉取失败（send 链 404 取钥面）`-32603` + `Failed to send message: Pre-key fetch failed. (PreKeyFetchException)`（确定未送达，重试 1 次）；会话建立/加密面失败（先于 wire：修复环耗尽/协议错误/密钥面）`-32603` + `Failed to send message: Session establishment failed. (SessionBuildException)`（确定未送达，重试 1 次）；附件/贴纸图/预览图上行失败 `-32603` + `Failed to send message: Attachment upload failed. (AttachmentUploadException)`（上传先于发送，消息确定未投递，重试 1 次）——六族结局类判定与自动重试硬边界（An unknown send outcome must not be retried automatically 同源纪律）详见 §5 批块；其余本地失败（store/解码/账号解析）维持 `-32603` `Internal error` 无锚词折叠不重试 | **P2 real**：直聊逐号码 + 群组 `send_message_to_group`；quote id/author→ACI + text 本机 store 找回（signal-cli 同行为，找不到缺省）；preview 面 + previewImage 随附件同批 CDN 上行（官方 Preview.image 同构）；mentions→BodyRange.MentionAci；textStyle→BodyRange.Style 五值词表单点映射（2026-10-06 透传批，connector 契约 1.69 §4.62 引擎侧缺口闭合：UTF-16 offsets 透传不查 body 边界——官方 parseTextStyles 同口径，与 mentions 同款调用方纪律，详见 §5）；attachments 为 connector 上游唯一形状（data URI 数组，`data:<type>[;filename=<pct>][;voice=true][;gif=true];base64,<payload>`，voice=true 映射官方 VOICE_MESSAGE flags + 官方算法波形/时长生成面（`AttachmentPointer.audioWaveform=21`/`audioDurationSeconds=22`，生成失败两字段全不带照发，2026-10-14 批 §5；presage voice_note 同构，2026-10-04）；gif=true 映射官方 Flags.GIF=8 位（flags 纯客户端线上陈述 CDN 上行面零涉及，engine 侧上传返回指针置位与官方消息组装期置位同构，与 voice/borderless 按位叠加；2026-10-14 GIF 批，§5））→ presage 官方 upload_attachments 上行（≤32 条、单条 ≤100MB，超限 fail-closed）；sticker 贴纸面（2026-10-04，官方 sendStickerMessage 同构）：image data URI 上行（mediatype 必须 image/*，width/height 官方 AttachmentPointer 展示位透传），packId hex/packKey base64（官方 Bytes.fromHex/fromBase64 同构），body=undefined 无常规附件；sticker 与 quote 共存（2026-10-04，官方「贴纸回应」StagedStickerReply = 同一 DataMessage 带 sticker+quote，非 reaction——Reaction proto 无贴纸位）：quote 组装与文本分支同源（assemble_quote 单点），author 不可解析 fail-closed、被引正文 store 找回失败降级缺 text，body 维持 undefined；viewOnce 阅后即焚面（2026-10-04，官方 isViewOnce=14 同名直投）：`viewOnce: true` → body 空 + 恰 1 附件 + `is_view_once=Some(true)` 的 DataMessage（官方发送侧不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入默认 0 = 官方初值），直聊/群组两形态同构，与 disappearing messages 完全独立；2026-10-11 群发送语义批（§5）：发送前刷群态（typing 免刷、取态失败回落本地 fail-open）+ 群形态 `results` 逐成员填充（成功/失败条目与直聊同构，type 四词表 additive）+ transcript 无论成败一律落库（群黑洞消除）+ 单成员 profile 行不可读降级 identified 不炸批；**2026-10-11 六问批 Q5（§5）**：quoteType/quoteBodyRanges 发送扩面——vendored SendQuote 扩 `gift_badge`/`body_ranges` 位（Quote.type=GIFT_BADGE 枚举 1/Quote.bodyRanges 字段 6——原文「Quote.type=2」系笔误，窗D A7 批订正），assemble_quote 单点同写 type（恒写 NORMAL/GIFTBADGE）与 BodyRange 条目，官方发送侧不 bump requiredProtocolVersion（构造面不设该字段，viewOnce 先例同构）；**2026-10-11 P15b 批（时序审计组二#9，§5，wire additive）**：直聊腿 per-recipient 成败收集——不再 fail-fast 丢弃部分成功（重试全批会对已达收件人重复投递）；混合结局（既有成功又有失败）返回 `{timestamp, results(成功条目原样), failures: [{recipientNumber, error: {code, message}}]}`（failures 空表键不在，旧宿主零变化；error 分类与整批错误面逐字同源——send_error_face 分类单点）；全败维持整批错误面（首错分类上抛，零已达收件人整批重试无重复风险）；附件/贴纸图上行失败仍整批早退（批级共享指针，未进逐收件人面）；群腿/editMessage/群发送系不变 |
@@ -142,7 +146,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
-| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}` | 同 send | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组 |
+| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}`（群腿全败面见错误列） | 同 send；**群腿失败显形批（2026-10-16，wire additive，engine-compat，§5 块）**：群腿零收件人（群成员过滤自身后为空）`-32603` + `Failed to send message: No recipients in group. (NoRecipientsException)`（确定未送达）；群腿逐收件人**全部失败** `-1` + `SEND_TYPING_GROUP_FAILED` + data.failures 词条计数（`{"UnregisteredFailure": 2}` 形，词表 = 群发送 per-recipient 失败词表同一单点 `group_send_failure_word`——只计词条与次数，无收件人身份）；部分失败 = `{}` 照常成功应答 + 引擎日志 warn 失败计数（固定字面量，无身份） | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组；**群腿失败显形批（2026-10-16，§5 块）**：群腿不再丢弃逐收件人 outcomes（此前 `.map(|_ | ())` 整体丢弃——成员全失败也回 `{}` 静默成功） |
 | `sendPinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, pinDurationSeconds?}` | `{}` | 同 send；pinDurationSeconds 超 u32 `-32603` | **P2 real**：官方 pinMessage=27；字段缺席/null=pinDurationForever |
 | `sendUnpinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp}` | `{}` | 同 send | **P2 real**：官方 unpinMessage=28 |
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
@@ -5663,6 +5667,92 @@ oneof 字段 19），各设备会话据此落通话记录条。引擎此前只�
   静默无日志降级（不写 stderr，IPC 服务不受影响）；引擎自有行只落固定
   字面量 cause 类（如 `send fast retry cause=WsRejected`），无收件人/
   号码/内容。
+
+### profile 名字刷新读路径 + 群腿零收件人防御批（2026-10-16，联系人名字材料与发送真空洞，wire additive【engine-compat】）
+
+- **背景（三路只读调查实证）**：桌面端联系人全部显示「未知联系人」/掩码名
+  （`c9b***4b` 形）——引擎只写自己的 profile、从不读别人的：JSON-RPC 全集
+  无 getProfile 类方法。运行库实证：contacts 3 行中 2 行 `name=''`
+  （掩码源）、profile_keys 3/3 齐全（名字材料在服务器可得）、profiles 表
+  0 行（从未拉过）。另一个洞：群腿零收件人（群成员过滤自身后为空）=
+  静默真空成功（三层无防御：vendored `send_message_to_group` 循环零次
+  results 空、引擎聚合点 `group_send_result_entries` 空进空出、send 应答
+  `Ok((ts, []))` 整体成功）；群 typing 逐收件人 outcomes 被整体丢弃
+  （`.map(|_| ())`），成员全失败也回 `{}`。
+- **vendored 名字持久化位置查证结论（本批先查证后动工）**：presage
+  `Manager::retrieve_profile_by_uuid`（vendor registered.rs 同路径）= 缓存
+  查（`store.profile(uuid, key)` 命中即回、零网络）→ 服务器拉
+  （`AccountManager::retrieve_profile`：identified websocket 取加密
+  profile → `ProfileCipher::decrypt` 解出名字）→ `store.save_profile`
+  落库。落库位置 = **`profiles` 表**（vendored
+  presage-store-sqlite content.rs：`INSERT OR REPLACE INTO profiles
+  VALUES (uuid, given_name, family_name, about, about_emoji, avatar,
+  unrestricted_unidentified_access)`），**不是 contacts.name**——
+  contacts 表与 profiles 表无写联动，getAvatar 既有的
+  `retrieve_profile_avatar_by_uuid` 同路径早已把完整 profile 落进
+  profiles 表，只是引擎从未读过名字列。因此 listContacts 投影数据源 =
+  profiles 表（经 `store.profile(uuid, key)` 读，profile_keys INNER
+  JOIN），不写 contacts.name（contacts 同步名权威 = 手机 contacts sync，
+  引擎不发明 system/nickname 面，storage_merge 既有纪律）。
+- **新方法 `profiles.refreshContacts`（KT 扩展，wire additive）**：
+  params `{account}`（字符串必需，缺席/非字符串 fail-closed `-32603`
+  ——phoneLookup 同款参数纪律）；
+  result `{refreshed, failed, skipped}` 三 u32 计数恒在，**只计数不含
+  任何身份/号码/名字内容**（引擎零联系人外传纪律同向）。目标集 = store
+  contacts 中 profile_key 在库且名字材料为空者（contacts.name 空且
+  profiles 表无名字材料——后者查证即上条结论；无 profile_key =
+  skipped）；刷新单点 `refresh_contact_profiles`：presage
+  `retrieve_profile_by_uuid` 逐联系人拉取，**并发 ≤3**（3 个独立
+  `Manager::load_registered` 各持 websocket 槽，不与发送常驻管理器争
+  锁），**单联系人失败不中断批次**（逐个 best-effort），**整批时限 20s**
+  （到期未尝试计 failed——诚实语义：本次刷新尝试未使其刷新成功）；
+  refreshed = 拉取成功（服务器侧名字材料仍空也如实计 refreshed——计数
+  语义是「刷新动作结局」）；failed = 拉取失败或到期未尝试；skipped =
+  无需刷新。presage 侧 profile 缓存使重复刷新零流量幂等（profiles 表
+  已有名者本就不进目标集；名字仍空的缓存命中零网络）。
+- **自动批触发面**：登录/建流 sync 臂（60s 一次性纪律同门，`initial_sync_due`
+  单点闸）在 `send_initial_sync_requests` + manifest 自动拉
+  之后 spawn_local 独立任务，**+10s 联系人沉降**（contacts sync 从主
+  设备异步回传，等材料落库）后跑同一刷新单点，best-effort 失败静默（零
+  stderr 纪律，失败靠显式方法/下次链路建立重补）；与显式方法零互斥
+  （读面幂等）。
+- **listContacts 投影补全（wire additive）**：条目 additive `profile`
+  键——`{givenName, familyName}`，**仅非空时出现**：两件全空 = 整键不
+  在；单件空 = 该键不在（no-null 纪律，缺席与 null 折叠同一无键态）。
+  键名与 signal-cli 同形（connector supervisor 消费腿
+  `profile.givenName`/`profile.familyName` 同形状），数据源 = 刷新后的
+  profiles 表。`name` 键语义不变。旧宿主零变化：未刷新库（profiles 表
+  空）应答逐字节同形。
+- **群腿零收件人防御（确定性失败，杜绝真空成功）**：新增
+  `SendError::NoRecipients`（错误面 `-32603` + `Failed to send message:
+  No recipients in group. (NoRecipientsException)`，锚词
+  `(NoRecipientsException)`，`is_definite_failure=true`——请求从未构造
+  收件人面，确定未送达；群腿无整体自动重试（既有裁定），该 true 只补
+  结局类完备性）。防御点两处全覆盖：
+  1. MRM 主路径（group_mrm.rs targets 计算，members 过滤自身后）为空
+     → 直接 `NoRecipients`（此前掉进 failover → vendored 空循环 →
+     Ok 空真空成功）；
+  2. vendored failover 返回后 outcomes 为空（群态取不到回退路径与
+     逐收件人路径的全部空收件人面）→ 转 `NoRecipients`（vendored 内部
+     已落的本地 transcript 副本为无 wire 影响的本地副作用，可接受；
+     引擎对 connector 的结局从 Ok([]) 翻转为确定性失败，真空成功
+     关闭）。
+  群 typing 同口径：vendored 返回空 outcomes → `NoRecipients`。
+- **sendTyping 群腿失败显形（wire additive）**：不再丢弃逐收件人
+  outcomes——空 outcomes = `NoRecipients`（上条）；**全部收件人失败**
+  = `-1` + `SEND_TYPING_GROUP_FAILED` + `data.failures` 词条计数
+  （`{"UnregisteredFailure": 2, "NetworkFailure": 1}` 形；词表复用群
+  发送 per-recipient 失败词表单点 `group_send_failure_word`——
+  NotFound=UnregisteredFailure、UntrustedIdentity=
+  UntrustedIdentityFailure、Unauthorized=AuthorizationFailedFailure、
+  其余=NetworkFailure；只计词条与次数，无收件人身份/顺序）；**部分
+  失败** = `{}` 照常成功应答（typing 非投递承诺，部分成员收到即达标）
+  + `tracing::warn!` 失败计数（固定字面量+数值，无身份——进
+  engine-stderr.log，send 链日志纪律同向）。
+- **fake 面**：`profiles.refreshContacts` → `{refreshed:0, failed:0,
+  skipped:0}`（形状桩）；listContacts fake → `[]` 不变；sendTyping
+  fake 早退成功 `{}` 不变（fake 无 store 无群态，失败面只在 real 生
+  效）。
 
 ## 6. fake 服务模式（仅测试）
 
