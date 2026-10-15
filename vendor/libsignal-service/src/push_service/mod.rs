@@ -234,6 +234,7 @@ impl PushService {
             unidentified_push_service,
         );
         let task = task.instrument(span);
+        tracing::warn!("ka_diag task spawned"); // KA-DIAG
         tokio::task::spawn(task);
         Ok(ws)
     }

@@ -186,6 +186,15 @@
   停滞 30-60s 判死带）。
 - `src/push_service/cdn.rs`（同批）— `get_from_cdn`（附件/头像/贴纸
   CDN GET 流式下载面）改走 `download_request`；上传/resume 面不动。
+- `src/websocket/mod.rs`、`src/push_service/mod.rs`（2026-10-16 ka_diag
+  保活可见性诊断批，**临时插桩可整体回退**）— 纯日志：`run` 保活循环
+  加 8 条 `// KA-DIAG` warn 探针（tick 开火带 pending 计数、keepalive
+  send 失败 info→warn、keepalive 应答非 2xx、全部 break/return 退出
+  路径带字面量 reason、spawn 点 `ka_diag task spawned`），全部固定
+  字面量无内容，不改任何行为逻辑（`?` 传播路径仍由既有
+  `SignalWebSocket: {}` error 行覆盖）。背景：WS 管道服务器侧 1001
+  idle timeout 与保活任务静默死亡无第一手证据（"sending keep-alive"
+  为 debug 级不落 engine-stderr.log）。
 
 `vendor/presage/`（rev 33dd149）：
 

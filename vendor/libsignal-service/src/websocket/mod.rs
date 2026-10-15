@@ -196,6 +196,7 @@ impl SignalWebSocketProcess {
                                 %status,
                                 "response code for keep-alive not successful"
                             );
+                            tracing::warn!(%status, "ka_diag keepalive response non-success, task exiting"); // KA-DIAG
                             return Err(ServiceError::UnhandledResponseCode {
                                 status,
                                 body: String::from_utf8_lossy(response.body())
@@ -238,6 +239,7 @@ impl SignalWebSocketProcess {
         loop {
             futures::select! {
                 _ = ka_interval.tick().fuse() => {
+                    tracing::warn!(pending = self.outgoing_keep_alive_set.len(), "ka_diag tick fired"); // KA-DIAG
                     use prost::Message;
                     if !self.outgoing_keep_alive_set.is_empty() {
                         tracing::warn!("Websocket will be closed due to failed keepalives.");
@@ -245,6 +247,7 @@ impl SignalWebSocketProcess {
                             tracing::debug!("Could not close WebSocket: {:?}", e);
                         }
                         self.outgoing_keep_alive_set.clear();
+                        tracing::warn!("ka_diag task exiting: failed keepalives"); // KA-DIAG
                         break;
                     }
                     tracing::debug!("sending keep-alive");
@@ -260,7 +263,8 @@ impl SignalWebSocketProcess {
                     };
                     let buffer = msg.encode_to_vec();
                     if let Err(e) = self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await {
-                        tracing::info!("Websocket sink has closed: {:?}.", e);
+                        tracing::warn!("Websocket sink has closed: {:?}.", e); // KA-DIAG: info→warn
+                        tracing::warn!("ka_diag task exiting: keepalive send failed"); // KA-DIAG
                         break;
                     };
                 },
@@ -297,6 +301,7 @@ impl SignalWebSocketProcess {
                         }
                         None => {
                             debug!("end of application request stream; websocket closing");
+                            tracing::warn!("ka_diag task exiting: application request stream ended"); // KA-DIAG
                             return Ok(());
                         }
                     }
@@ -307,6 +312,7 @@ impl SignalWebSocketProcess {
                     match web_socket_item {
                         Some(Ok(Message::Close { code, reason })) => {
                             tracing::warn!(%code, reason, "websocket closed");
+                            tracing::warn!("ka_diag task exiting: websocket close frame"); // KA-DIAG
                             break;
                         },
                         Some(Ok(Message::Binary(frame))) => {
@@ -321,8 +327,12 @@ impl SignalWebSocketProcess {
                         Some(Ok(Message::Text(_))) => {
                             tracing::trace!("received text (unsupported, skipping)");
                         }
-                        Some(Err(e)) => return Err(e.into()),
+                        Some(Err(e)) => {
+                            tracing::warn!("ka_diag task exiting: inbound websocket error"); // KA-DIAG
+                            return Err(e.into());
+                        }
                         None => {
+                            tracing::warn!("ka_diag task exiting: end of web request stream"); // KA-DIAG
                             return Err(ServiceError::WsClosing {
                                 reason: "end of web request stream; socket closing"
                             });
