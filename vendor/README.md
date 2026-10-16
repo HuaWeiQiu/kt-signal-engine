@@ -236,6 +236,19 @@
   读面（groups.rs）保持 v1 + 裸 Group 解码不动（v1 契约自洽）。双契约以
   活体捕获字节钉入 `groups_v2::manager::live_group_endpoint_fixture`
   单测。
+- `src/websocket/mod.rs`（2026-10-17 保活 STALE 哨兵批）— 保活 tick 发送
+  前检查 `last_alive_at`（上次成功保活应答时刻，成功应答即刷新、构造时
+  初始化 `Instant::now()`）：距今 ≥5 分钟
+  （`STALE_KEEPALIVE_THRESHOLD`，纯函数 `keepalive_is_stale`，官方
+  `isOlderThan` 同判含边界）→ 不在该链路上发送，走既有 failed-keepalives
+  关闭路径自关重连（close frame reason 字面量 `"stale"` + warn 字面量 +
+  KA-DIAG 退出探针）。背景：机器休眠唤醒后在死链上照发保活（官方桌面
+  WebsocketResources.preload.ts:508 STALE_THRESHOLD_MS=5min / :612-620
+  send 前 stale 检查同位；既有 30s 未应答闸只覆盖「发过没回」，不覆盖
+  「应答成功后链路静默死亡」）。`keepalive_stale_tests` 三例单测
+  （阈值钉形 / 超阈含边界判 stale / 新鲜应答不误伤）。
+- `src/websocket/directory.rs`、`src/websocket/slot.rs`（同批
+  `cargo fmt` 收口）— 稳定通道 rustfmt 子集重排，语义零变化。
 
 `vendor/presage/`（rev 33dd149）：
 

@@ -42,6 +42,19 @@ mod usernames;
 /// KT (single-connection): the 4409 branch decision consumes this literal.
 pub const CLOSE_CODE_CONNECTED_ELSEWHERE: u16 = 4409;
 
+/// Close the websocket when the last successful keepalive response is at
+/// least this old, instead of sending on a dead link (machine
+/// suspend/wake). Official Desktop
+/// `WebsocketResources.preload.ts:508` `STALE_THRESHOLD_MS`.
+pub const STALE_KEEPALIVE_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Official `isOlderThan(lastAliveAt, STALE_THRESHOLD_MS)` — an elapsed
+/// time at or beyond the threshold is stale.
+fn keepalive_is_stale(last_alive_at: Instant, now: Instant) -> bool {
+    now.duration_since(last_alive_at) >= STALE_KEEPALIVE_THRESHOLD
+}
+
 pub use request::WebSocketRequestMessageBuilder;
 
 type RequestStreamItem = (
@@ -133,6 +146,10 @@ struct SignalWebSocketProcess {
     >,
 
     outgoing_keep_alive_set: HashSet<u64>,
+
+    // KT: moment of the last successful keepalive response; the tick arm
+    // closes the link instead of sending once this goes stale (suspend/wake).
+    last_alive_at: Instant,
 
     outgoing_responses: FuturesUnordered<
         BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
@@ -232,6 +249,7 @@ impl SignalWebSocketProcess {
                                     .into_owned(),
                             });
                         }
+                        self.last_alive_at = Instant::now();
                     } else {
                         tracing::warn!(
                             ?response,
@@ -270,6 +288,15 @@ impl SignalWebSocketProcess {
                 _ = ka_interval.tick().fuse() => {
                     tracing::warn!(pending = self.outgoing_keep_alive_set.len(), "ka_diag tick fired"); // KA-DIAG
                     use prost::Message;
+                    if keepalive_is_stale(self.last_alive_at, Instant::now()) {
+                        tracing::warn!("Websocket will be closed due to stale keepalive state: last successful keepalive response is at least 5 minutes in the past (stale).");
+                        if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, Some("stale")).await {
+                            tracing::debug!("Could not close WebSocket: {:?}", e);
+                        }
+                        self.outgoing_keep_alive_set.clear();
+                        tracing::warn!("ka_diag task exiting: stale keepalive state"); // KA-DIAG
+                        break;
+                    }
                     if !self.outgoing_keep_alive_set.is_empty() {
                         tracing::warn!("Websocket will be closed due to failed keepalives.");
                         if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, None).await {
@@ -439,6 +466,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             request_sink: incoming_request_sink,
             outgoing_requests: HashMap::default(),
             outgoing_keep_alive_set: HashSet::new(),
+            last_alive_at: Instant::now(),
             // Initializing the FuturesUnordered with a `pending` future means it will never fuse
             // itself, so an "empty" FuturesUnordered will still allow new futures to be added.
             outgoing_responses: vec![
@@ -580,5 +608,42 @@ impl WebSocketResponseMessage {
             .as_ref()
             .ok_or(ServiceError::UnsupportedContent)
             .and_then(|b| serde_json::from_slice(b).map_err(Into::into))
+    }
+}
+
+#[cfg(test)]
+mod keepalive_stale_tests {
+    use super::{keepalive_is_stale, STALE_KEEPALIVE_THRESHOLD};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    // KT: the suspend/wake sentinel must match the official 5-minute
+    // threshold exactly (WebsocketResources.preload.ts:508).
+    #[test]
+    fn stale_threshold_is_five_minutes() {
+        assert_eq!(STALE_KEEPALIVE_THRESHOLD, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn last_alive_at_or_beyond_threshold_is_stale() {
+        // Official isOlderThan: elapsed >= threshold, boundary included.
+        let last = Instant::now();
+        assert!(keepalive_is_stale(last, last + Duration::from_secs(5 * 60)));
+        // Machine slept for half an hour: first tick after wake must trip.
+        assert!(keepalive_is_stale(
+            last,
+            last + Duration::from_secs(30 * 60)
+        ));
+    }
+
+    #[test]
+    fn fresh_keepalive_response_is_not_stale() {
+        let last = Instant::now();
+        assert!(!keepalive_is_stale(last, last));
+        assert!(!keepalive_is_stale(last, last + Duration::from_secs(30)));
+        assert!(!keepalive_is_stale(
+            last,
+            last + Duration::from_secs(4 * 60)
+        ));
     }
 }

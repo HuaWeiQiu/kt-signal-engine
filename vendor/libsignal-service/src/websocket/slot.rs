@@ -37,8 +37,10 @@ impl<C: super::WebSocketType> Default for AccountSlot<C> {
 
 type SlotMap<C> = LazyLock<Mutex<HashMap<String, Arc<AccountSlot<C>>>>>;
 
-static IDENTIFIED_SLOTS: SlotMap<Identified> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static UNIDENTIFIED_SLOTS: SlotMap<Unidentified> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static IDENTIFIED_SLOTS: SlotMap<Identified> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static UNIDENTIFIED_SLOTS: SlotMap<Unidentified> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 async fn slot_for<C: super::WebSocketType>(
     slots: &SlotMap<C>,
