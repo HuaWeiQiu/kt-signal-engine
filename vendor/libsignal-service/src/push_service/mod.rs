@@ -102,9 +102,14 @@ pub struct PushService {
     download_client: reqwest::Client,
 }
 
-fn pinned_client_builder(ca_pem: &str, user_agent: &str) -> reqwest::ClientBuilder {
+fn pinned_client_builder(
+    ca_pem: &str,
+    user_agent: &str,
+) -> reqwest::ClientBuilder {
     reqwest::ClientBuilder::new()
-        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()])
+        .tls_certs_only([
+            reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()
+        ])
         .user_agent(user_agent)
         .http1_only()
 }
@@ -122,17 +127,22 @@ impl PushService {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
 
-        let client = pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
-            .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
-            .timeout(CONTROL_PLANE_TOTAL_TIMEOUT)
-            .build()
-            .unwrap();
-        let download_client =
-            pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
-                .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
-                .read_timeout(DOWNLOAD_READ_STALL_TIMEOUT)
-                .build()
-                .unwrap();
+        let client = pinned_client_builder(
+            &cfg.certificate_authority,
+            user_agent.as_ref(),
+        )
+        .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
+        .timeout(CONTROL_PLANE_TOTAL_TIMEOUT)
+        .build()
+        .unwrap();
+        let download_client = pinned_client_builder(
+            &cfg.certificate_authority,
+            user_agent.as_ref(),
+        )
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_STALL_TIMEOUT)
+        .build()
+        .unwrap();
 
         Self {
             servers: env,
@@ -239,17 +249,19 @@ impl PushService {
         Ok(ws)
     }
 
-    // KT (groups fetch): GET /v1/groups/ answers GroupResponse{group=1,
-    // group_send_endorsements_response=2} (Android GroupsV2Api.getGroup);
-    // decoding it as a bare Group lands the inner group bytes in
-    // `publicKey` and drops the endorsements needed for group-send tokens.
+    // KT (groups fetch): the GroupResponse{group=1,
+    // group_send_endorsements_response=2} wrapper is served by
+    // /v2/groups/ (Android GROUPSV2_GROUP). /v1/groups/ strips the
+    // wrapper and answers a bare Group, which fails this decode with
+    // "invalid tag value: 0" — see the live-fixture test in
+    // groups_v2::manager.
     pub(crate) async fn get_group_response(
         &mut self,
         credentials: HttpAuth,
     ) -> Result<crate::proto::GroupResponse, ServiceError> {
         self.request(
             Method::GET,
-            Endpoint::storage("/v1/groups/"),
+            Endpoint::storage("/v2/groups/"),
             HttpAuthOverride::Identified(credentials),
         )?
         .send()

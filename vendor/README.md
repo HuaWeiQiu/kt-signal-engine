@@ -223,6 +223,16 @@
   -> Result<bool, MessageSenderError>`（true=新建会话；SESSION_ESTABLISH
   emit 随臂走；原调用点改委托，行为零变化）——发送路径与宿主预热共用
   单一建会话点，不发任何消息。
+- `src/push_service/mod.rs`（2026-10-17 群态取回端点批）—
+  `get_group_response` 路径 `/v1/groups/` → `/v2/groups/`（Android
+  GROUPSV2_GROUP 同位）：/v1 应答裸 `Group`（GroupsV1Controller 剥包装、
+  不回 endorsements），`GroupResponse` 解码必败 tag 0（活体
+  2026-10-16 04:05/07:38Z 双臂同败）；v2 才是
+  `GroupResponse{group=1, group_send_endorsements_response=2}` 包装面，
+  GSE endorsements 自此真实回到取数面。engine 侧 `fetch_group_state`
+  读面（groups.rs）保持 v1 + 裸 Group 解码不动（v1 契约自洽）。双契约以
+  活体捕获字节钉入 `groups_v2::manager::live_group_endpoint_fixture`
+  单测。
 
 `vendor/presage/`（rev 33dd149）：
 
