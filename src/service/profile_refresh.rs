@@ -135,6 +135,7 @@ pub(crate) async fn refresh_contact_profiles(
         // fake 形状桩（compat §6）：零计数应答，无 store 可达。
         return Ok(RefreshCounts::default());
     }
+    let batch_started = std::time::Instant::now();
     let dir = {
         let state = service.state.lock().await;
         let rel = state
@@ -142,9 +143,30 @@ pub(crate) async fn refresh_contact_profiles(
             .ok_or(RefreshError::UnknownAccount)?;
         service.data_dir.join(rel)
     };
-    let store = open_store(&dir)
-        .await
-        .map_err(|_| RefreshError::UnknownAccount)?;
+    // 归因探针（2026-10-16 listGroups Internal 批）：批开始（零内容——
+    // 账号不落，落目标面数量级即可），与 listGroups 0ms 失败窗时序对表。
+    tracing::warn!("profile refresh batch start");
+    let store_open_started = std::time::Instant::now();
+    let store = match open_store(&dir).await {
+        Ok(store) => {
+            tracing::warn!(
+                stage = "collect_store_open",
+                ok = true,
+                elapsed_ms = store_open_started.elapsed().as_millis() as u64,
+                "profile refresh store open",
+            );
+            store
+        }
+        Err(()) => {
+            tracing::warn!(
+                stage = "collect_store_open",
+                ok = false,
+                elapsed_ms = store_open_started.elapsed().as_millis() as u64,
+                "profile refresh store open",
+            );
+            return Err(RefreshError::UnknownAccount);
+        }
+    };
 
     // —— 目标收集：profile_key 权威读（profile_keys 表，join 键同源）+
     // 材料在库跳过检查（本地读零网络）。contacts/profile_keys/profile
@@ -200,6 +222,14 @@ pub(crate) async fn refresh_contact_profiles(
         counts.refreshed += partial.refreshed;
         counts.failed += partial.failed;
     }
+    // 归因探针：批结束（计数 + 全批耗时，与开始探针对表锁窗时序）。
+    tracing::warn!(
+        refreshed = counts.refreshed,
+        failed = counts.failed,
+        skipped = counts.skipped,
+        elapsed_ms = batch_started.elapsed().as_millis() as u64,
+        "profile refresh batch done",
+    );
     Ok(counts)
 }
 
@@ -216,11 +246,31 @@ async fn refresh_chunk(
     if targets.is_empty() {
         return;
     }
-    let Ok(store) = open_store(dir).await else {
+    // 归因探针（每 Manager store 打开结果，含耗时 ms）：独立连接/manager
+    // 与主 manager 的 store 并发面即本批归因重点，打开成败与耗时落日志。
+    let store_open_started = std::time::Instant::now();
+    let store_open = open_store(dir).await;
+    tracing::warn!(
+        stage = "chunk_store_open",
+        ok = store_open.is_ok(),
+        targets = targets.len(),
+        elapsed_ms = store_open_started.elapsed().as_millis() as u64,
+        "profile refresh store open",
+    );
+    let Ok(store) = store_open else {
         counts.failed += targets.len() as u32;
         return;
     };
-    let Ok(mut manager) = Manager::<SqliteStore, Registered>::load_registered(store).await else {
+    let manager_open_started = std::time::Instant::now();
+    let manager_open = Manager::<SqliteStore, Registered>::load_registered(store).await;
+    tracing::warn!(
+        stage = "chunk_manager_open",
+        ok = manager_open.is_ok(),
+        targets = targets.len(),
+        elapsed_ms = manager_open_started.elapsed().as_millis() as u64,
+        "profile refresh manager open",
+    );
+    let Ok(mut manager) = manager_open else {
         counts.failed += targets.len() as u32;
         return;
     };
