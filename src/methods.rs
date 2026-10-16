@@ -2190,6 +2190,7 @@ async fn dispatch(
                         "identitiesReplaced": outcome.identities_replaced,
                         "profileKeysSet": outcome.profile_keys_set,
                         "contactsCreated": outcome.contacts_created,
+                        "contactsNameUpdated": outcome.contacts_name_updated,
                         "trustStatesSynced": outcome.trust_states_synced,
                     }),
                 ),

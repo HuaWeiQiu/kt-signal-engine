@@ -507,7 +507,8 @@ fn storage_merge_contacts_fake_shapes_and_param_fail_closed() {
     let dir = temp_dir("merge-contacts-fake");
     let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
 
-    // fake：零汇总幂等形状（七字段 camelCase 全键在场）。
+    // fake：零汇总幂等形状（八字段 camelCase 全键在场；contactsNameUpdated
+    // wire additive 2026-10-16 姓名升级批）。
     assert_eq!(
         engine.request(
             "storage.mergeContacts",
@@ -520,6 +521,7 @@ fn storage_merge_contacts_fake_shapes_and_param_fail_closed() {
             "identitiesReplaced": 0,
             "profileKeysSet": 0,
             "contactsCreated": 0,
+            "contactsNameUpdated": 0,
             "trustStatesSynced": 0,
         })
     );

@@ -17,7 +17,9 @@
 //! - profileKey 非空且本地缺失 → upsert_profile_key（官方 isFirstSync ||
 //!   !localProfileKey 同闸；已有不覆盖）。
 //! - 联系人缺失 → save_contact 建档（e164/name/profileKey 随建）；已有
-//!   不改（姓名权威 = 手机 contacts sync，引擎不发明 system/nickname 面）。
+//!   档 → 存储名（given+family）非空且与本地不同 → 覆盖本地 contacts.name
+//!   （官方 Storage 通道可信同步源语义，姓名升级批 2026-10-16；存储名空
+//!   保留本地，同名跳过；引擎仍不发明 system/nickname 面）。
 //! - 无消费模型字段（unregisteredAtTimestamp/hideStory/hidden/avatarColor/
 //!   note/nickname 族）记档跳过——archived/markedUnread/muted/blocked 已有
 //!   专用读写面（A2/拉黑批），此处不重复。
@@ -52,8 +54,11 @@ pub(crate) struct MergeOutcome {
     pub(crate) identities_replaced: u32,
     /// 本地缺失而补入的 profile key 数。
     pub(crate) profile_keys_set: u32,
-    /// contacts 表新建档数（已有档不动）。
+    /// contacts 表新建档数。
     pub(crate) contacts_created: u32,
+    /// contacts 表既有档名字升级数（存储名非空且与本地不同 → 覆盖本地
+    /// name；姓名升级批 2026-10-16，wire additive）。
+    pub(crate) contacts_name_updated: u32,
     /// sidecar 信任态随 identityState 收敛次数。
     pub(crate) trust_states_synced: u32,
 }
@@ -67,6 +72,26 @@ fn trust_state_of(identity_state: i32) -> identity::TrustState {
         Ok(IdentityState::Unverified) => identity::TrustState::Unverified,
         _ => identity::TrustState::Default,
     }
+}
+
+/// 存储名复合（given+family 空格拼接，family 空则单段）——建档与姓名
+/// 升级两臂共用单点（复合规则漂移即断）。
+fn stored_name_of(contact: &storage_proto::ContactRecord) -> String {
+    let mut name = contact.given_name.clone();
+    if !contact.family_name.is_empty() {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(&contact.family_name);
+    }
+    name
+}
+
+/// 姓名升级判定（官方 Storage 通道姓名权威批 2026-10-16，纯函数零 IO
+/// ——三臂单测钉定）：存储名非空且 != 本地名 → Some(新名)；存储名空
+/// （无权威材料，保留本地）或同名（幂等 no-op）→ None。
+fn name_upgrade_of(stored_name: &str, local_name: &str) -> Option<String> {
+    (!stored_name.is_empty() && stored_name != local_name).then(|| stored_name.to_owned())
 }
 
 /// ContactRecord → service id（官方 fromAciUuidBytesOrString/
@@ -262,36 +287,43 @@ pub(crate) async fn merge_contacts(
             }
         }
 
-        // 联系人建档：缺失才建（姓名/e164/profileKey 随建）；已有档不动（姓名权威 =
-        // 手机 contacts sync，engine 不发明 system/nickname 面——官方
-        // systemGivenName 族 set 位记档跳过）。
-        if matches!(context.store.contact_by_id(&service_id).await, Ok(None)) {
-            let mut name = contact.given_name.clone();
-            if !contact.family_name.is_empty() {
-                if !name.is_empty() {
-                    name.push(' ');
+        // 联系人面（官方 mergeContactRecord 姓名升级批 2026-10-16）：缺失
+        // → 建档（e164/name/profileKey 随建）；已有 → 存储名非空且与本地
+        // 不同 → save_contact 覆盖本地 name（其余本地字段原样保留，
+        // contacts_name_updated 计数）；存储名空保留本地；同名跳过。读
+        // 失败维持原状静默跳过（与此前 Err 臂同口径）。
+        match context.store.contact_by_id(&service_id).await {
+            Ok(None) => {
+                let contact_model = Contact {
+                    uuid,
+                    phone_number: if contact.e164.is_empty() {
+                        None
+                    } else {
+                        presage::libsignal_service::prelude::phonenumber::parse(None, &contact.e164)
+                            .ok()
+                    },
+                    name: stored_name_of(&contact),
+                    verified: Default::default(),
+                    profile_key: contact.profile_key.clone(),
+                    expire_timer: 0,
+                    expire_timer_version: 0,
+                    inbox_position: 0,
+                    avatar: None,
+                };
+                if context.store.save_contact(&contact_model).await.is_ok() {
+                    outcome.contacts_created += 1;
                 }
-                name.push_str(&contact.family_name);
             }
-            let contact_model = Contact {
-                uuid,
-                phone_number: if contact.e164.is_empty() {
-                    None
-                } else {
-                    presage::libsignal_service::prelude::phonenumber::parse(None, &contact.e164)
-                        .ok()
-                },
-                name,
-                verified: Default::default(),
-                profile_key: contact.profile_key.clone(),
-                expire_timer: 0,
-                expire_timer_version: 0,
-                inbox_position: 0,
-                avatar: None,
-            };
-            if context.store.save_contact(&contact_model).await.is_ok() {
-                outcome.contacts_created += 1;
+            Ok(Some(local)) => {
+                if let Some(name) = name_upgrade_of(&stored_name_of(&contact), &local.name) {
+                    let mut updated = local;
+                    updated.name = name;
+                    if context.store.save_contact(&updated).await.is_ok() {
+                        outcome.contacts_name_updated += 1;
+                    }
+                }
             }
+            Err(_) => {}
         }
     }
     Ok((outcome, observed))
@@ -498,5 +530,46 @@ mod tests {
             identity::TrustState::Default
         );
         assert_eq!(trust_state_of(99), identity::TrustState::Default);
+    }
+
+    /// 姓名升级三臂（姓名升级批 2026-10-16，compat §3/§5 窗D A4）+ 复合
+    /// 单点：空→非空升级、非空不同覆盖、空存储名保留本地、同名跳过；
+    /// given+family 空格拼接规则建档/升级两臂同源。
+    #[test]
+    fn contact_name_upgrade_arms() {
+        fn record(given: &str, family: &str) -> storage_proto::ContactRecord {
+            storage_proto::ContactRecord {
+                given_name: given.to_owned(),
+                family_name: family.to_owned(),
+                ..storage_proto::ContactRecord::default()
+            }
+        }
+
+        // 复合单点：两段 → "given family"；单段 → 原样；两段全空 → 空串。
+        assert_eq!(stored_name_of(&record("Ada", "Lovelace")), "Ada Lovelace");
+        assert_eq!(stored_name_of(&record("Ada", "")), "Ada");
+        assert_eq!(stored_name_of(&record("", "Lovelace")), "Lovelace");
+        assert_eq!(stored_name_of(&record("", "")), "");
+
+        // 臂一：空→非空升级（本地旧名被存储名覆盖）。
+        assert_eq!(
+            name_upgrade_of(&stored_name_of(&record("Ada", "Lovelace")), "stale local"),
+            Some("Ada Lovelace".to_owned())
+        );
+        // 臂二：非空不同 → 覆盖（手机端改名收敛进引擎）。
+        assert_eq!(
+            name_upgrade_of(&stored_name_of(&record("Ada", "King")), "Ada Lovelace"),
+            Some("Ada King".to_owned())
+        );
+        // 臂三：空存储名 → 保留本地（None）。
+        assert_eq!(
+            name_upgrade_of(&stored_name_of(&record("", "")), "Ada Lovelace"),
+            None
+        );
+        // 同名 → 跳过（幂等 no-op）。
+        assert_eq!(
+            name_upgrade_of(&stored_name_of(&record("Ada", "Lovelace")), "Ada Lovelace"),
+            None
+        );
     }
 }
