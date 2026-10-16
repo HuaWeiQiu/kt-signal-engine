@@ -1211,6 +1211,32 @@ fn presage_error_variant_face(
     }
 }
 
+/// SendError 变体路径字面量（listGroups/listContacts 读面探针专用，
+/// 2026-10-16 listGroups Internal 归因批）：dispatch 层读面 Err 折
+/// -32603 前落一行变体路径（与 send_error_of 三 fallback 臂同风格——
+/// 只走类型路径零 payload）。SendError 非 non_exhaustive，逐变体穷尽
+/// 映射，上游加变体编译期报错。
+pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
+    match error {
+        SendError::UnknownAccount => "SendError::UnknownAccount",
+        SendError::TargetTerminated => "SendError::TargetTerminated",
+        SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
+        SendError::Unbound => "SendError::Unbound",
+        SendError::RateLimited => "SendError::RateLimited",
+        SendError::ProofRequired => "SendError::ProofRequired",
+        SendError::ServerUnavailable => "SendError::ServerUnavailable",
+        SendError::IdentityUnverified => "SendError::IdentityUnverified",
+        SendError::WsRejected => "SendError::WsRejected",
+        SendError::WsTimeout => "SendError::WsTimeout",
+        SendError::WsTransport => "SendError::WsTransport",
+        SendError::PreKey => "SendError::PreKey",
+        SendError::SessionBuild => "SendError::SessionBuild",
+        SendError::AttachmentUpload => "SendError::AttachmentUpload",
+        SendError::NoRecipients => "SendError::NoRecipients",
+        SendError::Internal => "SendError::Internal",
+    }
+}
+
 /// P9 身份拒发闸（服务层）：对端 sidecar 条目挂起（接收侧换钥未获确认）
 /// → 拒发。直聊内容发送单点判定（闸面与确认钩子见 identity 模块注与
 /// compat §5）；首联系人（无条目）恒放行。sidecar 读失败 = 未挂起
@@ -3554,6 +3580,15 @@ impl Service {
         let own_aci = presage::libsignal_service::protocol::Aci::from(
             manager.registration_data().service_ids.aci,
         );
+        // Internal 来源静态标注（2026-10-16 listGroups Internal 归因批）：
+        // 本函数 Err 出口仅两条——`open_registered` 失败（UnknownAccount，
+        // 冷路径含 open_store+load_registered，毫秒级）与本臂（groups()
+        // sqlx 读失败， Internal）。生产实证（engine+connector 双侧日志，
+        // 2026-10-16 07:37-07:39 窗）失败全部 duration_ms=0 且 open_store
+        // 零失败行——与本函数毫秒级路径不符；0ms 窗主因在 dispatch 层
+        // groupId 过滤 reject 臂（methods.rs，decode fail-closed 本函数
+        // 不可达）。本臂探针已由读面 Err 变体探针（send_error_variant_
+        // face）覆盖，此处不再单点落日志。
         let groups = manager
             .store()
             .groups()
@@ -9841,6 +9876,31 @@ pub(crate) fn decode_group_id(group_id: &str) -> Option<Vec<u8>> {
     (key.len() == 32).then_some(key)
 }
 
+/// listGroups groupId 过滤参数拒绝类别（2026-10-16 listGroups Internal
+/// 归因批，探针专用纯函数）：`decode_group_id` 返回 None 时细分失败类别
+/// 字面量（零内容——群 master key 值与其 base64 串不进日志，只落结构
+/// 类别）。类别集：非字符串条目 / base64 解码失败 / 解码成功但非 32B；
+/// `filter_decoded_ok` 为防御位（与主判定矛盾，理论不可达，记档不炸）。
+pub(crate) fn group_filter_reject_stage(entry: &Value) -> &'static str {
+    let Some(raw) = entry.as_str() else {
+        return "filter_not_string";
+    };
+    match decode_group_id(raw) {
+        None => {
+            use base64::Engine as _;
+            if base64::engine::general_purpose::STANDARD
+                .decode(raw.trim())
+                .is_err()
+            {
+                "filter_base64_invalid"
+            } else {
+                "filter_key_len"
+            }
+        }
+        Some(_) => "filter_decoded_ok",
+    }
+}
+
 /// listGroups 单群读过滤判定（P15b 审计项5：可选 groupId 过滤参数，
 /// connector §4.53/§4.57/§4.62 fold 读已派发 `groupId: [id]` 数组形）：
 /// filter 缺席 = 全放行（全表旧行为）；在场 = master key 逐字节命中任一
@@ -12971,6 +13031,43 @@ mod tests {
             None
         );
         assert_eq!(decode_group_id("not base64!!"), None);
+    }
+
+    /// 读面探针类别钉形（2026-10-16 listGroups Internal 归因批）：reject
+    /// 类别三分（非字符串/base64 坏/长度错）与零内容纪律（字面量不含
+    /// 参数值）；SendError 变体路径穷尽映射代表性臂 + 兜底字面量形状。
+    #[test]
+    fn list_read_face_probe_stage_and_variant_faces() {
+        assert_eq!(
+            group_filter_reject_stage(&serde_json::json!(32)),
+            "filter_not_string"
+        );
+        assert_eq!(
+            group_filter_reject_stage(&serde_json::json!("not base64!!")),
+            "filter_base64_invalid"
+        );
+        assert_eq!(
+            group_filter_reject_stage(&serde_json::json!(
+                base64::engine::general_purpose::STANDARD.encode([7u8; 16])
+            ),),
+            "filter_key_len"
+        );
+        // 与主判定矛盾位（decode 成功不该进 reject 路径）：防御位字面量。
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(
+            group_filter_reject_stage(&serde_json::json!(key)),
+            "filter_decoded_ok"
+        );
+        // 变体路径：读面两臂高频形状（UnknownAccount 折 -32603、Internal）
+        // 字面量即完整类型路径（日志拼读面，零 payload）。
+        assert_eq!(
+            send_error_variant_face(&SendError::UnknownAccount),
+            "SendError::UnknownAccount"
+        );
+        assert_eq!(
+            send_error_variant_face(&SendError::Internal),
+            "SendError::Internal"
+        );
     }
 
     /// 阅后即焚 E1：构造面 body 无/单附件/is_view_once=true，不碰

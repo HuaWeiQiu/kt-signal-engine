@@ -187,18 +187,31 @@ async fn dispatch(
                     None | Some(Value::Null) => None,
                     Some(Value::Array(entries)) => {
                         if entries.is_empty() {
+                            // 读面 reject 探针（2026-10-16 listGroups Internal
+                            // 归因批）：0ms 失败窗主嫌疑臂，字面量类别零内容。
+                            tracing::warn!(method = %method, stage = "filter_empty", "list read face rejected");
                             return internal_error(id);
                         }
                         let mut parsed = Vec::with_capacity(entries.len());
                         for entry in entries {
                             match entry.as_str().and_then(crate::service::decode_group_id) {
                                 Some(key) => parsed.push(key),
-                                None => return internal_error(id),
+                                None => {
+                                    tracing::warn!(
+                                        method = %method,
+                                        stage = crate::service::group_filter_reject_stage(entry),
+                                        "list read face rejected",
+                                    );
+                                    return internal_error(id);
+                                }
                             }
                         }
                         Some(parsed)
                     }
-                    Some(_) => return internal_error(id),
+                    Some(_) => {
+                        tracing::warn!(method = %method, stage = "filter_not_array", "list read face rejected");
+                        return internal_error(id);
+                    }
                 }
             } else {
                 None
@@ -210,7 +223,16 @@ async fn dispatch(
             };
             match rows {
                 Ok(rows) => jsonrpc::success_response(id, json!(rows)),
-                Err(_) => internal_error(id),
+                Err(error) => {
+                    // 读面错误变体探针（对齐 1591 send 面风格）：变体路径
+                    // 字面量零 payload（账号/群 key 不落）。
+                    tracing::warn!(
+                        method = %method,
+                        face = crate::service::send_error_variant_face(&error),
+                        "list read face error variant",
+                    );
+                    internal_error(id)
+                }
             }
         }
         "deleteLocalAccountData" => {
