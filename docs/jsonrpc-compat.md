@@ -495,13 +495,16 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   本机 deviceId 过滤（非指向自己的丢弃），引擎恒投原值由消费方自判；
   pniChangeNumber 只投 registrationId/newE164 两键，密钥材料不出引擎
   边界、re-key 消费不做，偏差全落 §5 组 5 块）。
-- `syncMessage.keys {mediaRootBackupKey?}`（P14 组 6 收投影，此前整信封
-  丢弃；官方 handleKeys 事件面 MessageReceiver.preload.ts:3338-3358）：云
-  媒体备份根钥（media backup 素材）标准 base64，非空才投（官方
-  Bytes.isNotEmpty 同口径），键全缺照投空对象（信号面即事件）。官方三键
-  面 {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎只投
-  mediaRootBackupKey——偏差落 §5 组 6 块；Request{Keys} 应答停答面
-  （P9 S2）与此接收投影面互不相干。
+- `syncMessage.keys {mediaRootBackupKey?, accountEntropyPoolPresent?}`（P14
+  组 6 收投影 + 2026-10-17 三键布尔面评估批，此前整信封丢弃；官方
+  handleKeys 事件面 MessageReceiver.preload.ts:3338-3358）：云媒体备份
+  根钥（media backup 素材）标准 base64，非空才投（官方 Bytes.isNotEmpty
+  同口径），键全缺照投空对象（信号面即事件）。官方三键面
+  {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎投
+  mediaRootBackupKey 材料 + `accountEntropyPoolPresent` 存在性布尔
+  （材料不出边界）——masterKey 存在性不可得，偏差与边界原因落 §5 组 6
+  块 + 三键布尔面评估批块；Request{Keys} 应答停答面（P9 S2）与此接收
+  投影面互不相干。
 - `syncMessage.storyRecipientUpdate {timestamp, storyMessageRecipients[]
   {destinationUuid?, distributionListIds, isAllowedToReply?}}`（story 删除
   扇出批 S5，2026-10-14，官方 StoryRecipientUpdateEvent 镜像
@@ -6052,6 +6055,35 @@ wire 变化面：`trust` 自发 sync 信封体内多两个填充位（nullMessag
 SyncMessage.padding）——填充位是元数据保护面，无消费语义（收向
 `project_verified_sync` 不读 null_message；官方桌面收向同样不消费），
 wire additive。
+
+### keys 三键布尔面评估批（2026-10-17，评估+additive 一位，官方对齐 Signal-Desktop abe80d3 handleKeys，wire additive【engine-compat】）
+
+任务口径：不出密钥材料边界的前提下，评估「三键存在性/健康度」布尔面
+（不含材料）可否投影供宿主诊断；能则加（additive），不能则记档边界
+原因。逐键评估结论：
+
+1. **mediaRootBackupKey**（Keys.mediaRootBackupKey=4）：既有投影已投
+   材料本体（标准 base64，P14 组 6 批官方事件同形）——存在性/健康度
+   可由消费方从既有键推导（非空 = 在场），不重复投布尔（语义冗余）。
+2. **accountEntropyPool**（Keys.accountEntropyPool=3，string）：解码模型
+   在场（`Option<String>`），存在性布尔可判且零材料外泄——**新增
+   `accountEntropyPoolPresent: true`**（非空串才投，空串与缺席同为
+   无键；键名带 Present 后缀与官方材料面 string 同名键区隔，防消费方
+   误当材料值）。健康度 = 非空即健康（引擎不解析 SVR2 熵格式，深校验
+   不做——格式属账号恢复材料域，引擎无消费面）。
+3. **masterKey**（官方 proto `optional bytes master = 2` deprecated；vendored
+   whisperfish proto `reserved 2`）：**存在性不可得，记档不扩面**。原因
+   = ①解码层无痕：prost 对 reserved/未知字段按 wire type 跳过，模型层
+   永远见不到该字段；②扩面唯一途径 = fork proto 去 reserve 重加
+   `master=2`——whisperfish 上游系有意删除（与 storageService=1 成对
+   剔除密钥材料），fork 重加即引入「摄入 32B 密钥材料却只产一个诊断位、
+   无任何消费面」的密钥持有面，违背薄 fork + 密钥材料最小持有纪律；
+   ③raw wire 嗅探（解码前自扫帧字节）拒绝——侵入公共解码路径，复杂度
+   与脆性远超诊断价值。宿主如需 masterKey 在场判定，属 connector 消费
+   立项范围（当前无需求）。
+
+wire 面：`syncMessage.keys` 增 `accountEntropyPoolPresent` 布尔一位
+（additive；既有 mediaRootBackupKey 材料面不动）。
 
 ## 6. fake 服务模式（仅测试）
 
