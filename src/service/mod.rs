@@ -929,7 +929,8 @@ impl SendError {
 /// reason 字面量/ServiceError::SendError）→ WsTransport、取钥 404 →
 /// PreKey、修复环耗尽/协议面 → SessionBuild、附件上行 → AttachmentUpload
 /// （`upload_error_of`）；其余（网络/协议/存储本地失败）折叠
-/// `SendError::Internal`。
+/// `SendError::Internal`——折叠臂同点落变体路径探针日志（见
+/// `*_variant_face` 三 helper 注）。
 /// send 链各触网点单点共用（getUserStatus 的 whoami 面同归型先行）。
 pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
     use presage::libsignal_service::prelude::ServiceError;
@@ -937,8 +938,9 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
 
     /// ServiceError 面单点归型（直接推送服务调用与 sender 再包层两触点
     /// 共用；vendored push_service/response.rs 归型路径 + websocket/mod.rs
-    /// 写出相/等响应相 WsClosing reason 字面量区分）。
-    fn service_error_face(error: ServiceError) -> SendError {
+    /// 写出相/等响应相 WsClosing reason 字面量区分）。`presage_path` =
+    /// 调用侧 presage 外层路径字面量（Internal 探针 face 前缀）。
+    fn service_error_face(error: ServiceError, presage_path: &'static str) -> SendError {
         match error {
             ServiceError::Unauthorized => SendError::Unbound,
             ServiceError::RateLimitExceeded { .. } => SendError::RateLimited,
@@ -970,14 +972,25 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             }
             ServiceError::SignalProtocolError(_) => SendError::SessionBuild,
             ServiceError::Curve(_) => SendError::SessionBuild,
-            _ => SendError::Internal,
+            other => {
+                // Internal 探针（2026-10-16 备忘录 Internal 批）：变体路径
+                // 字面量落日志（path + face 拼读 = 完整类型路径），零内容。
+                tracing::warn!(
+                    path = presage_path,
+                    face = service_error_variant_face(&other),
+                    "send error folded internal",
+                );
+                SendError::Internal
+            }
         }
     }
 
     match error {
         presage::Error::GroupAnnouncementsOnly => SendError::AnnouncementsOnly,
         presage::Error::MessageSenderError(sender_error) => match *sender_error {
-            MessageSenderError::ServiceError(service_error) => service_error_face(service_error),
+            MessageSenderError::ServiceError(service_error) => {
+                service_error_face(service_error, "PresageError::MessageSenderError::")
+            }
             MessageSenderError::ProofRequired { .. } => SendError::ProofRequired,
             // P9 身份拒发闸：sender 对 process_prekey_bundle 失败统一再包
             // UntrustedIdentity（vendor sender.rs），协议层拒发（旧钥会话/
@@ -996,15 +1009,29 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
                 SendError::SessionBuild
             }
             MessageSenderError::AttachmentUploadError(_) => SendError::AttachmentUpload,
-            _ => SendError::Internal,
+            other => {
+                tracing::warn!(
+                    face = message_sender_variant_face(&other),
+                    "send error folded internal",
+                );
+                SendError::Internal
+            }
         },
-        presage::Error::ServiceError(service_error) => service_error_face(service_error),
+        presage::Error::ServiceError(service_error) => {
+            service_error_face(service_error, "PresageError::")
+        }
         presage::Error::ProtocolError(
             presage::libsignal_service::protocol::SignalProtocolError::UntrustedIdentity(_),
         ) => SendError::IdentityUnverified,
         presage::Error::ProtocolError(_) => SendError::SessionBuild,
         presage::Error::Timeout(_) => SendError::WsTimeout,
-        _ => SendError::Internal,
+        other => {
+            tracing::warn!(
+                face = presage_error_variant_face(&other),
+                "send error folded internal",
+            );
+            SendError::Internal
+        }
     }
 }
 
@@ -1013,7 +1040,9 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
 /// `SendError::AttachmentUpload`——上传先于任何收件人发送，消息确定未
 /// 投递，上传请求自身的结局歧义（65s 控制面总超时内断流等）不构成重复
 /// 投递风险；外层错误（sender 构建/凭据面）沿 `send_error_of` 原语义
-/// （401 解绑等归型比笼统「上传失败」更诚实，且不进重试）。
+/// （401 解绑等归型比笼统「上传失败」更诚实，且不进重试）。未匹配臂经
+/// 委托折 Internal 时探针在 `send_error_of` 单点触发（本函数不重复落
+/// 日志——归型单点即日志单点）。
 pub(crate) fn upload_error_of(error: presage::Error<<SqliteStore as Store>::Error>) -> SendError {
     match error {
         presage::Error::MessageSenderError(boxed) => match *boxed {
@@ -1025,6 +1054,160 @@ pub(crate) fn upload_error_of(error: presage::Error<<SqliteStore as Store>::Erro
             other => send_error_of(presage::Error::MessageSenderError(Box::new(other))),
         },
         _ => send_error_of(error),
+    }
+}
+
+/// —— Internal 折叠臂变体路径探针（2026-10-16 备忘录 Internal 批）——
+/// `SendError::Internal` 的每个构造臂（`send_error_of` 三处 fallback）在
+/// 归型同时落一行变体路径字面量（warn 进 engine-stderr.log）：只走类型
+/// 路径，payload（收件人 UUID/号码/reason 串/错误正文）绝不进日志——
+/// 此前 "Internal error" 无锚词零归因（备忘录整夜 13 次失败实证）。三个
+/// helper 逐变体穷尽映射字面量（vendored rev 钉定，上游加变体编译期
+/// 报错；presage::Error 带 #[non_exhaustive] 走尾臂字面量兜底）。
+fn service_error_variant_face(
+    error: &presage::libsignal_service::prelude::ServiceError,
+) -> &'static str {
+    use presage::libsignal_service::prelude::ServiceError as Service;
+    match error {
+        Service::Timeout { .. } => "ServiceError::Timeout",
+        Service::InvalidUrl(_) => "ServiceError::InvalidUrl",
+        Service::InvalidAddressType(_) => "ServiceError::InvalidAddressType",
+        Service::InvalidPhoneNumber => "ServiceError::InvalidPhoneNumber",
+        Service::SendError { .. } => "ServiceError::SendError",
+        Service::IO(_) => "ServiceError::IO",
+        Service::JsonDecodeError(_) => "ServiceError::JsonDecodeError",
+        Service::ProtobufDecodeError(_) => "ServiceError::ProtobufDecodeError",
+        Service::BincodeError(_) => "ServiceError::BincodeError",
+        Service::Base64DecodeError(_) => "ServiceError::Base64DecodeError",
+        Service::RateLimitExceeded { .. } => "ServiceError::RateLimitExceeded",
+        Service::Unauthorized => "ServiceError::Unauthorized",
+        Service::Locked(_) => "ServiceError::Locked",
+        Service::UnhandledResponseCode { .. } => "ServiceError::UnhandledResponseCode",
+        Service::WsError(_) => "ServiceError::WsError",
+        Service::WsClosing { .. } => "ServiceError::WsClosing",
+        Service::Padding(_) => "ServiceError::Padding",
+        Service::PaddingVersion(_) => "ServiceError::PaddingVersion",
+        Service::InvalidFrame { .. } => "ServiceError::InvalidFrame",
+        Service::MacError => "ServiceError::MacError",
+        Service::SignalProtocolError(_) => "ServiceError::SignalProtocolError",
+        Service::SealedSenderDecryptionError(_) => "ServiceError::SealedSenderDecryptionError",
+        Service::InvalidDeviceId(_) => "ServiceError::InvalidDeviceId",
+        Service::ProofRequiredError(_) => "ServiceError::ProofRequiredError",
+        Service::MismatchedDevicesException(_) => "ServiceError::MismatchedDevicesException",
+        Service::StaleDevices(_) => "ServiceError::StaleDevices",
+        Service::CredentialsCacheError(_) => "ServiceError::CredentialsCacheError",
+        Service::GroupsV2Error => "ServiceError::GroupsV2Error",
+        Service::GroupsV2DecryptionError(_) => "ServiceError::GroupsV2DecryptionError",
+        Service::ZkGroupDeserializationFailure(_) => "ServiceError::ZkGroupDeserializationFailure",
+        Service::ZkGroupVerificationFailure(_) => "ServiceError::ZkGroupVerificationFailure",
+        Service::UnsupportedContent => "ServiceError::UnsupportedContent",
+        Service::NotFoundError => "ServiceError::NotFoundError",
+        Service::DecryptDeviceInfoFieldError(_) => "ServiceError::DecryptDeviceInfoFieldError",
+        Service::UnknownCdnVersion(_) => "ServiceError::UnknownCdnVersion",
+        Service::DeviceLimitReached { .. } => "ServiceError::DeviceLimitReached",
+        Service::DeprecatedVersion => "ServiceError::DeprecatedVersion",
+        Service::ServerRejected => "ServiceError::ServerRejected",
+        Service::UnregisteredRecipient => "ServiceError::UnregisteredRecipient",
+        Service::MessageTooLarge => "ServiceError::MessageTooLarge",
+        Service::MultiRecipientMismatchedDevices(_) => {
+            "ServiceError::MultiRecipientMismatchedDevices"
+        }
+        Service::MultiRecipientStaleDevices(_) => "ServiceError::MultiRecipientStaleDevices",
+        Service::InvalidDeviceVerificationCode => "ServiceError::InvalidDeviceVerificationCode",
+        Service::DeviceCapabilityDowngrade => "ServiceError::DeviceCapabilityDowngrade",
+        Service::NoSuchSession => "ServiceError::NoSuchSession",
+        Service::InvalidVerificationSessionId => "ServiceError::InvalidVerificationSessionId",
+        Service::TokenNotAccepted(_) => "ServiceError::TokenNotAccepted",
+        Service::RegistrationSessionConflict(_) => "ServiceError::RegistrationSessionConflict",
+        Service::VerificationSessionRateLimited { .. } => {
+            "ServiceError::VerificationSessionRateLimited"
+        }
+        Service::InvalidTransportMode(_) => "ServiceError::InvalidTransportMode",
+        Service::VerificationDeliveryFailed(_) => "ServiceError::VerificationDeliveryFailed",
+        Service::DeviceTransferAvailable => "ServiceError::DeviceTransferAvailable",
+        Service::UsernameHashNotSet => "ServiceError::UsernameHashNotSet",
+        Service::AttachmentTooLarge => "ServiceError::AttachmentTooLarge",
+        Service::ChallengeNotAccepted => "ServiceError::ChallengeNotAccepted",
+        Service::Http(_) => "ServiceError::Http",
+        Service::Curve(_) => "ServiceError::Curve",
+        Service::Hpke(_) => "ServiceError::Hpke",
+        Service::Fingerprint(_) => "ServiceError::Fingerprint",
+        Service::CdsiLookupError(_) => "ServiceError::CdsiLookupError",
+    }
+}
+
+/// MessageSenderError 变体路径字面量（探针专用，self-contained 全路径；
+/// 仅 `send_error_of` 的 sender fallback 臂消费——该臂实际可达面为
+/// InvalidDeviceId/SendSyncMessageError/NoMessagesToSend，其余变体字面量
+/// 为穷尽性完备位）。
+fn message_sender_variant_face(
+    error: &presage::libsignal_service::sender::MessageSenderError,
+) -> &'static str {
+    use presage::libsignal_service::sender::MessageSenderError as Sender;
+    match error {
+        Sender::ServiceError(_) => "PresageError::MessageSenderError::ServiceError",
+        Sender::ProtocolError(_) => "PresageError::MessageSenderError::ProtocolError",
+        Sender::InvalidPrivateKey(_) => "PresageError::MessageSenderError::InvalidPrivateKey",
+        Sender::InvalidDeviceId(_) => "PresageError::MessageSenderError::InvalidDeviceId",
+        Sender::AttachmentUploadError(_) => {
+            "PresageError::MessageSenderError::AttachmentUploadError"
+        }
+        Sender::SendSyncMessageError(_) => "PresageError::MessageSenderError::SendSyncMessageError",
+        Sender::UntrustedIdentity { .. } => "PresageError::MessageSenderError::UntrustedIdentity",
+        Sender::MaximumRetriesLimitExceeded => {
+            "PresageError::MessageSenderError::MaximumRetriesLimitExceeded"
+        }
+        Sender::ProofRequired { .. } => "PresageError::MessageSenderError::ProofRequired",
+        Sender::NotFound { .. } => "PresageError::MessageSenderError::NotFound",
+        Sender::NoMessagesToSend => "PresageError::MessageSenderError::NoMessagesToSend",
+    }
+}
+
+/// presage::Error 顶层变体路径字面量（探针专用；仅 `send_error_of` 外层
+/// fallback 臂消费，#[non_exhaustive] 尾臂兜底）。
+fn presage_error_variant_face(
+    error: &presage::Error<<SqliteStore as Store>::Error>,
+) -> &'static str {
+    use presage::Error as Presage;
+    match error {
+        Presage::CaptchaRequired => "PresageError::CaptchaRequired",
+        Presage::IoError(_) => "PresageError::IoError",
+        Presage::JsonError(_) => "PresageError::JsonError",
+        Presage::Base64Error(_) => "PresageError::Base64Error",
+        Presage::TryFromSliceError(_) => "PresageError::TryFromSliceError",
+        Presage::PhoneNumberError(_) => "PresageError::PhoneNumberError",
+        Presage::UuidError(_) => "PresageError::UuidError",
+        Presage::InvalidThread(_) => "PresageError::InvalidThread",
+        Presage::ProtocolError(_) => "PresageError::ProtocolError",
+        Presage::ServiceError(_) => "PresageError::ServiceError",
+        Presage::ProfileManagerError(_) => "PresageError::ProfileManagerError",
+        Presage::MessageSenderError(_) => "PresageError::MessageSenderError",
+        Presage::AlreadyRegisteredError => "PresageError::AlreadyRegisteredError",
+        Presage::NotYetRegisteredError => "PresageError::NotYetRegisteredError",
+        Presage::ProvisioningError(_) => "PresageError::ProvisioningError",
+        Presage::NoProvisioningMessageReceived => "PresageError::NoProvisioningMessageReceived",
+        Presage::LinkingError => "PresageError::LinkingError",
+        Presage::RelinkNecessary => "PresageError::RelinkNecessary",
+        Presage::MissingKeyError(_) => "PresageError::MissingKeyError",
+        Presage::MessagePipeNotStarted => "PresageError::MessagePipeNotStarted",
+        Presage::MessagePipeInterruptedError => "PresageError::MessagePipeInterruptedError",
+        Presage::ParseContactError(_) => "PresageError::ParseContactError",
+        Presage::AttachmentCipherError(_) => "PresageError::AttachmentCipherError",
+        Presage::UnknownGroup => "PresageError::UnknownGroup",
+        Presage::GroupAnnouncementsOnly => "PresageError::GroupAnnouncementsOnly",
+        Presage::UnknownRecipient => "PresageError::UnknownRecipient",
+        Presage::Timeout(_) => "PresageError::Timeout",
+        Presage::Store(_) => "PresageError::Store",
+        Presage::PushChallengeRequired => "PresageError::PushChallengeRequired",
+        Presage::RequestingCodeForbidden(_) => "PresageError::RequestingCodeForbidden",
+        Presage::UnexpectedAttachmentChecksum => "PresageError::UnexpectedAttachmentChecksum",
+        Presage::UnverifiedRegistrationSession => "PresageError::UnverifiedRegistrationSession",
+        Presage::ProfileCipherError(_) => "PresageError::ProfileCipherError",
+        Presage::NotPrimaryDevice => "PresageError::NotPrimaryDevice",
+        Presage::UpdatePreKeyFailure => "PresageError::UpdatePreKeyFailure",
+        Presage::InvalidDeviceId => "PresageError::InvalidDeviceId",
+        Presage::InvalidUsername(_) => "PresageError::InvalidUsername",
+        _ => "PresageError::Other",
     }
 }
 

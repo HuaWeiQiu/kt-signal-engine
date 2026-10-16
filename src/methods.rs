@@ -99,10 +99,34 @@ pub(crate) async fn respond(
                     crate::service::perf_metrics::keys::RPC_DISPATCH,
                     dispatch_started.elapsed().as_micros() as u64,
                 );
+                log_rpc_error_face(&request, &response);
                 response
             }
         },
     }
+}
+
+/// RPC 错误面单点归因（2026-10-16 listGroups 零痕迹批）：dispatch 层唯一
+/// 出口——应答带 error 键即落一行 warn（进 engine-stderr.log，真实 stderr
+/// 不动，compat §1/§5 日志纪律同向）。method = 方法名字面量，code/message
+/// = wire 应答上的固定字面量码位（构造上无用户内容——全部出自常量锚词与
+/// 结构化码位；data 面不落）。此前仅 send 族有同类日志（b33244c send_error
+/// 内联，本批并入本单点防双写）；listGroups 等读面/其余方法的错误应答
+/// 此前引擎侧零记录（2026-10-16 02:06 GROUP_NOT_FOUND 透传桌面实证）。
+/// 解析层错误（-32700 坏行/超限）无方法名，不在此面。
+fn log_rpc_error_face(request: &Request, response: &Value) {
+    let Some(error) = response.get("error") else {
+        return;
+    };
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    tracing::warn!(method = %request.method, code, message, "rpc error face");
 }
 
 async fn dispatch(
@@ -4807,11 +4831,9 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// ——决策在 connector/desktop，compat §3/§5）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
+    // 错误面归因日志由 dispatch 层单点 log_rpc_error_face 统一落（本批
+    // 并入；b33244c 的内联 warn 移除防双写——覆盖面为本单点真子集）。
     let (code, message) = send_error_face(&error);
-    // 每次 send 失败落一行引擎日志（warn 级进 engine-stderr.log）：code 与
-    // message 均为固定字面量（构造上无用户内容），覆盖未归类族（如引擎
-    // 未就绪期 Unbound 发送）——此前这类失败在引擎侧零痕迹，现场无法归因。
-    tracing::warn!(code, message, "send rpc failed");
     jsonrpc::error_response(id, &RpcError::new(code, message))
 }
 
