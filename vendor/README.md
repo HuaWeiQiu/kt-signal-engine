@@ -207,6 +207,13 @@
   `C: Clone` 界，泛型槽位克隆面）；④`pub mod slot` 挂载 + pub const
   `CLOSE_CODE_CONNECTED_ELSEWHERE = 4409`。
 - `Cargo.toml`（同批）— tokio features 加 `"sync"`（Notify kill 开关）。
+- `src/push_service/mod.rs`（2026-10-17 群态取回端点批，**探针提交，
+  随修复提交移除**）— `get_group_response` 解码拆手动：原始字节先行
+  `GroupResponse::decode`，失败时 warn 一条原始字节 base64（len+b64，
+  固定字面量前缀 `groups fetch raw response bytes captured on decode
+  failure`，仅解码失败时触发）后按既有错误面上抛。背景：群态取回 HTTP
+  200 但 `GroupResponse.group: invalid tag value: 0` 确定性失败
+  （活体 2026-10-16 04:05/07:38Z），需捕获真实应答字节定位根因。
 
 `vendor/presage/`（rev 33dd149）：
 

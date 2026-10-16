@@ -8,7 +8,6 @@ use crate::{
 };
 
 use libsignal_core::DeviceId;
-use protobuf::ProtobufResponseExt;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
@@ -102,9 +101,14 @@ pub struct PushService {
     download_client: reqwest::Client,
 }
 
-fn pinned_client_builder(ca_pem: &str, user_agent: &str) -> reqwest::ClientBuilder {
+fn pinned_client_builder(
+    ca_pem: &str,
+    user_agent: &str,
+) -> reqwest::ClientBuilder {
     reqwest::ClientBuilder::new()
-        .tls_certs_only([reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()])
+        .tls_certs_only([
+            reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()
+        ])
         .user_agent(user_agent)
         .http1_only()
 }
@@ -122,17 +126,22 @@ impl PushService {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
 
-        let client = pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
-            .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
-            .timeout(CONTROL_PLANE_TOTAL_TIMEOUT)
-            .build()
-            .unwrap();
-        let download_client =
-            pinned_client_builder(&cfg.certificate_authority, user_agent.as_ref())
-                .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
-                .read_timeout(DOWNLOAD_READ_STALL_TIMEOUT)
-                .build()
-                .unwrap();
+        let client = pinned_client_builder(
+            &cfg.certificate_authority,
+            user_agent.as_ref(),
+        )
+        .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
+        .timeout(CONTROL_PLANE_TOTAL_TIMEOUT)
+        .build()
+        .unwrap();
+        let download_client = pinned_client_builder(
+            &cfg.certificate_authority,
+            user_agent.as_ref(),
+        )
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_STALL_TIMEOUT)
+        .build()
+        .unwrap();
 
         Self {
             servers: env,
@@ -239,25 +248,48 @@ impl PushService {
         Ok(ws)
     }
 
-    // KT (groups fetch): GET /v1/groups/ answers GroupResponse{group=1,
-    // group_send_endorsements_response=2} (Android GroupsV2Api.getGroup);
-    // decoding it as a bare Group lands the inner group bytes in
-    // `publicKey` and drops the endorsements needed for group-send tokens.
+    // KT (groups fetch): the response is decoded as GroupResponse
+    // {group=1, group_send_endorsements_response=2} (Android
+    // GroupsV2Api.getGroup shape). INTERIM: the path below is still
+    // /v1/groups/ — the server strips the wrapper there and answers a
+    // bare Group, which is exactly the decode failure under diagnosis
+    // ("GroupResponse.group: invalid tag value: 0"). The one-shot probe
+    // below captures the raw bytes; the follow-up fix commit moves the
+    // path to /v2/groups/ and removes the probe.
     pub(crate) async fn get_group_response(
         &mut self,
         credentials: HttpAuth,
     ) -> Result<crate::proto::GroupResponse, ServiceError> {
-        self.request(
-            Method::GET,
-            Endpoint::storage("/v1/groups/"),
-            HttpAuthOverride::Identified(credentials),
-        )?
-        .send()
-        .await?
-        .service_error_for_status()
-        .await?
-        .protobuf()
-        .await
+        let response = self
+            .request(
+                Method::GET,
+                Endpoint::storage("/v1/groups/"),
+                HttpAuthOverride::Identified(credentials),
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        let bytes = response.bytes().await?;
+        // KT (TEMPORARY probe, group fetch diagnosis batch): one raw-byte
+        // capture when the decode fails; removed by the follow-up fix
+        // commit once the live fixture is captured.
+        match <crate::proto::GroupResponse as prost::Message>::decode(
+            bytes.clone(),
+        ) {
+            Ok(decoded) => Ok(decoded),
+            Err(error) => {
+                tracing::warn!(
+                    len = bytes.len(),
+                    b64 = %base64::Engine::encode(
+                        &base64::prelude::BASE64_STANDARD,
+                        &bytes
+                    ),
+                    "groups fetch raw response bytes captured on decode failure (one-shot diagnostic)"
+                );
+                Err(error.into())
+            },
+        }
     }
 }
 
