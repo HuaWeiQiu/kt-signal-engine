@@ -3580,15 +3580,18 @@ impl Service {
         let own_aci = presage::libsignal_service::protocol::Aci::from(
             manager.registration_data().service_ids.aci,
         );
-        // Internal 来源静态标注（2026-10-16 listGroups Internal 归因批）：
-        // 本函数 Err 出口仅两条——`open_registered` 失败（UnknownAccount，
-        // 冷路径含 open_store+load_registered，毫秒级）与本臂（groups()
-        // sqlx 读失败， Internal）。生产实证（engine+connector 双侧日志，
-        // 2026-10-16 07:37-07:39 窗）失败全部 duration_ms=0 且 open_store
-        // 零失败行——与本函数毫秒级路径不符；0ms 窗主因在 dispatch 层
-        // groupId 过滤 reject 臂（methods.rs，decode fail-closed 本函数
-        // 不可达）。本臂探针已由读面 Err 变体探针（send_error_variant_
-        // face）覆盖，此处不再单点落日志。
+        // Internal 来源静态标注（2026-10-16 listGroups Internal 归因批，
+        // 活体裁决版）：本函数 Err 出口仅两条——`open_registered` 失败
+        // （UnknownAccount，冷路径含 open_store+load_registered，毫秒级）
+        // 与本臂（groups() sqlx 读失败，Internal）。生产实证（engine+
+        // connector 双侧日志 07:37-07:39 窗全部 duration_ms=0、open_store
+        // 零失败行）排除本函数两条臂；探针部署后活体复现（08:27 桌面
+        // 进入 Signal 工作区）裁决失败臂 = dispatch 层 groupId 过滤
+        // `stage="filter_key_len"`——**groupId 是合法标准 base64 但解码
+        // 后 ≠32 字节**（桌面 SignalWorkspace.refreshSelectedGroupRoster
+        // 把会话 conversationId（sha256 hex 40 字符 → base64 解 30B）误
+        // 当 groupKey 传 groups.get，connector 透传；引擎 fail-closed 契
+        // 约不变，修复面在桌面仓）。本臂由读面 Err 变体探针覆盖，不双写。
         let groups = manager
             .store()
             .groups()
