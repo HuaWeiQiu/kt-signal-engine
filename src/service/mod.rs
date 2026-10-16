@@ -892,6 +892,16 @@ pub(crate) enum SendError {
     /// 群腿无整体自动重试（既有裁定），is_definite_failure=true 只补结局
     /// 类完备性（语义 = 确定未送达）。
     NoRecipients,
+    /// 群态取回解码类失败重试耗尽（接收完整性批②：群 update/sync 信封
+    /// 触发的群 fetch/decrypt 在 vendored 重试环内重试 1 次后仍败，结构化
+    /// 上抛不再静默回退旧群态；发送链该面已 fail-open 兜底、此臂为
+    /// getUserStatus 等旁路触点的归型完备臂）。发送面 -1 +
+    /// `GROUP_SYNC_FAILED` + `data.count`（尝试次数，additive，compat
+    /// §3）；不进 is_definite_failure——群态失败不自动重试，决策归
+    /// connector/desktop。
+    GroupSyncFailed {
+        count: u32,
+    },
     Internal,
 }
 
@@ -903,6 +913,7 @@ impl SendError {
     /// 调用内快速重试 1 次；`false` = 未知
     /// 结局或确定性失败，绝不自动重试（WsTimeout 响应缺失可能已落地、
     /// Unbound/RateLimited/ProofRequired/IdentityUnverified 确定性失败、
+    /// GroupSyncFailed 群态失败重试决策归调用方、
     /// ServerUnavailable 决策归 connector/desktop、Internal 本地面）。
     pub(crate) fn is_definite_failure(&self) -> bool {
         matches!(
@@ -1025,6 +1036,14 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
         ) => SendError::IdentityUnverified,
         presage::Error::ProtocolError(_) => SendError::SessionBuild,
         presage::Error::Timeout(_) => SendError::WsTimeout,
+        // 群取回分型降级（接收完整性批②，compat §3）：解码类重试耗尽结构
+        // 化上抛（count = 尝试次数）；404 群在服务器已消失 → 目标终止同面
+        // （group send 的 terminated 硬拒族，vendored 发送链已 fail-open
+        // 兜底，此臂覆盖 getUserStatus 等旁路触点）。
+        presage::Error::GroupSyncFailed { attempts } => {
+            SendError::GroupSyncFailed { count: attempts }
+        }
+        presage::Error::GroupGone => SendError::TargetTerminated,
         other => {
             tracing::warn!(
                 face = presage_error_variant_face(&other),
@@ -1233,6 +1252,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
         SendError::SessionBuild => "SendError::SessionBuild",
         SendError::AttachmentUpload => "SendError::AttachmentUpload",
         SendError::NoRecipients => "SendError::NoRecipients",
+        SendError::GroupSyncFailed { .. } => "SendError::GroupSyncFailed",
         SendError::Internal => "SendError::Internal",
     }
 }
@@ -5453,6 +5473,50 @@ fn queue_emptied_notification(account: &str) -> Value {
     })
 }
 
+/// 群取回解码失败结构化事件（接收完整性批②，compat §3 additive）：群
+/// update/sync 信封触发的群 fetch/decrypt 解码类失败经 vendored 重试环
+/// 耗尽 → receive 族 envelope 级 `groupSyncFailed` 标记（{groupId, count}，
+/// count = 重试环尝试次数，无身份/群名面）。旧群态保留，但不再静默兜底
+/// ——消费方自定后续（引擎只报态）。
+fn group_sync_failed_notification(account: &str, group_id: &str, count: u32) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "account": account,
+            "envelope": {
+                "timestamp": now_ms(),
+                "groupSyncFailed": {
+                    "groupId": group_id,
+                    "count": count,
+                },
+            },
+        },
+    })
+}
+
+/// 群在服务器侧已消失（HTTP 404 → 官方 GROUP_NONEXISTENT，接收完整性批②）：
+/// 复用既有 `groupTerminated` 事件面（terminator=null——非终止 change，
+/// 本地无编辑者可指），调用方随事件登记 terminated 注册表拦截后续发送。
+fn group_gone_notification(account: &str, group_id: &str) -> Value {
+    let timestamp = now_ms();
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "account": account,
+            "envelope": {
+                "timestamp": timestamp,
+                "groupTerminated": {
+                    "groupId": group_id,
+                    "terminator": Value::Null,
+                    "timestamp": timestamp,
+                },
+            },
+        },
+    })
+}
+
 /// 时钟偏移闸阈值（时序审计 G-时钟，P15b 项8）：官方 Signal-Android
 /// ClockSkewDetector 阈值 = remote config `client.maxAllowedClockSkewSeconds`
 /// 默认 24h（RemoteConfig.kt defaultValue = 24.hours）。引擎无 remote
@@ -6383,6 +6447,41 @@ async fn serve_account_stream(
                         envelope_started.elapsed().as_micros() as u64,
                     );
                     ack.ack();
+                }
+                // 群取回失败（接收完整性批②，compat §3 additive）：同信封
+                // 触发的群 update fetch/decrypt 在 vendored 重试环耗尽。解码
+                // 类 → groupSyncFailed 事件（{groupId, count}）；404 群在
+                // 服务器已消失 → 复用 groupTerminated 事件（terminator=null）
+                // 并登记 terminated 注册表（发送面同步拦截）。两臂均无 ack
+                // ——单 ack 契约由同信封 Content 槽承担（本体消息照常投影）。
+                Some(Received::GroupSyncFailed {
+                    master_key,
+                    kind,
+                    attempts,
+                }) => {
+                    perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_GROUP_SYNC_FAILED, 1);
+                    quick_seen += 1;
+                    use base64::Engine as _;
+                    let group_id =
+                        base64::engine::general_purpose::STANDARD.encode(master_key);
+                    match kind {
+                        presage::model::messages::GroupSyncFailureKind::Decode => {
+                            service.notify(group_sync_failed_notification(
+                                number, &group_id, attempts,
+                            ));
+                        }
+                        presage::model::messages::GroupSyncFailureKind::Gone => {
+                            service.terminated_groups.register(&group_id);
+                            service.notify(group_gone_notification(number, &group_id));
+                        }
+                    }
+                    if !service.flush_barrier().await {
+                        return StreamOutcome::StdioDead;
+                    }
+                    perf_metrics::record_us(
+                        perf_metrics::keys::RECEIVE_ENVELOPE,
+                        envelope_started.elapsed().as_micros() as u64,
+                    );
                 }
                 // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
                 // identity 被替换（会话按新钥重建，OnNewIdentity::Trust
@@ -17345,6 +17444,44 @@ mod tests {
         assert_eq!(notification["method"], json!("receive.emptied"));
         assert_eq!(notification["params"]["account"], json!("acct"));
         assert!(notification["params"].get("envelope").is_none());
+    }
+
+    /// 群取回失败两事件形状面（接收完整性批②，compat §3 additive）：解码
+    /// 类 → receive 族 envelope 级 `groupSyncFailed`（{groupId, count}，
+    /// count = vendored 重试环尝试次数，无身份/群名面）；404 群消失 → 复
+    /// 用 groupTerminated 事件（terminator=null——非终止 change 无编辑者
+    /// 面）且 envelope 顶层无 dataMessage 等其余投影键。
+    #[test]
+    fn group_sync_failure_notification_shapes_are_additive_receive_face() {
+        let group_id = "dGVzdC1ncm91cC1tYXN0ZXIta2V5LTIwMjYtc2lnbmFs";
+        let failed = group_sync_failed_notification("acct", group_id, 2);
+        assert_eq!(failed["jsonrpc"], json!("2.0"));
+        assert_eq!(failed["method"], json!("receive"));
+        assert_eq!(failed["params"]["account"], json!("acct"));
+        let envelope = &failed["params"]["envelope"];
+        assert!(
+            envelope["timestamp"].as_u64().is_some(),
+            "本地生成时间戳恒在"
+        );
+        assert_eq!(envelope["groupSyncFailed"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupSyncFailed"]["count"], json!(2));
+        assert!(
+            envelope.get("dataMessage").is_none(),
+            "整信封即事件，无其余投影键"
+        );
+
+        let gone = group_gone_notification("acct", group_id);
+        assert_eq!(gone["jsonrpc"], json!("2.0"));
+        assert_eq!(gone["method"], json!("receive"));
+        assert_eq!(gone["params"]["account"], json!("acct"));
+        let envelope = &gone["params"]["envelope"];
+        assert!(envelope["timestamp"].as_u64().is_some());
+        assert_eq!(envelope["groupTerminated"]["groupId"], json!(group_id));
+        assert_eq!(envelope["groupTerminated"]["terminator"], Value::Null);
+        assert_eq!(
+            envelope["groupTerminated"]["timestamp"], envelope["timestamp"],
+            "事件与信封同源时间戳"
+        );
     }
 
     /// P15b 项8 时钟偏移闸判定：阈内 None；越阈 Some(skew)（符号 = 本地 −

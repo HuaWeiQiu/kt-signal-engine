@@ -58,7 +58,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::model::contacts::Contact;
-use crate::model::messages::{ContactSync, DecryptionFailure};
+use crate::model::messages::{ContactSync, DecryptionFailure, GroupSyncFailureKind};
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
@@ -521,14 +521,24 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let mut gm = Box::pin(self.groups_manager()).await?;
-        let Some(group) = upsert_group(
+        // KT (group fetch degradation): the avatar path stays fail-open — a
+        // structured group fetch failure falls back to the stored group.
+        let upserted = match upsert_group(
             &self.store,
             &mut gm,
             context.master_key(),
             &context.revision(),
         )
-        .await?
-        else {
+        .await
+        {
+            Ok(upserted) => upserted,
+            Err(error @ (Error::GroupSyncFailed { .. } | Error::GroupGone)) => {
+                warn!(%error, "group fetch failed; falling back to stored group for avatar");
+                self.store.group(master_key_bytes).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(group) = upserted else {
             return Ok(None);
         };
 
@@ -645,29 +655,50 @@ impl<S: Store> Manager<S, Registered> {
         master_key_bytes: &[u8],
     ) -> Result<Option<(Group, Option<Vec<u8>>)>, Error<S::Error>> {
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        let response = groups_manager
-            .fetch_encrypted_group_response(&mut rand::rng(), master_key_bytes)
-            .await;
-        let endorsements = response
-            .as_ref()
-            .ok()
-            .map(|response| response.group_send_endorsements_response.clone())
-            .filter(|bytes| !bytes.is_empty());
-        match response {
-            Ok(response) => {
-                if let Some(encrypted_group) = response.group {
-                    let group = decrypt_group(master_key_bytes, encrypted_group)?;
-                    if let Err(error) = self
-                        .store
-                        .save_group(master_key_bytes.try_into()?, group.clone())
-                        .await
-                    {
-                        error!(%error, "failed to save group");
+        // KT (group fetch degradation): fetch+decrypt is one retry unit.
+        // Decode-class failures retry once in-call, then surface as a
+        // structured error instead of silently serving a stale group.
+        let mut endorsements = None;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut failure = None;
+            match groups_manager
+                .fetch_encrypted_group_response(&mut rand::rng(), master_key_bytes)
+                .await
+            {
+                Ok(response) => {
+                    endorsements = Some(response.group_send_endorsements_response.clone())
+                        .filter(|bytes| !bytes.is_empty());
+                    if let Some(encrypted_group) = response.group {
+                        match decrypt_group(master_key_bytes, encrypted_group) {
+                            Ok(group) => {
+                                if let Err(error) = self
+                                    .store
+                                    .save_group(master_key_bytes.try_into()?, group.clone())
+                                    .await
+                                {
+                                    error!(%error, "failed to save group");
+                                }
+                            }
+                            // Decrypt failures are decode-class by construction
+                            // (GroupsV2DecryptionError via GroupDecodingError).
+                            Err(error) => failure = Some(error),
+                        }
                     }
                 }
+                Err(error) if group_fetch_gone(&error) => return Err(Error::GroupGone),
+                Err(error) if group_fetch_decode_class(&error) => failure = Some(error),
+                Err(error) => {
+                    warn!(%error, "failed to fetch encrypted group with endorsements")
+                }
             }
-            Err(error) => {
-                warn!(%error, "failed to fetch encrypted group with endorsements")
+            match failure {
+                None => break,
+                Some(error) if attempts < GROUP_FETCH_MAX_ATTEMPTS => {
+                    warn!(%error, "decode-class failure, retrying once");
+                }
+                Some(_) => return Err(Error::GroupSyncFailed { attempts }),
             }
         }
         Ok(self
@@ -1185,7 +1216,24 @@ impl<S: Store> Manager<S, Registered> {
                                     // there's two things to implement: the group metadata (fetched from HTTP API)
                                     // and the group changes, which are part of the protobuf messages
                                     // this means we kinda need our own internal representation of groups inside of presage?
-                                    if let Ok(Some(group)) = upsert_group(
+                                    // KT (group fetch degradation): structured fetch
+                                    // failures surface as a dedicated Received; the
+                                    // envelope itself still projects below and the
+                                    // single ack stays with its Content slot.
+                                    let mut push_sync_failure = |kind, attempts| {
+                                        if let Ok(master_key) =
+                                            <[u8; 32]>::try_from(master_key_bytes.as_slice())
+                                        {
+                                            slots.push(BatchSlot::Ready(
+                                                Received::GroupSyncFailed {
+                                                    master_key,
+                                                    kind,
+                                                    attempts,
+                                                },
+                                            ));
+                                        }
+                                    };
+                                    match upsert_group(
                                         &state.store,
                                         &mut state.groups_manager,
                                         master_key_bytes,
@@ -1193,7 +1241,18 @@ impl<S: Store> Manager<S, Registered> {
                                     )
                                     .await
                                     {
-                                        trace!(?group, "upserted group");
+                                        Ok(Some(group)) => trace!(?group, "upserted group"),
+                                        Ok(None) => {}
+                                        Err(Error::GroupSyncFailed { attempts }) => {
+                                            push_sync_failure(
+                                                GroupSyncFailureKind::Decode,
+                                                attempts,
+                                            )
+                                        }
+                                        Err(Error::GroupGone) => {
+                                            push_sync_failure(GroupSyncFailureKind::Gone, 1)
+                                        }
+                                        Err(error) => warn!(%error, "failed to upsert group"),
                                     }
                                 }
 
@@ -1698,13 +1757,24 @@ impl<S: Store> Manager<S, Registered> {
             } else {
                 0
             };
-            upsert_group(
+            // KT (group fetch degradation): the send path stays fail-open —
+            // a structured group fetch failure falls back to the stored
+            // group (a stale recipient list beats a failed send).
+            match upsert_group(
                 &self.store,
                 &mut groups_manager,
                 &master_key_bytes,
                 &revision,
             )
-            .await?
+            .await
+            {
+                Ok(upserted) => upserted,
+                Err(error @ (Error::GroupSyncFailed { .. } | Error::GroupGone)) => {
+                    warn!(%error, "group fetch failed; falling back to stored group for send");
+                    self.store.group(master_key_bytes).await?
+                }
+                Err(error) => return Err(error),
+            }
         };
         let Some(group) = upserted else {
             return Err(Error::UnknownGroup);
@@ -2312,18 +2382,44 @@ async fn upsert_group<S: Store>(
 
     if upsert_group {
         debug!("fetching and saving group");
-        match groups_manager
-            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
-            .await
-        {
-            Ok(encrypted_group) => {
-                let group = decrypt_group(master_key_bytes, encrypted_group)?;
-                if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
-                    error!(%error, "failed to save group");
+        // KT (group fetch degradation): fetch+decrypt+save is one retry
+        // unit; decode-class exhaustion surfaces as a structured error
+        // instead of silently keeping a stale group.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let failure = match groups_manager
+                .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+                .await
+            {
+                Ok(encrypted_group) => {
+                    match decrypt_group(master_key_bytes, encrypted_group) {
+                        Ok(group) => {
+                            if let Err(error) =
+                                store.save_group(master_key_bytes.try_into()?, group).await
+                            {
+                                error!(%error, "failed to save group");
+                            }
+                            None
+                        }
+                        // Decrypt failures are decode-class by construction
+                        // (GroupsV2DecryptionError via GroupDecodingError).
+                        Err(error) => Some(error),
+                    }
                 }
-            }
-            Err(error) => {
-                warn!(%error, "failed to fetch encrypted group")
+                Err(error) if group_fetch_gone(&error) => return Err(Error::GroupGone),
+                Err(error) if group_fetch_decode_class(&error) => Some(error),
+                Err(error) => {
+                    warn!(%error, "failed to fetch encrypted group");
+                    None
+                }
+            };
+            match failure {
+                None => break,
+                Some(error) if attempts < GROUP_FETCH_MAX_ATTEMPTS => {
+                    warn!(%error, "decode-class failure, retrying once");
+                }
+                Some(_) => return Err(Error::GroupSyncFailed { attempts }),
             }
         }
     }
@@ -2674,6 +2770,35 @@ fn classify_open_error(error: &libsignal_service::prelude::ServiceError) -> &'st
         ServiceError::SignalProtocolError(_) => "protocol",
         _ => "other",
     }
+}
+
+/// KT (group fetch degradation): in-call retry bound for decode-class group
+/// fetch failures.
+const GROUP_FETCH_MAX_ATTEMPTS: u32 = 2;
+
+/// KT (group fetch degradation): decode-class group fetch failure — a fetch
+/// or decrypt that failed structurally (payload/protobuf/zkgroup decode)
+/// rather than transiently. Retried once in-call, then surfaced as
+/// [`Error::GroupSyncFailed`] instead of silently serving a stale group.
+fn group_fetch_decode_class(error: &libsignal_service::prelude::ServiceError) -> bool {
+    use libsignal_service::prelude::ServiceError;
+    matches!(
+        error,
+        ServiceError::GroupsV2DecryptionError(_)
+            | ServiceError::ProtobufDecodeError(_)
+            | ServiceError::ZkGroupDeserializationFailure(_)
+            | ServiceError::ZkGroupVerificationFailure(_)
+            | ServiceError::GroupsV2Error
+    )
+}
+
+/// KT (group fetch degradation): the group no longer exists server-side
+/// (HTTP 404 — official GROUP_NONEXISTENT).
+fn group_fetch_gone(error: &libsignal_service::prelude::ServiceError) -> bool {
+    matches!(
+        error,
+        libsignal_service::prelude::ServiceError::NotFoundError
+    )
 }
 
 /// Why collecting a receive-batch window stopped.
@@ -3049,5 +3174,29 @@ mod receive_batch_tests {
             "everything else degrades to the catch-all class"
         );
         assert_eq!(OPEN_RETRY_MAX_ATTEMPTS, 3);
+    }
+
+    // KT (group fetch degradation): the decode/gone partition decides the
+    // retry-then-structured-error path vs the fail-open fallback at every
+    // group fetch call site; the retry bound matches the in-call loop.
+    #[test]
+    fn group_fetch_failure_partition_and_bound() {
+        use libsignal_service::prelude::ServiceError;
+
+        assert!(group_fetch_decode_class(&ServiceError::GroupsV2Error));
+        assert!(group_fetch_decode_class(
+            &ServiceError::GroupsV2DecryptionError(
+                libsignal_service::groups_v2::GroupDecodingError::WrongBlob
+            )
+        ));
+        assert!(!group_fetch_decode_class(&ServiceError::Unauthorized));
+        assert!(!group_fetch_decode_class(
+            &ServiceError::RateLimitExceeded { retry_after: None }
+        ));
+
+        assert!(group_fetch_gone(&ServiceError::NotFoundError));
+        assert!(!group_fetch_gone(&ServiceError::Unauthorized));
+
+        assert_eq!(GROUP_FETCH_MAX_ATTEMPTS, 2);
     }
 }

@@ -365,6 +365,22 @@
   DecryptionError 槽语义不变（DERM 自愈链路不动）。presage 上游无
   unprocessed 持久化面——最小实现为流内内存队列。`classify_open_error`
   分类与界限单测 `open_error_classification_and_retry_bound`。
+- `presage/src/{errors.rs,manager/registered.rs,model/messages.rs}`
+  （2026-10-16 接收完整性批②群取回分型降级）— 群 update/sync 信封触发的
+  群 fetch/decrypt 不再静默回退旧群态：解码类失败
+  （`group_fetch_decode_class` 纯函数：GroupsV2DecryptionError /
+  ProtobufDecodeError / ZkGroupDeserializationFailure /
+  ZkGroupVerificationFailure / GroupsV2Error）fetch+decrypt（upsert 路径
+  连 save_group）整体重试 1 次（`GROUP_FETCH_MAX_ATTEMPTS = 2`），耗尽 →
+  新 `Error::GroupSyncFailed { attempts }` 结构化上抛；HTTP 404
+  （`group_fetch_gone`，官方 GROUP_NONEXISTENT）→ 新 `Error::GroupGone`；
+  401/403 及其余失败保留既有 warn + 本地兜底。接收流群更新腿把两结构化
+  错误转 `Received::GroupSyncFailed { master_key, kind, attempts }`
+  （新 `GroupSyncFailureKind::{Decode, Gone}`）随批上抛（无 ack——单 ack
+  契约由同信封 Content 槽承担）；两处旁路调用点（群头像路径、发送前群态
+  刷新）保持 fail-open：结构化错误 warn + `store.group` 兜底（stale 名单
+  胜过路径整体失败）。分类分界单测
+  `group_fetch_failure_partition_and_bound`。
 
 `vendor/presage/presage-store-sqlite/`：
 

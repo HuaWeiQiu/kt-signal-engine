@@ -83,4 +83,26 @@ pub enum Received {
     /// itself decrypted and is carried through unchanged: consumers project
     /// it exactly like `Content`, ack once, and may surface the change.
     IdentityChange(ServiceId, Box<Content>, EnvelopeAck),
+
+    /// KT (group fetch degradation): a group update envelope whose group
+    /// fetch/decrypt failed after the in-call retry bound. No ack is
+    /// carried — the single-ack contract stays with the source envelope's
+    /// `Content` slot, which the consumer still processes.
+    GroupSyncFailed {
+        master_key: [u8; 32],
+        kind: GroupSyncFailureKind,
+        attempts: u32,
+    },
+}
+
+/// KT (group fetch degradation): why a group fetch was surfaced as a
+/// structured failure instead of silently keeping stale group state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSyncFailureKind {
+    /// Payload/protobuf/zkgroup decode failed through the retry bound
+    /// (official GROUP_CALL FAILED class; consumer may retry later).
+    Decode,
+    /// The group no longer exists server-side (HTTP 404 — official
+    /// GROUP_NONEXISTENT); local state is obsolete.
+    Gone,
 }

@@ -64,6 +64,14 @@ pub enum Error<S: std::error::Error> {
     /// client-side, the server would not.
     #[error("group is announcements-only; sender is not an admin")]
     GroupAnnouncementsOnly,
+    /// KT (group fetch semantics): decode-class group fetch failures retried to
+    /// exhaustion — callers must not silently fall back to stale group state.
+    #[error("group sync failed after {attempts} attempt(s)")]
+    GroupSyncFailed { attempts: u32 },
+    /// KT (group fetch semantics): the group vanished server-side (HTTP 404,
+    /// official GROUP_NONEXISTENT) — the local group state is obsolete.
+    #[error("group is gone on the server")]
+    GroupGone,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]

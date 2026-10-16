@@ -72,6 +72,9 @@ pub(crate) mod keys {
     pub const RECEIVE_KIND_DUPLICATE: &str = "receive_kind_duplicate";
     pub const RECEIVE_KIND_CONTACTS: &str = "receive_kind_contacts";
     pub const RECEIVE_KIND_QUEUE_EMPTY: &str = "receive_kind_queue_empty";
+    /// 群取回失败信封计（接收完整性批②：groupSyncFailed/groupTerminated
+    /// 事件腿，decode+gone 合并计数）。
+    pub const RECEIVE_KIND_GROUP_SYNC_FAILED: &str = "receive_kind_group_sync_failed";
     pub const FLUSH_BARRIER_OK: &str = "flush_barrier_ok";
     pub const FLUSH_BARRIER_DEAD: &str = "flush_barrier_dead";
     pub const SEND_TEXT_OK: &str = "send_text_ok";
@@ -116,6 +119,7 @@ const KNOWN_KEYS: &[&str] = &[
     keys::RECEIVE_KIND_DUPLICATE,
     keys::RECEIVE_KIND_CONTACTS,
     keys::RECEIVE_KIND_QUEUE_EMPTY,
+    keys::RECEIVE_KIND_GROUP_SYNC_FAILED,
     keys::FLUSH_BARRIER_OK,
     keys::FLUSH_BARRIER_DEAD,
     keys::SEND_TEXT_OK,

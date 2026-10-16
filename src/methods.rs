@@ -4851,13 +4851,23 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// 原文（同一常量，connector 分类器按 message 直接命中）；限流（429/413）/
 /// 人机验证（428）/服务端 5xx 不可用 → `-32603` + 对应分类原文（锚词括注
 /// 异常类名，connector 分类器命中；5xx 建议可重试，限流/验证不自动重试
-/// ——决策在 connector/desktop，compat §3/§5）；其余（账号不可达/内部
+/// ——决策在 connector/desktop，compat §3/§5）；群态取回解码失败重试耗尽
+/// （接收完整性批②）→ `-1` + `GROUP_SYNC_FAILED` + `data.count`（vendored
+/// 重试环尝试次数，additive，compat §3）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     // 错误面归因日志由 dispatch 层单点 log_rpc_error_face 统一落（本批
     // 并入；b33244c 的内联 warn 移除防双写——覆盖面为本单点真子集）。
     let (code, message) = send_error_face(&error);
-    jsonrpc::error_response(id, &RpcError::new(code, message))
+    let data = match &error {
+        crate::service::SendError::GroupSyncFailed { count } => Some(json!({ "count": count })),
+        _ => None,
+    };
+    let rpc_error = match data {
+        Some(data) => RpcError::with_data(code, message, data),
+        None => RpcError::new(code, message),
+    };
+    jsonrpc::error_response(id, &rpc_error)
 }
 
 /// sendTyping 群腿全部收件人失败的错误面（失败显形批，2026-10-16，wire
@@ -4925,6 +4935,9 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::SessionBuild => (-32603, SESSION_BUILD_MESSAGE),
         SendError::AttachmentUpload => (-32603, ATTACHMENT_UPLOAD_MESSAGE),
         SendError::NoRecipients => (-32603, NO_RECIPIENTS_MESSAGE),
+        // 群取回分型降级（接收完整性批②，compat §3）：-1 同目标终止族
+        // （目标群态不可用即不应再发），data.count 由 send_error 单点附加。
+        SendError::GroupSyncFailed { .. } => (-1, "GROUP_SYNC_FAILED"),
         SendError::UnknownAccount | SendError::Internal => (-32603, "Internal error"),
     }
 }
@@ -4973,6 +4986,7 @@ mod tests {
             SendError::SessionBuild,
             SendError::AttachmentUpload,
             SendError::NoRecipients,
+            SendError::GroupSyncFailed { count: 2 },
             SendError::Internal,
         ];
         for error in cases {
@@ -4982,6 +4996,37 @@ mod tests {
             assert_eq!(face.get("code").and_then(Value::as_i64), Some(code));
             assert_eq!(face.get("message").and_then(Value::as_str), Some(message));
         }
+    }
+
+    /// 群取回分型降级（接收完整性批②）send 面：`-1` + `GROUP_SYNC_FAILED`
+    /// 与 `data.count`（vendored 重试环尝试次数，additive，compat §3）——
+    /// 唯一带 data 的 send 错误面；无其余词条（计数不含身份面）。
+    #[test]
+    fn send_error_group_sync_failed_carries_count_data() {
+        let response = send_error(
+            &Value::from(9),
+            crate::service::SendError::GroupSyncFailed { count: 2 },
+        );
+        let error = response.get("error").expect("error face");
+        assert_eq!(error.get("code").and_then(Value::as_i64), Some(-1));
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("GROUP_SYNC_FAILED")
+        );
+        assert_eq!(
+            error
+                .get("data")
+                .and_then(|data| data.get("count"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            error
+                .get("data")
+                .map(Value::as_object)
+                .map(|o| o.map_or(0, |o| o.len())),
+            Some(1)
+        );
     }
 
     /// 群腿零收件人防御面（2026-10-16 批）：`NoRecipients` 错误面 =
