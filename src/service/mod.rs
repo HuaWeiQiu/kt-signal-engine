@@ -7306,6 +7306,12 @@ async fn project_content_inner(
                     // 钉定 rev proto 已 reserved 删字段（prost 跳未知，无法
                     // 投）——两处偏差落 §5 组 6 块。Request{Keys} 应答停答
                     // 面（P9 S2）与此接收投影面互不相干。
+                    //
+                    // 三键布尔面评估批（2026-10-17）：AEP 存在性布尔一位
+                    // additive（材料不出边界，Present 后缀与官方材料面
+                    // string 同名键区隔）；masterKey 存在性不可得（评估
+                    // 结论与边界原因落评估批块）；mediaRootBackupKey 材料
+                    // 在场 = 存在性超集不重复投布尔。
                     let mut face = serde_json::Map::new();
                     if let Some(key) = keys
                         .media_root_backup_key
@@ -7317,6 +7323,13 @@ async fn project_content_inner(
                             "mediaRootBackupKey".into(),
                             json!(base64::engine::general_purpose::STANDARD.encode(key)),
                         );
+                    }
+                    if keys
+                        .account_entropy_pool
+                        .as_deref()
+                        .is_some_and(|pool| !pool.is_empty())
+                    {
+                        face.insert("accountEntropyPoolPresent".into(), json!(true));
                     }
                     envelope["syncMessage"] = json!({ "keys": Value::Object(face) });
                 }
@@ -13077,6 +13090,30 @@ mod tests {
         assert!(envelope["syncMessage"]["keys"]
             .get("accountEntropyPool")
             .is_none());
+        // 三键布尔面评估批：AEP 非空 → accountEntropyPoolPresent=true（材料
+        // 键仍不在，Present 布尔与官方材料面同名键区隔）。
+        assert_eq!(
+            envelope["syncMessage"]["keys"]["accountEntropyPoolPresent"],
+            json!(true)
+        );
+
+        // 空串 AEP 与缺席同为无键（非空才投）。
+        let envelope = pop_unwrap(
+            project_content(
+                "acct",
+                &store,
+                &make(sync_message::Keys {
+                    account_entropy_pool: Some(String::new()),
+                    media_root_backup_key: None,
+                }),
+                &registry,
+                None,
+            )
+            .await,
+            "keys projects empty aep",
+        )["params"]["envelope"]
+            .clone();
+        assert_eq!(envelope["syncMessage"]["keys"], json!({}));
 
         // 缺：全缺照投空对象。
         let envelope = pop_unwrap(
