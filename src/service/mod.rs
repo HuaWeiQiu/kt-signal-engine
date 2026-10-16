@@ -4665,16 +4665,11 @@ impl Service {
             now_ms(),
         )
         .await?;
-        let verified = presage::proto::Verified {
-            destination_aci_binary: Some(peer.service_id_binary()),
-            identity_key: Some(outcome.peer_key),
-            state: Some(outcome.state.sync_state() as i32),
-            ..Default::default()
-        };
-        let body = ContentBody::SynchronizeMessage(presage::proto::SyncMessage {
-            content: Some(presage::proto::sync_message::Content::Verified(verified)),
-            ..Default::default()
-        });
+        let body = ContentBody::SynchronizeMessage(identity::verified_sync_message(
+            &peer,
+            outcome.peer_key,
+            outcome.state,
+        ));
         let _ = manager.send_message(own_aci, body, now_ms()).await;
         Ok(())
     }
