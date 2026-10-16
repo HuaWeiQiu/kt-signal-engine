@@ -212,7 +212,10 @@
   （未安装 no-op，库独立可用）+ 五段键字面量模块 `keys`
   （`send_sender_setup`/`send_cert_fetch`/`send_session_establish`/
   `send_encrypt`/`send_ws_rtt`——与引擎 perf 词表字面量钉等，引擎侧
-  跨 crate 单测钉定）。三例单测。
+  跨 crate 单测钉定）。三例单测（2026-10-17 集成批修正：三例共用进程级
+  `SINK` OnceLock，模块内互斥锁串行 + no-op 例仅在未安装时验证——原
+  并发执行下 install 例先行时 no-op 例的 emit 会触 sink 断言，fixture
+  测试增量改变时序后以 ~1/3 概率炸）。
 - `src/lib.rs`（同批）— `pub mod perf_hook` 挂载。
 - `src/sender.rs`（同批）— `try_send_message` WS 上行→应答段 emit
   （`send_ws_rtt`；修复环每轮各计一条）+ `create_encrypted_message`
