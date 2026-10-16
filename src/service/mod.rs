@@ -6514,6 +6514,7 @@ async fn serve_account_stream(
                             manager.store(),
                             &content,
                             &service.terminated_groups,
+                            Some(service),
                         )
                         .await
                     {
@@ -6568,6 +6569,7 @@ async fn serve_account_stream(
                             manager.store(),
                             &content,
                             &service.terminated_groups,
+                            Some(service),
                         )
                         .await
                     {
@@ -6731,9 +6733,11 @@ async fn project_content(
     store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
     terminated_groups: &groups::TerminatedGroups,
+    service: Option<&Arc<Service>>,
 ) -> Vec<Value> {
     let started = std::time::Instant::now();
-    let projected = project_content_inner(account, store, content, terminated_groups).await;
+    let projected =
+        project_content_inner(account, store, content, terminated_groups, service).await;
     perf_metrics::record_us(
         perf_metrics::keys::RECEIVE_PROJECT,
         started.elapsed().as_micros() as u64,
@@ -6746,6 +6750,7 @@ async fn project_content_inner(
     store: &SqliteStore,
     content: &presage::libsignal_service::content::Content,
     terminated_groups: &groups::TerminatedGroups,
+    service: Option<&Arc<Service>>,
 ) -> Vec<Value> {
     use presage::libsignal_service::content::ContentBody;
 
@@ -6899,6 +6904,77 @@ async fn project_content_inner(
             });
         }
         ContentBody::SynchronizeMessage(sync) => {
+            // stickerPackSync 收投影臂（接收完整性批③，N1 缺口闭合，compat
+            // §3）：`syncMessage.stickerPackOperation` repeated 直挂字段独占
+            // 分发（官方 #handleStickerPackOperation 词条同形，
+            // MessageReceiver.preload.ts:3093/:3413）——此前该信封落 read/
+            // viewed 兜底臂整信封丢弃。词条 {id: packId 小写 hex, key:
+            // packKey 标准 base64, isInstall, isRemove}（源位缺席/空 → 该键
+            // 省略）；type 裸位判定（prost 枚举 getter 会把未知值兜成缺省
+            // INSTALL，宁缺勿错须跳整条）；写面 best-effort：install 须
+            // 32B packKey（缺/短只跳写面、事件照投），uninstall 走既有
+            // Storage Service 通道（P5 批 409 采纳重放+幂等同语义），写失败
+            // 事件照投（主设备自有写面 + manifest 读收敛兜底）；packId 空
+            // 词条只投影不写；服务面缺席（单测注入 None）只投影。
+            if !sync.sticker_pack_operation.is_empty() {
+                use presage::proto::sync_message::sticker_pack_operation::Type;
+                let mut entries = Vec::with_capacity(sync.sticker_pack_operation.len());
+                for operation in &sync.sticker_pack_operation {
+                    let (is_install, is_remove) = match operation.r#type {
+                        // proto 缺省 = INSTALL（官方 Type::INSTALL=0 同语义）。
+                        None => (true, false),
+                        Some(value) if value == Type::Install as i32 => (true, false),
+                        Some(value) if value == Type::Remove as i32 => (false, true),
+                        Some(_) => continue,
+                    };
+                    let pack_id = operation.pack_id();
+                    let pack_key = operation.pack_key();
+                    let mut entry = serde_json::Map::new();
+                    if !pack_id.is_empty() {
+                        entry.insert("id".into(), json!(hex_encode(pack_id)));
+                    }
+                    if !pack_key.is_empty() {
+                        use base64::Engine as _;
+                        entry.insert(
+                            "key".into(),
+                            json!(base64::engine::general_purpose::STANDARD.encode(pack_key)),
+                        );
+                    }
+                    entry.insert("isInstall".into(), json!(is_install));
+                    entry.insert("isRemove".into(), json!(is_remove));
+                    if let Some(service) = service {
+                        let intent = match (is_install, pack_key.try_into()) {
+                            (true, Ok(pack_key)) if !pack_id.is_empty() => {
+                                Some(storage_sticker::StickerPackWrite::Install {
+                                    pack_id: pack_id.to_vec(),
+                                    pack_key,
+                                    position: None,
+                                })
+                            }
+                            (false, _) if !pack_id.is_empty() => {
+                                Some(storage_sticker::StickerPackWrite::Uninstall {
+                                    pack_id: pack_id.to_vec(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(intent) = intent {
+                            let _ = service.set_sticker_pack_sync(account, intent).await;
+                        }
+                    }
+                    entries.push(Value::Object(entry));
+                }
+                if !entries.is_empty() {
+                    envelope["syncMessage"] = json!({ "stickerPackSync": entries });
+                    return vec![json!({
+                        "jsonrpc": "2.0",
+                        "method": "receive",
+                        "params": { "account": account, "envelope": envelope },
+                    })];
+                }
+                // 全部词条未知 type 值 → 整信封无可投影（宁缺勿错），落
+                // 下方既有 sync 臂兜底。
+            }
             // sent/viewOnceOpen 在 SyncMessage.content oneof 里（read/viewed
             // 是直接 repeated 字段，兜底臂承接，D2）。
             match sync.content.as_ref() {
@@ -12149,7 +12225,7 @@ mod tests {
             metadata.clone(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "typing projects",
         )["params"]["envelope"]
             .clone();
@@ -12172,7 +12248,7 @@ mod tests {
             metadata,
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "typing projects",
         )["params"]["envelope"]
             .clone();
@@ -12270,7 +12346,7 @@ mod tests {
             metadata.clone(),
         );
         let sent = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent projects",
         )["params"]["envelope"]["syncMessage"]["sentMessage"]
             .clone();
@@ -12307,7 +12383,7 @@ mod tests {
             metadata,
         );
         let sent = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent projects",
         )["params"]["envelope"]["syncMessage"]["sentMessage"]
             .clone();
@@ -12376,7 +12452,7 @@ mod tests {
             content: presage::libsignal_service::content::Content,
         ) -> serde_json::Value {
             pop_unwrap(
-                project_content("acct", store, &content, registry).await,
+                project_content("acct", store, &content, registry, None).await,
                 "sync arm projects",
             )["params"]["envelope"]["syncMessage"]
                 .clone()
@@ -12618,6 +12694,7 @@ mod tests {
                     media_root_backup_key: Some(vec![0xAB_u8; 32]),
                 }),
                 &registry,
+                None,
             )
             .await,
             "keys projects",
@@ -12642,6 +12719,7 @@ mod tests {
                 &store,
                 &make(sync_message::Keys::default()),
                 &registry,
+                None,
             )
             .await,
             "keys projects",
@@ -14097,7 +14175,7 @@ mod tests {
         );
         let registry = groups::TerminatedGroups::new();
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         );
         let envelope = &envelope["params"]["envelope"];
@@ -14118,7 +14196,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         );
         assert!(envelope.get("serverGuid").is_none());
@@ -14172,7 +14250,7 @@ mod tests {
             metadata(Some(true), Some(false), Some(vec![0xDE, 0xAD, 0xBE, 0xEF])),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         )["params"]["envelope"]
             .clone();
@@ -14189,7 +14267,7 @@ mod tests {
             metadata(Some(false), Some(true), Some(Vec::new())),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         )["params"]["envelope"]
             .clone();
@@ -14203,7 +14281,7 @@ mod tests {
             metadata(None, None, None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         )["params"]["envelope"]
             .clone();
@@ -14258,7 +14336,7 @@ mod tests {
             metadata.clone(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "dataMessage projects",
         )["params"]["envelope"]
             .clone();
@@ -14274,7 +14352,7 @@ mod tests {
             metadata,
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "editMessage projects",
         )["params"]["envelope"]
             .clone();
@@ -14482,7 +14560,7 @@ mod tests {
             ..sync_message::Blocked::default()
         });
         let face = &pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "blocked projects",
         )["params"]["envelope"]["syncMessage"]["blocked"];
         assert!(face.get("numbers").is_none(), "modern 在场时 legacy 不投");
@@ -14511,7 +14589,7 @@ mod tests {
             ..sync_message::Blocked::default()
         });
         let face = &pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "blocked legacy projects",
         )["params"]["envelope"]["syncMessage"]["blocked"];
         assert_eq!(face["numbers"], json!(["+15550000000"]));
@@ -14532,7 +14610,7 @@ mod tests {
         // 空对象（信号面即事件）。
         let content = blocked_body(sync_message::Blocked::default());
         let face = &pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "blocked empty projects",
         )["params"]["envelope"]["syncMessage"]["blocked"];
         assert_eq!(face, &json!({}));
@@ -14617,7 +14695,7 @@ mod tests {
             metadata(Some(true)),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story projects",
         )["params"]["envelope"]
             .clone();
@@ -14655,7 +14733,7 @@ mod tests {
             metadata(Some(true)),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story projects",
         )["params"]["envelope"]
             .clone();
@@ -14738,7 +14816,7 @@ mod tests {
             metadata(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story projects",
         )["params"]["envelope"]
             .clone();
@@ -14756,7 +14834,7 @@ mod tests {
             metadata(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story projects",
         )["params"]["envelope"]
             .clone();
@@ -14833,7 +14911,7 @@ mod tests {
             metadata(Some(true)),
         );
         assert!(
-            project_content("acct", &store, &content, &registry)
+            project_content("acct", &store, &content, &registry, None)
                 .await
                 .is_empty(),
             "非 story/群回复/remote delete 行丢弃"
@@ -14850,7 +14928,7 @@ mod tests {
             metadata(Some(true)),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "delete projects",
         )["params"]["envelope"]
             .clone();
@@ -14874,7 +14952,7 @@ mod tests {
             metadata(Some(true)),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "group story reply projects",
         )["params"]["envelope"]
             .clone();
@@ -14951,7 +15029,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story reply projects",
         )["params"]["envelope"]
             .clone();
@@ -14977,7 +15055,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story reply projects",
         )["params"]["envelope"]
             .clone();
@@ -15001,7 +15079,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story body projects",
         )["params"]["envelope"]
             .clone();
@@ -15086,7 +15164,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "1:1 story reaction projects",
         )["params"]["envelope"]
             .clone();
@@ -15114,7 +15192,7 @@ mod tests {
             metadata(Some(true)),
         );
         assert!(
-            project_content("acct", &store, &content, &registry)
+            project_content("acct", &store, &content, &registry, None)
                 .await
                 .is_empty(),
             "story 位 1:1 reaction 形状丢弃"
@@ -15131,7 +15209,7 @@ mod tests {
             metadata(Some(true)),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "group story reaction projects",
         )["params"]["envelope"]
             .clone();
@@ -15216,7 +15294,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "binary-first story reply projects",
         )["params"]["envelope"]
             .clone();
@@ -15240,7 +15318,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "plain row projects",
         )["params"]["envelope"]
             .clone();
@@ -15262,7 +15340,7 @@ mod tests {
             metadata(None),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "plain reaction projects",
         )["params"]["envelope"]
             .clone();
@@ -15304,7 +15382,7 @@ mod tests {
             ..Default::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent story reply projects",
         )["params"]["envelope"]
             .clone();
@@ -15337,7 +15415,7 @@ mod tests {
             ..Default::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent story reaction projects",
         )["params"]["envelope"]
             .clone();
@@ -15437,7 +15515,7 @@ mod tests {
             metadata.clone(),
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "terminate event projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15492,7 +15570,7 @@ mod tests {
             metadata.clone(),
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "group dataMessage projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15528,7 +15606,7 @@ mod tests {
             metadata,
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent terminate projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15637,7 +15715,7 @@ mod tests {
             metadata.clone(),
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "expiration event projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15667,7 +15745,7 @@ mod tests {
             metadata.clone(),
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "timer-off event projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15713,7 +15791,7 @@ mod tests {
             metadata.clone(),
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "group dataMessage projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -15749,7 +15827,7 @@ mod tests {
             metadata,
         );
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "sent expiration projects",
         );
         let envelope = &notification["params"]["envelope"];
@@ -16519,7 +16597,7 @@ mod tests {
         );
         let registry = groups::TerminatedGroups::new();
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "call message projects to receive",
         );
         let envelope = &notification["params"]["envelope"];
@@ -16558,7 +16636,7 @@ mod tests {
         );
         let registry = groups::TerminatedGroups::new();
         let notification = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "call event sync projects to receive",
         );
         let envelope = &notification["params"]["envelope"];
@@ -16636,7 +16714,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 2, "harvest: event + normal投影");
         let event = &notifications[0]["params"]["envelope"];
         assert_eq!(event["contactProfileUpdated"]["aci"], json!(sender_aci));
@@ -16655,7 +16733,7 @@ mod tests {
         );
 
         // 幂等：同 key 重复收 → 只有普通投影，无事件无重写。
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "idempotent: normal only");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16670,7 +16748,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 2, "rotate: event + normal投影");
         assert_eq!(
             notifications[0]["params"]["envelope"]["contactProfileUpdated"]["aci"],
@@ -16695,7 +16773,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "invalid length: normal only");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16722,7 +16800,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "empty key: normal only");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16738,7 +16816,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "flagged: single event");
         let envelope = &notifications[0]["params"]["envelope"];
         assert_eq!(envelope["contactProfileUpdated"]["aci"], json!(sender_aci));
@@ -16746,7 +16824,7 @@ mod tests {
 
         // 同 key 的 flag 行（换回旧值触发事件；再收一次 = 幂等：无事件且
         // 更新行本身无可投影正文 → 零通知，官方 hasChanged 门 no-op 同果）。
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert!(notifications.is_empty(), "flagged idempotent: no event");
 
         // sent sync（本机其他设备镜像）不处理：无事件、store 不动。
@@ -16765,7 +16843,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "sent sync: normal only");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16788,7 +16866,7 @@ mod tests {
             }),
             envelope_metadata(),
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "plain: single投影");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16822,7 +16900,7 @@ mod tests {
             }),
             metadata,
         );
-        let notifications = project_content("acct", &store, &content, &registry).await;
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
         assert_eq!(notifications.len(), 1, "pni sender: normal only");
         assert!(notifications[0]["params"]["envelope"]
             .get("contactProfileUpdated")
@@ -16882,6 +16960,7 @@ mod tests {
                 None,
             ),
             &registry,
+            None,
         )
         .await;
         assert_eq!(notifications.len(), 1, "accept: single投影");
@@ -16906,6 +16985,7 @@ mod tests {
                 None,
             ),
             &registry,
+            None,
         )
         .await;
         assert_eq!(notifications.len(), 1, "delete: single投影");
@@ -16927,6 +17007,7 @@ mod tests {
                 Some(group_key.to_vec()),
             ),
             &registry,
+            None,
         )
         .await;
         assert_eq!(notifications.len(), 1, "group: single投影");
@@ -16949,6 +17030,7 @@ mod tests {
             &store,
             &mrr(Some(1), None, Some(vec![0xde, 0xad]), None),
             &registry,
+            None,
         )
         .await;
         assert!(notifications.is_empty(), "unroutable: dropped");
@@ -17004,6 +17086,7 @@ mod tests {
                 Vec::new(),
             ),
             &registry,
+            None,
         )
         .await;
         assert_eq!(notifications.len(), 1, "read: single 投影");
@@ -17045,6 +17128,7 @@ mod tests {
                 ],
             ),
             &registry,
+            None,
         )
         .await;
         assert_eq!(notifications.len(), 1, "viewed: single 投影");
@@ -17055,10 +17139,221 @@ mod tests {
         assert_eq!(viewed[0]["timestamp"], json!(333));
 
         // 全空：整信封零投影。
-        let notifications =
-            project_content("acct", &store, &sync_of(Vec::new(), Vec::new()), &registry).await;
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(Vec::new(), Vec::new()),
+            &registry,
+            None,
+        )
+        .await;
         assert!(notifications.is_empty(), "空 read/viewed 不投影");
 
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// stickerPackSync 收投影臂（接收完整性批③，compat §3 additive）：
+    /// `stickerPackOperation` 非空 sync 信封独占早返（不落 read/viewed 兜底
+    /// 臂），词条 {id: packId 小写 hex, key: packKey 标准 base64,
+    /// isInstall, isRemove}（源位缺席 → 该键省略）；type 裸位判定
+    /// （None = proto 缺省 INSTALL 同官方、REMOVE=1、未知值整条跳过宁缺勿
+    /// 错，全部未知 → 整信封零投影）；服务面缺席（None 注入）只投影零写面。
+    #[tokio::test]
+    async fn sticker_pack_sync_projection_exclusive_arm_shapes() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let store_dir =
+            std::env::temp_dir().join(format!("kt-engine-sps-{:016x}", mix_seed_step(mix_seed())));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sync_of = |operations: Vec<sync_message::StickerPackOperation>| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    sticker_pack_operation: operations,
+                    ..SyncMessage::with_padding(&mut rng())
+                }),
+                envelope_metadata(),
+            )
+        };
+        let operation =
+            |pack_id: Option<Vec<u8>>, pack_key: Option<Vec<u8>>, r#type: Option<i32>| {
+                sync_message::StickerPackOperation {
+                    pack_id,
+                    pack_key,
+                    r#type,
+                }
+            };
+
+        // install（None = proto 缺省）+ remove：词条同官方事件面（id 小写
+        // hex、key base64、isInstall/isRemove 布尔），独占臂单通知。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(vec![
+                operation(Some(vec![0x0a; 16]), Some(vec![0x0b; 32]), None),
+                operation(Some(vec![0x0c; 16]), Some(vec![0x0d; 32]), Some(1)),
+            ]),
+            &registry,
+            None,
+        )
+        .await;
+        assert_eq!(notifications.len(), 1, "独占臂单通知");
+        let envelope = &notifications[0]["params"]["envelope"];
+        let entries = envelope["syncMessage"]["stickerPackSync"]
+            .as_array()
+            .expect("stickerPackSync array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], json!(hex_encode(&[0x0a_u8; 16])));
+        assert_eq!(
+            entries[0]["key"],
+            json!(base64::engine::general_purpose::STANDARD.encode([0x0b_u8; 32]))
+        );
+        assert_eq!(entries[0]["isInstall"], json!(true));
+        assert_eq!(entries[0]["isRemove"], json!(false));
+        assert_eq!(entries[1]["id"], json!(hex_encode(&[0x0c_u8; 16])));
+        assert_eq!(entries[1]["isInstall"], json!(false));
+        assert_eq!(entries[1]["isRemove"], json!(true));
+
+        // 显式 INSTALL=0 同缺省形状（官方 INSTALL=0 值面）。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(vec![operation(
+                Some(vec![0x0a; 16]),
+                Some(vec![0x0b; 32]),
+                Some(0),
+            )]),
+            &registry,
+            None,
+        )
+        .await;
+        assert_eq!(
+            notifications[0]["params"]["envelope"]["syncMessage"]["stickerPackSync"][0]
+                ["isInstall"],
+            json!(true),
+            "显式 INSTALL 与 proto 缺省同形状"
+        );
+
+        // 未知 type 值整条跳过（宁缺勿错）；全部未知 → 整信封零投影。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(vec![
+                operation(Some(vec![0x0a; 16]), Some(vec![0x0b; 32]), Some(7)),
+                operation(Some(vec![0x0c; 16]), Some(vec![0x0d; 32]), Some(1)),
+            ]),
+            &registry,
+            None,
+        )
+        .await;
+        let entries = notifications[0]["params"]["envelope"]["syncMessage"]["stickerPackSync"]
+            .as_array()
+            .expect("unknown entry skipped");
+        assert_eq!(entries.len(), 1, "未知 type 词条跳过");
+        assert_eq!(entries[0]["isRemove"], json!(true));
+
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(vec![operation(
+                Some(vec![0x0a; 16]),
+                Some(vec![0x0b; 32]),
+                Some(9),
+            )]),
+            &registry,
+            None,
+        )
+        .await;
+        assert!(notifications.is_empty(), "全未知词条零投影");
+
+        // 源位缺席 → 键省略（布尔恒在）：packId 缺 = id 键不在；独占臂不
+        // 落 read/viewed 兜底（syncMessage 无 read/viewed 键）。
+        let notifications = project_content(
+            "acct",
+            &store,
+            &sync_of(vec![operation(None, Some(vec![0x0b; 32]), None)]),
+            &registry,
+            None,
+        )
+        .await;
+        let entry = &notifications[0]["params"]["envelope"]["syncMessage"]["stickerPackSync"][0];
+        assert!(entry.get("id").is_none(), "packId 缺席 id 键不在");
+        assert!(entry.get("key").is_some());
+        assert_eq!(entry["isInstall"], json!(true));
+        assert!(notifications[0]["params"]["envelope"]["syncMessage"]
+            .get("read")
+            .is_none(),);
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// stickerPackSync 写面联动（接收完整性批③）：Some(service) 注入下投影
+    /// 逐字同形（写面 best-effort——未注册账号写面 Err 吞掉不炸投影）；
+    /// 短 packKey（<32B）install 只跳写面、事件照投（key 键在）。
+    #[tokio::test]
+    async fn sticker_pack_sync_projection_with_service_write_is_best_effort() {
+        use presage::libsignal_service::content::{Content, ContentBody};
+        use presage::proto::{sync_message, SyncMessage};
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-sps-write-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+
+        let store_dir =
+            std::env::temp_dir().join(format!("kt-engine-sps2-{:016x}", mix_seed_step(mix_seed())));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                sticker_pack_operation: vec![
+                    sync_message::StickerPackOperation {
+                        pack_id: Some(vec![0x11; 16]),
+                        pack_key: Some(vec![0x22; 32]),
+                        r#type: None,
+                    },
+                    // 短 packKey install：写面跳过（<32B），事件照投。
+                    sync_message::StickerPackOperation {
+                        pack_id: Some(vec![0x33; 16]),
+                        pack_key: Some(vec![0x44; 16]),
+                        r#type: Some(0),
+                    },
+                    sync_message::StickerPackOperation {
+                        pack_id: Some(vec![0x55; 16]),
+                        pack_key: None,
+                        r#type: Some(1),
+                    },
+                ],
+                ..SyncMessage::with_padding(&mut rng())
+            }),
+            envelope_metadata(),
+        );
+        let notifications =
+            project_content("acct", &store, &content, &registry, Some(&service)).await;
+        assert_eq!(notifications.len(), 1, "写面失败不影响投影");
+        let entries = notifications[0]["params"]["envelope"]["syncMessage"]["stickerPackSync"]
+            .as_array()
+            .expect("entries");
+        assert_eq!(entries.len(), 3, "三条词条全投影");
+        assert_eq!(entries[0]["isInstall"], json!(true));
+        assert_eq!(
+            entries[1]["key"].as_str().map(str::len),
+            Some(24),
+            "16B base64"
+        );
+        assert_eq!(entries[1]["isInstall"], json!(true), "短 key 只跳写面");
+        assert_eq!(entries[2]["isRemove"], json!(true));
+        assert!(entries[2].get("key").is_none(), "packKey 缺席 key 键不在");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
@@ -18884,6 +19179,7 @@ mod tests {
             &store,
             &verified_body(presage::proto::verified::State::Verified, true),
             &groups::TerminatedGroups::new(),
+            None,
         )
         .await
         .is_empty());
@@ -19503,7 +19799,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "edit echo projects",
         )["params"]["envelope"]
             .clone();
@@ -19538,7 +19834,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "story echo projects",
         )["params"]["envelope"]
             .clone();
@@ -19549,7 +19845,7 @@ mod tests {
 
         // 全缺位：整信封丢弃（宁缺勿错）。
         let content = sent_body(sync_message::Sent::default());
-        assert!(project_content("acct", &store, &content, &registry)
+        assert!(project_content("acct", &store, &content, &registry, None)
             .await
             .is_empty());
 
@@ -19636,7 +19932,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "recipient update projects",
         )["params"]["envelope"]
             .clone();
@@ -19672,7 +19968,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "gate precedes story face",
         )["params"]["envelope"]
             .clone();
@@ -19690,7 +19986,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "no isUpdate keeps echo",
         )["params"]["envelope"]
             .clone();
@@ -19709,7 +20005,7 @@ mod tests {
             ..sync_message::Sent::default()
         });
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "empty recipients keeps echo",
         )["params"]["envelope"]
             .clone();
@@ -19804,7 +20100,7 @@ mod tests {
             metadata.clone(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "deleteForMe projects",
         )["params"]["envelope"]
             .clone();
@@ -19836,7 +20132,7 @@ mod tests {
                 ..metadata
             },
         );
-        assert!(project_content("acct", &store, &content, &registry)
+        assert!(project_content("acct", &store, &content, &registry, None)
             .await
             .is_empty());
 
@@ -19953,7 +20249,7 @@ mod tests {
             metadata.clone(),
         );
         let envelope = pop_unwrap(
-            project_content("acct", &store, &content, &registry).await,
+            project_content("acct", &store, &content, &registry, None).await,
             "deleteForMe conversations project",
         )["params"]["envelope"]
             .clone();
@@ -19995,7 +20291,7 @@ mod tests {
             }),
             metadata,
         );
-        assert!(project_content("acct", &store, &content, &registry)
+        assert!(project_content("acct", &store, &content, &registry, None)
             .await
             .is_empty());
 
