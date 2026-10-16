@@ -7445,6 +7445,22 @@ async fn project_content_inner(
                     }
                     envelope["syncMessage"] = json!({ "blocked": Value::Object(face) });
                 }
+                // attachmentBackfillResponse 收投影臂（官方
+                // content oneof attachmentBackfillResponse=25，
+                // #handleAttachmentBackfillResponse 同位
+                // MessageReceiver.preload.ts:3146-3151/:3806——此前落兜底臂
+                // 整信封丢）。最小对齐：解包投影 targetMessage/
+                // targetConversation + 回填结果（error 词或 attachments 批，
+                // status 词/指针全投影），引擎不消费回填状态——connector 消费
+                // 面后续立项（compat §5 记档）。词表 additive。
+                Some(presage::proto::sync_message::Content::AttachmentBackfillResponse(
+                    response,
+                )) => {
+                    let Some(projection) = project_attachment_backfill_response(response) else {
+                        return Vec::new();
+                    };
+                    envelope["syncMessage"] = json!({ "attachmentBackfillResponse": projection });
+                }
                 // D2：syncMessage.read / viewed 收包投影（官方 #handleRead/
                 // #handleViewed「read 专信封」调度序同位——content 面分支
                 // 不动，兜底臂承接直接 repeated 字段 read=5/viewed=16）。
@@ -9011,6 +9027,123 @@ fn project_delete_for_me_message(message: &presage::proto::AddressableMessage) -
         "author": author,
         "timestamp": message.sent_timestamp.unwrap_or(0),
     }))
+}
+
+/// attachmentBackfillResponse 收投影（compat §5，词表 additive）：官方
+/// #handleAttachmentBackfillResponse（MessageReceiver.preload.ts:3806，
+/// content oneof attachmentBackfillResponse=25）的最小对齐——引擎不消费
+/// 回填状态（connector 后续消费面），只解包投影事件体。target 面 =
+/// 官方 processAddressableMessage/processConversationIdentifier 同构：
+/// author/sentTimestamp 双闸（官方任一缺席 drop 同判）、conversation
+/// service-id binary 优先 string 次之（fromServiceIdBinaryOrString 同序）。
+/// data 面 = error 词（未知 i32 投 UNKNOWN，官方兜 0 同口径）或
+/// attachments 批（status 词 / attachment 指针全投影
+/// [`project_attachment_pointer`] 同源；官方 processBackfilledAttachment
+/// 附加的 downloadPath 是桌面本地续传名，引擎不预分配下载面，缺席记档）。
+/// 官方 strictAssert 三处失败（targetMessage/targetConversation/attachments
+/// 缺席）都走丢信封路径——本投影同步返回 None 丢整信封（宁缺勿错）。
+fn project_attachment_backfill_response(
+    response: &presage::proto::sync_message::AttachmentBackfillResponse,
+) -> Option<Value> {
+    use presage::proto::sync_message::attachment_backfill_response::{
+        attachment_data, Data as ResponseData,
+    };
+
+    let target = response.target_message.as_ref()?;
+    let author = match target.author.as_ref()? {
+        presage::proto::addressable_message::Author::AuthorServiceId(id) => {
+            ServiceId::parse_from_service_id_string(id).map(|sid| sid.service_id_string())
+        }
+        presage::proto::addressable_message::Author::AuthorServiceIdBinary(bytes) => {
+            ServiceId::parse_from_service_id_binary(bytes).map(|sid| sid.service_id_string())
+        }
+        presage::proto::addressable_message::Author::AuthorE164(number) => {
+            Some(number.clone()).filter(|number| !number.is_empty())
+        }
+    }?;
+    let sent_timestamp = target.sent_timestamp?;
+    let mut target_message = serde_json::Map::new();
+    target_message.insert("author".into(), json!(author));
+    target_message.insert("sentTimestamp".into(), json!(sent_timestamp));
+
+    let conversation = response.target_conversation.as_ref()?;
+    let mut target_conversation = serde_json::Map::new();
+    match conversation.identifier.as_ref()? {
+        presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes) => {
+            target_conversation.insert(
+                "serviceId".into(),
+                json!(ServiceId::parse_from_service_id_binary(bytes)
+                    .map(|sid| sid.service_id_string())?),
+            );
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadServiceId(id) => {
+            target_conversation.insert(
+                "serviceId".into(),
+                json!(ServiceId::parse_from_service_id_string(id)
+                    .map(|sid| sid.service_id_string())?),
+            );
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadGroupId(group_id) => {
+            use base64::Engine as _;
+            if group_id.is_empty() {
+                return None;
+            }
+            target_conversation.insert(
+                "groupId".into(),
+                json!(base64::engine::general_purpose::STANDARD.encode(group_id)),
+            );
+        }
+        presage::proto::conversation_identifier::Identifier::ThreadE164(number) => {
+            if number.is_empty() {
+                return None;
+            }
+            target_conversation.insert("e164".into(), json!(number));
+        }
+    }
+
+    let backfill_entry =
+        |entry: &presage::proto::sync_message::attachment_backfill_response::AttachmentData| {
+            let mut value = serde_json::Map::new();
+            match entry.data.as_ref()? {
+                attachment_data::Data::Status(raw) => {
+                    let word = attachment_data::Status::try_from(*raw)
+                        .map(|status| status.as_str_name().to_owned())
+                        .unwrap_or_else(|_| "UNKNOWN".to_owned());
+                    value.insert("status".into(), json!(word));
+                }
+                attachment_data::Data::Attachment(pointer) => {
+                    value.insert("attachment".into(), project_attachment_pointer(pointer));
+                }
+            }
+            Some(Value::Object(value))
+        };
+
+    let mut face = serde_json::Map::new();
+    face.insert("targetMessage".into(), Value::Object(target_message));
+    face.insert(
+        "targetConversation".into(),
+        Value::Object(target_conversation),
+    );
+    match response.data.as_ref()? {
+        ResponseData::Error(raw) => {
+            let word =
+                presage::proto::sync_message::attachment_backfill_response::Error::try_from(*raw)
+                    .map(|error| error.as_str_name().to_owned())
+                    .unwrap_or_else(|_| "UNKNOWN".to_owned());
+            face.insert("error".into(), json!(word));
+        }
+        ResponseData::Attachments(list) => {
+            let attachments: Vec<Value> =
+                list.attachments.iter().filter_map(backfill_entry).collect();
+            face.insert("attachments".into(), Value::Array(attachments));
+            if let Some(long_text) = list.long_text.as_ref() {
+                if let Some(entry) = backfill_entry(long_text) {
+                    face.insert("longText".into(), entry);
+                }
+            }
+        }
+    }
+    Some(Value::Object(face))
 }
 
 /// P15a 项3 contacts sync 投影（compat §5）：解析后的联系人记录上抛事件
@@ -12655,6 +12788,219 @@ mod tests {
         assert!(face["pniChangeNumber"]
             .get("lastResortKyberPreKey")
             .is_none());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// attachmentBackfillResponse 收投影臂（官方
+    /// #handleAttachmentBackfillResponse 同位
+    /// MessageReceiver.preload.ts:3146-3151/:3806）：target 面
+    /// {author,sentTimestamp}/{serviceId|groupId|e164} 双闸（官方
+    /// processAddressableMessage/processConversationIdentifier 同构，缺席
+    /// 丢整信封）；error 词 / attachments 批（status 词 SCREAMING +
+    /// UNKNOWN 兜、attachment 指针全投影同源）；data 缺席丢整信封
+    /// （官方 strictAssert 同判）。
+    #[tokio::test]
+    async fn sync_attachment_backfill_response_arm_projects_minimal_face() {
+        use base64::Engine as _;
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::{
+            sync_message, AddressableMessage, AttachmentPointer, ConversationIdentifier,
+            SyncMessage,
+        };
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-backfill-face-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let destination =
+            ServiceId::parse_from_service_id_string("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+                .expect("destination aci");
+        let metadata = Metadata {
+            sender,
+            destination,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let make = |sync_content| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    content: Some(sync_content),
+                    ..Default::default()
+                }),
+                metadata.clone(),
+            )
+        };
+        async fn sync_arm_face(
+            store: &SqliteStore,
+            registry: &groups::TerminatedGroups,
+            content: presage::libsignal_service::content::Content,
+        ) -> serde_json::Value {
+            pop_unwrap(
+                project_content("acct", store, &content, registry, None).await,
+                "backfill arm projects",
+            )["params"]["envelope"]["syncMessage"]["attachmentBackfillResponse"]
+                .clone()
+        }
+
+        // 完整面：attachments 批（status 词条 + 指针词条 + longText）。
+        let response = sync_message::AttachmentBackfillResponse {
+            target_message: Some(AddressableMessage {
+                sent_timestamp: Some(1_690_000_000_000),
+                author: Some(presage::proto::addressable_message::Author::AuthorServiceIdBinary(
+                    [
+                        0x11_u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55,
+                        0x55, 0x55, 0x55, 0x55, 0x55,
+                    ]
+                    .to_vec(),
+                )),
+            }),
+            target_conversation: Some(ConversationIdentifier {
+                identifier: Some(
+                    presage::proto::conversation_identifier::Identifier::ThreadGroupId(
+                        vec![0xAB_u8; 16],
+                    ),
+                ),
+            }),
+            data: Some(sync_message::attachment_backfill_response::Data::Attachments(
+                sync_message::attachment_backfill_response::AttachmentDataList {
+                    attachments: vec![
+                        sync_message::attachment_backfill_response::AttachmentData {
+                            data: Some(
+                                sync_message::attachment_backfill_response::attachment_data::Data::Status(
+                                    sync_message::attachment_backfill_response::attachment_data::Status::TerminalError as i32,
+                                ),
+                            ),
+                        },
+                        sync_message::attachment_backfill_response::AttachmentData {
+                            data: Some(
+                                sync_message::attachment_backfill_response::attachment_data::Data::Attachment(
+                                    AttachmentPointer {
+                                        client_uuid: Some([0xEF_u8; 16].to_vec()),
+                                        content_type: Some("image/png".to_owned()),
+                                        size: Some(4096),
+                                        key: Some(vec![0x5A_u8; 64]),
+                                        cdn_number: Some(2),
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                        },
+                    ],
+                    long_text: Some(sync_message::attachment_backfill_response::AttachmentData {
+                        data: Some(
+                            sync_message::attachment_backfill_response::attachment_data::Data::Status(
+                                sync_message::attachment_backfill_response::attachment_data::Status::Pending as i32,
+                            ),
+                        ),
+                    }),
+                },
+            )),
+        };
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::AttachmentBackfillResponse(response)),
+        )
+        .await;
+        assert_eq!(
+            face["targetMessage"]["author"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(
+            face["targetMessage"]["sentTimestamp"],
+            json!(1_690_000_000_000_u64)
+        );
+        assert_eq!(
+            face["targetConversation"]["groupId"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode([0xAB_u8; 16])
+                    .as_str()
+            )
+        );
+        assert_eq!(face["attachments"].as_array().map(Vec::len), Some(2));
+        assert_eq!(face["attachments"][0]["status"], json!("TERMINAL_ERROR"));
+        assert_eq!(
+            face["attachments"][1]["attachment"]["contentType"],
+            json!("image/png")
+        );
+        assert_eq!(face["attachments"][1]["attachment"]["size"], json!(4096));
+        assert_eq!(
+            face["attachments"][1]["attachment"]["locator"]["cdnNumber"],
+            json!(2)
+        );
+        assert_eq!(face["longText"]["status"], json!("PENDING"));
+        assert!(face.get("error").is_none());
+
+        // error 臂：MESSAGE_NOT_FOUND 词。
+        let face = sync_arm_face(
+            &store,
+            &registry,
+            make(sync_message::Content::AttachmentBackfillResponse(
+                sync_message::AttachmentBackfillResponse {
+                    target_message: Some(AddressableMessage {
+                        sent_timestamp: Some(1_690_000_000_000),
+                        author: Some(presage::proto::addressable_message::Author::AuthorE164(
+                            "+15550001111".to_owned(),
+                        )),
+                    }),
+                    target_conversation: Some(ConversationIdentifier {
+                        identifier: Some(
+                            presage::proto::conversation_identifier::Identifier::ThreadServiceId(
+                                "11111111-2222-4333-8444-555555555555".to_owned(),
+                            ),
+                        ),
+                    }),
+                    data: Some(sync_message::attachment_backfill_response::Data::Error(
+                        sync_message::attachment_backfill_response::Error::MessageNotFound as i32,
+                    )),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(face["error"], json!("MESSAGE_NOT_FOUND"));
+        assert_eq!(face["targetMessage"]["author"], json!("+15550001111"));
+        assert_eq!(
+            face["targetConversation"]["serviceId"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert!(face.get("attachments").is_none());
+
+        // targetMessage 缺席 → 整信封丢弃（官方 strictAssert 同判）。
+        let dropped = project_content(
+            "acct",
+            &store,
+            &make(sync_message::Content::AttachmentBackfillResponse(
+                sync_message::AttachmentBackfillResponse {
+                    target_message: None,
+                    target_conversation: None,
+                    data: None,
+                },
+            )),
+            &registry,
+            None,
+        )
+        .await;
+        assert!(dropped.is_empty());
 
         let _ = std::fs::remove_dir_all(&store_dir);
     }
