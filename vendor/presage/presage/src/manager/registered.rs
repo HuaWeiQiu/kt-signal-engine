@@ -710,6 +710,12 @@ impl<S: Store> Manager<S, Registered> {
             // the stream yields them (in arrival order) before pulling new
             // envelopes, so the consumer-visible sequence is unchanged.
             pending: std::collections::VecDeque<Received>,
+            // KT (envelope retention): envelopes whose open failed below the
+            // retry bound, awaiting a later batch window. In-memory only —
+            // presage has no upstream unprocessed store; the unacked handles
+            // keep the server queue as the durability backstop.
+            failed: std::collections::VecDeque<WindowEnvelope>,
+            retry_due: Option<tokio::time::Instant>,
             end_of_stream: bool,
         }
 
@@ -762,6 +768,8 @@ impl<S: Store> Manager<S, Registered> {
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
             pending: Default::default(),
+            failed: Default::default(),
+            retry_due: None,
             end_of_stream: false,
         };
 
@@ -780,479 +788,509 @@ impl<S: Store> Manager<S, Registered> {
                     if state.end_of_stream {
                         return None;
                     }
-                    match state.encrypted_messages.next().await {
-                        Some(Ok(Incoming::Envelope(envelope, ack))) => {
+                    // KT (envelope retention): with held envelopes, the retry
+                    // timer races fresh traffic — fresh envelopes keep the
+                    // normal batching path (and preempt the timer); a quiet
+                    // stream retries on the timer so held envelopes cannot
+                    // sit unacked forever.
+                    enum Pull {
+                        RetryTimer,
+                        Item(Option<Result<Incoming, libsignal_service::prelude::ServiceError>>),
+                    }
+                    let pull = if state.failed.is_empty() {
+                        Pull::Item(state.encrypted_messages.next().await)
+                    } else {
+                        let due = state
+                            .retry_due
+                            .unwrap_or_else(|| tokio::time::Instant::now() + OPEN_RETRY_DELAY);
+                        let timer = std::pin::pin!(tokio::time::sleep_until(due));
+                        let next = std::pin::pin!(state.encrypted_messages.next());
+                        match futures::future::select(timer, next).await {
+                            futures::future::Either::Left(_) => Pull::RetryTimer,
+                            futures::future::Either::Right((item, _timer)) => Pull::Item(item),
+                        }
+                    };
+                    let (incoming, window_end) = match pull {
+                        Pull::RetryTimer => {
+                            state.retry_due = None;
+                            let retry_window: Vec<Incoming> = state
+                                .failed
+                                .drain(..)
+                                .map(|WindowEnvelope { envelope, ack, .. }| {
+                                    Incoming::Envelope(envelope, ack)
+                                })
+                                .collect();
+                            (retry_window, BatchWindowEnd::WindowClosed)
+                        }
+                        Pull::Item(Some(Ok(Incoming::Envelope(envelope, ack)))) => {
                             // KT (receive batching): collect the official
                             // 75ms/30 window (MessageReceiver.preload.ts
                             // :359-366). Decryption stays sequential — the
                             // cipher takes &mut self with a shared CSPRNG on
                             // a !Send stream — so the batch wins come from
                             // the merged single-transaction save below.
-                            let (incoming, window_end) = collect_window(
+                            collect_window(
                                 &mut state.encrypted_messages,
                                 Incoming::Envelope(envelope, ack),
                                 Self::RECEIVE_BATCH_WINDOW,
                                 Self::RECEIVE_BATCH_MAX,
                                 |item| matches!(item, Incoming::QueueEmpty),
                             )
-                            .await;
-                            if window_end == BatchWindowEnd::EndOfStream {
-                                state.end_of_stream = true;
-                            }
-                            let mut window: Vec<(Envelope, EnvelopeAck)> =
-                                Vec::with_capacity(incoming.len());
-                            let mut queue_empty_seen = false;
-                            for item in incoming {
-                                match item {
-                                    Incoming::Envelope(envelope, ack) => {
-                                        window.push((envelope, ack))
+                            .await
+                        }
+                        Pull::Item(Some(Ok(Incoming::QueueEmpty))) => {
+                            debug!("got empty queue");
+                            request_keys_from_primary_if_needed(
+                                &state.account_entropy_pool,
+                                &state.message_sender,
+                            );
+                            return Some((Received::QueueEmpty, state));
+                        }
+                        Pull::Item(Some(Err(error))) => {
+                            error!(%error, "unexpected error in message receiving loop");
+                            continue;
+                        }
+                        Pull::Item(None) => return None,
+                    };
+                    if window_end == BatchWindowEnd::EndOfStream {
+                        state.end_of_stream = true;
+                    }
+                    let mut window: Vec<WindowEnvelope> = Vec::with_capacity(incoming.len());
+                    let mut queue_empty_seen = false;
+                    for item in incoming {
+                        match item {
+                            Incoming::Envelope(envelope, ack) => window.push(WindowEnvelope {
+                                envelope,
+                                ack,
+                                attempts: 0,
+                            }),
+                            Incoming::QueueEmpty => queue_empty_seen = true,
+                        }
+                    }
+
+                    // Per-envelope classification: contents queued
+                    // for the batch save, ready items carried as-is.
+                    // Save-before-yield ordering is preserved by
+                    // flushing the save before emitting the slots.
+                    let mut to_save: Vec<Content> = Vec::with_capacity(window.len());
+                    enum BatchSlot {
+                        /// Materializes to `Received::Content` after
+                        /// the flush; `index` walks `to_save` in
+                        /// ascending order.
+                        Content {
+                            index: usize,
+                            ack: EnvelopeAck,
+                        },
+                        Ready(Received),
+                    }
+                    let mut slots: Vec<BatchSlot> = Vec::with_capacity(window.len());
+                    let mut batch_seen: std::collections::HashSet<(String, u64, Option<Thread>)> =
+                        Default::default();
+
+                    for WindowEnvelope {
+                        envelope,
+                        ack,
+                        attempts,
+                    } in window
+                    {
+                        // KT (DERM): retry-receipt material captured before the
+                        // envelope is consumed by decryption; only spent on the
+                        // failure path below.
+                        let retry_material = RetryReceiptMaterial::of(&envelope);
+                        // KT (envelope retention): keep the wire envelope so a
+                        // failed open can re-enter a later window; the copy is
+                        // dropped with the decrypt result on success.
+                        let wire_envelope = envelope.clone();
+                        let envelope = {
+                            // the permit is released at the end of the block (impl Drop)
+                            match envelope.parse_destination_service_id() {
+                                None | Some(ServiceId::Aci(_)) => {
+                                    state
+                                        .service_cipher_aci
+                                        .open_envelope(envelope, &mut rand::rng())
+                                        .await
+                                }
+                                Some(ServiceId::Pni(pni)) => {
+                                    if pni == state.service_ids.pni()
+                                        && envelope.parse_source_service_id().is_none()
+                                    {
+                                        warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
+                                        ack.ack();
+                                        continue;
                                     }
-                                    Incoming::QueueEmpty => queue_empty_seen = true,
+                                    state
+                                        .service_cipher_pni
+                                        .open_envelope(envelope, &mut rng())
+                                        .await
                                 }
                             }
-
-                            // Per-envelope classification: contents queued
-                            // for the batch save, ready items carried as-is.
-                            // Save-before-yield ordering is preserved by
-                            // flushing the save before emitting the slots.
-                            let mut to_save: Vec<Content> = Vec::with_capacity(window.len());
-                            enum BatchSlot {
-                                /// Materializes to `Received::Content` after
-                                /// the flush; `index` walks `to_save` in
-                                /// ascending order.
-                                Content {
-                                    index: usize,
-                                    ack: EnvelopeAck,
-                                },
-                                Ready(Received),
-                            }
-                            let mut slots: Vec<BatchSlot> = Vec::with_capacity(window.len());
-                            let mut batch_seen: std::collections::HashSet<(
-                                String,
-                                u64,
-                                Option<Thread>,
-                            )> = Default::default();
-
-                            for (envelope, ack) in window {
-                                // KT (DERM): retry-receipt material captured before the
-                                // envelope is consumed by decryption; only spent on the
-                                // failure path below.
-                                let retry_material = RetryReceiptMaterial::of(&envelope);
-                                let envelope = {
-                                    // the permit is released at the end of the block (impl Drop)
-                                    match envelope.parse_destination_service_id() {
-                                        None | Some(ServiceId::Aci(_)) => {
-                                            state
-                                                .service_cipher_aci
-                                                .open_envelope(envelope, &mut rand::rng())
-                                                .await
-                                        }
-                                        Some(ServiceId::Pni(pni)) => {
-                                            if pni == state.service_ids.pni()
-                                                && envelope.parse_source_service_id().is_none()
-                                            {
-                                                warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
-                                                ack.ack();
-                                                continue;
-                                            }
-                                            state
-                                                .service_cipher_pni
-                                                .open_envelope(envelope, &mut rng())
-                                                .await
-                                        }
-                                    }
-                                };
-                                // KT (identity change): the decryption above may
-                                // have replaced a stored identity (session
-                                // re-established on a changed key). Drain the
-                                // change log once per envelope; matched against
-                                // the sender below.
-                                let identity_changes = state.store.take_identity_changes();
-                                match envelope {
-                                    Ok(Some(content)) => {
-                                        if let ContentBody::DecryptionErrorMessage(e) =
-                                            &content.body
-                                        {
-                                            error!(
-                                                error = ?e,
-                                                "got error decrypting a message"
-                                            );
-                                            let timestamp = u64::try_from(
-                                                content
-                                                    .metadata
-                                                    .client_timestamp
-                                                    .timestamp_millis(),
-                                            )
-                                            .ok();
-                                            // KT (DERM): the embedded timestamp names the
-                                            // peer's original message that failed here;
-                                            // device ids/ratchet_key feed the
-                                            // archive-on-match leg (official
-                                            // RetryRequestEvent:
-                                            // MessageReceiver.preload.ts:2690-2698).
-                                            let failure = match e.timestamp {
-                                                Some(ts) => DecryptionFailure::RetryRequest {
-                                                    original_ts: ts,
-                                                    ratchet_key: e.ratchet_key.clone(),
-                                                    derm_device_id: e.device_id.unwrap_or_default(),
-                                                    requester_device: content
-                                                        .metadata
-                                                        .sender_device
-                                                        .into(),
-                                                },
-                                                // DERM without a timestamp names no
-                                                // original message; nothing to act
-                                                // on — ack and drop (no projection).
-                                                None => {
-                                                    ack.ack();
-                                                    continue;
-                                                }
-                                            };
-                                            slots.push(BatchSlot::Ready(
-                                                Received::DecryptionError(
-                                                    content.metadata.sender,
-                                                    timestamp,
-                                                    Some(failure),
-                                                    ack,
-                                                ),
-                                            ));
+                        };
+                        // KT (identity change): the decryption above may
+                        // have replaced a stored identity (session
+                        // re-established on a changed key). Drain the
+                        // change log once per envelope; matched against
+                        // the sender below.
+                        let identity_changes = state.store.take_identity_changes();
+                        match envelope {
+                            Ok(Some(content)) => {
+                                if let ContentBody::DecryptionErrorMessage(e) = &content.body {
+                                    error!(
+                                        error = ?e,
+                                        "got error decrypting a message"
+                                    );
+                                    let timestamp = u64::try_from(
+                                        content.metadata.client_timestamp.timestamp_millis(),
+                                    )
+                                    .ok();
+                                    // KT (DERM): the embedded timestamp names the
+                                    // peer's original message that failed here;
+                                    // device ids/ratchet_key feed the
+                                    // archive-on-match leg (official
+                                    // RetryRequestEvent:
+                                    // MessageReceiver.preload.ts:2690-2698).
+                                    let failure = match e.timestamp {
+                                        Some(ts) => DecryptionFailure::RetryRequest {
+                                            original_ts: ts,
+                                            ratchet_key: e.ratchet_key.clone(),
+                                            derm_device_id: e.device_id.unwrap_or_default(),
+                                            requester_device: content.metadata.sender_device.into(),
+                                        },
+                                        // DERM without a timestamp names no
+                                        // original message; nothing to act
+                                        // on — ack and drop (no projection).
+                                        None => {
+                                            ack.ack();
                                             continue;
                                         }
+                                    };
+                                    slots.push(BatchSlot::Ready(Received::DecryptionError(
+                                        content.metadata.sender,
+                                        timestamp,
+                                        Some(failure),
+                                        ack,
+                                    )));
+                                    continue;
+                                }
 
-                                        if let ContentBody::SynchronizeMessage(SyncMessage {
-                                            content: Some(SyncContent::Request(request)),
-                                            ..
-                                        }) = &content.body
-                                        {
-                                            use libsignal_service::content::sync_message::request::Type as RequestType;
+                                if let ContentBody::SynchronizeMessage(SyncMessage {
+                                    content: Some(SyncContent::Request(request)),
+                                    ..
+                                }) = &content.body
+                                {
+                                    use libsignal_service::content::sync_message::request::Type as RequestType;
 
-                                            // KT (sync request stop-answer, P9): linked
-                                            // devices only REQUEST syncs, they never
-                                            // answer them — official Desktop neither
-                                            // sends answers on request
-                                            // (ts/textsecure/syncRequests.preload.ts:11-33
-                                            // sends the three requests) nor processes
-                                            // incoming requests beyond logging
-                                            // (ts/textsecure/MessageReceiver.preload.ts:3070-3074
-                                            // removes the envelope from cache). The
-                                            // former Blocked arm replied with an EMPTY
-                                            // block table, which a consumer applies as
-                                            // a set-difference → unblock-everything
-                                            // (official _handleBlocked diff semantics,
-                                            // MessageReceiver.preload.ts:3988-4044 and
-                                            // :4207-4230); the Keys arm over-shared
-                                            // account entropy material on demand. All
-                                            // arms now log and skip — no reply of any
-                                            // table.
-                                            match request.r#type() {
-                                                RequestType::Contacts => {
-                                                    warn!("ignoring contacts sync request: linked devices only request syncs, never answer them (official syncRequests.preload.ts:11-33 / MessageReceiver.preload.ts:3070-3074)");
-                                                }
-                                                RequestType::Keys => {
-                                                    warn!("ignoring keys sync request: answering would over-share account entropy material; official clients never answer sync requests on a linked device (syncRequests.preload.ts:11-33)");
-                                                }
-                                                RequestType::Blocked => {
-                                                    warn!("ignoring blocked sync request: an empty-blocks reply would be consumed as unblock-everything (official _handleBlocked diff semantics, MessageReceiver.preload.ts:3988-4044); official linked devices never answer (syncRequests.preload.ts:11-33)");
-                                                }
-                                                t => {
-                                                    info!(type = ?t, "Got sync request of currently unhandled type")
-                                                }
-                                            }
+                                    // KT (sync request stop-answer, P9): linked
+                                    // devices only REQUEST syncs, they never
+                                    // answer them — official Desktop neither
+                                    // sends answers on request
+                                    // (ts/textsecure/syncRequests.preload.ts:11-33
+                                    // sends the three requests) nor processes
+                                    // incoming requests beyond logging
+                                    // (ts/textsecure/MessageReceiver.preload.ts:3070-3074
+                                    // removes the envelope from cache). The
+                                    // former Blocked arm replied with an EMPTY
+                                    // block table, which a consumer applies as
+                                    // a set-difference → unblock-everything
+                                    // (official _handleBlocked diff semantics,
+                                    // MessageReceiver.preload.ts:3988-4044 and
+                                    // :4207-4230); the Keys arm over-shared
+                                    // account entropy material on demand. All
+                                    // arms now log and skip — no reply of any
+                                    // table.
+                                    match request.r#type() {
+                                        RequestType::Contacts => {
+                                            warn!("ignoring contacts sync request: linked devices only request syncs, never answer them (official syncRequests.preload.ts:11-33 / MessageReceiver.preload.ts:3070-3074)");
                                         }
+                                        RequestType::Keys => {
+                                            warn!("ignoring keys sync request: answering would over-share account entropy material; official clients never answer sync requests on a linked device (syncRequests.preload.ts:11-33)");
+                                        }
+                                        RequestType::Blocked => {
+                                            warn!("ignoring blocked sync request: an empty-blocks reply would be consumed as unblock-everything (official _handleBlocked diff semantics, MessageReceiver.preload.ts:3988-4044); official linked devices never answer (syncRequests.preload.ts:11-33)");
+                                        }
+                                        t => {
+                                            info!(type = ?t, "Got sync request of currently unhandled type")
+                                        }
+                                    }
+                                }
 
-                                        // contacts synchronization sent from the primary device (happens after linking, or on demand)
-                                        if let ContentBody::SynchronizeMessage(SyncMessage {
-                                            content: Some(SyncContent::Contacts(contacts)),
-                                            ..
-                                        }) = &content.body
-                                        {
-                                            // KT (P15a): parsed records ride along
-                                            // for the engine projection; save loop
-                                            // keeps the upstream break-on-error face.
-                                            let complete = contacts.complete.unwrap_or(false);
-                                            match state
-                                                .message_receiver
-                                                .retrieve_contacts(contacts)
-                                                .await
-                                            {
-                                                Ok(contacts) => {
-                                                    info!("saving contacts");
-                                                    let mut saved = Vec::new();
-                                                    for contact in contacts.filter_map(Result::ok) {
-                                                        let contact: Contact = contact.into();
-                                                        if let Err(error) =
-                                                            state.store.save_contact(&contact).await
-                                                        {
-                                                            warn!(%error, "failed to save contacts");
-                                                            break;
-                                                        }
-                                                        saved.push(contact);
-                                                    }
-                                                    slots.push(BatchSlot::Ready(
-                                                        Received::Contacts(
-                                                            ContactSync {
-                                                                content: Box::new(content.clone()),
-                                                                complete,
-                                                                contacts: saved,
-                                                            },
-                                                            ack,
-                                                        ),
-                                                    ));
-                                                    continue;
+                                // contacts synchronization sent from the primary device (happens after linking, or on demand)
+                                if let ContentBody::SynchronizeMessage(SyncMessage {
+                                    content: Some(SyncContent::Contacts(contacts)),
+                                    ..
+                                }) = &content.body
+                                {
+                                    // KT (P15a): parsed records ride along
+                                    // for the engine projection; save loop
+                                    // keeps the upstream break-on-error face.
+                                    let complete = contacts.complete.unwrap_or(false);
+                                    match state.message_receiver.retrieve_contacts(contacts).await {
+                                        Ok(contacts) => {
+                                            info!("saving contacts");
+                                            let mut saved = Vec::new();
+                                            for contact in contacts.filter_map(Result::ok) {
+                                                let contact: Contact = contact.into();
+                                                if let Err(error) =
+                                                    state.store.save_contact(&contact).await
+                                                {
+                                                    warn!(%error, "failed to save contacts");
+                                                    break;
                                                 }
-                                                Err(error) => {
-                                                    warn!(%error, "failed to retrieve contacts");
-                                                }
+                                                saved.push(contact);
                                             }
-
                                             slots.push(BatchSlot::Ready(Received::Contacts(
                                                 ContactSync {
                                                     content: Box::new(content.clone()),
                                                     complete,
-                                                    contacts: Vec::new(),
+                                                    contacts: saved,
                                                 },
                                                 ack,
                                             )));
                                             continue;
                                         }
+                                        Err(error) => {
+                                            warn!(%error, "failed to retrieve contacts");
+                                        }
+                                    }
 
-                                        // sticker pack operations
-                                        if let ContentBody::SynchronizeMessage(SyncMessage {
-                                            sticker_pack_operation,
-                                            ..
-                                        }) = &content.body
-                                        {
-                                            for operation in sticker_pack_operation {
-                                                match operation.r#type() {
-                                                    sticker_pack_operation::Type::Install => {
-                                                        let store = state.store.clone();
-                                                        let unidentified_websocket =
-                                                            state.unidentified_websocket.clone();
-                                                        let operation = operation.clone();
+                                    slots.push(BatchSlot::Ready(Received::Contacts(
+                                        ContactSync {
+                                            content: Box::new(content.clone()),
+                                            complete,
+                                            contacts: Vec::new(),
+                                        },
+                                        ack,
+                                    )));
+                                    continue;
+                                }
 
-                                                        // download stickers in the background
-                                                        tokio::spawn(async move {
-                                                            match download_sticker_pack(
-                                                                store,
-                                                                unidentified_websocket,
-                                                                &operation,
-                                                            )
-                                                            .await
-                                                            {
-                                                                Ok(sticker_pack) => {
-                                                                    debug!(
+                                // sticker pack operations
+                                if let ContentBody::SynchronizeMessage(SyncMessage {
+                                    sticker_pack_operation,
+                                    ..
+                                }) = &content.body
+                                {
+                                    for operation in sticker_pack_operation {
+                                        match operation.r#type() {
+                                            sticker_pack_operation::Type::Install => {
+                                                let store = state.store.clone();
+                                                let unidentified_websocket =
+                                                    state.unidentified_websocket.clone();
+                                                let operation = operation.clone();
+
+                                                // download stickers in the background
+                                                tokio::spawn(async move {
+                                                    match download_sticker_pack(
+                                                        store,
+                                                        unidentified_websocket,
+                                                        &operation,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(sticker_pack) => {
+                                                            debug!(
                                                                 "downloaded sticker pack: {} made by {}",
                                                                 sticker_pack.manifest.title,
                                                                 sticker_pack.manifest.author
                                                             );
-                                                                }
-                                                                Err(error) => error!(
-                                                                    %error,
-                                                                    "failed to download sticker pack"
-                                                                ),
-                                                            }
-                                                        });
-                                                    }
-                                                    sticker_pack_operation::Type::Remove => {
-                                                        match state
-                                                            .store
-                                                            .remove_sticker_pack(
-                                                                operation.pack_id(),
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(was_present) => {
-                                                                debug!(
-                                                                    was_present,
-                                                                    "removed stick pack"
-                                                                )
-                                                            }
-                                                            Err(error) => {
-                                                                error!(
-                                                                    %error,
-                                                                    "failed to remove sticker pack"
-                                                                )
-                                                            }
                                                         }
+                                                        Err(error) => error!(
+                                                            %error,
+                                                            "failed to download sticker pack"
+                                                        ),
                                                     }
-                                                }
+                                                });
                                             }
-                                        }
-
-                                        // key synchronization sent from the primary device
-                                        if let ContentBody::SynchronizeMessage(SyncMessage {
-                                            content: Some(SyncContent::Keys(keys)),
-                                            ..
-                                        }) = &content.body
-                                        {
-                                            debug!("received key sync message");
-                                            if state.registration_type == RegistrationType::Primary
-                                            {
-                                                warn!("received a key sync message as a primary device; ignoring")
-                                            } else {
-                                                match keys
-                                                    .account_entropy_pool
-                                                    .as_ref()
-                                                    .map(|s| AccountEntropyPool::from_str(s))
+                                            sticker_pack_operation::Type::Remove => {
+                                                match state
+                                                    .store
+                                                    .remove_sticker_pack(operation.pack_id())
+                                                    .await
                                                 {
-                                                    Some(Ok(aep)) => {
-                                                        if let Err(error) = state
-                                                            .store
-                                                            .store_account_entropy_pool(Some(&aep))
-                                                            .await
-                                                        {
-                                                            error!(%error, "failed to store account entropy pool");
-                                                        }
-                                                        state.account_entropy_pool = Some(aep);
+                                                    Ok(was_present) => {
+                                                        debug!(was_present, "removed stick pack")
                                                     }
-                                                    Some(Err(error)) => {
-                                                        warn!(%error, "cannot convert account entropy pool from string")
+                                                    Err(error) => {
+                                                        error!(
+                                                            %error,
+                                                            "failed to remove sticker pack"
+                                                        )
                                                     }
-                                                    None => {}
                                                 }
                                             }
                                         }
+                                    }
+                                }
 
-                                        // group update
-                                        if let ContentBody::DataMessage(DataMessage {
-                                            group_v2:
-                                                Some(GroupContextV2 {
-                                                    master_key: Some(master_key_bytes),
-                                                    revision: Some(revision),
-                                                    ..
-                                                }),
+                                // key synchronization sent from the primary device
+                                if let ContentBody::SynchronizeMessage(SyncMessage {
+                                    content: Some(SyncContent::Keys(keys)),
+                                    ..
+                                }) = &content.body
+                                {
+                                    debug!("received key sync message");
+                                    if state.registration_type == RegistrationType::Primary {
+                                        warn!("received a key sync message as a primary device; ignoring")
+                                    } else {
+                                        match keys
+                                            .account_entropy_pool
+                                            .as_ref()
+                                            .map(|s| AccountEntropyPool::from_str(s))
+                                        {
+                                            Some(Ok(aep)) => {
+                                                if let Err(error) = state
+                                                    .store
+                                                    .store_account_entropy_pool(Some(&aep))
+                                                    .await
+                                                {
+                                                    error!(%error, "failed to store account entropy pool");
+                                                }
+                                                state.account_entropy_pool = Some(aep);
+                                            }
+                                            Some(Err(error)) => {
+                                                warn!(%error, "cannot convert account entropy pool from string")
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+
+                                // group update
+                                if let ContentBody::DataMessage(DataMessage {
+                                    group_v2:
+                                        Some(GroupContextV2 {
+                                            master_key: Some(master_key_bytes),
+                                            revision: Some(revision),
                                             ..
-                                        })
-                                        | ContentBody::SynchronizeMessage(SyncMessage {
-                                            content:
-                                                Some(SyncContent::Sent(sync_message::Sent {
-                                                    message:
-                                                        Some(DataMessage {
-                                                            group_v2:
-                                                                Some(GroupContextV2 {
-                                                                    master_key:
-                                                                        Some(master_key_bytes),
-                                                                    revision: Some(revision),
-                                                                    ..
-                                                                }),
+                                        }),
+                                    ..
+                                })
+                                | ContentBody::SynchronizeMessage(SyncMessage {
+                                    content:
+                                        Some(SyncContent::Sent(sync_message::Sent {
+                                            message:
+                                                Some(DataMessage {
+                                                    group_v2:
+                                                        Some(GroupContextV2 {
+                                                            master_key: Some(master_key_bytes),
+                                                            revision: Some(revision),
                                                             ..
                                                         }),
                                                     ..
-                                                })),
+                                                }),
                                             ..
-                                        }) = &content.body
-                                        {
-                                            // there's two things to implement: the group metadata (fetched from HTTP API)
-                                            // and the group changes, which are part of the protobuf messages
-                                            // this means we kinda need our own internal representation of groups inside of presage?
-                                            if let Ok(Some(group)) = upsert_group(
-                                                &state.store,
-                                                &mut state.groups_manager,
-                                                master_key_bytes,
-                                                revision,
-                                            )
-                                            .await
-                                            {
-                                                trace!(?group, "upserted group");
-                                            }
-                                        }
+                                        })),
+                                    ..
+                                }) = &content.body
+                                {
+                                    // there's two things to implement: the group metadata (fetched from HTTP API)
+                                    // and the group changes, which are part of the protobuf messages
+                                    // this means we kinda need our own internal representation of groups inside of presage?
+                                    if let Ok(Some(group)) = upsert_group(
+                                        &state.store,
+                                        &mut state.groups_manager,
+                                        master_key_bytes,
+                                        revision,
+                                    )
+                                    .await
+                                    {
+                                        trace!(?group, "upserted group");
+                                    }
+                                }
 
-                                        // Redelivery gate (KT): a (sender, client_timestamp) row
-                                        // in the same thread means this envelope was stored and
-                                        // projected once; re-store/re-project would duplicate
-                                        // downstream notifications. Ack the handle instead.
-                                        // KT: the gate is thread-scoped — the same sender may
-                                        // legitimately emit two messages with one client
-                                        // timestamp into two different groups; only a row in
-                                        // the very thread this content belongs to is a
-                                        // redelivery. An underivable thread keeps the
-                                        // conservative global suppression.
-                                        let incoming_thread = Thread::try_from(&content).ok();
-                                        let timestamp = u64::try_from(
-                                            content.metadata.client_timestamp.timestamp_millis(),
-                                        )
-                                        .ok();
-                                        let redelivered = {
-                                            match timestamp {
-                                                Some(timestamp) => {
-                                                    let stored = state
-                                                        .store
-                                                        .thread_for_sender_and_timestamp(
-                                                            &content.metadata.sender,
-                                                            timestamp,
-                                                        )
-                                                        .await
-                                                        .ok()
-                                                        .flatten();
-                                                    is_thread_scoped_redelivery(
-                                                        stored,
-                                                        incoming_thread.clone(),
-                                                    )
-                                                }
-                                                None => false,
-                                            }
-                                        };
-                                        // KT (receive batching): the store lookup above
-                                        // runs before this batch is saved, so a duplicate
-                                        // inside the same window would slip past it — the
-                                        // in-batch set closes that gap (keyed per thread).
-                                        let batch_key = timestamp.map(|timestamp| {
-                                            (
-                                                content.metadata.sender.service_id_string(),
-                                                timestamp,
+                                // Redelivery gate (KT): a (sender, client_timestamp) row
+                                // in the same thread means this envelope was stored and
+                                // projected once; re-store/re-project would duplicate
+                                // downstream notifications. Ack the handle instead.
+                                // KT: the gate is thread-scoped — the same sender may
+                                // legitimately emit two messages with one client
+                                // timestamp into two different groups; only a row in
+                                // the very thread this content belongs to is a
+                                // redelivery. An underivable thread keeps the
+                                // conservative global suppression.
+                                let incoming_thread = Thread::try_from(&content).ok();
+                                let timestamp = u64::try_from(
+                                    content.metadata.client_timestamp.timestamp_millis(),
+                                )
+                                .ok();
+                                let redelivered = {
+                                    match timestamp {
+                                        Some(timestamp) => {
+                                            let stored = state
+                                                .store
+                                                .thread_for_sender_and_timestamp(
+                                                    &content.metadata.sender,
+                                                    timestamp,
+                                                )
+                                                .await
+                                                .ok()
+                                                .flatten();
+                                            is_thread_scoped_redelivery(
+                                                stored,
                                                 incoming_thread.clone(),
                                             )
-                                        });
-                                        if redelivered
-                                            || batch_key
-                                                .as_ref()
-                                                .is_some_and(|key| batch_seen.contains(key))
-                                        {
-                                            slots.push(BatchSlot::Ready(Received::Duplicate(ack)));
-                                            continue;
                                         }
-                                        if let Some(key) = batch_key {
-                                            batch_seen.insert(key);
-                                        }
+                                        None => false,
+                                    }
+                                };
+                                // KT (receive batching): the store lookup above
+                                // runs before this batch is saved, so a duplicate
+                                // inside the same window would slip past it — the
+                                // in-batch set closes that gap (keyed per thread).
+                                let batch_key = timestamp.map(|timestamp| {
+                                    (
+                                        content.metadata.sender.service_id_string(),
+                                        timestamp,
+                                        incoming_thread.clone(),
+                                    )
+                                });
+                                if redelivered
+                                    || batch_key
+                                        .as_ref()
+                                        .is_some_and(|key| batch_seen.contains(key))
+                                {
+                                    slots.push(BatchSlot::Ready(Received::Duplicate(ack)));
+                                    continue;
+                                }
+                                if let Some(key) = batch_key {
+                                    batch_seen.insert(key);
+                                }
 
-                                        // KT (receive batching): contents are queued
-                                        // for the single-transaction batch save below;
-                                        // nothing is written per-message anymore.
-                                        // Save-before-yield ordering is kept because the
-                                        // flush runs before any slot is emitted.
-                                        let identity_changed =
-                                            identity_changes.iter().any(|name| {
-                                                *name == content.metadata.sender.service_id_string()
-                                            });
-                                        if identity_changed {
-                                            // KT (identity change): this envelope
-                                            // decrypted on a freshly replaced stored
-                                            // identity — surface the change and let
-                                            // the consumer project the message from
-                                            // the same item (single ack contract).
-                                            let sender = content.metadata.sender;
-                                            to_save.push(content.clone());
-                                            slots.push(BatchSlot::Ready(Received::IdentityChange(
-                                                sender,
-                                                Box::new(content),
-                                                ack,
-                                            )));
-                                        } else {
-                                            to_save.push(content);
-                                            slots.push(BatchSlot::Content {
-                                                index: to_save.len() - 1,
-                                                ack,
-                                            });
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        debug!("empty envelope, message will be skipped!");
-                                        ack.ack();
-                                    }
-                                    Err(error) => {
-                                        error!(%error, "error opening envelope, message will be skipped!");
-                                        let failure = retry_material.and_then(|m| m.into_failure());
-                                        if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
+                                // KT (receive batching): contents are queued
+                                // for the single-transaction batch save below;
+                                // nothing is written per-message anymore.
+                                // Save-before-yield ordering is kept because the
+                                // flush runs before any slot is emitted.
+                                let identity_changed = identity_changes.iter().any(|name| {
+                                    *name == content.metadata.sender.service_id_string()
+                                });
+                                if identity_changed {
+                                    // KT (identity change): this envelope
+                                    // decrypted on a freshly replaced stored
+                                    // identity — surface the change and let
+                                    // the consumer project the message from
+                                    // the same item (single ack contract).
+                                    let sender = content.metadata.sender;
+                                    to_save.push(content.clone());
+                                    slots.push(BatchSlot::Ready(Received::IdentityChange(
+                                        sender,
+                                        Box::new(content),
+                                        ack,
+                                    )));
+                                } else {
+                                    to_save.push(content);
+                                    slots.push(BatchSlot::Content {
+                                        index: to_save.len() - 1,
+                                        ack,
+                                    });
+                                }
+                            }
+                            Ok(None) => {
+                                debug!("empty envelope, message will be skipped!");
+                                ack.ack();
+                            }
+                            Err(error) => {
+                                let failure = retry_material.and_then(|m| m.into_failure());
+                                if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
                                         if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
                                             slots.push(BatchSlot::Ready(Received::DecryptionError(
                                                 sender,
@@ -1263,68 +1301,85 @@ impl<S: Store> Manager<S, Registered> {
                                             continue;
                                         }
                                     }
-                                        ack.ack();
-                                    }
+                                // KT (envelope retention, official
+                                // unprocessed semantics — Desktop keeps
+                                // failed envelopes with an attempts
+                                // counter): the envelope re-enters a
+                                // later window below the bound; the
+                                // handle stays unacked so the server
+                                // queue keeps it if the process dies.
+                                let class = classify_open_error(&error);
+                                let attempts = attempts + 1;
+                                if attempts < OPEN_RETRY_MAX_ATTEMPTS {
+                                    warn!(
+                                        attempts,
+                                        class,
+                                        %error,
+                                        "error opening envelope, held for a bounded retry"
+                                    );
+                                    state.failed.push_back(WindowEnvelope {
+                                        envelope: wire_envelope,
+                                        ack,
+                                        attempts,
+                                    });
+                                    state.retry_due.get_or_insert_with(|| {
+                                        tokio::time::Instant::now() + OPEN_RETRY_DELAY
+                                    });
+                                } else {
+                                    warn!(
+                                                attempts,
+                                                class,
+                                                "giving up on envelope after 3 failed decryption attempts; skipped permanently"
+                                            );
+                                    ack.ack();
                                 }
                             }
+                        }
+                    }
 
-                            // KT (receive batching): one store transaction for
-                            // the whole window (official Desktop
-                            // MessageReceiver.preload.ts:1003-1123). A save
-                            // failure must not lose the batch — the items are
-                            // still yielded (and acked downstream), exactly like
-                            // the per-message path logs and continues today.
-                            if let Err(error) = save_messages_batch(
-                                &mut state.store,
-                                &mut state.identified_websocket,
-                                to_save.clone(),
-                            )
-                            .await
-                            {
-                                error!(%error, "error saving message batch to store");
-                            }
+                    // KT (receive batching): one store transaction for
+                    // the whole window (official Desktop
+                    // MessageReceiver.preload.ts:1003-1123). A save
+                    // failure must not lose the batch — the items are
+                    // still yielded (and acked downstream), exactly like
+                    // the per-message path logs and continues today.
+                    if let Err(error) = save_messages_batch(
+                        &mut state.store,
+                        &mut state.identified_websocket,
+                        to_save.clone(),
+                    )
+                    .await
+                    {
+                        error!(%error, "error saving message batch to store");
+                    }
 
-                            // Materialize the slots in arrival order; `Content`
-                            // slots reference ascending positions in `to_save`.
-                            let mut contents = to_save.into_iter();
-                            let mut cursor = 0usize;
-                            for slot in slots {
-                                let received = match slot {
-                                    BatchSlot::Content { index, ack } => {
-                                        debug_assert_eq!(index, cursor);
-                                        cursor += 1;
-                                        Received::Content(
-                                            Box::new(
-                                                contents
-                                                    .next()
-                                                    .expect("content slots match to_save entries"),
-                                            ),
-                                            ack,
-                                        )
-                                    }
-                                    BatchSlot::Ready(received) => received,
-                                };
-                                state.pending.push_back(received);
+                    // Materialize the slots in arrival order; `Content`
+                    // slots reference ascending positions in `to_save`.
+                    let mut contents = to_save.into_iter();
+                    let mut cursor = 0usize;
+                    for slot in slots {
+                        let received = match slot {
+                            BatchSlot::Content { index, ack } => {
+                                debug_assert_eq!(index, cursor);
+                                cursor += 1;
+                                Received::Content(
+                                    Box::new(
+                                        contents
+                                            .next()
+                                            .expect("content slots match to_save entries"),
+                                    ),
+                                    ack,
+                                )
                             }
-                            // KT: a queue-empty seen mid-window is forwarded as
-                            // an event only — the keys-request side effect stays
-                            // on the first-of-pull arm below.
-                            if queue_empty_seen {
-                                state.pending.push_back(Received::QueueEmpty);
-                            }
-                        }
-                        Some(Ok(Incoming::QueueEmpty)) => {
-                            debug!("got empty queue");
-                            request_keys_from_primary_if_needed(
-                                &state.account_entropy_pool,
-                                &state.message_sender,
-                            );
-                            return Some((Received::QueueEmpty, state));
-                        }
-                        Some(Err(error)) => {
-                            error!(%error, "unexpected error in message receiving loop")
-                        }
-                        None => return None,
+                            BatchSlot::Ready(received) => received,
+                        };
+                        state.pending.push_back(received);
+                    }
+                    // KT: a queue-empty seen mid-window is forwarded as
+                    // an event only — the keys-request side effect stays
+                    // on the first-of-pull arm below.
+                    if queue_empty_seen {
+                        state.pending.push_back(Received::QueueEmpty);
                     }
                 }
             }
@@ -2591,6 +2646,36 @@ async fn save_messages_batch<S: Store>(
     Ok(())
 }
 
+/// KT (envelope retention): an envelope in the current processing window —
+/// fresh arrivals start at `attempts == 0`; entries already held for retry
+/// carry their failure count (official Desktop unprocessed `attempts` face).
+struct WindowEnvelope {
+    envelope: Envelope,
+    ack: EnvelopeAck,
+    attempts: u32,
+}
+
+/// KT (envelope retention): open-retry bound (official Desktop keeps failed
+/// envelopes with a bounded attempts counter; the value follows the task
+/// brief) and the quiet-stream delay between retry windows — fresh traffic
+/// always preempts the timer.
+const OPEN_RETRY_MAX_ATTEMPTS: u32 = 3;
+const OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// KT (envelope retention): failure-class literal for retention bookkeeping —
+/// typed path only, no payload.
+fn classify_open_error(error: &libsignal_service::prelude::ServiceError) -> &'static str {
+    use libsignal_service::prelude::ServiceError;
+    match error {
+        ServiceError::InvalidFrame { .. }
+        | ServiceError::MacError
+        | ServiceError::Padding(_)
+        | ServiceError::PaddingVersion(_) => "frame",
+        ServiceError::SignalProtocolError(_) => "protocol",
+        _ => "other",
+    }
+}
+
 /// Why collecting a receive-batch window stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum BatchWindowEnd {
@@ -2932,5 +3017,37 @@ mod receive_batch_tests {
         assert!(!is_thread_scoped_redelivery(None, None));
         // underivable incoming thread → conservative global suppression
         assert!(is_thread_scoped_redelivery(Some(contact), None));
+    }
+
+    // KT (envelope retention): failure classes are fixed literals for the
+    // bounded-retry bookkeeping (typed path, no payload); the give-up bound
+    // is the constant the retention loop tests against.
+    #[test]
+    fn open_error_classification_and_retry_bound() {
+        use libsignal_service::prelude::ServiceError;
+
+        assert_eq!(
+            classify_open_error(&ServiceError::MacError),
+            "frame",
+            "frame-integrity family"
+        );
+        assert_eq!(
+            classify_open_error(&ServiceError::InvalidFrame { reason: "x" }),
+            "frame"
+        );
+        assert_eq!(
+            classify_open_error(&ServiceError::SignalProtocolError(
+                libsignal_service::protocol::SignalProtocolError::InvalidArgument(
+                    "live sample class".into()
+                )
+            )),
+            "protocol"
+        );
+        assert_eq!(
+            classify_open_error(&ServiceError::UnsupportedContent),
+            "other",
+            "everything else degrades to the catch-all class"
+        );
+        assert_eq!(OPEN_RETRY_MAX_ATTEMPTS, 3);
     }
 }

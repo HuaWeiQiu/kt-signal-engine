@@ -348,6 +348,23 @@
   载体走 story 通道，官方 sendMessageToServiceId deleteForEveryone 同携
   profileKey，注入由引擎 P9 profileSharing 闸裁定）；既有调用点
   （stories 发送批）传 `false` 行为零变化。
+- `presage/src/manager/registered.rs`（2026-10-16 接收完整性批①信封保留
+  重试）— 接收批循环 envelope open `Err` 不再无条件丢弃：非
+  SealedSenderDecryptionError 族失败信封保留进接收流内存 failed 队列
+  （`WindowEnvelope{envelope, ack, attempts}`，**不 ack**——未 ack 句柄
+  使服务器队列在进程存活期保留该信封，进程死亡自然重放兜底），带错误
+  分类字面量（`classify_open_error` 纯函数：frame/protocol/other，
+  typed path 零 payload）与重试计数；下轮接收批窗口重试（新流量先到
+  并入窗口并抢占定时器；静默流 2s 定时器触发重试批
+  `OPEN_RETRY_DELAY`，`futures::future::select` 竞速不阻塞新信封）；
+  有界 3 次（`OPEN_RETRY_MAX_ATTEMPTS`，官方 Desktop unprocessed
+  attempts 有界同构——MessageReceiver.preload.ts:1075「keeping N failed
+  envelopes」+ attempts 字段；值取任务口径）后永久跳过：warn 固定字面量
+  「giving up on envelope after 3 failed decryption attempts; skipped
+  permanently」+ ack 放行。SealedSenderDecryptionError 族既有
+  DecryptionError 槽语义不变（DERM 自愈链路不动）。presage 上游无
+  unprocessed 持久化面——最小实现为流内内存队列。`classify_open_error`
+  分类与界限单测 `open_error_classification_and_retry_bound`。
 
 `vendor/presage/presage-store-sqlite/`：
 
