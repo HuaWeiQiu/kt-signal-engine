@@ -5978,6 +5978,44 @@ v1 + 裸 `Group` 解码不动**——v1 契约自洽且一直工作，切 v2 反
 `decrypt_group` 全链），作为 `GroupResponse` 解码必败（tag-0 错误类）——
 把「v1 裸 Group、v2 包装面」的服务器双契约永久钉在测试里。
 
+### attachmentBackfillResponse 收投影臂（2026-10-17，官方对齐 Signal-Desktop abe80d3，wire additive【engine-compat】）
+
+官方行为（`MessageReceiver.preload.ts:3146-3151` 分发 +
+`:3806` `#handleAttachmentBackfillResponse`）：sync content oneof
+`attachmentBackfillResponse=25`——长文本/大批附件消息的附件回填响应
+（手机端补传附件后按 `targetMessage`+`targetConversation` 定位原消息、
+更新其附件状态：逐附件 PENDING/TERMINAL_ERROR 或 MESSAGE_NOT_FOUND
+错误）。引擎投影第十五臂（此前该信封落 read/viewed 兜底臂整信封丢弃）。
+
+**wire 面（`receive` 信封 `syncMessage.attachmentBackfillResponse`，
+词表 additive，缺席键不在）**：
+
+```jsonc
+{
+  "targetMessage": { "author": "<aci|pni|e164>", "sentTimestamp": 1690000000000 },
+  "targetConversation": { "serviceId"?: "<aci|pni>", "groupId"?: "<base64>", "e164"?: "<num>" },
+  "error"?: "MESSAGE_NOT_FOUND" | "UNKNOWN",
+  "attachments"?: [ { "status"?: "PENDING"|"TERMINAL_ERROR"|"UNKNOWN", "attachment"?: {…指针全投影} } ],
+  "longText"?: { 同单条词条形状 }
+}
+```
+
+- target 面 = 官方 `processAddressableMessage`/`processConversationIdentifier`
+  同构：author/sentTimestamp 双闸（官方任一缺席 drop）、service-id
+  binary 优先 string 次之（`fromServiceIdBinaryOrString` 同序）、ACI 归一
+  裸 UUID 串（`service_id_string()` 口径同 sourceUuid）。
+- `attachment` 词条复用 `project_attachment_pointer` 单点全投影（id/
+  contentType/size/locator 等与 dataMessage 附件同形，消费面单一入口）。
+  官方 `processBackfilledAttachment` 附加的 `downloadPath` 是桌面端本地
+  续传下载名（`createName()` 客户端本地概念），引擎不预分配下载面，键
+  不投（记档）。
+- data 臂缺席 → 整信封丢弃（官方 strictAssert 同判）；error/未知枚举值
+  投 `UNKNOWN` 词（官方兜 0 同口径，宁收勿丢）。
+
+**消费后续（记档）**：connector 现无消费面（暂以引擎投影事件为准落
+ observation）——下游消费（按 targetMessage 定位行更新附件状态）另行
+立项；词表即事件面，先到先消费。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
