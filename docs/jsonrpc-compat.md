@@ -6016,6 +6016,43 @@ v1 + 裸 `Group` 解码不动**——v1 契约自洽且一直工作，切 v2 反
  observation）——下游消费（按 targetMessage 定位行更新附件状态）另行
 立项；词表即事件面，先到先消费。
 
+### verified 发送面对齐收尾（2026-10-17，官方对齐 Signal-Desktop abe80d3 SendMessage.getVerificationSync，wire additive（信封体内填充位）/ 前提勘误【engine-compat】）
+
+**前提勘误（记档）**：任务书称「verified 发送面缺失，新增
+`contacts.markVerified`」——与基线不符：发送面自六方法批（2026-10-11
+6bd9947）即存在——`trust` RPC（compat §3 行）verified 臂（三形态安全码
+比对闸）/state 臂 → `trust_identity` 落 sidecar 后自发
+`SyncMessage.verified`（Content oneof verified=7，走 note-to-self sync
+发送通道广播，signal-cli sendVerifiedMessage 同构；收向
+`project_verified_sync` 收投影对端闭环）。`contacts.markVerified` 不另
+设新方法——与 `trust` 同面，词表单一入口纪律（两方法一面 = 双词表漂移）。
+
+**真实缺口与收口**（对照官方 `SendMessage.preload.ts` `getVerificationSync`
+:2412-2465 + `conversations.preload.ts:3146-3165` `sendVerifySyncMessage`）：
+
+1. **`Verified.nullMessage` 填充位**（本次补齐）：官方
+   `nullMessage: MessageSender.getRandomPadding()`（:2420；getRandomPadding
+   :780 = 随机 1-512B）；引擎此前 `Default::default()`（None）。补齐 =
+   `null_message: Some(random_padding())`（1-512B 同分布）。
+2. **`SyncMessage.padding` 包装填充**（本次补齐）：官方
+   `MessageSender.padSyncMessage({content:{verified}})` 包装（SyncMessage
+   级 padding 同 1-512B 分布）；引擎此前裸 SyncMessage。补齐 =
+   `padding: Some(random_padding())`（vendored
+   `SyncMessage::with_padding` 同分布先例）。
+3. **多设备闸**（记档不实现）：官方
+   `sendVerifySyncMessage` 开头 `!doWeHaveOtherDevices()` 即跳过
+   （conversations.preload.ts:3150-3156）。引擎部署形态恒为链接的
+   secondary 设备（finishLink 流程，primary=手机），`device_id ≥ 2`
+   恒成立 ⇒ 官方闸在引擎形态下恒通过——实现为死代码，记档登记。
+4. **destinationAci string vs binary**（记档）：官方按 proto binary
+   encoding 开关二选一（:2427-2435）；引擎恒 `destination_aci_binary`
+   （wire 等价形态，服务器两形态同收）。
+
+wire 变化面：`trust` 自发 sync 信封体内多两个填充位（nullMessage/
+SyncMessage.padding）——填充位是元数据保护面，无消费语义（收向
+`project_verified_sync` 不读 null_message；官方桌面收向同样不消费），
+wire additive。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
