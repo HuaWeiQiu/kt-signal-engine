@@ -10649,9 +10649,11 @@ pub(crate) async fn open_registered_with_dir(
 }
 
 /// 收件人 → ServiceId：号码与 UUID 双形态都收（对齐 signal-cli 公开 JSON-RPC
-/// 的 recipient 语义）——UUID 直通为 ACI；号码走 contacts 数字位匹配（链接后
-/// 手机端立即推送同步）。冷启动窗口内未命中返回 None（发送按内部失败处理，
-/// compat §5）。
+/// 的 recipient 语义）——UUID 直通为 ACI；本机号码直解本机 ACI（self 解析
+/// 批 2026-10-16，Note-to-Self 官方语义——connector 备忘录 peer_key = 本机
+/// 号码，self 不在手机 contacts 表是常态，compat §5）；其余号码走 contacts
+/// 数字位匹配（链接后手机端立即推送同步）。冷启动窗口内未命中返回 None
+/// （发送按内部失败处理，compat §5）。
 async fn resolve_recipient(
     manager: &Manager<SqliteStore, Registered>,
     recipient: &str,
@@ -10659,8 +10661,29 @@ async fn resolve_recipient(
     if let Some(service_id) = ServiceId::parse_from_service_id_string(recipient.trim()) {
         return Some(service_id);
     }
+    let registration = manager.registration_data();
+    if self_recipient_by_number(recipient, &e164_string(&registration.phone_number)) {
+        return Some(ServiceId::Aci(registration.service_ids.aci.into()));
+    }
     let contact = find_contact_by_number(manager, recipient).await?;
     Some(ServiceId::Aci(contact.uuid.into()))
+}
+
+/// 收件人 = 本机号码判定（self 解析批 2026-10-16，纯函数零 IO——两臂
+/// 单测钉定）：双方只比数字位（入参 E.164/裸号/排版形态与注册数据 E.164
+/// 同收敛）；UUID 形态不进此臂（resolve_recipient 首臂 parse 直解先返，
+/// 互斥由调用序保证）。
+fn self_recipient_by_number(recipient: &str, own_e164: &str) -> bool {
+    let want: String = recipient
+        .trim()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    if want.is_empty() {
+        return false;
+    }
+    let own: String = own_e164.chars().filter(char::is_ascii_digit).collect();
+    want == own
 }
 
 pub(crate) async fn find_contact_by_number(
@@ -10770,6 +10793,50 @@ mod tests {
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
+
+    /// self 解析两臂（self 解析批 2026-10-16，compat §5）：号码臂=数字位
+    /// 等于本机号码（E.164/裸号/排版形态同收敛，空串恒否）→ resolve_
+    /// recipient 直解本机 ACI 不经 contacts；UUID 臂=service-id 串（含本机
+    /// ACI）在首臂 parse 直解、不经号码臂（互斥由调用序保证，此处钉定
+    /// parse 直解语义与本机 ACI 形态确实覆盖）。Manager 不可单测构造
+    /// （RegistrationData 构造受限），判定逻辑以纯函数层验证。
+    #[test]
+    fn self_recipient_resolution_arms() {
+        // —— self-by-e164 臂 ——
+        assert!(self_recipient_by_number("+15551234567", "+15551234567"));
+        // 裸号（无 +）/排版形态（international 空格连字符）与本机 E.164
+        // 数字位同收敛。
+        assert!(self_recipient_by_number("15551234567", "+15551234567"));
+        assert!(self_recipient_by_number(
+            "+1 (555) 123-4567",
+            "+15551234567"
+        ));
+        // 非本机号码 → 否（照旧走 contacts 匹配臂）。
+        assert!(!self_recipient_by_number("+15551230000", "+15551234567"));
+        // 数字位前缀重叠 ≠ 相等。
+        assert!(!self_recipient_by_number("+1555123456700", "+15551234567"));
+        // 空串/无数字入参恒否（不劫持 contacts 臂）。
+        assert!(!self_recipient_by_number("", "+15551234567"));
+        assert!(!self_recipient_by_number("  ", "+15551234567"));
+
+        // —— self-by-aci 臂：首臂 parse 直解（ACI/PNI 串形态）——
+        let own_aci = "11111111-2222-4333-8444-555555555555";
+        let parsed = ServiceId::parse_from_service_id_string(own_aci).expect("own aci parse");
+        assert_eq!(
+            parsed,
+            ServiceId::Aci(
+                presage::libsignal_service::prelude::Uuid::parse_str(own_aci)
+                    .expect("uuid")
+                    .into()
+            )
+        );
+        // 带标签 PNI 形态同直解（vendored parse 词表 = 裸 UUID + PNI: 前缀；
+        // ACI: 标签形不被接受——只钉定真实词表不发明）。
+        assert!(ServiceId::parse_from_service_id_string(&format!("PNI:{own_aci}")).is_some());
+        assert!(ServiceId::parse_from_service_id_string(&format!("ACI:{own_aci}")).is_none());
+        // UUID 形态不被号码臂劫持（首臂先返的调用序防线）。
+        assert!(!self_recipient_by_number(own_aci, "+15551234567"));
+    }
 
     /// 发送链凭据失效归型：presage 两层归型点（直接 ServiceError 面 /
     /// MessageSenderError 内 sender 同源再包一层）的 401/403 同归
