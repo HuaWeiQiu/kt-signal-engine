@@ -5045,7 +5045,8 @@ round-trip 保真单测早已钉定，仅缺写面接线）。
   或经 connector 透传取快照。vendored presage 批窗内部（75ms/30 窗的
   窗填充/解密/批量落库三相细分）在 vendor 面，未随本批打点（vendor 纪律
   成本，engine 侧 `receive_envelope` 已含其端到端时延）——如需相细分另批
-  按 vendor/README.md 纪律登记。
+  按 vendor/README.md 纪律登记。词表后续 additive 增批见
+  「send 链分段打点 + 冷启动归因 + 启动预热批」（2026-10-16）。
 
 ### F 链路入站观测批（2026-10-12，connector implementation-plan §4.113 缺口引擎腿，wire additive【engine-compat】）
 
@@ -5852,6 +5853,82 @@ getStickerPackSyncs/setStickerPackSync P5 批已有）。本批：
   信封走本臂早返（不落 read/viewed 兜底臂），零信封丢弃。
 - P5 批「v1 单通道」边界记档废止（该节已注明）：legacy sync 通道与
   Storage Service 真相源并存。
+
+### send 链分段打点 + 冷启动归因 + 启动预热批（2026-10-16，冷启动首批发送 10-15s 分解归因与预热修复，perf 词表 additive / 零 wire 新方法【engine-compat】）
+
+背景（connector 侧实证，12:26Z 窗）：通道启动后首批真实发送两笔串行——
+15002ms（撞连接器 call 15s 预算 → unknown outcome）与 10724ms（ok）；
+之后暖发送 270-278ms。引擎侧发送路径此前无分段打点（`send_text_total`
+只有整体），10-15s 无法分解。
+
+#### ① send 分段打点（perf 词表 additive）
+
+阶段边界与键（计时，微秒制，`engine.perfMetrics.timings` 透出；词表
+`perf_metrics::keys` 封闭集新增，快照形状不变）：
+
+| 键 | 边界 | 落点 |
+|---|---|---|
+| `send_resolve` | 收件人解析整体（号码位匹配/UUID 直解/self 直解） | 引擎 `resolve_recipient` 单一咽喉自计时 |
+| `send_sender_setup` | 发送管理器装配：identified+unidentified 两条 WS 复用或拨号（含槽位 handover） | vendor presage `new_message_sender` 单一咽喉 |
+| `send_cert_fetch` | 发送证书续期网络臂（缓存命中零网络不计时） | vendor presage `sender_certificate` |
+| `send_session_establish` | 冷会话建立：`load_session` 缺席 → `GET /v2/keys/{id}/*`（一次拉全设备）+ process_prekey_bundle×N | vendor libsignal-service `create_encrypted_message` 会话建立臂（与预热共用单点） |
+| `send_encrypt` | 会话内加密（`cipher.encrypt`） | vendor libsignal-service 同函数 |
+| `send_ws_rtt` | WS 消息上行 → 服务器应答（修复环每轮各计一条） | vendor libsignal-service `try_send_message` send 臂 |
+
+total 段沿用既有 `send_text_total` / `send_group_total`（不改语义）；锁
+等待沿用既有 `send_lock_wait`。vendor 侧计时经单向钩子
+（`libsignal_service::perf_hook`：进程内一次性 `install(fn(&'static str,
+u64))`，缺省 no-op）回注引擎注册表——键字面量双侧常量对齐
+（引擎单测钉定跨 crate 字面量相等），词表仍由引擎封闭管理。预热的
+sender_setup/session 段与真实发送落同一序列（同一操作成本，`count`
+含预热流量；冷拨代价恰是归因要的 max 值）。
+
+#### ② 冷启动归因候选表（静态理论量级 × 实证，裁决待打点数据回传）
+
+| 候选 | 机制（代码锚） | 理论量级 | 实证 |
+|---|---|---|---|
+| WS 冷拨号（sender setup） | `new_message_sender` 每发必取双 WS；unidentified 槽进程内首拨必冷；SOCKS 代理上 TCP+TLS+WS 升级；reqwest `connect_timeout=10s`/`total=65s`（push_service/mod.rs:31-33） | 暖（槽内复用）≈0ms；冷 ≈数百 ms～10s（贴 connect 超时上限；启动期代理/网络未就绪时一拨顶满） | 引擎日志 12:26:17.900/12:26:19.360 两条 `ka_diag task spawned`（两次拨号）落在发送窗内；首拨距启动 ~13.7s ≈ 接收流 Fibonacci 退避累计（1+1+2+3+5=12s）+ 拨号时长——启动期首拨并非立即成功 |
+| 冷会话 prekey 预取 | 无会话收件人 `GET /v2/keys/{id}/*` 1 RTT（一次拉全设备）+ 本地建会话 | 1 RTT（代理下数百 ms～2s）/冷收件人 | 两笔不同收件人各付各的（与两笔独立慢一致） |
+| 发送证书冷取 | `sender_certificate` 缓存缺席/临期 → identified WS 1 RTT | RTT 级，每进程至多一次（`load_registered` 预载持久证书 + 后台 CertificateMaintenance 预轮换） | 弱嫌疑 |
+| WS 发送+应答 | `send_messages` 1 RTT | 暖全路径实测 270-278ms 的主体 | 暖基线 |
+| MismatchedDevices 修复环 | 每轮 = 发送 RTT + missing×prekey RTT，≤4 轮 | 最多 ~5-6 RTT；仅设备视图失配时 | 待 send_ws_rtt 条数与 count 对账裁决 |
+| profile_refresh 抢 store.db | 独立 Manager×3（WAL，busy_timeout 默认 5s）+ 登录后 +12s 起批 | ms～秒级写锁等待（WAL 读写不互斥） | **本窗反证**：12:27:07 批探针 1ms 全 skipped、零失败行——本实例无实据 |
+| 队列串行 | 同账号发送 `lock_registered_for_send` 互斥逐收件人串行 | 第二笔观察耗时 = 自身冷路径（不叠加第一笔）；连接器视角背靠背 25.7s | 日志「第二笔起始于第一笔结束瞬间」即此；已打点 `send_lock_wait` |
+
+静态结论：10-15s 最可能 = WS 冷拨号（上限 10s，unidentified 槽冷 +
+启动期代理慢/失败重试）+ 冷会话 prekey/发送 RTT 叠加；10.724s 那笔
+≈ 10s connect 超时 + 正常路径的特征同向。归因裁决凭
+`send_sender_setup.max`（冷拨）与 `send_session_establish`（prekey）
+直接分型。无锁粒度小修可行面（store 争用反证 + 串行系既有设计且已
+打点）；启动期预热即下节。
+
+#### ③ 启动预热（通道 ready 后后台保障发送路径，零 wire 面零真实消息）
+
+触发：登录期 profile 名字刷新批完成**之后**触发一次（同一 spawn 链尾
+随，`serve_account_stream` sync 臂；60s 一次性纪律继承——重连风暴不重复）。
+
+- **对象**：近期活跃会话 last message 时间最近的 N=5 个 thread
+  （direct + 群混合，vendor store 新增 `recent_threads(limit)` 查询：
+  `threads`×`thread_messages` 取 `MAX(ts)` 最新序）。direct → 收件人
+  ACI；群 → 群成员 ACI 扇出（去重、总量帽 32、按 thread 新近度优先）；
+  Note-to-Self（自身 ACI）跳过。
+- **动作**（vendor presage 新增 `Manager::warm_send_path(recipients)`，
+  组合既有公开语义、不发送任何消息）：`new_message_sender()`（双 WS
+  槽复用或拨号——恰是冷发送必付的 sender setup）→ 证书续期 best-effort
+  （identified 保险丝同款，失败不连坐）→ 逐收件人 `ensure_session`
+  （无会话 → `GET /v2/keys/{id}/*` + 本地建会话，与发送路径共用单点；
+  有会话零网络即返）。
+- **有界性**：目标分块并发 ≤2（独立 Manager/块，profile_refresh 同款
+  槽位纪律；WS 槽进程级共享，预热与真实发送并发安全——live 槽复用，
+  不 handover）；整批超时 ≤10s（到期未完成目标计失败，诚实计数）；
+  失败静默——只落 perf 计数，零 stderr 零 tracing。
+- **perf 计数**（additive）：`send_warmup_run`（触发次数）、
+  `send_warmup_ok`（会话确保成功数，含既有会话）、
+  `send_warmup_err`（失败数：超时在途/网络/基础设施）。
+- **不阻塞保证**：预热用独立 Manager（独立 store 连接，不取
+  `lock_registered_for_send` 互斥），预热完成前到达的发送照常走原
+  路径；两端在 WS 槽拨号锁上天然串行（先到先拨，后到复用）。
+- **fake 模式**：不触发（real 闸，同收发管线纪律）。
 
 ## 6. fake 服务模式（仅测试）
 
