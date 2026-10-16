@@ -1203,73 +1203,7 @@ where
 
         // establish a session with the recipient/device if necessary
         // no need to establish a session with ourselves (and our own current device)
-        if self
-            .protocol_store
-            .load_session(&recipient_protocol_address)
-            .await?
-            .is_none()
-        {
-            info!(
-                "establishing new session with {}",
-                recipient_protocol_address
-            );
-            // KT (send perf): the whole cold-session arm — the prekey fetch
-            // over the identified websocket plus local bundle processing.
-            // Shared with the host's send-path warmup via `ensure_session`.
-            let session_started = std::time::Instant::now();
-            let pre_keys = match self
-                .identified_ws
-                .get_pre_keys(recipient, device_id)
-                .await
-            {
-                Ok(ok) => {
-                    tracing::trace!("Get prekeys OK");
-                    ok
-                },
-                Err(ServiceError::NotFoundError) => {
-                    return Err(MessageSenderError::NotFound {
-                        service_id: *recipient,
-                    });
-                },
-                Err(e) => Err(e)?,
-            };
-
-            let mut rng = rng();
-
-            for pre_key_bundle in pre_keys {
-                if recipient == &self.local_aci
-                    && self.device_id == pre_key_bundle.device_id()?
-                {
-                    trace!("not establishing a session with myself!");
-                    continue;
-                }
-
-                let pre_key_address = get_preferred_protocol_address(
-                    &self.protocol_store,
-                    recipient,
-                    pre_key_bundle.device_id()?,
-                )
-                .await?;
-
-                process_prekey_bundle(
-                    &pre_key_address,
-                    &self
-                        .local_aci
-                        .to_protocol_address(self.device_id)
-                        .expect("valid device id"),
-                    &mut self.protocol_store.clone(),
-                    &mut self.protocol_store,
-                    &pre_key_bundle,
-                    SystemTime::now(),
-                    &mut rng,
-                )
-                .await?;
-            }
-            crate::perf_hook::emit(
-                crate::perf_hook::keys::SESSION_ESTABLISH,
-                session_started.elapsed().as_micros() as u64,
-            );
-        }
+        self.ensure_session(recipient, device_id).await?;
 
         let encrypt_started = std::time::Instant::now();
         let message = self
@@ -1288,6 +1222,89 @@ where
         );
 
         Ok(message)
+    }
+
+    /// Establish a session with `recipient`/`device_id` when none exists,
+    /// fetching the peer's prekey bundles (`GET /v2/keys/{id}/*` — one
+    /// request covers every device) over the identified websocket and
+    /// processing them locally. Returns whether a new session was built.
+    ///
+    /// KT (send warmup): the single shared session-establishment point for
+    /// the send path (`create_encrypted_message`) and the host's warmup;
+    /// sends nothing.
+    pub async fn ensure_session(
+        &mut self,
+        recipient: &ServiceId,
+        device_id: DeviceId,
+    ) -> Result<bool, MessageSenderError> {
+        let recipient_protocol_address =
+            recipient.to_protocol_address(device_id);
+        if self
+            .protocol_store
+            .load_session(&recipient_protocol_address)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        info!(
+            "establishing new session with {}",
+            recipient_protocol_address
+        );
+        // KT (send perf): the whole cold-session arm — the prekey fetch
+        // over the identified websocket plus local bundle processing.
+        let session_started = std::time::Instant::now();
+        let pre_keys =
+            match self.identified_ws.get_pre_keys(recipient, device_id).await {
+                Ok(ok) => {
+                    tracing::trace!("Get prekeys OK");
+                    ok
+                },
+                Err(ServiceError::NotFoundError) => {
+                    return Err(MessageSenderError::NotFound {
+                        service_id: *recipient,
+                    });
+                },
+                Err(e) => Err(e)?,
+            };
+
+        let mut rng = rng();
+
+        for pre_key_bundle in pre_keys {
+            if recipient == &self.local_aci
+                && self.device_id == pre_key_bundle.device_id()?
+            {
+                trace!("not establishing a session with myself!");
+                continue;
+            }
+
+            let pre_key_address = get_preferred_protocol_address(
+                &self.protocol_store,
+                recipient,
+                pre_key_bundle.device_id()?,
+            )
+            .await?;
+
+            process_prekey_bundle(
+                &pre_key_address,
+                &self
+                    .local_aci
+                    .to_protocol_address(self.device_id)
+                    .expect("valid device id"),
+                &mut self.protocol_store.clone(),
+                &mut self.protocol_store,
+                &pre_key_bundle,
+                SystemTime::now(),
+                &mut rng,
+            )
+            .await?;
+        }
+        crate::perf_hook::emit(
+            crate::perf_hook::keys::SESSION_ESTABLISH,
+            session_started.elapsed().as_micros() as u64,
+        );
+        Ok(true)
     }
 
     fn create_multi_device_sent_transcript_content<'a>(

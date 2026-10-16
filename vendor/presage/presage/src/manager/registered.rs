@@ -176,6 +176,17 @@ impl RegistrationData {
     }
 }
 
+/// KT (send warmup): per-batch outcome of `warm_send_path`. `established`
+/// counts recipients a session was newly built for (prekey fetch + bundle
+/// processing), `existing` recipients that already had one, `failed`
+/// recipients whose establishment errored.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SendWarmupStats {
+    pub established: usize,
+    pub existing: usize,
+    pub failed: usize,
+}
+
 impl<S: Store> Manager<S, Registered> {
     /// Loads a previously registered account from the implemented [Store].
     ///
@@ -2187,6 +2198,35 @@ impl<S: Store> Manager<S, Registered> {
                 self.state.device_id(),
             ),
         )
+    }
+
+    /// KT (send warmup): best-effort pre-establishment of the send path for
+    /// `recipients` — dials both websockets via `new_message_sender`, makes
+    /// the sender certificate a cache hit, then builds a session with every
+    /// distinct non-self recipient (prekey fetch + bundle processing).
+    /// Sends nothing; individual failures are counted, not propagated.
+    pub async fn warm_send_path(
+        &mut self,
+        recipients: &[ServiceId],
+    ) -> Result<SendWarmupStats, Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        let _ = self.sender_certificate().await;
+
+        let mut stats = SendWarmupStats::default();
+        let own = ServiceId::Aci(self.state.data.service_ids.aci.into());
+        let mut seen: Vec<&ServiceId> = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            if *recipient == own || seen.contains(&recipient) {
+                continue;
+            }
+            seen.push(recipient);
+            match sender.ensure_session(recipient, *DEFAULT_DEVICE_ID).await {
+                Ok(true) => stats.established += 1,
+                Ok(false) => stats.existing += 1,
+                Err(_) => stats.failed += 1,
+            }
+        }
+        Ok(stats)
     }
 
     /// Returns the title of a thread (contact or group).

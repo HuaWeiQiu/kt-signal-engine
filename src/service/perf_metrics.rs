@@ -78,6 +78,13 @@ pub(crate) mod keys {
     pub const SEND_WS_RTT: &str = "send_ws_rtt";
 
     // —— 计数器 ——
+    /// 启动预热批（send 性能批 2026-10-16，compat §5「启动预热」块；
+    /// send_warmup 模块）：RUN 每次预热批尝试 +1（fake 账号不计）；
+    /// OK = established + existing（变热收件人数）；ERR = failed +
+    /// 超时未确认数（诚实语义，超时 = 整批目标数）。
+    pub const SEND_WARMUP_RUN: &str = "send_warmup_run";
+    pub const SEND_WARMUP_OK: &str = "send_warmup_ok";
+    pub const SEND_WARMUP_ERR: &str = "send_warmup_err";
     /// T-9 manifest 自动拉（消费臂触发源：FetchLatest STORAGE_MANIFEST 防抖
     /// 窗沿到期一次一计）。
     pub const STORAGE_MANIFEST_PULL: &str = "storage_manifest_pull";
@@ -137,6 +144,9 @@ const KNOWN_KEYS: &[&str] = &[
     keys::SEND_SESSION_ESTABLISH,
     keys::SEND_ENCRYPT,
     keys::SEND_WS_RTT,
+    keys::SEND_WARMUP_RUN,
+    keys::SEND_WARMUP_OK,
+    keys::SEND_WARMUP_ERR,
     keys::STORAGE_MANIFEST_PULL,
     keys::STORAGE_MANIFEST_PULL_LOGIN,
     keys::STORAGE_MANIFEST_PULL_ERR,
@@ -356,5 +366,21 @@ mod tests {
         );
         assert_eq!(keys::SEND_ENCRYPT, perf_hook::keys::ENCRYPT);
         assert_eq!(keys::SEND_WS_RTT, perf_hook::keys::WS_RTT);
+    }
+
+    /// 启动预热批：三计数键全部在册（累加不落 unknownKeyDropped，快照
+    /// 可见——观测面唯一出口，失败静默纪律的计数承载）。
+    #[test]
+    fn send_warmup_counter_keys_are_registered_not_dropped() {
+        reset_for_tests();
+        add(keys::SEND_WARMUP_RUN, 1);
+        add(keys::SEND_WARMUP_OK, 4);
+        add(keys::SEND_WARMUP_ERR, 1);
+        let snapshot = snapshot_json();
+        let counters = snapshot["counters"].as_object().expect("counters object");
+        assert_eq!(counters[keys::SEND_WARMUP_RUN], 1);
+        assert_eq!(counters[keys::SEND_WARMUP_OK], 4);
+        assert_eq!(counters[keys::SEND_WARMUP_ERR], 1);
+        assert_eq!(snapshot["unknownKeyDropped"], 0);
     }
 }

@@ -13,7 +13,7 @@ use presage::{
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
 };
-use sqlx::{query, query_as, query_scalar, types::Json};
+use sqlx::{Row, query, query_as, query_scalar, types::Json};
 
 use crate::{
     SqliteStore, SqliteStoreError,
@@ -652,6 +652,46 @@ impl ContentsStore for SqliteStore {
             _ => panic!("Thread table stored both group master key and recipient"),
         }
     }
+
+    /// KT (send warmup): newest-first threads by last stored message ts.
+    /// Runtime query (no `query!` macro) on purpose — the offline `.sqlx`
+    /// cache stays untouched (save_pre_key precedent).
+    async fn recent_threads(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Thread, u64)>, Self::ContentsStoreError> {
+        let rows = query(
+            r#"SELECT t.group_master_key AS group_master_key,
+                      t.recipient_id AS recipient_id,
+                      MAX(m.ts) AS last_ts
+               FROM threads t
+               JOIN thread_messages m ON m.thread_id = t.id
+               GROUP BY t.id
+               ORDER BY last_ts DESC
+               LIMIT ?"#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.db)
+        .await?;
+
+        let mut threads = Vec::with_capacity(rows.len());
+        for row in rows {
+            let group_master_key: Option<Vec<u8>> = row.try_get("group_master_key")?;
+            let recipient_id: Option<Uuid> = row.try_get("recipient_id")?;
+            let last_ts: i64 = row.try_get("last_ts")?;
+            let thread = match (group_master_key, recipient_id) {
+                (Some(key), _) => Thread::Group(
+                    key.try_into()
+                        .map_err(|_| SqliteStoreError::InvalidFormat)?,
+                ),
+                (None, Some(recipient_id)) => Thread::Contact(ServiceId::Aci(recipient_id.into())),
+                (None, None) => return Err(SqliteStoreError::InvalidFormat),
+            };
+            let ts = u64::try_from(last_ts).map_err(|_| SqliteStoreError::InvalidFormat)?;
+            threads.push((thread, ts));
+        }
+        Ok(threads)
+    }
 }
 
 /// KT (receive batching): single-message insert within a caller-managed
@@ -962,6 +1002,75 @@ mod test {
             );
         }
         assert_eq!(store.messages(&thread, ..).await?.count(), 3);
+
+        Ok(())
+    }
+
+    // KT (send warmup): `recent_threads` reports threads newest-first by
+    // their last stored message ts — direct + group mixed, `limit` truncates.
+    #[tokio::test]
+    async fn recent_threads_orders_newest_first_and_truncates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+
+        let content = |sender: ServiceId, ts: u64| {
+            Content::from_body(
+                ContentBody::NullMessage(NullMessage::default()),
+                Metadata {
+                    sender,
+                    destination: sender,
+                    sender_device: DeviceId::new(1).unwrap(),
+                    pni_verified: None,
+                    client_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
+                    server_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    server_guid: None,
+                    story: None,
+                    ephemeral: None,
+                    urgent: None,
+                    report_spam_token: None,
+                },
+            )
+        };
+
+        let peer_a = ServiceId::Aci(Uuid::from_u128(1).into());
+        let peer_b = ServiceId::Aci(Uuid::from_u128(2).into());
+        let group_key: GroupMasterKeyBytes = [7u8; 32];
+
+        // 存储顺序故意与 ts 序不同：期望读出序 = peer_b (300) > 群 (200)
+        // > peer_a (100)，peer_a 的两条里只取 MAX(ts) 那条。
+        store
+            .save_messages(vec![
+                (Thread::Contact(peer_a), content(peer_a, 1_700_000_000_090)),
+                (Thread::Contact(peer_a), content(peer_a, 1_700_000_000_100)),
+                (Thread::Group(group_key), content(peer_a, 1_700_000_000_200)),
+                (Thread::Contact(peer_b), content(peer_b, 1_700_000_000_300)),
+            ])
+            .await?;
+
+        let recent = store.recent_threads(5).await?;
+        assert_eq!(recent.len(), 3, "三个 thread（直聊×2 + 群×1）");
+        let (Thread::Contact(newest), newest_ts) = &recent[0] else {
+            panic!("newest should be peer_b direct thread");
+        };
+        assert_eq!(newest, &peer_b);
+        assert_eq!(*newest_ts, 1_700_000_000_300);
+        let (Thread::Group(stored_key), group_ts) = &recent[1] else {
+            panic!("second should be the group thread");
+        };
+        assert_eq!(*stored_key, group_key);
+        assert_eq!(*group_ts, 1_700_000_000_200);
+        let (Thread::Contact(oldest), oldest_ts) = &recent[2] else {
+            panic!("oldest should be peer_a direct thread");
+        };
+        assert_eq!(oldest, &peer_a);
+        assert_eq!(*oldest_ts, 1_700_000_000_100, "peer_a 只取 MAX(ts)");
+
+        let limited = store.recent_threads(2).await?;
+        assert_eq!(limited.len(), 2, "limit 截断");
+        assert!(matches!(&limited[1], (Thread::Group(_), _)));
 
         Ok(())
     }

@@ -69,6 +69,9 @@ pub(crate) mod profile;
 /// 自动批，2026-10-16 批，模块头注载语义/纪律/落表查证结论）。
 pub(crate) mod profile_refresh;
 pub(crate) mod report;
+/// 启动预热批（send 性能批 2026-10-16，模块头注载契约纪律：零真实消息、
+/// 不阻塞真实发送、有界并发/时限、失败静默 perf 计数）。
+pub(crate) mod send_warmup;
 pub(crate) mod snapshot_import;
 pub(crate) mod stickers;
 pub(crate) mod storage_call_link;
@@ -6298,6 +6301,17 @@ async fn serve_account_stream(
                         ))
                         .await;
                         let _ = profile_refresh::refresh_contact_profiles(
+                            &refresh_service,
+                            &refresh_account,
+                        )
+                        .await;
+                        // 启动预热批（send 性能批 2026-10-16，compat §5）：
+                        // 刷新批之后同一沉降带一次发送路径预热（近活跃会话
+                        // 目标收集 → 独立 Manager ensure_session，零真实
+                        // 消息、不阻塞真实发送、≤10s 整批、失败静默 perf
+                        // 计数）。触发面继承 60s 一次性纪律（重连风暴不
+                        // 重复轰），每窗至多一批。
+                        send_warmup::warm_after_profile_refresh(
                             &refresh_service,
                             &refresh_account,
                         )

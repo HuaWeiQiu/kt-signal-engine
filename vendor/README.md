@@ -218,6 +218,11 @@
   （`send_ws_rtt`；修复环每轮各计一条）+ `create_encrypted_message`
   冷会话臂 emit（`send_session_establish`：prekey 拉取+本地建会话）与
   加密段 emit（`send_encrypt`）。纯计时包络，调用序/控制流零变化。
+- `src/sender.rs`（2026-10-16 启动预热批）— `create_encrypted_message`
+  的会话建立臂抽成 pub `ensure_session(&mut self, recipient, device_id)
+  -> Result<bool, MessageSenderError>`（true=新建会话；SESSION_ESTABLISH
+  emit 随臂走；原调用点改委托，行为零变化）——发送路径与宿主预热共用
+  单一建会话点，不发任何消息。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -392,6 +397,15 @@
   刷新）保持 fail-open：结构化错误 warn + `store.group` 兜底（stale 名单
   胜过路径整体失败）。分类分界单测
   `group_fetch_failure_partition_and_bound`。
+- `presage/src/store.rs`（2026-10-16 启动预热批）— `ContentsStore` 新增
+  `recent_threads(limit)`：按最后一条落库消息 ts 新序的 `(Thread, ts)`
+  列表（无消息 thread 不报）。
+- `presage/src/manager/registered.rs`（同批）— 新增 pub
+  `Manager::warm_send_path(recipients)` 与 `SendWarmupStats{established,
+  existing, failed}`：`new_message_sender`（双 WS 复用/拨号）+
+  `sender_certificate` best-effort（保险丝同款）+ 逐收件人
+  `ensure_session`（Vec 线性去重保序、跳自身、单收件人失败计数不上抛）。
+  零真实消息、零 wire 新面——宿主启动预热批地基。
 
 `vendor/presage/presage-store-sqlite/`：
 
@@ -477,6 +491,12 @@
   零变化）加 `send_sender_setup` emit（双 WS 复用或拨号整段）；`sender_
   certificate` 续期网络臂加 `send_cert_fetch` emit（缓存命中零网络不
   计时）。纯计时包络，经 `libsignal_service::perf_hook` 单向回注。
+- `src/content.rs`（2026-10-16 启动预热批）— `recent_threads` 运行时
+  query 实现（JOIN threads×thread_messages 取 MAX(ts) 新序，刻意不用
+  `query!` 宏——`.sqlx/` 离线缓存不动，save_pre_key 先例；行映射同既有
+  thread 行语义：group_master_key → `Thread::Group`、recipient_id Uuid →
+  `Thread::Contact`）；`recent_threads_orders_newest_first_and_truncates`
+  单测（直聊×2+群混排新序/MAX(ts)/limit 截断）。
 
 ## 更新纪律
 

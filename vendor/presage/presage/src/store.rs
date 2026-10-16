@@ -171,6 +171,14 @@ pub trait ContentsStore: Send + Sync {
         timestamp: u64,
     ) -> impl Future<Output = Result<Option<Thread>, Self::ContentsStoreError>>;
 
+    /// KT (send warmup): threads ordered by their most recent stored
+    /// message timestamp, newest first, as `(thread, last-message-ts)`.
+    /// Threads without stored messages are not reported.
+    fn recent_threads(
+        &self,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<(Thread, u64)>, Self::ContentsStoreError>>;
+
     /// Retrieve all messages from a [Thread] within a range in time
     fn messages(
         &self,
