@@ -172,7 +172,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `getBlockedConversations` | `{account}` | `{blocked: [{conversationId, kind: contact\|group\|legacyGroup, blockedAtTimestampMs?(u64 毫秒)}]}`（存储序；条目形状与置顶面同构 + blockedAtTimestampMs 透出（2026-10-12 窗D B7，wire additive）——contact/GV2 记录 blockedAtTimestamp>0 在场、0=官方「拉黑时刻未知」口径与无该位的 GV1 记录键缺席） | 未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message，connector 1.36 白名单逐字，§4.33） | **P5 real（2026-10-05 只读面）+ 2026-10-12 窗D B7（blockedAt 透出，§5 块）**：Storage Service manifest → 全部 type=1/2/3（CONTACT/GROUPV1/GROUPV2）identifier 批量原样读 → vendored proto 解码 → blocked 位过滤投影（contact 口径与置顶面同构：aciBinary 16B → UUID 串优先、字符串形态直通、e164 跳过；group=master key 标准 base64、legacyGroup=legacy id bytes）；无 master key 或 manifest 404（从未有 storage 状态）→ 空列表；坏条目（缺 item/解密失败/解码失败/标识映射不出）跳过零 stderr；fake：恒 `{blocked: []}` |
 | `getAvatar` | `{account, conversationId}`（形状分派：ACI/PNI ServiceId UUID 直通、手机号文本（E.164/裸数字）经 contacts 反查、群 = master key 标准 base64（listGroups id 同源）；三者皆不中 `-32603`） | `{dataUri, size}`（data URI = `data:<mime>;base64,<payload>`，MIME 魔数嗅探、未识别回退 `application/octet-stream`；size = 原始字节数） | 参数缺失/会话标识形状非法/未注册账号 `-32603`（参数面不占用结构化码）；无头像（未同步 profile_key/对端或群未设头像/服务器 403/404）→ `AVATAR_UNAVAILABLE`；网络/下载/解密失败 → `AVATAR_FETCH_FAILED`；超 10MB 帽 → `AVATAR_TOO_LARGE`（均 `-1` + message 码位） | **2026-10-06 real（KT 扩展）**：1:1 走 presage `retrieve_profile_avatar_by_uuid`（profileKey = presage store `profile_key(service_id)`，contacts 同步随行落库；未同步 → 诚实「无头像」）；群走 presage `retrieve_group_avatar`（master key 派生 GroupSecretParams 解密）；缓存/CDN/解密/入库由 presage 承担；10MB 帽照 presage 注释口径，超出 fail-closed；fake：`AVATAR_UNAVAILABLE`（不落调度日志，读面纪律） |
 | `setConversationBlocked` | `{account, conversationId, kind: contact\|group\|legacyGroup, blocked(bool)}` | `{blocked: [...]}`（写后全量，同 getBlockedConversations 形状含 blockedAtTimestampMs 透出——新拉黑目标条目携引擎时刻，存储序；2026-10-12 窗D B7 wire additive） | 云目标记录解析失败 `CONVERSATION_NOT_RESOLVED`；PUT 失败/409 conflictBackOff 连满 3 次 `STORAGE_WRITE_FAILED`；服务不可达 `STORAGE_UNAVAILABLE`；读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，同置顶面）；参数缺失/未知 kind/blocked 非布尔/未注册账号 `-32603` | **2026-10-06 real（KT 扩展）**：官方 blocked 位写语义（读改写目标会话记录仅动 blocked 位 + blockedAtTimestamp，官方 storageRecordOps 同语义：首次拉黑 = 引擎时刻、已拉黑幂等不重写他端时刻（含 0 原样保留）、解除清零；GV1 无时间戳字段）+ 新 16B item id + version+1 + 409 响应体采纳重放（置顶面同款）；从未有 storage 状态：blocked=true → master key 播种 + version 1 最小 AccountRecord 与目标记录同批首写，blocked=false → 无可解除幂等成功不播种；纯拉黑不删会话（官方桌面同语义，消息/会话不清理）；**2026-10-12 窗D B7**：写后回显名单携 blockedAtTimestampMs（补尾条目 = 引擎时刻，与写面真值同源，§5 块）；fake：成功回 `{blocked: []}` |
-| `storage.mergeContacts` | `{account}` | `{recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, trustStatesSynced}`（七汇总字段；逐条 merge 幂等——同钥重跑全 no-op） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A4，官方 mergeContactRecord engine 腿，§5 块）**：Storage Service manifest → 全部 CONTACT identifier 批读 → ContactRecord 逐条 merge——identityKey 非空 → 身份库 save（官方 updateIdentityAfterSync 同构：absent 新增/同钥 no-op/异钥替换 + vendored 换钥 archive sessions）+ identityState 落 sidecar 信任态（Default/坏值归 default）；profileKey 非空且本地缺失 → upsert（官方 isFirstSync\|!localProfileKey 同闸）；联系人缺失 → contacts 建档（e164/given+family 姓名随建，已有档不动——姓名权威 = 手机 contacts sync）；本机 uuid/无 serviceId/坏形跳过（官方 shouldDrop 同位，skipped 汇总）；无引擎消费模型字段（unregisteredAt/hideStory/hidden/avatarColor/note/nickname 族）记档跳过，archived/markedUnread/muted/blocked 已有专用面不重复；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A4 块；fake：恒七字段零汇总 |
+| `storage.mergeContacts` | `{account}` | `{recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, contactsNameUpdated, trustStatesSynced}`（八汇总字段；逐条 merge 幂等——同钥重跑全 no-op；`contactsNameUpdated` wire additive 2026-10-16 姓名升级批） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A4，官方 mergeContactRecord engine 腿，§5 块）**：Storage Service manifest → 全部 CONTACT identifier 批读 → ContactRecord 逐条 merge——identityKey 非空 → 身份库 save（官方 updateIdentityAfterSync 同构：absent 新增/同钥 no-op/异钥替换 + vendored 换钥 archive sessions）+ identityState 落 sidecar 信任态（Default/坏值归 default）；profileKey 非空且本地缺失 → upsert（官方 isFirstSync\|!localProfileKey 同闸）；联系人缺失 → contacts 建档（e164/given+family 姓名随建）；已有档 → 存储名（given+family）非空且与本地不同 → save_contact 覆盖本地 name（`contactsNameUpdated` 计数；存储名空保留本地，同名跳过——2026-10-16 姓名升级批，官方 Storage 通道可信同步源语义）；本机 uuid/无 serviceId/坏形跳过（官方 shouldDrop 同位，skipped 汇总）；无引擎消费模型字段（unregisteredAt/hideStory/hidden/avatarColor/note/nickname 族）记档跳过，archived/markedUnread/muted/blocked 已有专用面不重复；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A4 块；fake：恒八字段零汇总 |
 | `storage.importGroups` | `{account}` | `{recordsRead, imported, alreadyKnown, failed}`（四汇总字段；幂等——本地已有 master key 零网络跳过） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-11 real（KT 扩展，窗D A5，官方 mergeGroupV2Record engine 腿，§5 块）**：Storage Service manifest → 全部 GROUPV2 identifier 批读 → GroupV2Record masterKey 逐群导入——本地 `store.group()` 命中 → alreadyKnown 零网络跳过（增量纪律）；未知 → 既有 `fetch_group_state` 群态拉取（groups 服务器 GET v1/groups/）→ `save_group` 落 presage store（listGroups/open_group_sender 发现与发送面即刻可用）；master key 坏形（≠32B）/群态拉取失败/落库失败 → failed 逐群 best-effort 计数不炸批（官方桌面按需拉态，引擎 sidecar 无群快照惰性层 → 导入即拉态，偏差 §5 记档）；GV1 迁移面归窗D B8；无 master key 或 manifest 404 → 零汇总幂等成功；详见 §5 窗D A5 块；fake：恒四字段零汇总 |
 | `storage.getCallLinks` | `{account}` | `{callLinks: [{rootKey(标准 base64 16/21B), adminPasskey?(标准 base64), deletedAtTimestampMs?(u64 毫秒)}]}`（存储序 = manifest CALL_LINK identifiers 首现序；坏条目跳过不炸面；deletedAtTimestampMs 在场即删除态，adminPasskey 恒缺——官方 isBadRemoteData「assume deleted」同位） | account 缺席·非字符串/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_READ_FAILED`（`-1` + message） | **2026-10-12 real（KT 扩展，窗D A6 读面，官方 mergeCallLinkRecord engine 读腿，§5 块）**：Storage Service manifest → 全部 CALL_LINK（=7）identifier 批读 → CallLinkRecord 三字段投影（vendored 生成 proto 已含 Type::CallLink/CallLinkRecord，与引擎自有 proto 同线格式双源）；官方以 roomId 定位同链接（RingRTC derive_room_id(rootKey) 纯函数），引擎以 rootKey 字节等价定位不复制派生面；无 master key 或 manifest 404 → 空列表幂等成功；fake：恒 `{callLinks: []}` |
 | `storage.setCallLink` | `{account, rootKey(标准 base64，解码后恰 16B(V0)/21B(V1)——RingRTC CallLinkRootKey 两版本定长，calls.linkPresentation 闸同源), adminPasskey?(标准 base64 非空) \| deletedAtTimestampMs?(u64 正整数)}`（**两腿恰一**：active = adminPasskey、deleted = deletedAtTimestampMs，同置/双缺 `-32603`；deleted 腿 adminPasskey 恒不写——官方 toCallLinkRecord deleted 分支 adminKey 恒缺同形） | `{callLinks: [...]}`（写后全量，同 getCallLinks 形状，存储序） | 参数缺失/rootKey 非 base64·≠16·21B·非字符串/adminPasskey 非字符串·非法 base64·空解码/deletedAtTimestampMs 非数值·≤0·小数/两键同置（官方 isBadRemoteData 同位矛盾意图）/双缺（空意图——官方 upload 恒不写无 adminKey call link 同位）/未注册账号 `-32603`；storage 链路同置顶面：`STORAGE_UNAVAILABLE`/`STORAGE_WRITE_FAILED`（`-1` + message） | **2026-10-12 real（KT 扩展，窗D A6 写面，官方 toCallLinkRecord engine 写腿，§5 块）**：官方 upload 语义（storage.preload.ts callLinks 段）——读 manifest + 全部 CALL_LINK item → 定位 replaced key（rootKey 字节等价）→ 新 16B item key + 旧 key 进 deleteKey → PUT → 409 采纳重放（conflictBackOff 3 次，置顶/贴纸面同款）；云态已满足意图（投影等值）→ 幂等无写返回当前云态（官方 storageNeedsSync=false 同语义）；manifest 404 → master key 播种 + version 1 最小 AccountRecord 同批首写（置顶/贴纸面同口径）；RecordPayload::CallLink 进 storage_sync 统一 shim（StorageRecord tag=7 包裹）；fake：成功回 `{callLinks: []}` |
@@ -582,6 +582,13 @@ P2 real 模式差异（connector 侧需知的边界，逐条 ADR 0004 对齐）�
 - **号码解析冷启动窗口**：send 系方法的 recipient 号码 → ServiceId 经本地
   contacts 解析；链接后手机端自动推送 contacts，推送落地前的窗口内发送按
   `-32603` 内部失败。connector 侧行为不变（失败即报，不重试语义未变）。
+  **2026-10-16 self 解析批（engine-compat）**：收件人号码数字位等于本机
+  号码（注册数据 phone_number，E.164/裸号同收敛）→ 直解本机 ACI，不经
+  contacts 匹配——官方 Note to Self 会话键 = 自身 ACI，connector 备忘录
+  会话 peer_key = 本机号码（`recipient` 形态直发，非 groupId），而 self
+  不在手机 contacts 表是常态（2026-10-16 备忘录整夜 13 次折
+  `SendError::Internal` 实证）；UUID 形态（ACI/PNI 串）在首臂 parse 直解
+  本就不受影响。非本机号码照旧走 contacts 匹配，冷启动窗口语义不变。
 - **reaction targetAuthor**：协议字段是 ACI UUID；本机号走注册数据（回应
   自己的消息），其余号码经 contacts 解析，UUID 形状直通；1:1 均未命中按
   内部失败，群内保留原样由协议侧报错。
@@ -4590,8 +4597,9 @@ presage 身份库为空，对端身份钥只能靠首次发送时服务器 preke
      isFirstSync || !localProfileKey 同闸，已有不覆盖）；≠32B 坏长度诚实
      跳过。
   3. 联系人缺失 → `save_contact` 建档（e164 解析 + given+family 复合名 +
-     profileKey 随建）；**已有档不动**——手机 contacts sync 是姓名权威
-     （P15a 项3 落库面），engine 不发明 system/nickname 建模。
+     profileKey 随建）；已有档 → 存储名非空且与本地不同 → 覆盖本地
+     name（**2026-10-16 姓名升级批**，wire additive `contactsNameUpdated`，
+     见下）；engine 不发明 system/nickname 建模（P15a 项3 落库面不变）。
   4. service id 解析：aciBinary 16B → aci 串（只收 ACI 形态）→ pniBinary
      → pni 串（untagged 裸 UUID 即 PNI，官方 fromPniUuidBytesOrUntagged-
      String 字段声明种类同构；"PNI:" 标签形宽容）。无 serviceId/本机
@@ -4609,14 +4617,26 @@ presage 身份库为空，对端身份钥只能靠首次发送时服务器 preke
   merge 后也不回写 ContactRecord，写由主设备权威）；触发时机归调用方
   （connector 链接完成/manifest 变更时调用，引擎不自动后台跑——按需面
   纪律）。
+- **2026-10-16 姓名升级批（wire additive，engine-compat）**：既有档
+  「一律不动」改为官方语义——Storage 同步通道是服务器认证 + 端到端加密
+  的可信同步源，ContactRecord 姓名随每次 merge 落本地（桌面
+  mergeContactRecord 对既有记录做字段级覆盖同域）。三臂：存储名
+  （given+family 空格拼接，建档臂同一复合单点）非空且 != 本地
+  contacts.name → `save_contact` 覆盖本地 name（其余本地字段原样保留，
+  outcome 新字段 `contactsNameUpdated` 计数）；存储名为空 → 保留本地；
+  同名 → 跳过。此前「已有档不动」使手机端后续改名永不收敛进引擎
+  （resolve_recipient 号码匹配/投影面读的正是 contacts.name/phone）。
+  无该字段前的消费方不受影响（additive）。
 - **错误面**：account 缺席/未注册 `-32603`；storage 链路 STORAGE_UNAVAILABLE/
   STORAGE_READ_FAILED（-1 + message，置顶面同码位）；无 master key 或
-  manifest 404 → 七字段零汇总幂等成功（blocked 只读面同口径）。
-- **fake**：恒七字段零汇总（读面纪律）。
+  manifest 404 → 八字段零汇总幂等成功（blocked 只读面同口径）。
+- **fake**：恒八字段零汇总（读面纪律）。
 - **单测**：service_id_resolution_precedence（binary 优先/aci 串 ACI-only/
   pni untagged 裸 UUID/标签形/全缺/invalid-aci 逐形）+ trust_state_mapping
-  （三态直映 + 坏值归 default）+ contract storage_merge_contacts_fake_
-  shapes_and_param_fail_closed（fake 零汇总 + 参数闸 + real 未注册折叠）。
+  （三态直映 + 坏值归 default）+ contact_name_upgrade_arms 三臂（空→非空
+  升级/非空不同覆盖/空存储名保留本地 + 同名跳过）+ contract
+  storage_merge_contacts_fake_shapes_and_param_fail_closed（fake 零汇总 +
+  参数闸 + real 未注册折叠）。
 
 ### 窗D A5 Storage GroupV2Record 群导入批（2026-10-11，官方对齐 Signal-Desktop storageRecordOps，wire additive）
 
