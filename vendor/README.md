@@ -207,6 +207,17 @@
   `C: Clone` 界，泛型槽位克隆面）；④`pub mod slot` 挂载 + pub const
   `CLOSE_CODE_CONNECTED_ELSEWHERE = 4409`。
 - `Cargo.toml`（同批）— tokio features 加 `"sync"`（Notify kill 开关）。
+- `src/perf_hook.rs`（2026-10-16 send 链分段打点批，新文件）— 单向计时
+  钩子：进程内一次性 `install(fn(&'static str, u64))` + `emit`
+  （未安装 no-op，库独立可用）+ 五段键字面量模块 `keys`
+  （`send_sender_setup`/`send_cert_fetch`/`send_session_establish`/
+  `send_encrypt`/`send_ws_rtt`——与引擎 perf 词表字面量钉等，引擎侧
+  跨 crate 单测钉定）。三例单测。
+- `src/lib.rs`（同批）— `pub mod perf_hook` 挂载。
+- `src/sender.rs`（同批）— `try_send_message` WS 上行→应答段 emit
+  （`send_ws_rtt`；修复环每轮各计一条）+ `create_encrypted_message`
+  冷会话臂 emit（`send_session_establish`：prekey 拉取+本地建会话）与
+  加密段 emit（`send_encrypt`）。纯计时包络，调用序/控制流零变化。
 
 `vendor/presage/`（rev 33dd149）：
 
@@ -461,6 +472,11 @@
   `identified_websocket_close_code()` /
   `has_open_identified_websocket()`（引擎 4409 分支判定读数面，
   `docs/websocket-connection-ledger.md` §3）。
+- `presage/src/manager/registered.rs`（2026-10-16 send 链分段打点批）—
+  `new_message_sender` 拆薄壳（原体挪 `new_message_sender_inner`，行为
+  零变化）加 `send_sender_setup` emit（双 WS 复用或拨号整段）；`sender_
+  certificate` 续期网络臂加 `send_cert_fetch` emit（缓存命中零网络不
+  计时）。纯计时包络，经 `libsignal_service::perf_hook` 单向回注。
 
 ## 更新纪律
 

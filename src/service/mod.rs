@@ -10896,15 +10896,26 @@ async fn resolve_recipient(
     manager: &Manager<SqliteStore, Registered>,
     recipient: &str,
 ) -> Option<presage::libsignal_service::protocol::ServiceId> {
-    if let Some(service_id) = ServiceId::parse_from_service_id_string(recipient.trim()) {
-        return Some(service_id);
+    // S2a send 分段打点：收件人解析整体（send 性能批 2026-10-16；单一
+    // 咽喉自计时，成败两臂同计）。
+    let resolve_started = std::time::Instant::now();
+    let resolved = async {
+        if let Some(service_id) = ServiceId::parse_from_service_id_string(recipient.trim()) {
+            return Some(service_id);
+        }
+        let registration = manager.registration_data();
+        if self_recipient_by_number(recipient, &e164_string(&registration.phone_number)) {
+            return Some(ServiceId::Aci(registration.service_ids.aci.into()));
+        }
+        let contact = find_contact_by_number(manager, recipient).await?;
+        Some(ServiceId::Aci(contact.uuid.into()))
     }
-    let registration = manager.registration_data();
-    if self_recipient_by_number(recipient, &e164_string(&registration.phone_number)) {
-        return Some(ServiceId::Aci(registration.service_ids.aci.into()));
-    }
-    let contact = find_contact_by_number(manager, recipient).await?;
-    Some(ServiceId::Aci(contact.uuid.into()))
+    .await;
+    perf_metrics::record_us(
+        perf_metrics::keys::SEND_RESOLVE,
+        resolve_started.elapsed().as_micros() as u64,
+    );
+    resolved
 }
 
 /// 收件人 = 本机号码判定（self 解析批 2026-10-16，纯函数零 IO——两臂

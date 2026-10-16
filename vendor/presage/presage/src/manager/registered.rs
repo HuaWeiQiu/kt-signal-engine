@@ -342,11 +342,17 @@ impl<S: Store> Manager<S, Registered> {
         let mut unidentified_sender_certificate =
             self.state.unidentified_sender_certificate.lock().await;
         if needs_renewal(unidentified_sender_certificate.as_ref()) {
+            // KT (send perf): the network arm only — a cache hit stays free.
+            let cert_started = std::time::Instant::now();
             let sender_certificate = self
                 .identified_websocket(false)
                 .await?
                 .get_uuid_only_sender_certificate()
                 .await?;
+            libsignal_service::perf_hook::emit(
+                libsignal_service::perf_hook::keys::CERT_FETCH,
+                cert_started.elapsed().as_micros() as u64,
+            );
             self.store
                 .save_sender_certificate(&sender_certificate)
                 .await?;
@@ -2118,6 +2124,20 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Creates a new message sender.
     async fn new_message_sender(&self) -> Result<MessageSender<S::AciStore>, Error<S::Error>> {
+        // KT (send perf): reuse-or-dial of both websockets is the dominant
+        // cold-start segment; the shared slot makes a live ws a cheap clone.
+        let setup_started = std::time::Instant::now();
+        let sender = self.new_message_sender_inner().await;
+        libsignal_service::perf_hook::emit(
+            libsignal_service::perf_hook::keys::SENDER_SETUP,
+            setup_started.elapsed().as_micros() as u64,
+        );
+        sender
+    }
+
+    async fn new_message_sender_inner(
+        &self,
+    ) -> Result<MessageSender<S::AciStore>, Error<S::Error>> {
         let identified_websocket = self.identified_websocket(false).await?;
         let unidentified_websocket = self.unidentified_websocket().await?;
 

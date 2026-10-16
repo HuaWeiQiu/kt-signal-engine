@@ -742,6 +742,7 @@ where
                 online,
             };
 
+            let send_started = std::time::Instant::now();
             let send = if let Some(_sender_certificate) = story {
                 tracing::debug!("sending via unidentified (story)");
                 self.unidentified_ws
@@ -756,6 +757,14 @@ where
                 tracing::debug!("sending identified");
                 self.identified_ws.send_messages(messages).await
             };
+            // KT (send perf): one series entry per ws round trip, including
+            // every mismatched-device repair round.
+            crate::perf_hook::emit(
+                crate::perf_hook::keys::WS_RTT,
+                std::time::Instant::now()
+                    .duration_since(send_started)
+                    .as_micros() as u64,
+            );
 
             match send {
                 Ok(SendMessageResponse { needs_sync }) => {
@@ -1204,6 +1213,10 @@ where
                 "establishing new session with {}",
                 recipient_protocol_address
             );
+            // KT (send perf): the whole cold-session arm — the prekey fetch
+            // over the identified websocket plus local bundle processing.
+            // Shared with the host's send-path warmup via `ensure_session`.
+            let session_started = std::time::Instant::now();
             let pre_keys = match self
                 .identified_ws
                 .get_pre_keys(recipient, device_id)
@@ -1252,8 +1265,13 @@ where
                 )
                 .await?;
             }
+            crate::perf_hook::emit(
+                crate::perf_hook::keys::SESSION_ESTABLISH,
+                session_started.elapsed().as_micros() as u64,
+            );
         }
 
+        let encrypt_started = std::time::Instant::now();
         let message = self
             .cipher
             .encrypt(
@@ -1264,6 +1282,10 @@ where
             )
             .instrument(tracing::trace_span!("encrypting message"))
             .await?;
+        crate::perf_hook::emit(
+            crate::perf_hook::keys::ENCRYPT,
+            encrypt_started.elapsed().as_micros() as u64,
+        );
 
         Ok(message)
     }

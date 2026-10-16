@@ -55,6 +55,27 @@ pub(crate) mod keys {
     pub const RECONNECT_BACKOFF: &str = "reconnect_backoff";
     /// 链接建立后存量补同步三请求（P15c 项4；2s 沉降后一次性）。
     pub const INITIAL_SYNC_REQUESTS: &str = "initial_sync_requests";
+    /// send 链分段打点（send 性能批 2026-10-16，docs/jsonrpc-compat.md §5
+    /// 「send 链分段打点」块）：阶段边界 resolve → sender_setup →
+    /// cert_fetch → session → encrypt → ws_rtt；total 段沿用
+    /// [`SEND_TEXT_TOTAL`]/[`SEND_GROUP_TOTAL`]，锁等待沿用
+    /// [`SEND_LOCK_WAIT`]。vendor 侧四键字面量与
+    /// `libsignal_service::perf_hook::keys` 跨 crate 钉等（单测）。
+    /// 收件人解析整体（resolve_recipient 单一咽喉自计时）。
+    pub const SEND_RESOLVE: &str = "send_resolve";
+    /// 发送管理器装配：双 WS 复用或拨号（vendor presage
+    /// new_message_sender；预热同序列——冷拨代价即归因要的 max 值）。
+    pub const SEND_SENDER_SETUP: &str = "send_sender_setup";
+    /// 发送证书续期网络臂（缓存命中零网络不计时；vendor presage）。
+    pub const SEND_CERT_FETCH: &str = "send_cert_fetch";
+    /// 冷会话建立：prekey 一次拉全设备 + 本地建会话（vendor
+    /// libsignal-service create_encrypted_message 会话臂，预热共用单点）。
+    pub const SEND_SESSION_ESTABLISH: &str = "send_session_establish";
+    /// 会话内加密（cipher.encrypt；vendor libsignal-service）。
+    pub const SEND_ENCRYPT: &str = "send_encrypt";
+    /// WS 消息上行 → 服务器应答（修复环每轮各计一条；vendor
+    /// libsignal-service try_send_message）。
+    pub const SEND_WS_RTT: &str = "send_ws_rtt";
 
     // —— 计数器 ——
     /// T-9 manifest 自动拉（消费臂触发源：FetchLatest STORAGE_MANIFEST 防抖
@@ -110,6 +131,12 @@ const KNOWN_KEYS: &[&str] = &[
     keys::PREKEY_CLEANUP,
     keys::RECONNECT_BACKOFF,
     keys::INITIAL_SYNC_REQUESTS,
+    keys::SEND_RESOLVE,
+    keys::SEND_SENDER_SETUP,
+    keys::SEND_CERT_FETCH,
+    keys::SEND_SESSION_ESTABLISH,
+    keys::SEND_ENCRYPT,
+    keys::SEND_WS_RTT,
     keys::STORAGE_MANIFEST_PULL,
     keys::STORAGE_MANIFEST_PULL_LOGIN,
     keys::STORAGE_MANIFEST_PULL_ERR,
@@ -297,5 +324,37 @@ mod tests {
         sorted.sort();
         assert_eq!(collected, sorted, "BTreeMap 键序确定性");
         assert_eq!(counters.len(), 2);
+    }
+
+    /// send 分段打点批：六计时键全部在册（记录不落 unknownKeyDropped），
+    /// 且 vendor 钩子键字面量与引擎词表跨 crate 钉等（单一真相在引擎，
+    /// vendor 字面量漂移即此测试红）。
+    #[test]
+    fn send_segment_keys_are_registered_and_pinned_to_vendor_literals() {
+        reset_for_tests();
+        for key in [
+            keys::SEND_RESOLVE,
+            keys::SEND_SENDER_SETUP,
+            keys::SEND_CERT_FETCH,
+            keys::SEND_SESSION_ESTABLISH,
+            keys::SEND_ENCRYPT,
+            keys::SEND_WS_RTT,
+        ] {
+            record_us(key, 7);
+        }
+        let snapshot = snapshot_json();
+        let timings = snapshot["timings"].as_object().expect("timings object");
+        assert_eq!(timings.len(), 6, "六键全部落表");
+        assert_eq!(snapshot["unknownKeyDropped"], 0, "在册键零丢弃");
+
+        use presage::libsignal_service::perf_hook;
+        assert_eq!(keys::SEND_SENDER_SETUP, perf_hook::keys::SENDER_SETUP);
+        assert_eq!(keys::SEND_CERT_FETCH, perf_hook::keys::CERT_FETCH);
+        assert_eq!(
+            keys::SEND_SESSION_ESTABLISH,
+            perf_hook::keys::SESSION_ESTABLISH
+        );
+        assert_eq!(keys::SEND_ENCRYPT, perf_hook::keys::ENCRYPT);
+        assert_eq!(keys::SEND_WS_RTT, perf_hook::keys::WS_RTT);
     }
 }
