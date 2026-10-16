@@ -349,3 +349,54 @@ fn current_days_seconds() -> (u64, u64) {
 
     (days_seconds(today), days_seconds(today_plus_7_days))
 }
+
+#[cfg(test)]
+mod live_group_endpoint_fixture {
+    // Live capture (2026-10-16 one-shot diagnostic probe) of the storage
+    // service answer for the operator's own test group, plus that group's
+    // master key. Pins the dual endpoint contract: /v1/groups/ answers a
+    // bare Group, while the same bytes fail GroupResponse with tag 0 —
+    // the decode failure that moving get_group_response to /v2/groups/
+    // fixed.
+    use base64::prelude::*;
+    use prost::Message;
+
+    use super::decrypt_group;
+    use crate::proto::{Group, GroupResponse};
+
+    const BARE_GROUP_B64: &str = "CmEAG0vfAA6uuDEanZKlIJDDY7iKwDqZHkWHs5BouIUxBHbwC+gHzpR7gaK0K88czGLwvIX7xVQOYG/LLhqNeogvLiCj2WfQzq+qNiRMDFyovipxRSWbSejStGZ6B2+esnUxEiddWx0iXAuMU82AuMQcmi/hqqXXZB5g2nG+dVWo3K5/8DyuZRfAvQAqCAgCEAIYBCACMBA6sQEKQQAs2LWlNk6tqGGseY9byQe5lvA6IdeoJ9WrPoAoSGq5F5JfdqM/RyKtydu43h/dL/8ppUG/k770+wKq4SgZ2FEBEAIaQQBMGoHeOQ1GXw0zPCOxmGq3WdWqZcPHswRi4XvmuUk6Twp7LNC/jqAnCFup0MBn4rQY2k3fadCLABOQkzqm4VApOifgK8rE74mKRPJaeYJejUzHZ8nkEM+bh+g9ViO9Z7PqUjnFnqxlGgA6iAEKQQD6Mtet86gGvJOUorgnuJnj8aYX/jSR/M/nRbRZHh2gc+wmXLJScKHy9Knno6KT3XwBLlycZ5AU84ZC9RsjyysiEAEaQQDCXyJ6Syf57TP99Nv3Ndrp/FdfLL7sYk4T/KRp+WHbXoLhJeLsGF7Fi3TAL1Jj2fppVeGC1wn+J/F+bGp+anBjUhCn7J60rpum8IRcTOIL4R8BakoKQQB6InxEM1RxwhkCFg/oWj0MxXKjhmu3GJLpeLJrjBsFCwxKETmt2f5UrovreBWR1UntokvgM2n7XHQnjg5+eqdDEK2wmM6SNA==";
+
+    const MASTER_KEY_B64: &str = "D4DyutMEtvpawXahRoFH/5KPjE/z7ThINwByaAh7Zfw=";
+
+    #[test]
+    fn v1_answer_is_a_bare_group_that_decodes_and_decrypts() {
+        let bytes = BASE64_STANDARD
+            .decode(BARE_GROUP_B64)
+            .expect("fixture is valid base64");
+        let group = Group::decode(bytes.as_slice())
+            .expect("v1 groups answers a bare Group");
+        assert_eq!(group.version, 16);
+        assert_eq!(group.members.len(), 2);
+        let master_key = BASE64_STANDARD
+            .decode(MASTER_KEY_B64)
+            .expect("master key fixture is valid base64");
+        let group = decrypt_group(&master_key, group)
+            .expect("bare Group decrypts with its master key");
+        assert_eq!(group.title, "gggg");
+        assert_eq!(group.members.len(), 2);
+        assert!(!group.terminated);
+    }
+
+    #[test]
+    fn v1_answer_rejected_as_group_response_with_tag_zero() {
+        let bytes = BASE64_STANDARD
+            .decode(BARE_GROUP_B64)
+            .expect("fixture is valid base64");
+        let error = GroupResponse::decode(bytes.as_slice())
+            .expect_err("bare Group must not decode as GroupResponse");
+        assert!(
+            error.to_string().contains("invalid tag value: 0"),
+            "unexpected decode error: {error}"
+        );
+    }
+}

@@ -8,6 +8,7 @@ use crate::{
 };
 
 use libsignal_core::DeviceId;
+use protobuf::ProtobufResponseExt;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
@@ -248,48 +249,27 @@ impl PushService {
         Ok(ws)
     }
 
-    // KT (groups fetch): the response is decoded as GroupResponse
-    // {group=1, group_send_endorsements_response=2} (Android
-    // GroupsV2Api.getGroup shape). INTERIM: the path below is still
-    // /v1/groups/ — the server strips the wrapper there and answers a
-    // bare Group, which is exactly the decode failure under diagnosis
-    // ("GroupResponse.group: invalid tag value: 0"). The one-shot probe
-    // below captures the raw bytes; the follow-up fix commit moves the
-    // path to /v2/groups/ and removes the probe.
+    // KT (groups fetch): the GroupResponse{group=1,
+    // group_send_endorsements_response=2} wrapper is served by
+    // /v2/groups/ (Android GROUPSV2_GROUP). /v1/groups/ strips the
+    // wrapper and answers a bare Group, which fails this decode with
+    // "invalid tag value: 0" — see the live-fixture test in
+    // groups_v2::manager.
     pub(crate) async fn get_group_response(
         &mut self,
         credentials: HttpAuth,
     ) -> Result<crate::proto::GroupResponse, ServiceError> {
-        let response = self
-            .request(
-                Method::GET,
-                Endpoint::storage("/v1/groups/"),
-                HttpAuthOverride::Identified(credentials),
-            )?
-            .send()
-            .await?
-            .service_error_for_status()
-            .await?;
-        let bytes = response.bytes().await?;
-        // KT (TEMPORARY probe, group fetch diagnosis batch): one raw-byte
-        // capture when the decode fails; removed by the follow-up fix
-        // commit once the live fixture is captured.
-        match <crate::proto::GroupResponse as prost::Message>::decode(
-            bytes.clone(),
-        ) {
-            Ok(decoded) => Ok(decoded),
-            Err(error) => {
-                tracing::warn!(
-                    len = bytes.len(),
-                    b64 = %base64::Engine::encode(
-                        &base64::prelude::BASE64_STANDARD,
-                        &bytes
-                    ),
-                    "groups fetch raw response bytes captured on decode failure (one-shot diagnostic)"
-                );
-                Err(error.into())
-            },
-        }
+        self.request(
+            Method::GET,
+            Endpoint::storage("/v2/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
     }
 }
 
