@@ -2291,13 +2291,23 @@ impl Service {
             "send-latency-probe",
         );
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
-        let whitelist = profile_sharing_whitelist(self, account).await;
+        // KT (send latency probe): 暗区段探针三之一——whitelist 读面（修1
+        // 缓存后命中即近零；cache=hit|miss 固定词，正文/号码不入日志）。
+        let probe_whitelist_t0 = std::time::Instant::now();
+        let (whitelist, probe_whitelist_hit) =
+            profile_sharing_whitelist_probed(self, account).await;
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.whitelist",
+            dur_ms = probe_whitelist_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            cache = if probe_whitelist_hit { "hit" } else { "miss" },
+            "send-latency-probe",
+        );
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
         // 同样多收件人共享指针。caption 位 = story 媒体腿专属（send 面无
         // caption 参数，None 零变化）。上传失败整批确定未投递（先于全部
         // 收件人），AttachmentUpload 族同调用内快速重试 1 次（§5）。
-        let probe_has_upload =
-            !attachments.is_empty() || preview.and_then(|item| item.image.as_deref()).is_some();
         let probe_upload_t0 = std::time::Instant::now();
         let (pointers, preview_image) = {
             let mut attempt = 0usize;
@@ -2321,6 +2331,16 @@ impl Service {
                 }
             }
         };
+        // KT (send latency probe): 暗区段探针三之二——upload 段恒落（纯文
+        // 本 no-op 早退也测，钉死排除法；原 engine.upload 条件行更名）。
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.upload-pre",
+            dur_ms = probe_upload_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
+        let probe_sticker_t0 = std::time::Instant::now();
         let sticker_pointer = match sticker {
             Some(sticker) => {
                 let mut attempt = 0usize;
@@ -2340,15 +2360,15 @@ impl Service {
             }
             None => None,
         };
-        if probe_has_upload {
-            tracing::warn!(
-                target: "send_latency_probe",
-                stage = "engine.upload",
-                dur_ms = probe_upload_t0.elapsed().as_millis() as u64,
-                ts_id = timestamp,
-                "send-latency-probe",
-            );
-        }
+        // KT (send latency probe): 暗区段探针三之三——sticker 段恒落
+        //（None 臂 no-op 也测，钉死排除法）。
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.sticker-pre",
+            dur_ms = probe_sticker_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
         // 时序审计组二#9：per-recipient 成败收集（不再 fail-fast 丢弃部分
         // 成功——重试全批会对已达收件人重复投递）。results = 成功条目（旧
         // 形状原样）；failures = 失败条目（wire additive，connector 只补
