@@ -194,18 +194,29 @@ pub(crate) async fn dispatch_group_message(
     // 网络；miss/失效才走 fetch（官方失效→刷群态一次→重试同语义，此处刷
     // 取在发送前完成）。fetch 失败回 store 缓存；群不存在 → failover 走
     // vendored 的 UnknownGroup 错误面。
-    let fetched =
+    // KT (send latency probe): 获取段打点（群发送延迟批 2026-10-18）——
+    // deliver-group 细分第一段，cache=hit|network 固定词；纯日志零行为变化。
+    let group_refresh_t0 = std::time::Instant::now();
+    let (fetched, group_refresh_hit) =
         match super::group_cache::cached_group_with_endorsements(manager, &master_key).await {
-            Some(hit) => Some(hit),
+            Some(hit) => (Some(hit), true),
             None => {
                 let fresh = manager
                     .fetch_group_with_endorsements(&master_key)
                     .await
                     .map_err(super::send_error_of)?;
                 super::group_cache::store_endorsements(manager.store(), &master_key, &fresh).await;
-                fresh
+                (fresh, false)
             }
         };
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "engine.group-refresh",
+        cache = if group_refresh_hit { "hit" } else { "network" },
+        dur_ms = group_refresh_t0.elapsed().as_millis() as u64,
+        ts_id = timestamp,
+        "send-latency-probe",
+    );
 
     // DataMessage 注入群上下文（接收方进群线程的唯一依据；B 批审计缺
     // group_v2 的修复，failover 路径同样受益）。
@@ -371,6 +382,10 @@ pub(crate) async fn dispatch_group_message(
         }
         destinations.sort_by(|a, b| a.0.name().cmp(b.0.name()));
 
+        // KT (send latency probe): 加密段打点（群发送延迟批 2026-10-18）——
+        // deliver-group 细分第二段 = sender key 加密 + 证书装配 + 逐设备
+        // sealed 封装（修复轮每轮一条，round 固定词）；纯日志零行为变化。
+        let encrypt_t0 = std::time::Instant::now();
         let skm = match group_encrypt(
             &mut aci_store,
             &own_address,
@@ -421,8 +436,29 @@ pub(crate) async fn dispatch_group_message(
                 return failover(service, manager, &self_sync, &master_key, body, timestamp).await
             }
         };
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.group-encrypt",
+            round = rounds,
+            dur_ms = encrypt_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
 
-        match send_mrm(service, &payload, timestamp, token.clone()).await {
+        let wire_t0 = std::time::Instant::now();
+        let wire_result = send_mrm(service, &payload, timestamp, token.clone()).await;
+        // KT (send latency probe): wire 段打点——deliver-group 细分第三段 =
+        // MRM 单请求 WS/HTTPS 往返（失败轮 outcome=err，修复/刷新后重试照付）。
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.group-wire",
+            round = rounds,
+            outcome = if wire_result.is_ok() { "ok" } else { "err" },
+            dur_ms = wire_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
+        match wire_result {
             Ok(response) => break response.unregistered_ids,
             Err(MrmSendFailure::Mismatched(accounts)) => {
                 rounds += 1;

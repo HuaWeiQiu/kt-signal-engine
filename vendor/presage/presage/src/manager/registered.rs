@@ -1928,16 +1928,17 @@ impl<S: Store> Manager<S, Registered> {
         // outgoing transcript save.
         let upserted = {
             let mut groups_manager = Box::pin(self.groups_manager()).await?;
-            // KT (group send semantics): message sends refresh the group state
-            // first (the u32::MAX revision comparison always triggers the fetch),
-            // so the recipient list no longer eats stale memberships; a failed
-            // fetch falls back to the stored group (fail-open). Typing stays on
-            // the local state — official typing carries no group fetch.
-            let revision = if group_refresh_needed(&content_body) {
-                u32::MAX
-            } else {
-                0
-            };
+            // KT (group send latency, official semantics): sends dispatch on
+            // the locally stored group state — revision 0 never forces a
+            // network fetch. upsert_group still fetches exactly once when the
+            // store holds no state for this group (no blind sends), and the
+            // fetch-failure fallback below is unchanged (fail-open). The
+            // stored state is kept current by the consumer's post-send
+            // background refresh (official clients read local group state in
+            // the send path and delegate refreshing to background group
+            // sync; stale-membership window = until that refresh lands, the
+            // same trade-off).
+            let revision = 0;
             // KT (group fetch degradation): the send path stays fail-open —
             // a structured group fetch failure falls back to the stored
             // group (a stale recipient list beats a failed send).
@@ -2581,14 +2582,6 @@ impl RetryReceiptMaterial {
 /// delivered, `Some` = that recipient's failure. Official clients report
 /// per-recipient results; individual failures don't fail the whole send.
 pub type GroupSendOutcomes = Vec<(ServiceId, Option<MessageSenderError>)>;
-
-/// KT (group send semantics): typing skips the group-state refresh (official
-/// typing carries no group fetch); real sends refresh before dispatch.
-/// `pub` so the engine workspace (this fork's only consumer) can pin the
-/// refresh contract in its test gate; not part of the upstream API surface.
-pub fn group_refresh_needed(body: &ContentBody) -> bool {
-    !matches!(body, ContentBody::TypingMessage(_))
-}
 
 /// KT (group send semantics): sender holds the ADMINISTRATOR role in this
 /// group — the announcements-only send gate predicate. `pub` so the engine

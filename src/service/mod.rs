@@ -2745,6 +2745,7 @@ impl Service {
             build_story_reaction_data_message(&author_aci, story_timestamp, emoji, timestamp);
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -2890,6 +2891,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -2929,6 +2931,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -2966,6 +2969,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3000,6 +3004,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3045,6 +3050,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3076,6 +3082,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3634,6 +3641,7 @@ impl Service {
         let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3762,6 +3770,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3941,6 +3950,7 @@ impl Service {
         // spawn_local 后台执行（官方 wrapWithSyncMessageSend 语义对齐）。
         let outcomes = dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -3982,6 +3992,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -4024,6 +4035,7 @@ impl Service {
         };
         dispatch_group(
             self,
+            account,
             &mut manager,
             group_id,
             body,
@@ -10683,6 +10695,7 @@ fn group_send_result_entries(
 
 async fn dispatch_group(
     service: &Arc<Service>,
+    account: &str,
     manager: &mut Manager<SqliteStore, Registered>,
     group_id: &str,
     body: DataMessage,
@@ -10700,7 +10713,75 @@ async fn dispatch_group(
         perf_metrics::keys::SEND_GROUP_TOTAL,
         started.elapsed().as_micros() as u64,
     );
+    // 群发送延迟批（2026-10-18）：主投递腿成功 → 后台 ensure-fresh 群态
+    // 刷新（官方发送读本地群态、刷新由后台群同步承担；失败 best-effort
+    // 不上抛，只影响下一次发送）。
+    if sent.is_ok() {
+        spawn_group_state_refresh(service, account, group_id, timestamp);
+    }
     sent
+}
+
+/// 群态后台 ensure-fresh 单点（群发送延迟批 2026-10-18，官方后台群同步
+/// 语义对位）：主投递成功后 `spawn_local` 承载（引擎单线程 LocalSet，
+/// vendor future 非 Send 进不了 tokio::spawn；spawn_self_sync_leg 同款
+/// 纪律）。锁内先做本地新鲜度判定（store 群态 + kv GSE 双校验，与发送
+/// 路径读面同源同闸）：命中 = 零网络快速放锁，不与下一次发送争用；miss
+/// 才 `fetch_group_with_endorsements`（群态落 store、GSE 落 kv——下一次
+/// 发送的 engine.group-refresh 段应转 cache=hit）。失败只 warn 不上抛
+/// （best-effort：下一次发送按既有路径同步取回，结局面零变化）；结果只
+/// 打点（`engine.group-refresh-bg` + cache=hit|network|err 固定词），
+/// 正文/号码/群名/密钥永不入日志。fake 模式早退（send_warmup 同姿态）。
+fn spawn_group_state_refresh(
+    service: &Arc<Service>,
+    account: &str,
+    group_id: &str,
+    timestamp: u64,
+) {
+    if !service.real {
+        return;
+    }
+    let service = Arc::clone(service);
+    let account = account.to_owned();
+    let group_id = group_id.to_owned();
+    tokio::task::spawn_local(async move {
+        let started = std::time::Instant::now();
+        let cache: Result<&'static str, ()> = async {
+            let Some(shared) = open_registered(&service, &account).await else {
+                return Err(());
+            };
+            let mut manager = lock_registered_for_send(&shared).await;
+            let Some(master_key) = decode_group_id(&group_id) else {
+                return Err(());
+            };
+            if group_cache::cached_group_with_endorsements(&mut manager, &master_key)
+                .await
+                .is_some()
+            {
+                return Ok("hit");
+            }
+            let fresh = manager
+                .fetch_group_with_endorsements(&master_key)
+                .await
+                .map_err(|_| ())?;
+            group_cache::store_endorsements(manager.store(), &master_key, &fresh).await;
+            Ok("network")
+        }
+        .await;
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.group-refresh-bg",
+            cache = cache.unwrap_or("err"),
+            dur_ms = started.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
+        if cache.is_err() {
+            tracing::warn!(
+                "background group state refresh failed (best-effort); next send falls back to in-path fetch"
+            );
+        }
+    });
 }
 
 /// contacts 的 uuid 字符串 → E.164 映射（群组成员/作者号批量解析共用）。
@@ -19394,25 +19475,18 @@ mod tests {
         );
     }
 
-    /// 群发送语义三件的两个 vendor 纯函数契约：typing 不触发群态刷新
-    /// （官方 typing 不刷群态），其余发送强刷；announcements-only 闸判
-    /// ADMINISTRATOR 角色（Default/缺席皆非 admin）。
+    /// 群发送语义两件：announcements-only 闸判 ADMINISTRATOR 角色
+    /// （Default/缺席皆非 admin）。群发送延迟批（2026-10-18）后发送路径
+    /// 不再有同步群态刷新决策（vendored `group_refresh_needed` 强刷契约
+    /// 废止——官方同语义：发送读本地群态直投，刷新由后台群同步承担，
+    /// vendor 侧该纯函数随之移除，无表面可钉）。
     #[test]
-    fn group_refresh_and_announcements_gate_contract() {
+    fn group_announcements_gate_contract() {
         use presage::libsignal_service::groups_v2::Role;
         use presage::libsignal_service::prelude::{ProfileKey, Uuid};
         use presage::libsignal_service::protocol::Aci;
-        use presage::manager::{group_member_is_admin, group_refresh_needed};
+        use presage::manager::group_member_is_admin;
         use presage::model::groups::{Group, Member};
-        use presage::proto::DataMessage;
-
-        // 刷新决策：typing 免刷，DataMessage 强刷。
-        assert!(!group_refresh_needed(&ContentBody::TypingMessage(
-            presage::proto::TypingMessage::default()
-        )));
-        assert!(group_refresh_needed(&ContentBody::DataMessage(
-            DataMessage::default()
-        )));
 
         let own = Aci::from(Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("own"));
         let other =

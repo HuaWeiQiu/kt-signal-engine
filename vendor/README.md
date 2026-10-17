@@ -583,6 +583,18 @@
   瞬时族（网络/profile key/其余协议错误）保持 1612 批有界重试语义不变。
   `duplicated_message_is_already_processed_and_not_retried` 单测钉定
   三形态（裸/封装 duplicate 命中，非 duplicate 的封装错误回 DERM 面）。
+- `presage/src/manager/registered.rs`（2026-10-18 群发送延迟批）— 发送
+  路径群态强刷（B2 批 `group_refresh_needed` → `revision=u32::MAX`，
+  每条群消息投递前一次完整群态网络取回，实证 deliver-group
+  1200-3800ms）废止为官方语义：恒 `revision=0` 读本地存储群态直接投递
+  （官方发送链本地读面对位；安全闸保留——store 无该群 upsert_group 仍
+  同步取回一次不盲发，取回失败 fail-open 回落本地，announcements 闸/
+  逐成员 outcomes 不变）；`group_refresh_needed` 纯函数移除（发送路径
+  不再有同步刷新决策面，官方刷新由后台群同步承担——engine 侧主投递成
+  功后 spawn ensure-fresh 后台腿复用 `fetch_group_with_endorsements`）。
+- `presage/src/manager/mod.rs`（同批）— `group_refresh_needed` 再导出
+  摘除（`group_member_is_admin` 保留，engine 测试门改钉 announcements
+  闸单件）。
 
 ## 更新纪律
 

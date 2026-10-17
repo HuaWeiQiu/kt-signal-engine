@@ -13,9 +13,11 @@ pub use self::registered::{Registered, RegistrationData, RegistrationType};
 // KT fuse contract re-export: the engine test gate pins the identified
 // fallback helper (see registered::unidentified_access_or_identified).
 pub use self::registered::unidentified_access_or_identified;
-// KT group send semantics re-export: the engine test gate pins the refresh
-// decision and the announcements-only admin predicate.
-pub use self::registered::{group_member_is_admin, group_refresh_needed};
+// KT group send semantics re-export: the engine test gate pins the
+// announcements-only admin predicate (the send-path group-state refresh was
+// removed in the group send latency batch — sends dispatch on the locally
+// stored state, refresh is the consumer's post-send background job).
+pub use self::registered::group_member_is_admin;
 pub use self::registration::{Registration, RegistrationOptions};
 
 /// Signal manager
