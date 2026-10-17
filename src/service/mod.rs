@@ -2219,18 +2219,21 @@ impl Service {
     /// 唯一决定），重试无重复投递；未知结局（WsTimeout——请求可能已在
     /// 服务器落地）绝不自动重试（connector 契约 An unknown send outcome
     /// must not be retried automatically 同源纪律）。body 按次克隆（prost
-    /// 消息，各 attempt 间互不影响）。
+    /// 消息，各 attempt 间互不影响）。返回值第二位 = 已备好的 self 同步
+    /// 转录腿载荷（修2 send-done 语义批：直聊腿 ack 即完成本函数，转录腿
+    /// 由调用方 spawn_local 后台执行，官方 wrapWithSyncMessageSend 同语义；
+    /// None = 无转录面/Note-to-Self 臂）。
     async fn deliver_direct_message(
         manager: &mut Manager<SqliteStore, Registered>,
         service_id: ServiceId,
         body: DataMessage,
         timestamp: u64,
         include_profile_key: bool,
-    ) -> Result<(), SendError> {
+    ) -> Result<Option<presage::libsignal_service::content::ContentBody>, SendError> {
         let mut attempt = 0usize;
         loop {
             match manager
-                .send_message_with_profile_sharing(
+                .send_message_with_profile_sharing_split_self(
                     service_id,
                     body.clone(),
                     timestamp,
@@ -2239,7 +2242,7 @@ impl Service {
                 .await
                 .map_err(send_error_of)
             {
-                Ok(()) => return Ok(()),
+                Ok(sync_body) => return Ok(sync_body),
                 Err(error)
                     if attempt < Self::SEND_FAST_RETRY_LIMIT && error.is_definite_failure() =>
                 {
@@ -2430,7 +2433,22 @@ impl Service {
                     outcome = if probe_deliver_result.is_ok() { "ok" } else { "err" },
                     "send-latency-probe",
                 );
-                probe_deliver_result
+                // 修2 send-done 语义批：self 同步转录腿后台化——官方
+                // wrapWithSyncMessageSend 语义（send-done = 主投递腿 ack），
+                // 转录腿失败只 warn 不上抛（转录丢失官方桌面同样后台化）。
+                match probe_deliver_result {
+                    Ok(Some(sync_body)) => {
+                        spawn_self_sync_leg(
+                            self,
+                            account,
+                            BackgroundSelfLeg::Prepared(sync_body),
+                            timestamp,
+                        );
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                }
             };
             match send_one.await {
                 Ok(()) => results.push(json!({
@@ -2699,7 +2717,15 @@ impl Service {
             .ok_or(SendError::Internal)?;
         let body =
             build_story_reaction_data_message(&author_aci, story_timestamp, emoji, timestamp);
-        dispatch_group(self, &mut manager, group_id, body, timestamp).await?;
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await?;
         Ok(json!({ "groupId": group_id, "timestamp": timestamp }))
     }
 
@@ -2836,9 +2862,16 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// sendPinMessage（群组）：目标消息置顶跨群发（官方群内置顶同字段）。
@@ -2868,9 +2901,16 @@ impl Service {
             )),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// sendUnpinMessage（群组）。
@@ -2898,9 +2938,16 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// sendPollCreate（群组）：官方 DataMessage.pollCreate=24（Polls 发送
@@ -2925,9 +2972,16 @@ impl Service {
             poll_create: Some(poll_create_proto(question, options, allow_multiple)),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// sendPollVote（群组）：官方 DataMessage.pollVote=26。voteCount 由调用
@@ -2963,9 +3017,16 @@ impl Service {
             )),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// sendPollTerminate（群组）：官方 DataMessage.pollTerminate=25（终止
@@ -2987,9 +3048,16 @@ impl Service {
             poll_terminate: Some(poll_terminate_proto(target_timestamp)),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// 直聊 targeted dataMessage 公共头（pin/unpin 共用）：解析作者 ACI、
@@ -3538,9 +3606,16 @@ impl Service {
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
         let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())?;
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())?;
         Ok(timestamp)
     }
 
@@ -3659,9 +3734,16 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// listContacts：presage store 已同步的联系人投影（手机端链接后自动推送）。
@@ -3828,7 +3910,18 @@ impl Service {
             }
         };
         let probe_deliver_t0 = std::time::Instant::now();
-        let outcomes = dispatch_group(self, &mut manager, group_id, body, timestamp).await?;
+        // 修2 send-done 语义批：send 文本群面 = Deferred——MRM/逐收件人主
+        // 投递腿 ack 即完成 deliver-group（send-done），self 同步转录腿
+        // spawn_local 后台执行（官方 wrapWithSyncMessageSend 语义对齐）。
+        let outcomes = dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Deferred(account),
+        )
+        .await?;
         tracing::warn!(
             target: "send_latency_probe",
             stage = "engine.deliver-group",
@@ -3861,9 +3954,16 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn send_reaction_group(
@@ -3896,9 +3996,16 @@ impl Service {
             }),
             ..DataMessage::default()
         };
-        dispatch_group(self, &mut manager, group_id, body, timestamp)
-            .await
-            .map(|_| ())
+        dispatch_group(
+            self,
+            &mut manager,
+            group_id,
+            body,
+            timestamp,
+            GroupSelfSync::Blocking,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn send_typing_group(
@@ -10541,11 +10648,14 @@ async fn dispatch_group(
     group_id: &str,
     body: DataMessage,
     timestamp: u64,
+    self_sync: GroupSelfSync<'_>,
 ) -> Result<GroupSendOutcomes, SendError> {
     // C 批提速：sender-key + 单请求 MRM 主路径；目标过少/MRM 链路不可用
     // 时内部 failover 回 vendored 逐收件人路径（官方合法 fallback）。
     let started = std::time::Instant::now();
-    let sent = group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp).await;
+    let sent =
+        group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp, self_sync)
+            .await;
     // S2a 打点：群发送整体耗时（MRM/failover 汇总咽喉；P12 #11 观测面）。
     perf_metrics::record_us(
         perf_metrics::keys::SEND_GROUP_TOTAL,
@@ -11192,6 +11302,89 @@ async fn lock_registered_for_send(
         started.elapsed().as_micros() as u64,
     );
     manager
+}
+
+/// self 同步转录腿载荷（修2 send-done 语义批）：主投递腿 ack 后交给
+/// [`spawn_self_sync_leg`] 后台执行的两种形态——与各自原 in-call 腿逐字
+/// 同语义，仅时序后台化。
+pub(crate) enum BackgroundSelfLeg {
+    /// vendored 已备好转录（直聊 split / 群 failover split 返回值）：
+    /// `send_prepared_sync_transcript`（与原 in-call try_send_message 腿
+    /// 同语义，不落库——主发送已落库）。
+    Prepared(presage::libsignal_service::content::ContentBody),
+    /// MRM 主路径自建群转录（group_mrm build_group_sent_transcript）：
+    /// `manager.send_message(self, SyncMessage)`（含既有落库与 self+sync
+    /// 转发行为，行为零漂移）。
+    GroupManaged(presage::proto::SyncMessage),
+}
+
+/// 群发送 self 腿处置（修2 send-done 语义批）：send 文本发送面（send_text_
+/// group 一处）= Deferred（官方 wrapWithSyncMessageSend 语义对齐）；其余
+/// 群面（remoteDelete/reaction/typing/call/poll/story reaction…）维持
+/// Blocking 零变化（各自 wire 应答时刻语义不动）。
+pub(crate) enum GroupSelfSync<'a> {
+    Blocking,
+    Deferred(&'a str),
+}
+
+/// self 同步转录腿后台化单点（修2，官方 wrapWithSyncMessageSend 语义）：
+/// spawn_local 承载（引擎单线程 LocalSet，vendor future 非 Send 进不了
+/// tokio::spawn；delivery_receipt flush 同款纪律），重开常驻管理器取锁
+/// （主发送已释放锁；与下一发送互斥串行 = 官方 sync 转录队列化同位）。
+/// 失败只 warn 不上抛（转录丢失官方桌面同样后台化，主发送结局不受影响）；
+/// 结果只打点（`engine.deliver-self-async` + vendor `engine.ws` peer=self
+/// 行），正文/号码/群名/密钥永不入日志。
+fn spawn_self_sync_leg(
+    service: &Arc<Service>,
+    account: &str,
+    leg: BackgroundSelfLeg,
+    timestamp: u64,
+) {
+    let service = Arc::clone(service);
+    let account = account.to_owned();
+    tokio::task::spawn_local(async move {
+        let started = std::time::Instant::now();
+        let outcome: Result<(), SendError> = async {
+            let Some(shared) = open_registered(&service, &account).await else {
+                return Err(SendError::UnknownAccount);
+            };
+            let mut manager = lock_registered_for_send(&shared).await;
+            match leg {
+                BackgroundSelfLeg::Prepared(body) => manager
+                    .send_prepared_sync_transcript(body, timestamp)
+                    .await
+                    .map_err(send_error_of),
+                BackgroundSelfLeg::GroupManaged(sync) => {
+                    let own_aci = manager.registration_data().service_ids.aci();
+                    manager
+                        .send_message(
+                            own_aci,
+                            presage::libsignal_service::content::ContentBody::SynchronizeMessage(
+                                sync,
+                            ),
+                            timestamp,
+                        )
+                        .await
+                        .map_err(send_error_of)
+                }
+            }
+        }
+        .await;
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.deliver-self-async",
+            dur_ms = started.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            outcome = if outcome.is_ok() { "ok" } else { "err" },
+            "send-latency-probe",
+        );
+        if let Err(error) = outcome {
+            tracing::warn!(
+                face = send_error_variant_face(&error),
+                "self sync transcript failed (backgrounded); main send result unaffected"
+            );
+        }
+    });
 }
 
 /// 取用常驻管理器共享句柄 + 账号目录（安全码 trust sidecar 等账号目录伴生

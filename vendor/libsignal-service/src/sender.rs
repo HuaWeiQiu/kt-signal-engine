@@ -355,12 +355,66 @@ where
     pub async fn send_message(
         &mut self,
         recipient: &ServiceId,
-        mut unidentified_access: Option<&UnidentifiedAccess>,
+        unidentified_access: Option<&UnidentifiedAccess>,
         message: impl Into<ContentBody>,
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
     ) -> SendMessageResult {
+        let (result, sync_body) = self
+            .send_message_split_sync(
+                recipient,
+                unidentified_access,
+                message,
+                timestamp,
+                include_pni_signature,
+                online,
+            )
+            .await;
+        if let Some(body) = sync_body {
+            debug!("sending multi-device sync message");
+            // KT (best-effort transcript): official wrapWithSyncMessageSend /
+            // Android SignalServiceMessageSender keep the main send result
+            // when the multi-device copy fails; a transcript error must not
+            // turn an already-delivered message into a send failure.
+            if let Err(error) = self
+                .try_send_message(
+                    self.local_aci.into(),
+                    None,
+                    None,
+                    &body,
+                    timestamp,
+                    false,
+                    false,
+                )
+                .await
+            {
+                warn!(%error, "multi-device sync transcript failed; keeping main send result");
+            }
+        }
+        result
+    }
+
+    /// KT fork (deferred self sync): like [`Self::send_message`], but the
+    /// multi-device sync transcript is **not** awaited — the direct-leg
+    /// result comes back together with the prepared transcript body, which
+    /// the caller delivers later via [`Self::send_sync_transcript`].
+    /// Official Desktop resolves the send promise on the direct ack and runs
+    /// the sync copy afterwards
+    /// (ts/util/wrapWithSyncMessageSend.preload.ts).
+    #[tracing::instrument(
+        skip(self, unidentified_access, message),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    pub async fn send_message_split_sync(
+        &mut self,
+        recipient: &ServiceId,
+        mut unidentified_access: Option<&UnidentifiedAccess>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> (SendMessageResult, Option<ContentBody>) {
         let content_body = message.into();
         let message_to_self = recipient == &self.local_aci;
         let sync_message =
@@ -378,7 +432,7 @@ where
                     None,
                 )
             {
-                return self
+                let result = self
                     .try_send_message(
                         *recipient,
                         None,
@@ -389,12 +443,18 @@ where
                         online,
                     )
                     .await;
+                // the note-to-self transcript *is* the message; no second
+                // leg is due.
+                return (result, None);
             } else {
                 // KT (sync transcript): same as the group path — None is the
                 // documented "not syncing to self" case, not a failure.
                 debug!("message body has no sent transcript form; not syncing message to self");
-                return SendMessageResult::Err(
-                    MessageSenderError::NoMessagesToSend,
+                return (
+                    SendMessageResult::Err(
+                        MessageSenderError::NoMessagesToSend,
+                    ),
+                    None,
                 );
             }
         }
@@ -422,8 +482,8 @@ where
             _ => false,
         };
 
-        if needs_sync || is_multi_device {
-            let sync_body = if sync_message {
+        let sync_body = if needs_sync || is_multi_device {
+            if sync_message {
                 Some(content_body)
             } else {
                 // Only some ContentBody types are syncable to self,
@@ -434,31 +494,31 @@ where
                     timestamp,
                     Some(&result),
                 )
-            };
-            if let Some(body) = sync_body {
-                debug!("sending multi-device sync message");
-                // KT (best-effort transcript): official wrapWithSyncMessageSend /
-                // Android SignalServiceMessageSender keep the main send result
-                // when the multi-device copy fails; a transcript error must not
-                // turn an already-delivered message into a send failure.
-                if let Err(error) = self
-                    .try_send_message(
-                        self.local_aci.into(),
-                        None,
-                        None,
-                        &body,
-                        timestamp,
-                        false,
-                        false,
-                    )
-                    .await
-                {
-                    warn!(%error, "multi-device sync transcript failed; keeping main send result");
-                }
             }
-        }
+        } else {
+            None
+        };
+        (result, sync_body)
+    }
 
-        result
+    /// KT fork (deferred self sync): deliver a prepared sync transcript to
+    /// the local devices — counterpart of [`Self::send_message_split_sync`]
+    /// and [`Self::send_message_to_group_split_sync`].
+    pub async fn send_sync_transcript(
+        &mut self,
+        body: ContentBody,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        self.try_send_message(
+            self.local_aci.into(),
+            None,
+            None,
+            &body,
+            timestamp,
+            false,
+            false,
+        )
+        .await
     }
 
     /// Send `PlaintextContent` (e.g. a resend request) to `recipient` without
@@ -562,6 +622,47 @@ where
         timestamp: u64,
         online: bool,
     ) -> Vec<SendMessageResult> {
+        let (results, sync_body) = self
+            .send_message_to_group_split_sync(
+                recipients, message, timestamp, online,
+            )
+            .await;
+        if let Some(sync_message) = sync_body {
+            // Note: the result of sending a sync message is not included in results
+            // See Signal Android `SignalServiceMessageSender.java:2817`
+            if let Err(error) = self
+                .try_send_message(
+                    self.local_aci.into(),
+                    None,
+                    None,
+                    &sync_message,
+                    timestamp,
+                    false, // XXX: maybe the sync device does want a PNI signature?
+                    false,
+                )
+                .await
+            {
+                error!(%error, "failed to send a synchronization message");
+            }
+        }
+        results
+    }
+
+    /// KT fork (deferred self sync): group counterpart of
+    /// [`Self::send_message_split_sync`] — per-recipient results return
+    /// without awaiting the group sync transcript; the prepared body (when
+    /// one is due) is delivered later via [`Self::send_sync_transcript`].
+    #[tracing::instrument(
+        skip(self, recipients, message),
+        fields(recipients = recipients.as_ref().len()),
+    )]
+    pub async fn send_message_to_group_split_sync(
+        &mut self,
+        recipients: impl AsRef<[(ServiceId, Option<UnidentifiedAccess>, bool)]>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        online: bool,
+    ) -> (Vec<SendMessageResult>, Option<ContentBody>) {
         let content_body: ContentBody = message.into();
         let mut results = vec![];
 
@@ -593,41 +694,26 @@ where
         }
 
         // we only need to send a synchronization message once
-        if needs_sync_in_results || self.is_multi_device().await {
-            if let Some(sync_message) = self
-                .create_multi_device_sent_transcript_content(
-                    None,
-                    content_body.clone(),
-                    timestamp,
-                    &results,
-                )
-            {
-                // Note: the result of sending a sync message is not included in results
-                // See Signal Android `SignalServiceMessageSender.java:2817`
-                if let Err(error) = self
-                    .try_send_message(
-                        self.local_aci.into(),
-                        None,
-                        None,
-                        &sync_message,
-                        timestamp,
-                        false, // XXX: maybe the sync device does want a PNI signature?
-                        false,
-                    )
-                    .await
-                {
-                    error!(%error, "failed to send a synchronization message");
-                }
-            } else {
+        let sync_body = if needs_sync_in_results || self.is_multi_device().await
+        {
+            let body = self.create_multi_device_sent_transcript_content(
+                None,
+                content_body.clone(),
+                timestamp,
+                &results,
+            );
+            if body.is_none() {
                 // KT (sync transcript): a None here is the documented
                 // "not syncing to self" case (only DataMessage/EditMessage
                 // have a Sent form), not a failure — typing and friends
                 // hitting the group path must not log as errors.
                 debug!("message body has no sent transcript form; not syncing group message to self")
             }
-        }
-
-        results
+            body
+        } else {
+            None
+        };
+        (results, sync_body)
     }
 
     /// Send a sender-key retry receipt

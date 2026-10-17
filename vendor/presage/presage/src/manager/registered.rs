@@ -1541,6 +1541,49 @@ impl<S: Store> Manager<S, Registered> {
         timestamp: u64,
         include_profile_key: bool,
     ) -> Result<(), Error<S::Error>> {
+        self.send_message_profile_sharing_inner(
+            recipient,
+            message,
+            timestamp,
+            include_profile_key,
+            false,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// KT fork (deferred self sync, send-done semantics): like
+    /// [`Self::send_message_with_profile_sharing`], but the multi-device
+    /// sync transcript leg is **not** awaited — the prepared transcript body
+    /// comes back for the caller to deliver in the background via
+    /// [`Self::send_prepared_sync_transcript`]. Official Desktop resolves
+    /// the send promise on the direct ack and runs the sync copy afterwards
+    /// (ts/util/wrapWithSyncMessageSend.preload.ts).
+    pub async fn send_message_with_profile_sharing_split_self(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_profile_key: bool,
+    ) -> Result<Option<ContentBody>, Error<S::Error>> {
+        self.send_message_profile_sharing_inner(
+            recipient,
+            message,
+            timestamp,
+            include_profile_key,
+            true,
+        )
+        .await
+    }
+
+    async fn send_message_profile_sharing_inner(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_profile_key: bool,
+        defer_self_sync: bool,
+    ) -> Result<Option<ContentBody>, Error<S::Error>> {
         let mut sender = self.new_message_sender().await?;
         let recipient = recipient.into();
 
@@ -1585,16 +1628,34 @@ impl<S: Store> Manager<S, Registered> {
 
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
-        sender
-            .send_message(
-                &recipient,
-                unidentified_access.as_ref(),
-                content_body.clone(),
-                timestamp,
-                include_pni_signature,
-                online_only,
-            )
-            .await?;
+        // KT (deferred self sync): the split variant returns the prepared
+        // transcript instead of awaiting the self leg.
+        let sync_body = if defer_self_sync {
+            let (result, sync_body) = sender
+                .send_message_split_sync(
+                    &recipient,
+                    unidentified_access.as_ref(),
+                    content_body.clone(),
+                    timestamp,
+                    include_pni_signature,
+                    online_only,
+                )
+                .await;
+            result?;
+            sync_body
+        } else {
+            sender
+                .send_message(
+                    &recipient,
+                    unidentified_access.as_ref(),
+                    content_body.clone(),
+                    timestamp,
+                    include_pni_signature,
+                    online_only,
+                )
+                .await?;
+            None
+        };
 
         // save the message
         let content = Content {
@@ -1627,6 +1688,21 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
+        Ok(sync_body)
+    }
+
+    /// KT fork (deferred self sync): deliver a prepared sync transcript (as
+    /// returned by [`Self::send_message_with_profile_sharing_split_self`] /
+    /// [`Self::send_message_to_group_split_self`]) to the local devices.
+    /// The outgoing message was already saved by the main send, so no store
+    /// write happens here.
+    pub async fn send_prepared_sync_transcript(
+        &mut self,
+        body: ContentBody,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        sender.send_sync_transcript(body, timestamp).await?;
         Ok(())
     }
 
@@ -1749,6 +1825,33 @@ impl<S: Store> Manager<S, Registered> {
         message: impl Into<ContentBody>,
         timestamp: u64,
     ) -> Result<GroupSendOutcomes, Error<S::Error>> {
+        self.send_message_to_group_inner(master_key_bytes, message, timestamp, false)
+            .await
+            .map(|(outcomes, _)| outcomes)
+    }
+
+    /// KT fork (deferred self sync, send-done semantics): group counterpart
+    /// of [`Self::send_message_with_profile_sharing_split_self`] — per-
+    /// member outcomes return without awaiting the sync transcript leg; the
+    /// prepared transcript body (when one is due) is delivered by the caller
+    /// in the background via [`Self::send_prepared_sync_transcript`].
+    pub async fn send_message_to_group_split_self(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> Result<(GroupSendOutcomes, Option<ContentBody>), Error<S::Error>> {
+        self.send_message_to_group_inner(master_key_bytes, message, timestamp, true)
+            .await
+    }
+
+    async fn send_message_to_group_inner(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        defer_self_sync: bool,
+    ) -> Result<(GroupSendOutcomes, Option<ContentBody>), Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
             .try_into()
@@ -1843,9 +1946,23 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let online_only = false;
-        let results = sender
-            .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
-            .await;
+        // KT (deferred self sync): the split variant returns the prepared
+        // transcript instead of awaiting the self leg.
+        let (results, sync_body) = if defer_self_sync {
+            sender
+                .send_message_to_group_split_sync(
+                    recipients,
+                    content_body.clone(),
+                    timestamp,
+                    online_only,
+                )
+                .await
+        } else {
+            let results = sender
+                .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
+                .await;
+            (results, None)
+        };
 
         // KT (group send semantics): per-recipient outcomes — individual
         // failures (unregistered members included) no longer fail the whole
@@ -1888,7 +2005,7 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
-        Ok(outcomes)
+        Ok((outcomes, sync_body))
     }
 
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {

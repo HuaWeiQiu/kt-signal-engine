@@ -180,6 +180,7 @@ pub(crate) async fn dispatch_group_message(
     group_id: &str,
     body: DataMessage,
     timestamp: u64,
+    self_sync: super::GroupSelfSync<'_>,
 ) -> Result<GroupSendOutcomes, SendError> {
     let Some(master_key) = super::decode_group_id(group_id) else {
         return Err(SendError::Internal);
@@ -216,7 +217,7 @@ pub(crate) async fn dispatch_group_message(
     });
 
     let Some((group, endorsements)) = fetched else {
-        return failover(manager, &master_key, body, timestamp).await;
+        return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
     };
 
     let own_aci = manager.registration_data().service_ids.aci();
@@ -245,7 +246,7 @@ pub(crate) async fn dispatch_group_message(
 
     // 官方 fallback：目标 < 2 走逐收件人（Desktop sendToGroup 同语义）。
     if targets.len() < 2 {
-        return failover(manager, &master_key, body, timestamp).await;
+        return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
     }
 
     // —— SKDM 阶段：增量分发 sender key（失败成员进 outcomes 并剔除）——
@@ -308,7 +309,7 @@ pub(crate) async fn dispatch_group_message(
     if mrm_targets.len() < 2 {
         // SKDM 增量后目标收敛到 < 2（全部失败/仅剩单成员的边角）：官方
         // fallback 面兜住（vendored 路径幂等重发，正确性不受影响）。
-        return failover(manager, &master_key, body, timestamp).await;
+        return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
     }
 
     // —— GSE token 循环内建（R1 失效→刷一次→重试，官方
@@ -332,7 +333,7 @@ pub(crate) async fn dispatch_group_message(
     super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_MRM, 1);
     let unregistered: Vec<ServiceId> = loop {
         let Some(endorsement) = endorsement_bytes.clone() else {
-            return failover(manager, &master_key, body, timestamp).await;
+            return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
         };
         let token = match build_group_send_token(
             &endorsement,
@@ -342,7 +343,9 @@ pub(crate) async fn dispatch_group_message(
             super::now_ms(),
         ) {
             Ok(token) => token,
-            Err(_) => return failover(manager, &master_key, body, timestamp).await,
+            Err(_) => {
+                return failover(service, manager, &self_sync, &master_key, body, timestamp).await
+            }
         };
         let plaintext = presage::proto::Content {
             content: Some(presage::proto::content::Content::DataMessage(body.clone())),
@@ -378,7 +381,9 @@ pub(crate) async fn dispatch_group_message(
         .await
         {
             Ok(skm) => skm,
-            Err(_) => return failover(manager, &master_key, body, timestamp).await,
+            Err(_) => {
+                return failover(service, manager, &self_sync, &master_key, body, timestamp).await
+            }
         };
 
         // 群证书 uuid-only（vendored sender_certificate 即 uuid-only 面），
@@ -391,10 +396,12 @@ pub(crate) async fn dispatch_group_message(
                 ContentHint::Implicit,
                 Some(master_key.clone()),
             ),
-            Err(_) => return failover(manager, &master_key, body, timestamp).await,
+            Err(_) => {
+                return failover(service, manager, &self_sync, &master_key, body, timestamp).await
+            }
         };
         let Ok(usmc) = usmc else {
-            return failover(manager, &master_key, body, timestamp).await;
+            return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
         };
 
         let address_refs: Vec<&ProtocolAddress> = destinations.iter().map(|(a, _)| a).collect();
@@ -410,7 +417,9 @@ pub(crate) async fn dispatch_group_message(
         .await
         {
             Ok(payload) => payload,
-            Err(_) => return failover(manager, &master_key, body, timestamp).await,
+            Err(_) => {
+                return failover(service, manager, &self_sync, &master_key, body, timestamp).await
+            }
         };
 
         match send_mrm(service, &payload, timestamp, token.clone()).await {
@@ -420,7 +429,8 @@ pub(crate) async fn dispatch_group_message(
                 // S2a 打点：409/410 修复轮计数（每轮一次）。
                 super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_REPAIR_ROUND, 1);
                 if rounds > MRM_REPAIR_ROUNDS {
-                    return failover(manager, &master_key, body, timestamp).await;
+                    return failover(service, manager, &self_sync, &master_key, body, timestamp)
+                        .await;
                 }
                 repair_device_mismatch::<SqliteStore>(
                     manager,
@@ -436,18 +446,23 @@ pub(crate) async fn dispatch_group_message(
                 // 403 只刷一次；缓存废弃 → 群态+GSE 重取 → 修订 revision →
                 // 下轮重建 token。取回失败/仍 403 → failover 兜底。
                 if gse_refreshed {
-                    return failover(manager, &master_key, body, timestamp).await;
+                    return failover(service, manager, &self_sync, &master_key, body, timestamp)
+                        .await;
                 }
                 gse_refreshed = true;
                 super::group_cache::invalidate_endorsements(manager.store(), &master_key).await;
                 let refreshed = match manager.fetch_group_with_endorsements(&master_key).await {
                     Ok(fresh) => fresh,
-                    Err(_) => return failover(manager, &master_key, body, timestamp).await,
+                    Err(_) => {
+                        return failover(service, manager, &self_sync, &master_key, body, timestamp)
+                            .await
+                    }
                 };
                 super::group_cache::store_endorsements(manager.store(), &master_key, &refreshed)
                     .await;
                 let Some((fresh_group, fresh_endorsements)) = refreshed else {
-                    return failover(manager, &master_key, body, timestamp).await;
+                    return failover(service, manager, &self_sync, &master_key, body, timestamp)
+                        .await;
                 };
                 endorsement_bytes = fresh_endorsements;
                 body.group_v2 = Some(GroupContextV2 {
@@ -457,7 +472,7 @@ pub(crate) async fn dispatch_group_message(
                 });
             }
             Err(MrmSendFailure::Fatal) => {
-                return failover(manager, &master_key, body, timestamp).await;
+                return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
             }
         }
     };
@@ -483,20 +498,37 @@ pub(crate) async fn dispatch_group_message(
         .map(|(service_id, _)| *service_id)
         .collect();
     let sent = build_group_sent_transcript(body, timestamp, &succeeded);
-    if let Err(error) = manager
-        .send_message(
-            own_aci,
-            ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(sent)),
-                ..Default::default()
-            }),
-            timestamp,
-        )
-        .await
-    {
-        // best-effort：群成员已达，副本失败不连坐主发送结局（官方
-        // wrapWithSyncMessageSend 同语义），记 stderr（connector 转发通道）。
-        eprintln!("kt-signal-engine: group sent transcript failed: {error}");
+    match self_sync {
+        super::GroupSelfSync::Blocking => {
+            if let Err(error) = manager
+                .send_message(
+                    own_aci,
+                    ContentBody::SynchronizeMessage(SyncMessage {
+                        content: Some(sync_message::Content::Sent(sent)),
+                        ..Default::default()
+                    }),
+                    timestamp,
+                )
+                .await
+            {
+                // best-effort：群成员已达，副本失败不连坐主发送结局（官方
+                // wrapWithSyncMessageSend 同语义），记 stderr（connector 转发通道）。
+                eprintln!("kt-signal-engine: group sent transcript failed: {error}");
+            }
+        }
+        // 修2 send-done 语义批：send 文本群面转录腿后台化——行为零漂移
+        //（同 manager.send_message 载荷），仅时序移出主应答。
+        super::GroupSelfSync::Deferred(account) => {
+            super::spawn_self_sync_leg(
+                service,
+                account,
+                super::BackgroundSelfLeg::GroupManaged(SyncMessage {
+                    content: Some(sync_message::Content::Sent(sent)),
+                    ..Default::default()
+                }),
+                timestamp,
+            );
+        }
     }
 
     Ok(outcomes)
@@ -538,19 +570,44 @@ fn build_group_sent_transcript(
 }
 
 /// vendored 逐收件人 failover（官方 fallback；body 已带 group_v2，接收方
-/// 群线程正确；expire timer 由 vendored 内部 restore）。
+/// 群线程正确；expire timer 由 vendored 内部 restore）。Deferred 面（修2
+/// send-done 语义批，send 文本群面）= split_self 变体：逐收件人腿 ack 即
+/// 返回，self 同步转录腿 spawn_local 后台执行；Blocking 面行为零变化。
 async fn failover(
+    service: &Arc<super::Service>,
     manager: &mut Manager<SqliteStore, Registered>,
+    self_sync: &super::GroupSelfSync<'_>,
     master_key: &[u8],
     body: DataMessage,
     timestamp: u64,
 ) -> Result<GroupSendOutcomes, SendError> {
     // S2a 打点：vendored 逐收件人 failover 路径计数（官方合法 fallback）。
     super::perf_metrics::add(super::perf_metrics::keys::SEND_GROUP_FAILOVER, 1);
-    let outcomes = manager
-        .send_message_to_group(master_key, ContentBody::DataMessage(body), timestamp)
-        .await
-        .map_err(super::send_error_of)?;
+    let outcomes = match self_sync {
+        super::GroupSelfSync::Blocking => manager
+            .send_message_to_group(master_key, ContentBody::DataMessage(body), timestamp)
+            .await
+            .map_err(super::send_error_of)?,
+        super::GroupSelfSync::Deferred(account) => {
+            let (outcomes, sync_body) = manager
+                .send_message_to_group_split_self(
+                    master_key,
+                    ContentBody::DataMessage(body),
+                    timestamp,
+                )
+                .await
+                .map_err(super::send_error_of)?;
+            if let Some(body) = sync_body {
+                super::spawn_self_sync_leg(
+                    service,
+                    account,
+                    super::BackgroundSelfLeg::Prepared(body),
+                    timestamp,
+                );
+            }
+            outcomes
+        }
+    };
     // 群腿零收件人防御第二点（2026-10-16 批，compat §5）：vendored 路径
     // 空 outcomes ⟺ 群成员过滤自身后为空（群态取不到回退路径与逐收件人
     // 路径的全部零收件人面）——同转确定性失败，真空成功关闭。vendored

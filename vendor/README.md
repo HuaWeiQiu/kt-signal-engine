@@ -546,6 +546,21 @@
   bundle 处理全程）、`try_send_message` WS 往返（PUT /v1/messages 应答 =
   ack 收到）各一条 `send-latency-probe` 行（target `send_latency_probe`，
   warn 级；typing 臂恒 debug——4e168c5/5463bc0 降噪纪律不回退）。
+- `src/sender.rs`（2026-10-17 send-done 语义批）— 主投递腿与 self 同步
+  转录腿解耦：①`send_message` 抽 `send_message_split_sync`（直聊腿 +
+  已备好转录体返回，不 await 转录腿；原方法 = split + 等待转录腿，行为
+  零漂移；note-to-self 臂两形态同序保持）；②`send_message_to_group` 抽
+  `send_message_to_group_split_sync`（同构；None 转录降噪 debug 行保留
+  在 split 侧）；③新增 pub `send_sync_transcript`（已备好转录体 → 本机
+  设备 try_send_message，split 变体 counterpart）。
+- `presage/presage/src/manager/registered.rs`（2026-10-17 send-done 语义批）—
+  ①`send_message_with_profile_sharing` 抽私有 inner（`defer_self_sync`
+  旗；fork 行为零漂移）+ 新增 pub `send_message_with_profile_sharing_
+  split_self`（返回已备好转录体）；②`send_message_to_group` 同构 inner +
+  新增 pub `send_message_to_group_split_self`（返回 (逐成员 outcomes,
+  已备好转录体)）；③新增 pub `send_prepared_sync_transcript`（后台转录
+  腿投递入口，不落库——主发送已落库）。官方锚 wrapWithSyncMessageSend
+  （send-done = 主投递腿 ack，转录后续化）。
 
 ## 更新纪律
 
