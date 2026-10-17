@@ -1272,14 +1272,73 @@ fn identity_send_gate(account_dir: &Path, service_id: &ServiceId) -> Result<(), 
     }
 }
 
-/// P9 profileSharing 闸读面（S3）：Storage Service 联系人记录 whitelist 位
-/// map。任一读失败 → 空 map = 照常注入（fail-open，官方读本地库无失败面，
-/// 偏差登记 compat §5）。
-async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> HashMap<String, bool> {
-    match storage_context(service, account).await {
+/// P9 profileSharing 闸读面（S3，发送长尾修1 加会话级缓存）：Storage
+/// Service 联系人记录 whitelist 位 map。account 作用域进程内存缓存，TTL 内
+/// 直聊/群发送批零 Storage 网络读（活体 2026-10-17 实测该读 1.5-2.3s =
+/// send 暗区根因）；联系人族写面（`storage.write` Contact 臂 / blocked /
+/// state 读改写 / 入站 merge Contact 观测）即清该账号缓存，残余陈旧
+/// ≤ [`WHITELIST_CACHE_TTL`]。fail-open 语义零变化（缺记录/位 true/读失败
+/// 空 map 恒注入，[`include_profile_key_for`] 判定式不动；错误空 map 与
+/// 真实空 map 同缓存同语义）。返回值第二位 = 缓存命中与否（探针段用）。
+async fn profile_sharing_whitelist_probed(
+    service: &Arc<Service>,
+    account: &str,
+) -> (HashMap<String, bool>, bool) {
+    if let Some(hit) = whitelist_cache_get(&service.whitelist_cache, account) {
+        return (hit, true);
+    }
+    let fresh = match storage_context(service, account).await {
         Ok(context) => storage_sync::contact_whitelist_map(&context).await,
         Err(_) => HashMap::new(),
-    }
+    };
+    whitelist_cache_put(&service.whitelist_cache, account, fresh.clone());
+    (fresh, false)
+}
+
+/// profileSharing 闸读面（探针不关心的调用面薄壳，语义同
+/// [`profile_sharing_whitelist_probed`]）。
+async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> HashMap<String, bool> {
+    profile_sharing_whitelist_probed(service, account).await.0
+}
+
+/// whitelist 缓存 TTL（发送长尾修1）：5s 内重复发送零 Storage 读；写面
+/// 失效兜住主动翻转，残余陈旧窗口 ≤ TTL（profileSharing 位非实时安全闸，
+/// 偏差面同 compat §5 fail-open 登记）。
+const WHITELIST_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// whitelist 缓存条目：(位 map, 过期时刻)（到期判定用注入时钟可比对的
+/// deadline 形，测试可拨针）。
+type WhitelistCacheEntry = (HashMap<String, bool>, std::time::Instant);
+
+/// account 作用域 whitelist 缓存（Service 字段类型，进程内存不落盘）。
+type WhitelistCache = HashMap<String, WhitelistCacheEntry>;
+
+/// 缓存读取：TTL 内命中返回位 map，过期/缺席 None（锁内零 await）。
+fn whitelist_cache_get(
+    cache: &StdMutex<WhitelistCache>,
+    account: &str,
+) -> Option<HashMap<String, bool>> {
+    let guard = cache.lock().expect("whitelist cache lock");
+    let (map, deadline) = guard.get(account)?;
+    (std::time::Instant::now() < *deadline).then(|| map.clone())
+}
+
+/// 缓存写入（读面 miss 回填单点）。
+fn whitelist_cache_put(
+    cache: &StdMutex<WhitelistCache>,
+    account: &str,
+    map: HashMap<String, bool>,
+) {
+    cache.lock().expect("whitelist cache lock").insert(
+        account.to_owned(),
+        (map, std::time::Instant::now() + WHITELIST_CACHE_TTL),
+    );
+}
+
+/// 联系人族写面 → 该账号缓存失效（storage.write Contact 臂 / blocked /
+/// state 读改写 / 入站 merge Contact 观测共用单点；下一发送重读全量）。
+fn whitelist_cache_invalidate(cache: &StdMutex<WhitelistCache>, account: &str) {
+    cache.lock().expect("whitelist cache lock").remove(account);
 }
 
 /// whitelist 位 → 是否注入本机 profile_key：仅记录显式 `whitelisted == false`
@@ -1796,6 +1855,10 @@ pub(crate) struct Service {
     /// （PUT /v1/messages/multi_recipient 不带账号凭据，跨账号共用）；
     /// 传输失败摘除重连一次（group_mrm::send_mrm），惰性建连。
     mrm_chat: AsyncMutex<Option<libsignal_net::chat::ChatConnection>>,
+    /// profileSharing 闸 whitelist 位缓存（发送长尾修1）：账号 → (位 map,
+    /// 过期时刻)，TTL [`WHITELIST_CACHE_TTL`] + 联系人族写面失效；进程内存
+    /// 不落盘不跨重启。delete_account 摘除。
+    whitelist_cache: StdMutex<WhitelistCache>,
 }
 
 /// 常驻发送管理器缓存：号码 → 共享互斥管理器（Service 同型，单测可断言）。
@@ -1839,6 +1902,7 @@ impl Service {
             send_managers: AsyncMutex::new(HashMap::new()),
             calling_relays_cache: AsyncMutex::new(HashMap::new()),
             mrm_chat: AsyncMutex::new(None),
+            whitelist_cache: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -2139,6 +2203,8 @@ impl Service {
             .remove(account);
         // calls.relays 缓存摘除（账号面随注册表生命周期）。
         self.calling_relays_cache.lock().await.remove(account);
+        // whitelist 缓存摘除（账号面随注册表生命周期，修1）。
+        whitelist_cache_invalidate(&self.whitelist_cache, account);
         Ok(had_dir || !self.real)
     }
 
@@ -4512,6 +4578,14 @@ impl Service {
         if observed.is_empty() {
             return;
         }
+        // 入站 merge 路过的 Contact 记录（修1）：远端（手机端）whitelist 位
+        // 翻转的引擎可见面，缓存同步失效（TTL 兜残余窗口）。
+        if observed
+            .iter()
+            .any(|(id, _)| matches!(id, storage_sync::EngineConversationId::Contact(_)))
+        {
+            whitelist_cache_invalidate(&self.whitelist_cache, account);
+        }
         let flips = {
             let mut books = self
                 .conversation_state_books
@@ -4573,7 +4647,13 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::write_blocked(&context, &conversation, blocked, now_ms()).await
+        let result = storage_sync::write_blocked(&context, &conversation, blocked, now_ms()).await;
+        // Contact 族拉黑读改写同携全记录重写（修1）：写成功即失效缓存。
+        if result.is_ok() && matches!(conversation, storage_sync::EngineConversationId::Contact(_))
+        {
+            whitelist_cache_invalidate(&self.whitelist_cache, account);
+        }
+        result
     }
 
     /// getConversationState（P15b 项2）：读 Storage Service 目标会话记录
@@ -4615,6 +4695,11 @@ impl Service {
         let context = storage_context(self, account).await?;
         let (canonical, written) =
             storage_sync::write_conversation_state(&context, &conversation, intent).await?;
+        // Contact 族读改写携全记录重写（whitelist 位随读值回写，修1）：缓存
+        // 同步失效，与写面真相对齐。
+        if matches!(canonical, storage_sync::EngineConversationId::Contact(_)) {
+            whitelist_cache_invalidate(&self.whitelist_cache, account);
+        }
         self.note_conversation_state_known(account, canonical, written);
         Ok(written)
     }
@@ -5180,6 +5265,11 @@ impl Service {
             if let (Some((canonical, state)), storage_write::ItemOutcome::Written { .. }) =
                 (observation, &result.outcome)
             {
+                // whitelist 位住在 ContactRecord（修1）：联系人族写面即清
+                // 发送闸缓存，下一发送重读全量。
+                if matches!(canonical, storage_sync::EngineConversationId::Contact(_)) {
+                    whitelist_cache_invalidate(&self.whitelist_cache, account);
+                }
                 self.note_conversation_state_known(account, canonical, state);
             }
         }
@@ -18851,6 +18941,45 @@ mod tests {
             kind: storage_sync::StorageRecordKind::Contact,
         };
         assert!(conversation_write_observation(&bad).is_none());
+    }
+
+    /// whitelist 会话级缓存（修1）：TTL 内命中、过期未命中、失效单点、
+    /// 跨账号隔离（deadline 形可拨针，无真实等待）。
+    #[test]
+    fn whitelist_cache_ttl_and_invalidation() {
+        let cache = StdMutex::new(WhitelistCache::new());
+        assert!(
+            whitelist_cache_get(&cache, "acct").is_none(),
+            "空缓存未命中"
+        );
+        let mut map = HashMap::new();
+        map.insert("aci-a".to_owned(), false);
+        map.insert("aci-b".to_owned(), true);
+        whitelist_cache_put(&cache, "acct", map);
+        let hit = whitelist_cache_get(&cache, "acct").expect("TTL 内命中");
+        assert_eq!(hit.get("aci-a"), Some(&false), "位值逐条保真");
+        assert_eq!(hit.get("aci-b"), Some(&true));
+        // 拨针过期：deadline 拨到过去 → 未命中（fail-open 面由调用方空
+        // map 语义兜住，缓存只管时限）。
+        cache
+            .lock()
+            .expect("whitelist cache lock")
+            .get_mut("acct")
+            .expect("entry")
+            .1 = std::time::Instant::now() - WHITELIST_CACHE_TTL;
+        assert!(
+            whitelist_cache_get(&cache, "acct").is_none(),
+            "TTL 过期未命中"
+        );
+        // 失效单点：在册账号移除；他账号不受牵连。
+        whitelist_cache_put(&cache, "acct", HashMap::new());
+        whitelist_cache_put(&cache, "other", HashMap::new());
+        whitelist_cache_invalidate(&cache, "acct");
+        assert!(whitelist_cache_get(&cache, "acct").is_none(), "单账号失效");
+        assert!(
+            whitelist_cache_get(&cache, "other").is_some(),
+            "他账号不受牵连"
+        );
     }
 
     /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内
