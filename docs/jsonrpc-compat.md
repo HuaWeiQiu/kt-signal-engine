@@ -5978,6 +5978,68 @@ v1 + 裸 `Group` 解码不动**——v1 契约自洽且一直工作，切 v2 反
 `decrypt_group` 全链），作为 `GroupResponse` 解码必败（tag-0 错误类）——
 把「v1 裸 Group、v2 包装面」的服务器双契约永久钉在测试里。
 
+### 群消息 sync 转录取证与降噪批（2026-10-17，group-message sync-transcript 取证批，零 wire 变化【engine-compat】）
+
+**症状与前提勘误（活体取证）**：`ERROR libsignal_service::sender: could not
+create sync message from a group message`（vendored sender.rs 群发送转录
+None 臂）活体 22 次（10-15T18 一条、10-16T03 四条、T04 三条、T07 两条、
+T19 十二条），任务假设「群文本 sent transcript 未发送 → 链接设备看不到群
+消息」。**取证证伪该假设**：
+
+- 转录构造函数唯一 None 返回点 = 变体 catch-all 臂（DataMessage/
+  EditMessage 之外 → trace `not syncing to self` → None；两可转录臂内部
+  无条件 Some）。群文本（DataMessage）在引擎两条群发送路径上都不经过该
+  None：MRM 主路径自建转录（group_mrm.rs `build_group_sent_transcript` →
+  self-ACI SynchronizeMessage 单发，不经该函数）；failover 路径引擎传
+  `ContentBody::DataMessage` → 命中 Some 臂。
+- 活体触发变体 = **TypingMessage（群 typing）**：T19 窗报错全部成对出现
+  （start/stop 对，间隔 1-2s），每条报错与 connector 侧 `method_class=send
+  result_class=ok` 约 240ms 单收件人发送完成同毫秒（typing 载荷小、无转
+  录 RTT），与 331B/3585ms 的群文本发送完成时刻（无报错）错位——即群文
+  本转录一直是工作的，报错全部来自 typing 流量。引擎群 typing 腿
+  （sendTyping group 臂）走 vendored `send_message_to_group`（TypingMessage
+  无 MRM 面），多设备恒真 → 每次群 typing start/stop 各打一条 ERROR。
+- 伴生证据（`could not create sync message from message to self` ×4，
+  03:52-03:53）：self 分支（`message_to_self && is_multi_device &&
+  !sync_message`）+ TypingMessage → None → `error!` + `NoMessagesToSend`
+  → sendTyping 直聊腿对备忘录会话（self 目标）返回 -32603——与引擎日志
+  `method=sendTyping code=-32603` 同毫秒对应四条。
+
+**官方语义锚（行为参照）**：
+
+- `wrapWithSyncMessageSend`（ts/util/wrapWithSyncMessageSend.preload.ts:
+  21-100）：sent transcript 载体 = send 层返回的 DataMessage（EditMessage
+  走 Sent.editMessage 同面）；TypingMessage/ReceiptMessage/CallMessage/
+  NullMessage/DERM/SKDM 无 Sent 槽位，官方从不为其产转录——vendored
+  match（仅 DataMessage/EditMessage）= 官方正确语义，None 是「有意不
+  sync」而非失败。
+- 官方 typing（models/conversations.preload.ts:1456-1459）：
+  `if (isMe) return`——note-to-self 会话根本不发 typing；群 typing 直发
+  群成员、无 sync wrap。
+- 群 call 信令（CallMessage）无转录；通话状态/历史同步走 callEvent sync
+  （引擎 sendCallEvent 已同构）；sendGroupCallUpdate 官方走
+  DataMessage.groupCallUpdate（引擎 dispatch_group 同构，可转录）。
+
+**修复（两处，均零 wire 变化）**：
+
+- **vendored sender.rs（纯日志级）**：群路径 `error!("could not create
+  sync message from a group message")` 与 self 路径
+  `error!("could not create sync message from message to self")` 降级为
+  `debug!`——非可转录变体的转录缺席是官方正确语义（函数内 trace
+  `not syncing to self` 已如实标注），error 级别把正常 typing 流量刷成
+  报错、淹没真错。控制流/返回值零变化（self 路径 None 仍按上游返回
+  `NoMessagesToSend`，不改上游行为面）。
+- **vendored sender.rs（纯函数抽取，测试面）**：转录构造抽 free 函数
+  `sent_transcript_body`（无 self 依赖），方法委托。单测钉定：群
+  DataMessage → Some（destination 缺省 + UDS 逐成功收件人 + expiration
+  起始位规则）、self DataMessage → Some（destination 双形态 +
+  expirationStartTimestamp）、EditMessage → Some（Sent.editMessage）、
+  TypingMessage/ReceiptMessage/CallMessage/NullMessage/DERM/SKDM → None
+  （既有语义清单化钉死）。
+- **引擎 sendTyping 直聊腿（官方 isMe 同位闸）**：resolve 后目标 =
+  本机 ACI → 直接成功返回（官方「不发 typing 给自己其他设备」同位），
+  备忘录会话打字不再产生 -32603 失败面与 vendor self-None 路径流量。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
