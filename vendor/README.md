@@ -212,7 +212,10 @@
   （未安装 no-op，库独立可用）+ 五段键字面量模块 `keys`
   （`send_sender_setup`/`send_cert_fetch`/`send_session_establish`/
   `send_encrypt`/`send_ws_rtt`——与引擎 perf 词表字面量钉等，引擎侧
-  跨 crate 单测钉定）。三例单测。
+  跨 crate 单测钉定）。三例单测（2026-10-17 集成批修正：三例共用进程级
+  `SINK` OnceLock，模块内互斥锁串行 + no-op 例仅在未安装时验证——原
+  并发执行下 install 例先行时 no-op 例的 emit 会触 sink 断言，fixture
+  测试增量改变时序后以 ~1/3 概率炸）。
 - `src/lib.rs`（同批）— `pub mod perf_hook` 挂载。
 - `src/sender.rs`（同批）— `try_send_message` WS 上行→应答段 emit
   （`send_ws_rtt`；修复环每轮各计一条）+ `create_encrypted_message`
@@ -249,6 +252,19 @@
   在场钉 expiration_start_timestamp）、self DataMessage Some（destination
   双形态）、EditMessage Some（Sent.editMessage 槽）、非可转录八变体
   （Null/Sync/Call/Receipt/Typing/SKDM/DERM/Story）恒 None。
+- `src/websocket/mod.rs`（2026-10-17 保活 STALE 哨兵批）— 保活 tick 发送
+  前检查 `last_alive_at`（上次成功保活应答时刻，成功应答即刷新、构造时
+  初始化 `Instant::now()`）：距今 ≥5 分钟
+  （`STALE_KEEPALIVE_THRESHOLD`，纯函数 `keepalive_is_stale`，官方
+  `isOlderThan` 同判含边界）→ 不在该链路上发送，走既有 failed-keepalives
+  关闭路径自关重连（close frame reason 字面量 `"stale"` + warn 字面量 +
+  KA-DIAG 退出探针）。背景：机器休眠唤醒后在死链上照发保活（官方桌面
+  WebsocketResources.preload.ts:508 STALE_THRESHOLD_MS=5min / :612-620
+  send 前 stale 检查同位；既有 30s 未应答闸只覆盖「发过没回」，不覆盖
+  「应答成功后链路静默死亡」）。`keepalive_stale_tests` 三例单测
+  （阈值钉形 / 超阈含边界判 stale / 新鲜应答不误伤）。
+- `src/websocket/directory.rs`、`src/websocket/slot.rs`（同批
+  `cargo fmt` 收口）— 稳定通道 rustfmt 子集重排，语义零变化。
 
 `vendor/presage/`（rev 33dd149）：
 

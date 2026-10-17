@@ -495,13 +495,16 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   本机 deviceId 过滤（非指向自己的丢弃），引擎恒投原值由消费方自判；
   pniChangeNumber 只投 registrationId/newE164 两键，密钥材料不出引擎
   边界、re-key 消费不做，偏差全落 §5 组 5 块）。
-- `syncMessage.keys {mediaRootBackupKey?}`（P14 组 6 收投影，此前整信封
-  丢弃；官方 handleKeys 事件面 MessageReceiver.preload.ts:3338-3358）：云
-  媒体备份根钥（media backup 素材）标准 base64，非空才投（官方
-  Bytes.isNotEmpty 同口径），键全缺照投空对象（信号面即事件）。官方三键
-  面 {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎只投
-  mediaRootBackupKey——偏差落 §5 组 6 块；Request{Keys} 应答停答面
-  （P9 S2）与此接收投影面互不相干。
+- `syncMessage.keys {mediaRootBackupKey?, accountEntropyPoolPresent?}`（P14
+  组 6 收投影 + 2026-10-17 三键布尔面评估批，此前整信封丢弃；官方
+  handleKeys 事件面 MessageReceiver.preload.ts:3338-3358）：云媒体备份
+  根钥（media backup 素材）标准 base64，非空才投（官方 Bytes.isNotEmpty
+  同口径），键全缺照投空对象（信号面即事件）。官方三键面
+  {masterKey, accountEntropyPool, mediaRootBackupKey}，引擎投
+  mediaRootBackupKey 材料 + `accountEntropyPoolPresent` 存在性布尔
+  （材料不出边界）——masterKey 存在性不可得，偏差与边界原因落 §5 组 6
+  块 + 三键布尔面评估批块；Request{Keys} 应答停答面（P9 S2）与此接收
+  投影面互不相干。
 - `syncMessage.storyRecipientUpdate {timestamp, storyMessageRecipients[]
   {destinationUuid?, distributionListIds, isAllowedToReply?}}`（story 删除
   扇出批 S5，2026-10-14，官方 StoryRecipientUpdateEvent 镜像
@@ -6039,6 +6042,109 @@ T19 十二条），任务假设「群文本 sent transcript 未发送 → 链接
 - **引擎 sendTyping 直聊腿（官方 isMe 同位闸）**：resolve 后目标 =
   本机 ACI → 直接成功返回（官方「不发 typing 给自己其他设备」同位），
   备忘录会话打字不再产生 -32603 失败面与 vendor self-None 路径流量。
+### attachmentBackfillResponse 收投影臂（2026-10-17，官方对齐 Signal-Desktop abe80d3，wire additive【engine-compat】）
+
+官方行为（`MessageReceiver.preload.ts:3146-3151` 分发 +
+`:3806` `#handleAttachmentBackfillResponse`）：sync content oneof
+`attachmentBackfillResponse=25`——长文本/大批附件消息的附件回填响应
+（手机端补传附件后按 `targetMessage`+`targetConversation` 定位原消息、
+更新其附件状态：逐附件 PENDING/TERMINAL_ERROR 或 MESSAGE_NOT_FOUND
+错误）。引擎投影第十五臂（此前该信封落 read/viewed 兜底臂整信封丢弃）。
+
+**wire 面（`receive` 信封 `syncMessage.attachmentBackfillResponse`，
+词表 additive，缺席键不在）**：
+
+```jsonc
+{
+  "targetMessage": { "author": "<aci|pni|e164>", "sentTimestamp": 1690000000000 },
+  "targetConversation": { "serviceId"?: "<aci|pni>", "groupId"?: "<base64>", "e164"?: "<num>" },
+  "error"?: "MESSAGE_NOT_FOUND" | "UNKNOWN",
+  "attachments"?: [ { "status"?: "PENDING"|"TERMINAL_ERROR"|"UNKNOWN", "attachment"?: {…指针全投影} } ],
+  "longText"?: { 同单条词条形状 }
+}
+```
+
+- target 面 = 官方 `processAddressableMessage`/`processConversationIdentifier`
+  同构：author/sentTimestamp 双闸（官方任一缺席 drop）、service-id
+  binary 优先 string 次之（`fromServiceIdBinaryOrString` 同序）、ACI 归一
+  裸 UUID 串（`service_id_string()` 口径同 sourceUuid）。
+- `attachment` 词条复用 `project_attachment_pointer` 单点全投影（id/
+  contentType/size/locator 等与 dataMessage 附件同形，消费面单一入口）。
+  官方 `processBackfilledAttachment` 附加的 `downloadPath` 是桌面端本地
+  续传下载名（`createName()` 客户端本地概念），引擎不预分配下载面，键
+  不投（记档）。
+- data 臂缺席 → 整信封丢弃（官方 strictAssert 同判）；error/未知枚举值
+  投 `UNKNOWN` 词（官方兜 0 同口径，宁收勿丢）。
+
+**消费后续（记档）**：connector 现无消费面（暂以引擎投影事件为准落
+ observation）——下游消费（按 targetMessage 定位行更新附件状态）另行
+立项；词表即事件面，先到先消费。
+
+### verified 发送面对齐收尾（2026-10-17，官方对齐 Signal-Desktop abe80d3 SendMessage.getVerificationSync，wire additive（信封体内填充位）/ 前提勘误【engine-compat】）
+
+**前提勘误（记档）**：任务书称「verified 发送面缺失，新增
+`contacts.markVerified`」——与基线不符：发送面自六方法批（2026-10-11
+6bd9947）即存在——`trust` RPC（compat §3 行）verified 臂（三形态安全码
+比对闸）/state 臂 → `trust_identity` 落 sidecar 后自发
+`SyncMessage.verified`（Content oneof verified=7，走 note-to-self sync
+发送通道广播，signal-cli sendVerifiedMessage 同构；收向
+`project_verified_sync` 收投影对端闭环）。`contacts.markVerified` 不另
+设新方法——与 `trust` 同面，词表单一入口纪律（两方法一面 = 双词表漂移）。
+
+**真实缺口与收口**（对照官方 `SendMessage.preload.ts` `getVerificationSync`
+:2412-2465 + `conversations.preload.ts:3146-3165` `sendVerifySyncMessage`）：
+
+1. **`Verified.nullMessage` 填充位**（本次补齐）：官方
+   `nullMessage: MessageSender.getRandomPadding()`（:2420；getRandomPadding
+   :780 = 随机 1-512B）；引擎此前 `Default::default()`（None）。补齐 =
+   `null_message: Some(random_padding())`（1-512B 同分布）。
+2. **`SyncMessage.padding` 包装填充**（本次补齐）：官方
+   `MessageSender.padSyncMessage({content:{verified}})` 包装（SyncMessage
+   级 padding 同 1-512B 分布）；引擎此前裸 SyncMessage。补齐 =
+   `padding: Some(random_padding())`（vendored
+   `SyncMessage::with_padding` 同分布先例）。
+3. **多设备闸**（记档不实现）：官方
+   `sendVerifySyncMessage` 开头 `!doWeHaveOtherDevices()` 即跳过
+   （conversations.preload.ts:3150-3156）。引擎部署形态恒为链接的
+   secondary 设备（finishLink 流程，primary=手机），`device_id ≥ 2`
+   恒成立 ⇒ 官方闸在引擎形态下恒通过——实现为死代码，记档登记。
+4. **destinationAci string vs binary**（记档）：官方按 proto binary
+   encoding 开关二选一（:2427-2435）；引擎恒 `destination_aci_binary`
+   （wire 等价形态，服务器两形态同收）。
+
+wire 变化面：`trust` 自发 sync 信封体内多两个填充位（nullMessage/
+SyncMessage.padding）——填充位是元数据保护面，无消费语义（收向
+`project_verified_sync` 不读 null_message；官方桌面收向同样不消费），
+wire additive。
+
+### keys 三键布尔面评估批（2026-10-17，评估+additive 一位，官方对齐 Signal-Desktop abe80d3 handleKeys，wire additive【engine-compat】）
+
+任务口径：不出密钥材料边界的前提下，评估「三键存在性/健康度」布尔面
+（不含材料）可否投影供宿主诊断；能则加（additive），不能则记档边界
+原因。逐键评估结论：
+
+1. **mediaRootBackupKey**（Keys.mediaRootBackupKey=4）：既有投影已投
+   材料本体（标准 base64，P14 组 6 批官方事件同形）——存在性/健康度
+   可由消费方从既有键推导（非空 = 在场），不重复投布尔（语义冗余）。
+2. **accountEntropyPool**（Keys.accountEntropyPool=3，string）：解码模型
+   在场（`Option<String>`），存在性布尔可判且零材料外泄——**新增
+   `accountEntropyPoolPresent: true`**（非空串才投，空串与缺席同为
+   无键；键名带 Present 后缀与官方材料面 string 同名键区隔，防消费方
+   误当材料值）。健康度 = 非空即健康（引擎不解析 SVR2 熵格式，深校验
+   不做——格式属账号恢复材料域，引擎无消费面）。
+3. **masterKey**（官方 proto `optional bytes master = 2` deprecated；vendored
+   whisperfish proto `reserved 2`）：**存在性不可得，记档不扩面**。原因
+   = ①解码层无痕：prost 对 reserved/未知字段按 wire type 跳过，模型层
+   永远见不到该字段；②扩面唯一途径 = fork proto 去 reserve 重加
+   `master=2`——whisperfish 上游系有意删除（与 storageService=1 成对
+   剔除密钥材料），fork 重加即引入「摄入 32B 密钥材料却只产一个诊断位、
+   无任何消费面」的密钥持有面，违背薄 fork + 密钥材料最小持有纪律；
+   ③raw wire 嗅探（解码前自扫帧字节）拒绝——侵入公共解码路径，复杂度
+   与脆性远超诊断价值。宿主如需 masterKey 在场判定，属 connector 消费
+   立项范围（当前无需求）。
+
+wire 面：`syncMessage.keys` 增 `accountEntropyPoolPresent` 布尔一位
+（additive；既有 mediaRootBackupKey 材料面不动）。
 
 ## 6. fake 服务模式（仅测试）
 

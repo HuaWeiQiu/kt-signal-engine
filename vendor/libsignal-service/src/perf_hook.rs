@@ -37,10 +37,15 @@ pub mod keys {
 #[cfg(test)]
 mod tests {
     use super::keys;
-    use super::{emit, install};
+    use super::{emit, install, SINK};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static SEEN_VALUES: AtomicU64 = AtomicU64::new(0);
+
+    // Tests share the process-wide `SINK` OnceLock, so they must not run
+    // concurrently with each other.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn capture(key: &'static str, us: u64) {
         assert_eq!(key, keys::WS_RTT);
@@ -49,11 +54,17 @@ mod tests {
 
     #[test]
     fn emit_without_install_is_a_no_op() {
-        emit("anything", 5);
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Only verifiable while no sink is installed yet; the install test
+        // may have run first in this process.
+        if SINK.get().is_none() {
+            emit("anything", 5);
+        }
     }
 
     #[test]
     fn install_once_then_emit_reaches_the_sink() {
+        let _guard = TEST_LOCK.lock().unwrap();
         install(capture).expect("first install wins");
         assert!(
             install(capture).is_err(),

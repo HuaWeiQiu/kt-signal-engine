@@ -481,6 +481,37 @@ pub(crate) fn apply_synced_trust(
     save_trust_state(account_dir, sid, state, added_at, now)
 }
 
+/// 1-512B 随机填充（官方 `MessageSender.getRandomPadding`
+/// SendMessage.preload.ts:780 同分布：Uint16 & 0x1ff + 1）。
+fn random_padding() -> Vec<u8> {
+    use rand::Rng;
+    let length = rand::rng().random_range(1..=512usize);
+    rand::rng().random_iter::<u8>().take(length).collect()
+}
+
+/// 自发 verified 同步信封（官方 `getVerificationSync`
+/// SendMessage.preload.ts:2412-2465 同构）：`SyncMessage.verified`
+/// {destinationAciBinary, identityKey, state} + `nullMessage` 随机填充
+/// （:2420）+ `padSyncMessage` 包装级 padding（同分布）。
+pub(crate) fn verified_sync_message(
+    peer: &ServiceId,
+    peer_key: Vec<u8>,
+    state: TrustState,
+) -> presage::proto::SyncMessage {
+    let verified = presage::proto::Verified {
+        destination_aci_binary: Some(peer.service_id_binary()),
+        identity_key: Some(peer_key),
+        state: Some(state.sync_state() as i32),
+        null_message: Some(random_padding()),
+        ..Default::default()
+    };
+    presage::proto::SyncMessage {
+        padding: Some(random_padding()),
+        content: Some(presage::proto::sync_message::Content::Verified(verified)),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1076,49 @@ mod tests {
         assert_eq!(records[0]["pending"], serde_json::Value::Bool(false));
         assert_eq!(records[0]["trustLevel"], "TRUSTED_UNVERIFIED");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 自发 verified 同步信封（getVerificationSync 同构）：destination 二进制
+    // 位、identityKey 透传、state 枚举映射、nullMessage/padding 两填充位
+    // 1-512B 同分布（官方 SendMessage.preload.ts:780/:2420 + padSyncMessage）。
+    #[test]
+    fn verified_sync_message_carries_target_and_padding() {
+        use presage::proto::sync_message::Content;
+
+        let peer = service_id(TEST_PEER_UUID);
+        let key: Vec<u8> = (0u8..=32).collect();
+        for (state, expected) in [
+            (
+                TrustState::Verified,
+                presage::proto::verified::State::Verified as i32,
+            ),
+            (
+                TrustState::Unverified,
+                presage::proto::verified::State::Unverified as i32,
+            ),
+            (
+                TrustState::Default,
+                presage::proto::verified::State::Default as i32,
+            ),
+        ] {
+            let sync = verified_sync_message(&peer, key.clone(), state);
+            let padding_len = sync.padding.expect("sync padding").len();
+            assert!(
+                (1..=512).contains(&padding_len),
+                "sync padding {padding_len}"
+            );
+            let Content::Verified(verified) = sync.content.expect("verified content") else {
+                panic!("content must be verified arm");
+            };
+            assert_eq!(
+                verified.destination_aci_binary,
+                Some(peer.service_id_binary())
+            );
+            assert_eq!(verified.identity_key, Some(key.clone()));
+            assert_eq!(verified.state, Some(expected));
+            let null_len = verified.null_message.expect("null message").len();
+            assert!((1..=512).contains(&null_len), "null message {null_len}");
+        }
     }
 
     fn fingerprint_of(

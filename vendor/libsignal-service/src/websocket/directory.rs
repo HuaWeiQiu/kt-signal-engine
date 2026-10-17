@@ -105,9 +105,10 @@ impl SignalWebSocket<Identified> {
                 inner: cdsi_endpoint.enclave_websocket_provider(
                     libsignal_net_infra::EnableDomainFronting::No,
                 ),
-                mode: libsignal_net_infra::route::DirectOrProxyMode::maybe_proxy(
-                    proxy_from_environment(),
-                ),
+                mode:
+                    libsignal_net_infra::route::DirectOrProxyMode::maybe_proxy(
+                        proxy_from_environment(),
+                    ),
             },
             cdsi_endpoint.ws_config,
             &cdsi_endpoint.params,
@@ -176,7 +177,9 @@ fn proxy_from_environment() -> Option<ConnectionProxyConfig> {
     }
     let auth = match (url.username(), url.password()) {
         ("", None) => None,
-        (user, password) => Some((user.to_owned(), password.unwrap_or_default().to_owned())),
+        (user, password) => {
+            Some((user.to_owned(), password.unwrap_or_default().to_owned()))
+        },
     };
     ConnectionProxyConfig::from_parts(
         url.scheme(),

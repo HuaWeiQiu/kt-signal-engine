@@ -99,3 +99,29 @@
   面为未来并发路径留位。
 - KA-DIAG 临时探针仍在（diag 分支引入，本批未摘）——现场观察任务结束
   后由上级决定整体回退批次。
+
+## 5. 保活 STALE 哨兵（2026-10-17 批，零 wire 变化）
+
+官方语义（Signal-Desktop `WebsocketResources.preload.ts:508`
+`STALE_THRESHOLD_MS = 5min` / `:612-620` `send()` 开头检查）：每次保活
+发送前检查上次成功保活应答时刻，距今超 5 分钟（典型为机器休眠唤醒）→
+不在该链路上发送，直接 close 自关强制重连。官方 30s 未应答闸只覆盖
+「发过没回」，此哨兵补「应答成功后链路静默死亡」——两者互补。
+
+引擎实现（vendor fork 面，`vendor/libsignal-service/src/websocket/mod.rs`，
+台账见 `vendor/README.md` 保活 STALE 哨兵批条目）：
+
+- `SignalWebSocketProcess.last_alive_at`：构造时初始化 `Instant::now()`
+  （官方 `#lastAliveAt = Date.now()` 同位），`process_frame` 保活应答
+  2xx 臂刷新。
+- tick 发送前 `keepalive_is_stale` 纯函数判定（官方 `isOlderThan` 同判，
+  elapsed ≥ 阈值含边界，`STALE_KEEPALIVE_THRESHOLD = 5min`）→ 命中走既有
+  failed-keepalives 关闭路径：warn 字面量（含 `stale`）+ close frame
+  reason 字面量 `"stale"` + `ka_diag task exiting: stale keepalive
+  state` 退出探针 → 进程退出、receive 流按既有退避重连。
+- 事件序列：休眠唤醒后首个保活 tick（≤30s）即自关，不再向死链发送
+  keepalive 或业务请求；与单连接纪律（§0-§3）正交——重连仍走
+  kill-before-create + dial_lock 串行。
+
+单测：`websocket::keepalive_stale_tests` 三例（阈值钉形 5min / 超阈含
+边界判 stale / 新鲜应答不误伤）。
