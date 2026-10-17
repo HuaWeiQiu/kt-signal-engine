@@ -2938,10 +2938,18 @@ impl Service {
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        // KT (typing self gate): typing is never sent to our own other
+        // devices (official `isMe` early return in sendTypingMessage) — a
+        // TypingMessage has no sent-transcript form, so a self target would
+        // land in the vendored self-None path and fail this RPC (-32603).
+        let own = ServiceId::from(manager.registration_data().service_ids.aci());
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
                 .ok_or(SendError::Internal)?;
+            if service_id == own {
+                continue;
+            }
             let body = ContentBody::TypingMessage(presage::proto::TypingMessage {
                 timestamp: Some(timestamp),
                 action: Some(if stop {
