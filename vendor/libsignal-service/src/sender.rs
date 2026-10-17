@@ -723,6 +723,11 @@ where
 
         let mut rng = rng();
 
+        // KT (send latency probe): typing rides this same funnel (service
+        // send_typing → send_message) — level gating needs the content kind.
+        let probe_is_typing =
+            matches!(content_body, ContentBody::TypingMessage(_));
+
         for _ in 0..4u8 {
             let Some(EncryptedMessages {
                 messages,
@@ -732,6 +737,7 @@ where
                     &recipient,
                     story.or(unidentified_access.map(|x| &x.certificate)),
                     &content_bytes,
+                    probe_is_typing,
                 )
                 .await?
             else {
@@ -771,6 +777,26 @@ where
                     .duration_since(send_started)
                     .as_micros() as u64,
             );
+            // KT (send latency probe): the ws round trip IS the ack wait (the
+            // PUT /v1/messages response closes the wait); typing stays debug.
+            let ws_probe_ms = send_started.elapsed().as_millis() as u64;
+            if probe_is_typing {
+                tracing::debug!(
+                    target: "send_latency_probe",
+                    stage = "engine.ws",
+                    dur_ms = ws_probe_ms,
+                    peer = if recipient == self.local_aci { "self" } else { "direct" },
+                    "send-latency-probe",
+                );
+            } else {
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.ws",
+                    dur_ms = ws_probe_ms,
+                    peer = if recipient == self.local_aci { "self" } else { "direct" },
+                    "send-latency-probe",
+                );
+            }
 
             match send {
                 Ok(SendMessageResponse { needs_sync }) => {
@@ -1087,6 +1113,7 @@ where
         recipient: &ServiceId,
         unidentified_access: Option<&SenderCertificate>,
         content: &[u8],
+        is_typing: bool,
     ) -> Result<Option<EncryptedMessages>, MessageSenderError> {
         let mut messages = vec![];
 
@@ -1126,6 +1153,7 @@ where
                         unidentified_access,
                         device_id,
                         content,
+                        is_typing,
                     )
                     .await
                 {
@@ -1198,6 +1226,7 @@ where
         unidentified_access: Option<&SenderCertificate>,
         device_id: DeviceId,
         content: &[u8],
+        is_typing: bool,
     ) -> Result<OutgoingPushMessage, MessageSenderError> {
         let recipient_protocol_address =
             recipient.to_protocol_address(device_id);
@@ -1226,6 +1255,24 @@ where
             crate::perf_hook::keys::ENCRYPT,
             encrypt_started.elapsed().as_micros() as u64,
         );
+        // KT (send latency probe): per-device encrypt duration; typing stays
+        // debug (noise discipline 4e168c5/5463bc0), real sends land warn.
+        let encrypt_probe_ms = encrypt_started.elapsed().as_millis() as u64;
+        if is_typing {
+            tracing::debug!(
+                target: "send_latency_probe",
+                stage = "engine.encrypt",
+                dur_ms = encrypt_probe_ms,
+                "send-latency-probe",
+            );
+        } else {
+            tracing::warn!(
+                target: "send_latency_probe",
+                stage = "engine.encrypt",
+                dur_ms = encrypt_probe_ms,
+                "send-latency-probe",
+            );
+        }
 
         Ok(message)
     }
@@ -1309,6 +1356,16 @@ where
         crate::perf_hook::emit(
             crate::perf_hook::keys::SESSION_ESTABLISH,
             session_started.elapsed().as_micros() as u64,
+        );
+        // KT (send latency probe): new-session arm only (cold prekey fetch +
+        // bundle processing — the send long-tail suspect); log level warn so
+        // it lands in the engine rolling file (info is gated off there).
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.prekey",
+            dur_ms = session_started.elapsed().as_millis() as u64,
+            peer = if *recipient == self.local_aci { "self" } else { "direct" },
+            "send-latency-probe",
         );
         Ok(true)
     }

@@ -926,6 +926,7 @@ impl AccountManager {
                     None,
                     local_device_id,
                     &content.into_proto().encode_to_vec(),
+                    false,
                 )
                 .await?;
             device_messages.push(msg);

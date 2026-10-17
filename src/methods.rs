@@ -251,6 +251,11 @@ async fn dispatch(
             let account = params.get("account").and_then(Value::as_str);
             let message = params.get("message").and_then(Value::as_str);
             let group = params.get("groupId").and_then(Value::as_str);
+            // KT (send latency probe): 纯日志零行为变化。入口一行——rpcid 供
+            // 跨仓对账（connector JSON-RPC request id）；账号仅前 8 字符、
+            // 对端仅固定分类词；正文/号码/群名永不入日志。
+            let probe_t0 = std::time::Instant::now();
+            let probe_peer = if group.is_some() { "group" } else { "direct" };
             // 引用/预览/mentions 扩面：键名与 connector 上游同名直投。
             // quote 半参（只有 timestamp 或只有 author）fail-closed；mentions
             // 条目缺字段/超 u32 fail-closed。quoteType/quoteBodyRanges（Q5
@@ -574,11 +579,36 @@ async fn dispatch(
                         )
                         .await
                     {
-                        Ok((timestamp, results)) => jsonrpc::success_response(
-                            id,
-                            json!({ "timestamp": timestamp, "results": results }),
-                        ),
-                        Err(error) => send_error(id, error),
+                        Ok((timestamp, results)) => {
+                            tracing::warn!(
+                                target: "send_latency_probe",
+                                stage = "engine.send-done",
+                                rpcid = %id,
+                                account = %probe_account8(Some(account)),
+                                peer = probe_peer,
+                                rel_ms = probe_t0.elapsed().as_millis() as u64,
+                                ts_id = timestamp,
+                                "send-latency-probe",
+                            );
+                            jsonrpc::success_response(
+                                id,
+                                json!({ "timestamp": timestamp, "results": results }),
+                            )
+                        }
+                        Err(error) => {
+                            let (face, _) = send_error_face(&error);
+                            tracing::warn!(
+                                target: "send_latency_probe",
+                                stage = "engine.send-err",
+                                rpcid = %id,
+                                account = %probe_account8(Some(account)),
+                                peer = probe_peer,
+                                rel_ms = probe_t0.elapsed().as_millis() as u64,
+                                face = face,
+                                "send-latency-probe",
+                            );
+                            send_error(id, error)
+                        }
                     }
                 }
                 (Some(account), message, None, Ok(recipients))
@@ -608,6 +638,16 @@ async fn dispatch(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
                                 send_started.elapsed().as_micros() as u64,
                             );
+                            tracing::warn!(
+                                target: "send_latency_probe",
+                                stage = "engine.send-done",
+                                rpcid = %id,
+                                account = %probe_account8(Some(account)),
+                                peer = probe_peer,
+                                rel_ms = probe_t0.elapsed().as_millis() as u64,
+                                ts_id = timestamp,
+                                "send-latency-probe",
+                            );
                             let mut payload = json!({ "timestamp": timestamp, "results": results });
                             // 时序审计组二#9 additive：per-recipient 失败条目
                             //（空表键不在，旧宿主零变化）。
@@ -621,6 +661,17 @@ async fn dispatch(
                             perf_metrics::record_us(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
                                 send_started.elapsed().as_micros() as u64,
+                            );
+                            let (face, _) = send_error_face(&error);
+                            tracing::warn!(
+                                target: "send_latency_probe",
+                                stage = "engine.send-err",
+                                rpcid = %id,
+                                account = %probe_account8(Some(account)),
+                                peer = probe_peer,
+                                rel_ms = probe_t0.elapsed().as_millis() as u64,
+                                face = face,
+                                "send-latency-probe",
                             );
                             send_error(id, error)
                         }
@@ -1191,6 +1242,16 @@ async fn dispatch(
             let account = params.get("account").and_then(Value::as_str);
             let stop = params.get("stop").and_then(Value::as_bool);
             let group = params.get("groupId").and_then(Value::as_str);
+            // KT (send latency probe): typing 探针恒 debug——降噪纪律
+            // （4e168c5/5463bc0）不因打点回退，warn 级只留给真实发送。
+            tracing::debug!(
+                target: "send_latency_probe",
+                stage = "engine.typing-entry",
+                rpcid = %id,
+                account = %probe_account8(account),
+                peer = if group.is_some() { "group" } else { "direct" },
+                "send-latency-probe",
+            );
             match (account, stop, group, recipients_of(params)) {
                 (Some(account), Some(stop), Some(group), _) => {
                     // 失败显形批（2026-10-16，wire additive，compat §3/§5）：
@@ -4855,6 +4916,11 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// （接收完整性批②）→ `-1` + `GROUP_SYNC_FAILED` + `data.count`（vendored
 /// 重试环尝试次数，additive，compat §3）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
+/// 发送延迟探针账号前缀：前 8 字符（字符界安全截取，非字节切片）。
+fn probe_account8(account: Option<&str>) -> String {
+    account.unwrap_or_default().chars().take(8).collect()
+}
+
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     // 错误面归因日志由 dispatch 层单点 log_rpc_error_face 统一落（本批
     // 并入；b33244c 的内联 warn 移除防双写——覆盖面为本单点真子集）。

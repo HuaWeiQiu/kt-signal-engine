@@ -2205,17 +2205,31 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new(), Vec::new()));
         }
+        // KT (send latency probe): 纯日志零行为变化——lock 段含 db 打开与
+        // 账号互斥等待（发送长尾嫌疑面），ts_id 供与 dispatch/vendor 行
+        // 对账；正文/号码/群名永不入日志。
+        let probe_t0 = std::time::Instant::now();
         let (shared, account_dir) = open_registered_with_dir(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
         let timestamp = now_ms();
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.lock",
+            dur_ms = probe_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
         let whitelist = profile_sharing_whitelist(self, account).await;
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
         // 同样多收件人共享指针。caption 位 = story 媒体腿专属（send 面无
         // caption 参数，None 零变化）。上传失败整批确定未投递（先于全部
         // 收件人），AttachmentUpload 族同调用内快速重试 1 次（§5）。
+        let probe_has_upload =
+            !attachments.is_empty() || preview.and_then(|item| item.image.as_deref()).is_some();
+        let probe_upload_t0 = std::time::Instant::now();
         let (pointers, preview_image) = {
             let mut attempt = 0usize;
             loop {
@@ -2257,6 +2271,15 @@ impl Service {
             }
             None => None,
         };
+        if probe_has_upload {
+            tracing::warn!(
+                target: "send_latency_probe",
+                stage = "engine.upload",
+                dur_ms = probe_upload_t0.elapsed().as_millis() as u64,
+                ts_id = timestamp,
+                "send-latency-probe",
+            );
+        }
         // 时序审计组二#9：per-recipient 成败收集（不再 fail-fast 丢弃部分
         // 成功——重试全批会对已达收件人重复投递）。results = 成功条目（旧
         // 形状原样）；failures = 失败条目（wire additive，connector 只补
@@ -2267,15 +2290,24 @@ impl Service {
         let mut first_error: Option<SendError> = None;
         for number in recipients {
             let send_one = async {
+                let probe_resolve_t0 = std::time::Instant::now();
                 let service_id = resolve_recipient(&manager, number)
                     .await
                     .ok_or(SendError::Internal)?;
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.resolve",
+                    dur_ms = probe_resolve_t0.elapsed().as_millis() as u64,
+                    ts_id = timestamp,
+                    "send-latency-probe",
+                );
                 // P9 身份拒发闸：对端换钥未确认 → 拒发（直聊内容发送面统一
                 // 判定；整批失败与既有逐收件人失败同语义，compat §3）。
                 identity_send_gate(&account_dir, &service_id)?;
                 // P9 profileSharing 闸（S3）：会话未同意 profileSharing → 不注入
                 // 本机 profile_key（官方 sendNormalMessage.preload.ts:183-185）。
                 let include_profile_key = include_profile_key_for(&whitelist, &service_id);
+                let probe_build_t0 = std::time::Instant::now();
                 let body = match sticker {
                     Some(sticker) => {
                         build_sticker_data_message(
@@ -2304,16 +2336,35 @@ impl Service {
                         .await?
                     }
                 };
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.build",
+                    dur_ms = probe_build_t0.elapsed().as_millis() as u64,
+                    ts_id = timestamp,
+                    "send-latency-probe",
+                );
                 // 直聊投递 + 确定未送达快速重试 1 次（§5；逐收件人失败 =
-                // 该收件人确定未送达，重试无重复投递）。
-                Self::deliver_direct_message(
+                // 该收件人确定未送达，重试无重复投递）。探针 outcome 只落
+                // ok/err 固定词（内部含 ensure_session/加密/WS/ack 全程，
+                // vendor 层再逐段拆）。
+                let probe_deliver_t0 = std::time::Instant::now();
+                let probe_deliver_result = Self::deliver_direct_message(
                     &mut manager,
                     service_id,
                     body,
                     timestamp,
                     include_profile_key,
                 )
-                .await
+                .await;
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.deliver",
+                    dur_ms = probe_deliver_t0.elapsed().as_millis() as u64,
+                    ts_id = timestamp,
+                    outcome = if probe_deliver_result.is_ok() { "ok" } else { "err" },
+                    "send-latency-probe",
+                );
+                probe_deliver_result
             };
             match send_one.await {
                 Ok(()) => results.push(json!({
@@ -3667,8 +3718,19 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new()));
         }
+        // KT (send latency probe): 群腿两行——open_group_sender（群钥/凭据
+        // 准备）+账号互斥为 lock 段，dispatch_group（MRM/逐收件人）为
+        // deliver 段；纯日志零行为变化。
+        let probe_t0 = std::time::Instant::now();
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.lock-group",
+            dur_ms = probe_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
         let (pointers, preview_image) = upload_attachments_for_send(
             &manager,
             attachments,
@@ -3699,7 +3761,15 @@ impl Service {
                 .await?
             }
         };
+        let probe_deliver_t0 = std::time::Instant::now();
         let outcomes = dispatch_group(self, &mut manager, group_id, body, timestamp).await?;
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.deliver-group",
+            dur_ms = probe_deliver_t0.elapsed().as_millis() as u64,
+            ts_id = timestamp,
+            "send-latency-probe",
+        );
         let numbers = contacts_number_map(manager.store()).await;
         Ok((
             timestamp,

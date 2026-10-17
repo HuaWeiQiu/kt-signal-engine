@@ -539,6 +539,13 @@
   thread 行语义：group_master_key → `Thread::Group`、recipient_id Uuid →
   `Thread::Contact`）；`recent_threads_orders_newest_first_and_truncates`
   单测（直聊×2+群混排新序/MAX(ts)/limit 截断）。
+- `src/sender.rs`（2026-10-17 send-latency-probe 探针批）— 纯日志零行为
+  变化：①`create_encrypted_message`/`create_encrypted_messages` 增
+  `is_typing: bool` 尾参（typing 级别闸，account_manager PNI change 调用
+  点传 false）；②encrypt 后、`ensure_session` 新会话臂（prekey 取回 +
+  bundle 处理全程）、`try_send_message` WS 往返（PUT /v1/messages 应答 =
+  ack 收到）各一条 `send-latency-probe` 行（target `send_latency_probe`，
+  warn 级；typing 臂恒 debug——4e168c5/5463bc0 降噪纪律不回退）。
 
 ## 更新纪律
 
