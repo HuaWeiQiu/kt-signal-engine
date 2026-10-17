@@ -1301,10 +1301,16 @@ async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> Has
     profile_sharing_whitelist_probed(service, account).await.0
 }
 
-/// whitelist 缓存 TTL（发送长尾修1）：5s 内重复发送零 Storage 读；写面
-/// 失效兜住主动翻转，残余陈旧窗口 ≤ TTL（profileSharing 位非实时安全闸，
-/// 偏差面同 compat §5 fail-open 登记）。
-const WHITELIST_CACHE_TTL: Duration = Duration::from_secs(5);
+/// whitelist 缓存 TTL（发送长尾修1）：TTL 内重复发送零 Storage 读；
+/// 写面失效兜住主动翻转，残余陈旧窗口 ≤ TTL（profileSharing 位非实时
+/// 安全闸，偏差面同 compat §5 fail-open 登记）。
+/// 取值依据（2026-10-17 真机探针复盘）：5s TTL 在真实发送节奏（间隔
+/// 7-16s）下每条必 miss（服务端全量 manifest+联系人往返 1.5-1.7s 照付），
+/// 形同虚设；读取面是 Signal Storage Service 网络往返（storage_sync::
+/// contact_whitelist_map 全量拉取），本地 SQLite 假设不成立。TTL=600s
+/// 让正常节奏全部命中，正确性由联系人族写面失效（本文件
+/// whitelist_cache_invalidate 四处挂载）承担，TTL 仅作失联兜底。
+const WHITELIST_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// whitelist 缓存条目：(位 map, 过期时刻)（到期判定用注入时钟可比对的
 /// deadline 形，测试可拨针）。
