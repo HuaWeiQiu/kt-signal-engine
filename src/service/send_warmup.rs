@@ -28,7 +28,7 @@ use presage::manager::{Manager, Registered};
 use presage::store::{ContentsStore as _, StateStore as _, Thread};
 use presage_store_sqlite::SqliteStore;
 
-use super::{open_store, perf_metrics, profile_refresh, Service};
+use super::{open_store, perf_metrics, profile_refresh, storage_sync, Service};
 
 /// 近活跃 thread 数（按最后一条消息 ts 新序取前 N；直聊 + 群混排）。
 pub(crate) const WARMUP_RECENT_THREADS: usize = 5;
@@ -192,6 +192,53 @@ async fn warm_chunk(dir: &Path, targets: &[ServiceId]) -> (u64, u64) {
         ),
         Err(_) => failed,
     }
+}
+
+/// whitelist 冷启动预热（发送长尾修3，2026-10-17）：账号 sync 臂沉降带
+/// （60s 一次性纪律继承）后台 best-effort 回填 profileSharing 闸位 map
+/// 缓存。探针实证（restart26-28，2026-10-17）：TTL 过期/进程冷启动后的
+/// 首条 send 付 ~1.8s Storage Service 全量拉取（engine.whitelist
+/// cache=miss），首批真实发送踩冷缓存；本预热在真实发送前提前回填，让
+/// 首条 send 的 `engine.whitelist` 段踩 hit（dur_ms≈0）。
+///
+/// 语义面（与发送路径读面 [`super::profile_sharing_whitelist_probed`]
+/// 逐字同源，仅多出失败不毒缓存一位）：
+/// - 已有缓存（窗内真实发送先行回填）→ 零网络零动作，cache=hit；
+/// - storage 上下文可得 → `storage_sync::contact_whitelist_map` 全量读
+///   经 [`super::whitelist_cache_put`] 单点回填（TTL/写面失效四处挂载
+///   与发送路径完全同一语义），cache=filled；
+/// - storage 上下文不可得 → **不回填**（保持冷态，下条真实发送按既有
+///   路径重试；发送路径的「错误空 map 同缓存」语义在此不复制——预热
+///   是锦上添花，失败不得毒缓存压后续 600s），cache=err。
+///
+/// 全失败面静默不上抛（零 stderr 纪律），观测只走本探针行；fake 模式
+/// 早退（与 [`warm_after_profile_refresh`] 同姿态）。正文/号码不入日志，
+/// 账号仅前 8 字符前缀（probe_account8 单点）。
+pub(crate) async fn warm_whitelist_cache(service: &Arc<Service>, account: &str) {
+    if !service.real {
+        return;
+    }
+    let probe_t0 = std::time::Instant::now();
+    let cache_word = if super::whitelist_cache_get(&service.whitelist_cache, account).is_some() {
+        "hit"
+    } else {
+        match super::storage_context(service, account).await {
+            Ok(context) => {
+                let map = storage_sync::contact_whitelist_map(&context).await;
+                super::whitelist_cache_put(&service.whitelist_cache, account, map);
+                "filled"
+            }
+            Err(_) => "err",
+        }
+    };
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "engine.whitelist-warmup",
+        dur_ms = probe_t0.elapsed().as_millis() as u64,
+        account = %crate::methods::probe_account8(Some(account)),
+        cache = cache_word,
+        "send-latency-probe",
+    );
 }
 
 #[cfg(test)]

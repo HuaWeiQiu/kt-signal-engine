@@ -4917,7 +4917,9 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// 重试环尝试次数，additive，compat §3）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
 /// 发送延迟探针账号前缀：前 8 字符（字符界安全截取，非字节切片）。
-fn probe_account8(account: Option<&str>) -> String {
+/// pub(crate)：service 侧沉降带探针（send_warmup whitelist 预热行）复用
+/// 同一截取纪律，单点不复制。
+pub(crate) fn probe_account8(account: Option<&str>) -> String {
     account.unwrap_or_default().chars().take(8).collect()
 }
 

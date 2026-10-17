@@ -6170,7 +6170,10 @@ wire 面：`syncMessage.keys` 增 `accountEntropyPoolPresent` 布尔一位
    `*_split_self` 变体 + `send_prepared_sync_transcript`（后台腿投递
    入口）。Note-to-Self（对端=本机）臂无第二腿，语义零变化。
 2. **profileSharing 闸 whitelist 位会话级缓存（修1）**：account 作用域
-   进程内存缓存，TTL 5s；联系人族写面（`storage.write` Contact 臂 /
+   进程内存缓存（TTL 取值后经 2026-10-17T07:59Z restart26 真机探针复盘
+   修正 5s→600s，见 git 462818a——5s 在真实发送节奏 7-16s 间隔下每条必
+   miss；正确性由联系人族写面失效四处挂载承担，TTL 仅失联兜底）；联系
+   人族写面（`storage.write` Contact 臂 /
    `setConversationBlocked` / `setConversationState` / 入站 merge Contact
    观测）写即失效该账号缓存，残余陈旧窗口 ≤ TTL。**闸语义零变化**：
    `include_profile_key_for` 判定式不动（仅显式 `whitelisted == false`
@@ -6182,6 +6185,33 @@ wire 面：`syncMessage.keys` 增 `accountEntropyPoolPresent` 布尔一位
    `engine.sticker-pre`（no-op 段同样落行，钉死排除法；原
    `engine.upload` 条件行更名 `engine.upload-pre` 且恒落）。
    `engine.deliver` 保持总观（现 = 主投递腿时长，不含后台转录腿）。
+
+### whitelist 冷启动预热批（2026-10-17，发送长尾修3：sync 臂沉降带后台回填 profileSharing 闸缓存，消冷启动/重连窗口后首条 send 的 Storage 全量拉取税，零 wire 变化【engine-compat】）
+
+restart26-28 探针链余项：TTL（600s，见上节修1参数修正）过期或进程冷
+启动后的**首条** send 付 ~1.8s Storage Service 全量拉取
+（`engine.whitelist` 段 cache=miss，manifest+联系人服务端往返），首批
+真实发送踩冷缓存。修法 = 账号 sync 臂既有沉降带（profile 名字刷新批 →
+send_warmup 启动预热批之后，同一 `spawn_local` 任务、60s 一次性纪律
+继承——重连风暴不重复轰，每窗至多一次）追加 whitelist 预热单点
+（`send_warmup::warm_whitelist_cache`）：
+
+- **预热面 = 发送路径读面同源**：`storage_context` 可得 →
+  `storage_sync::contact_whitelist_map` 全量读 +
+  `whitelist_cache_put` 单点回填（TTL/联系人族写面失效四处挂载与发送
+  路径完全同一语义）；缓存已在（窗内真实发送先行回填）→ 零网络零动作；
+  storage 上下文不可得 → **不回填不毒缓存**（保持冷态，下条真实发送按
+  既有路径重试——发送路径「错误空 map 同缓存」语义在预热面不复制，预热
+  失败不得把空 map 压进后续 600s）。
+- **best-effort 静默**：全失败面不上抛、零 stderr（compat §1 纪律）；
+  fake 模式早退（与 send_warmup 批同姿态）。
+- **验证面**：新增探针行 `engine.whitelist-warmup`（send-latency-probe
+  词表 additive，warn 级）：`dur_ms`（预热全程）、`account`（前 8 字符
+  前缀）、`cache = hit|filled|err` 固定词。复现验证口径：预热行
+  cache=filled 之后，同窗首条真实 send 的 `engine.whitelist` 段应为
+  cache=hit 且 dur_ms≈0；cache=err 则下条 send 照旧 cache=miss（诚实）。
+
+wire 面：零变化（方法/应答/错误面全部不动；探针行为纯日志）。
 
 ## 6. fake 服务模式（仅测试）
 

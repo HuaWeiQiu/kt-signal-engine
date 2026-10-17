@@ -6612,6 +6612,19 @@ async fn serve_account_stream(
                             &refresh_account,
                         )
                         .await;
+                        // whitelist 冷启动预热（发送长尾修3，compat §5）：
+                        // 同一沉降带最后一步——profileSharing 闸位 map 在
+                        // 真实发送前提前回填（TTL 过期/进程冷启动后的首条
+                        // send 免付 ~1.8s Storage 全量拉取税；探针行
+                        // engine.whitelist-warmup 承载验证面，cache=
+                        // hit|filled|err 固定词）。best-effort 失败静默不
+                        // 上抛、失败不毒缓存；60s 一次性纪律随本臂继承
+                        // （重连风暴不重复轰），每窗至多一次。
+                        send_warmup::warm_whitelist_cache(
+                            &refresh_service,
+                            &refresh_account,
+                        )
+                        .await;
                     });
                     *last_contacts_sync = Some(std::time::Instant::now());
                 }
