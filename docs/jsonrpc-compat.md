@@ -6213,6 +6213,63 @@ send_warmup 启动预热批之后，同一 `spawn_local` 任务、60s 一次性�
 
 wire 面：零变化（方法/应答/错误面全部不动；探针行为纯日志）。
 
+### 接收风暴死循环批（2026-10-17，DuplicatedMessage 分类 + 有界重试真界，零 wire 变化【engine-compat】）
+
+**现场**：引擎重启（20:16、21:28 的 watchdog 重启）后 Signal 服务器重发
+全部未确认积压，其中一批信封 open 恒失败 `Protocol error: message with
+old counter 354 / 351..353`；connector 看门狗 `receive liveness ping failed
+repeatedly`（13:28:46Z 实证）重启 → 再次全量重发 → 死循环。用户新消息
+堵在服务器队列（未丢）。
+
+**根因两层**：
+
+1. **有界重试实际无界**（1612 批缺陷）：重试窗口把 failed 队列投影回
+   `Incoming` 后，在主循环里按「新到信封」重新构造
+   `WindowEnvelope{attempts: 0}`——`attempts + 1` 恒为 1，`attempts <
+   OPEN_RETRY_MAX_ATTEMPTS(3)` 恒真，`giving up` 分支永远不可达。实证：
+   三份日志合计 6.3 万+ 条 `held for a bounded retry attempts=1`、
+   `giving up on envelope` **零条**。于是确定性失败被以 2s 节拍无限重试
+   （实测每 2s 128 条，CPU 全被吃）。
+2. **确定性失败被当成可重试**：`DuplicatedMessage`（libsignal
+   `double_ratchet.rs:222`，文案 `message with old counter {chain} /
+   {counter}`）的语义是**消息钥已消费、该密文永远解不开**，不是瞬时故障。
+
+**修法**（`vendor/presage/presage/src/manager/registered.rs`）：
+
+- 重试臂直接 `drain` 携带 `attempts` 的 `WindowEnvelope` 列表，计数跨窗口
+  延续——有界重试恢复为真有界（3 次后 `giving up` + ack 放行，语义回到
+  1612 批设计意图）。
+- 新增 `open_error_is_already_processed`：命中
+  `ServiceError::SignalProtocolError(DuplicatedMessage(_, _))` 或
+  `SealedSenderDecryptionError{ inner: DuplicatedMessage, .. }` →
+  **ack + 丢弃，不进入重试持有**。每流首条 `warn`（现场留一行），其后
+  `debug`，每 1000 条一条 `warn` 进度行（滚动文件订阅器只收 warn+，
+  info 落不了盘——原 warn 洪水正是把 watchdog 证据淹没的原因）。
+- 该判定**先于** sealed-sender DERM 臂：sealed sender 把协议失败包进
+  `SealedSenderDecryptionError` 且保留 sender，若先走 DERM 会回发重试
+  回执，对端重发的仍是同一批不可解字节（第二重风暴环）。
+- `classify_open_error` 新增 `"duplicate"` 类字面量（与既有
+  frame/protocol/other 并列，typed path 零 payload）。
+
+**官方锚**：libsignal DuplicatedMessage = 已处理；官方桌面
+`MessageReceiver.preload.ts:2016-2020` 对 `DuplicatedMessage` 直接
+`#removeFromCache` 并 rethrow，且该判断**先于** blocked sender/PNI/DERM
+全部后续逻辑。瞬时族（网络、profile key、其余协议错误）保持 1612 批
+有界重试语义不变。
+
+**积压清空预期**：单条重复件成本从「3 次解密尝试 + 3 条 warn + 2s 节拍
+无限重复」降到「1 次失败判定 + 1 次 ack + 1 条 debug」。2 万积压在单次
+连接内按 75ms/30 的批窗吞吐（~400 封/s，仅受 WS 投递速率约束）清空，
+不再触发看门狗重启。
+
+**看门狗面（修3 评估结论：不改 connector）**：pin 的失败是**结果**而非
+原因——引擎在风暴中被解密循环吃满，`getUserStatus`（15s 预算）排不进
+LocaSet 单线程而失败。风暴消除后 ping 自然恢复；实证 13:29:46–13:31:18
+窗内 ping 多次以 duration_ms=0/1 失败（队列前排已积压），而同一时刻
+`ka_diag tick fired` 持续输出（WS 保活本身是健康的）。connector 零改动。
+
+wire 面：零变化（无方法/应答/错误面变化；日志面 warn→debug 降噪）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

@@ -764,6 +764,11 @@ impl<S: Store> Manager<S, Registered> {
             // keep the server queue as the durability backstop.
             failed: std::collections::VecDeque<WindowEnvelope>,
             retry_due: Option<tokio::time::Instant>,
+            // KT (receive storm): how many envelopes were dropped as
+            // already-processed duplicates on this stream — first one is
+            // logged at warn so the incident leaves one line behind, the
+            // rest stay at debug (a flood must not become a log flood).
+            duplicate_drops: u64,
             end_of_stream: bool,
         }
 
@@ -818,6 +823,7 @@ impl<S: Store> Manager<S, Registered> {
             pending: Default::default(),
             failed: Default::default(),
             retry_due: None,
+            duplicate_drops: 0,
             end_of_stream: false,
         };
 
@@ -858,17 +864,18 @@ impl<S: Store> Manager<S, Registered> {
                             futures::future::Either::Right((item, _timer)) => Pull::Item(item),
                         }
                     };
-                    let (incoming, window_end) = match pull {
+                    let (window, queue_empty_seen, window_end) = match pull {
                         Pull::RetryTimer => {
                             state.retry_due = None;
-                            let retry_window: Vec<Incoming> = state
-                                .failed
-                                .drain(..)
-                                .map(|WindowEnvelope { envelope, ack, .. }| {
-                                    Incoming::Envelope(envelope, ack)
-                                })
-                                .collect();
-                            (retry_window, BatchWindowEnd::WindowClosed)
+                            // KT (receive storm): the retry window carries the
+                            // original `attempts` forward. Re-entering with
+                            // `attempts: 0` (as a fresh arrival would) made the
+                            // bound unreachable — every retry looked like the
+                            // first one, so a deterministic open failure was
+                            // retried forever.
+                            let retry_window: Vec<WindowEnvelope> =
+                                state.failed.drain(..).collect();
+                            (retry_window, false, BatchWindowEnd::WindowClosed)
                         }
                         Pull::Item(Some(Ok(Incoming::Envelope(envelope, ack)))) => {
                             // KT (receive batching): collect the official
@@ -877,14 +884,30 @@ impl<S: Store> Manager<S, Registered> {
                             // cipher takes &mut self with a shared CSPRNG on
                             // a !Send stream — so the batch wins come from
                             // the merged single-transaction save below.
-                            collect_window(
+                            let (incoming, end) = collect_window(
                                 &mut state.encrypted_messages,
                                 Incoming::Envelope(envelope, ack),
                                 Self::RECEIVE_BATCH_WINDOW,
                                 Self::RECEIVE_BATCH_MAX,
                                 |item| matches!(item, Incoming::QueueEmpty),
                             )
-                            .await
+                            .await;
+                            let mut window: Vec<WindowEnvelope> =
+                                Vec::with_capacity(incoming.len());
+                            let mut queue_empty_seen = false;
+                            for item in incoming {
+                                match item {
+                                    Incoming::Envelope(envelope, ack) => {
+                                        window.push(WindowEnvelope {
+                                            envelope,
+                                            ack,
+                                            attempts: 0,
+                                        });
+                                    }
+                                    Incoming::QueueEmpty => queue_empty_seen = true,
+                                }
+                            }
+                            (window, queue_empty_seen, end)
                         }
                         Pull::Item(Some(Ok(Incoming::QueueEmpty))) => {
                             debug!("got empty queue");
@@ -902,18 +925,6 @@ impl<S: Store> Manager<S, Registered> {
                     };
                     if window_end == BatchWindowEnd::EndOfStream {
                         state.end_of_stream = true;
-                    }
-                    let mut window: Vec<WindowEnvelope> = Vec::with_capacity(incoming.len());
-                    let mut queue_empty_seen = false;
-                    for item in incoming {
-                        match item {
-                            Incoming::Envelope(envelope, ack) => window.push(WindowEnvelope {
-                                envelope,
-                                ack,
-                                attempts: 0,
-                            }),
-                            Incoming::QueueEmpty => queue_empty_seen = true,
-                        }
                     }
 
                     // Per-envelope classification: contents queued
@@ -1366,6 +1377,57 @@ impl<S: Store> Manager<S, Registered> {
                             }
                             Err(error) => {
                                 let failure = retry_material.and_then(|m| m.into_failure());
+                                // KT (receive storm): `DuplicatedMessage` means
+                                // the message key was already consumed, so no
+                                // later attempt can open this envelope. Its
+                                // meaning is "already handled": official
+                                // Desktop removes the envelope from its cache
+                                // on that error (MessageReceiver.preload.ts
+                                // :2016-2020) before any retry/receipt logic,
+                                // so the server may drop it too.
+                                //
+                                // This check comes FIRST, before the
+                                // sealed-sender DERM arm below: the sealed
+                                // sender layer wraps protocol failures into
+                                // `SealedSenderDecryptionError` with the
+                                // sender preserved, so a duplicate there would
+                                // otherwise emit a retry receipt — the peer
+                                // would resend the same unrecoverable bytes
+                                // and the duplicate would come straight back
+                                // (a second storm loop). Retrying a
+                                // duplicate only burns CPU, starves the
+                                // receive loop and gets the engine restarted
+                                // by the watchdog — which redelivers the whole
+                                // backlog.
+                                let class = classify_open_error(&error);
+                                if open_error_is_already_processed(&error) {
+                                    state.duplicate_drops += 1;
+                                    // One warn per stream keeps the incident
+                                    // visible in the rolling log; the rest
+                                    // stay at debug — a 20k-line flood is what
+                                    // buried the watchdog evidence.
+                                    if state.duplicate_drops == 1 {
+                                        warn!(
+                                            class,
+                                            %error,
+                                            "dropping already-processed envelope (ack); further duplicates on this stream stay at debug"
+                                        );
+                                    } else {
+                                        debug!(class, %error, "dropping already-processed envelope");
+                                    }
+                                    // Drain progress: one warn line per 1000
+                                    // drops so a long backlog stays visible in
+                                    // the rolling file (which only keeps
+                                    // warn+) without re-creating the flood.
+                                    if state.duplicate_drops % 1000 == 0 {
+                                        warn!(
+                                            dropped = state.duplicate_drops,
+                                            "still draining already-processed envelopes"
+                                        );
+                                    }
+                                    ack.ack();
+                                    continue;
+                                }
                                 if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
                                         if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
                                             slots.push(BatchSlot::Ready(Received::DecryptionError(
@@ -1384,9 +1446,8 @@ impl<S: Store> Manager<S, Registered> {
                                 // later window below the bound; the
                                 // handle stays unacked so the server
                                 // queue keeps it if the process dies.
-                                let class = classify_open_error(&error);
                                 let attempts = attempts + 1;
-                                if attempts < OPEN_RETRY_MAX_ATTEMPTS {
+                                if envelope_retry_is_bounded(attempts) {
                                     warn!(
                                         attempts,
                                         class,
@@ -2935,10 +2996,31 @@ struct WindowEnvelope {
 const OPEN_RETRY_MAX_ATTEMPTS: u32 = 3;
 const OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// KT (envelope retention): failure-class literal for retention bookkeeping —
-/// typed path only, no payload.
+/// KT (envelope retention / receive storm): should this envelope be held for
+/// another retry window? `attempts` is the count *after* this failure, carried
+/// across windows by [`WindowEnvelope`].
+///
+/// Split out as a pure function because the non-obvious bug lived exactly
+/// here: the retry window used to rebuild its entries as fresh arrivals
+/// (`attempts: 0`), so every retry counted as the first one and the bound was
+/// unreachable — an unbounded retry wearing a bound's clothes.
+fn envelope_retry_is_bounded(attempts: u32) -> bool {
+    attempts < OPEN_RETRY_MAX_ATTEMPTS
+}
+
+/// KT (envelope retention / receive storm): failure-class literal for
+/// retention bookkeeping — typed path only, no payload.
+///
+/// `duplicate` is called out separately from the rest of the protocol family:
+/// it is the one class that carries an "already handled" meaning (libsignal
+/// `DuplicatedMessage` — `double_ratchet.rs:222`; the text is
+/// `message with old counter {chain_index} / {counter}`), so it must never
+/// enter the retry hold.
 fn classify_open_error(error: &libsignal_service::prelude::ServiceError) -> &'static str {
     use libsignal_service::prelude::ServiceError;
+    if open_error_is_already_processed(error) {
+        return "duplicate";
+    }
     match error {
         ServiceError::InvalidFrame { .. }
         | ServiceError::MacError
@@ -2946,6 +3028,38 @@ fn classify_open_error(error: &libsignal_service::prelude::ServiceError) -> &'st
         | ServiceError::PaddingVersion(_) => "frame",
         ServiceError::SignalProtocolError(_) => "protocol",
         _ => "other",
+    }
+}
+
+/// KT (receive storm): this open failure can never succeed on a later attempt,
+/// and its official meaning is "already processed" — acked and dropped on
+/// sight instead of being held for the bounded retry.
+///
+/// Anchor: libsignal `SignalProtocolError::DuplicatedMessage` is raised when
+/// the message key for that counter was already consumed (either the chain
+/// advanced past it or the cached skipped key was taken), so the ciphertext is
+/// unrecoverable by design. Official Desktop treats it as terminal — the
+/// duplicate check runs before any receipt/retry bookkeeping and the envelope
+/// leaves the cache (`MessageReceiver.preload.ts:2016-2020`, "We don't do
+/// anything if it's just a duplicated message"). Retrying it is what turned a
+/// post-restart redelivery backlog into a receive-storm.
+///
+/// Both shapes are matched: the bare protocol error (identified/legacy
+/// envelope) and the sealed-sender wrapper, whose `inner` carries the same
+/// error while `sender` is preserved.
+fn open_error_is_already_processed(error: &libsignal_service::prelude::ServiceError) -> bool {
+    fn is_duplicate(error: &libsignal_service::protocol::SignalProtocolError) -> bool {
+        matches!(
+            error,
+            libsignal_service::protocol::SignalProtocolError::DuplicatedMessage(_, _)
+        )
+    }
+    match error {
+        libsignal_service::prelude::ServiceError::SignalProtocolError(inner) => is_duplicate(inner),
+        libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(wrapped) => {
+            is_duplicate(&wrapped.inner)
+        }
+        _ => false,
     }
 }
 
@@ -3351,6 +3465,98 @@ mod receive_batch_tests {
             "everything else degrades to the catch-all class"
         );
         assert_eq!(OPEN_RETRY_MAX_ATTEMPTS, 3);
+    }
+
+    // KT (receive storm): `DuplicatedMessage` is the "already handled" class —
+    // it is named apart from the rest of the protocol family and never enters
+    // the retry hold. The live sample is `message with old counter 354 / 351`
+    // (libsignal double_ratchet.rs:222: the message key was already consumed).
+    #[test]
+    fn duplicated_message_is_already_processed_and_not_retried() {
+        use libsignal_service::prelude::ServiceError;
+        use libsignal_service::protocol::SignalProtocolError;
+
+        let duplicated =
+            ServiceError::SignalProtocolError(SignalProtocolError::DuplicatedMessage(354, 351));
+        assert_eq!(classify_open_error(&duplicated), "duplicate");
+        assert!(open_error_is_already_processed(&duplicated));
+        // Evidence pin: this is the exact text the live engine wrote 58524
+        // times (`error=Protocol error: message with old counter 354 / 351`).
+        // If libsignal ever rewords it, this assertion fails and points at the
+        // classification the incident depended on.
+        assert_eq!(
+            duplicated.to_string(),
+            "Protocol error: message with old counter 354 / 351"
+        );
+
+        // The sealed-sender layer wraps protocol failures while keeping the
+        // sender — the same duplicate arrives in this shape and must classify
+        // the same way, otherwise it would emit a retry receipt (DERM) and the
+        // peer would resend bytes that can never decrypt.
+        let wrapped = ServiceError::SealedSenderDecryptionError(
+            libsignal_service::cipher::SealedSenderDecryptionError {
+                inner: SignalProtocolError::DuplicatedMessage(354, 351),
+                sender: None,
+            },
+        );
+        assert_eq!(classify_open_error(&wrapped), "duplicate");
+        assert!(open_error_is_already_processed(&wrapped));
+
+        // A sealed-sender failure that is NOT a duplicate keeps the existing
+        // DERM path (sender face), not the drop path.
+        let sealed_other = ServiceError::SealedSenderDecryptionError(
+            libsignal_service::cipher::SealedSenderDecryptionError {
+                inner: SignalProtocolError::InvalidArgument("not a duplicate".into()),
+                sender: None,
+            },
+        );
+        assert_eq!(classify_open_error(&sealed_other), "other");
+        assert!(!open_error_is_already_processed(&sealed_other));
+
+        // Other protocol failures keep the bounded retry: they are not
+        // "already processed" and may be transient (e.g. a session that a
+        // later prekey message repairs).
+        let other_protocol = ServiceError::SignalProtocolError(
+            SignalProtocolError::InvalidArgument("not a duplicate".into()),
+        );
+        assert_eq!(classify_open_error(&other_protocol), "protocol");
+        assert!(!open_error_is_already_processed(&other_protocol));
+
+        assert!(!open_error_is_already_processed(&ServiceError::MacError));
+        assert!(!open_error_is_already_processed(
+            &ServiceError::InvalidFrame { reason: "x" }
+        ));
+    }
+
+    // KT (receive storm): the retry bound must actually be reachable. The live
+    // incident had 58524 `held for a bounded retry attempts=1` lines and ZERO
+    // give-ups in three log generations: the counter restarted every window.
+    // This walks one envelope across windows the way the loop does.
+    #[test]
+    fn retry_counter_reaches_the_bound_across_windows() {
+        let mut attempts = 0u32;
+        let mut window_entries = 0usize;
+        // Each iteration = one window: open fails, we decide hold-or-give-up,
+        // and the held entry carries the incremented counter to the next one.
+        for window in 0..10 {
+            attempts += 1;
+            if envelope_retry_is_bounded(attempts) {
+                window_entries += 1;
+                assert!(
+                    attempts < OPEN_RETRY_MAX_ATTEMPTS,
+                    "held entry must be below the bound (window {window})"
+                );
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            window_entries,
+            OPEN_RETRY_MAX_ATTEMPTS as usize - 1,
+            "exactly two holds, then give up on the third failure"
+        );
+        assert_eq!(attempts, OPEN_RETRY_MAX_ATTEMPTS);
+        assert!(!envelope_retry_is_bounded(OPEN_RETRY_MAX_ATTEMPTS));
     }
 
     // KT (group fetch degradation): the decode/gone partition decides the

@@ -561,6 +561,28 @@
   已备好转录体)）；③新增 pub `send_prepared_sync_transcript`（后台转录
   腿投递入口，不落库——主发送已落库）。官方锚 wrapWithSyncMessageSend
   （send-done = 主投递腿 ack，转录后续化）。
+- `presage/src/manager/registered.rs`（2026-10-17 接收风暴死循环批）—
+  ①`WindowEnvelope.attempts` 在重试窗口间真正延续（原重试臂把 failed
+  队列投影回 `Incoming` 后再按「新到信封」构造 `WindowEnvelope{attempts:
+  0}`，`attempts+1` 恒为 1，`OPEN_RETRY_MAX_ATTEMPTS=3` 永远打不到——
+  实测 2 万+ 条 `held for a bounded retry attempts=1`、`giving up` 零条，
+  即「有界重试」实为无界重试）；重试臂改为直接 `drain` 携带 attempts 的
+  `WindowEnvelope` 列表；②新增 `open_error_is_already_processed` 分类面
+  （`ServiceError::SignalProtocolError(DuplicatedMessage(_, _))` 与
+  `SealedSenderDecryptionError{ inner: DuplicatedMessage }` 两形态）：
+  命中即 `ack()` + 丢弃、不进重试队列，每流首条 `warn` 一条、其后
+  `debug`，每 1000 条一条 `info` 进度行（原 warn 洪水即 watchdog 现场
+  被淹没的原因）；`classify_open_error` 增加 `"duplicate"` 类字面量；
+  ③该判定置于 sealed-sender DERM 臂**之前**——sealed sender 层把协议
+  失败包进 `SealedSenderDecryptionError` 且保留 sender，若先走 DERM 会
+  回发重试回执，对端重发的仍是同一批不可解字节（第二重风暴环）。
+  官方锚：libsignal `double_ratchet.rs:222`「message with old counter」
+  = 消息钥已消费（`DuplicatedMessage` 语义即「已处理」）；官方桌面
+  `MessageReceiver.preload.ts:2016-2020` 对 `DuplicatedMessage` 直接
+  `#removeFromCache` 且不做任何进一步处理，先于所有 receipt/retry 逻辑。
+  瞬时族（网络/profile key/其余协议错误）保持 1612 批有界重试语义不变。
+  `duplicated_message_is_already_processed_and_not_retried` 单测钉定
+  三形态（裸/封装 duplicate 命中，非 duplicate 的封装错误回 DERM 面）。
 
 ## 更新纪律
 
