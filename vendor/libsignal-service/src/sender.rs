@@ -390,7 +390,9 @@ where
                     )
                     .await;
             } else {
-                error!("could not create sync message from message to self");
+                // KT (sync transcript): same as the group path — None is the
+                // documented "not syncing to self" case, not a failure.
+                debug!("message body has no sent transcript form; not syncing message to self");
                 return SendMessageResult::Err(
                     MessageSenderError::NoMessagesToSend,
                 );
@@ -617,7 +619,11 @@ where
                     error!(%error, "failed to send a synchronization message");
                 }
             } else {
-                error!("could not create sync message from a group message")
+                // KT (sync transcript): a None here is the documented
+                // "not syncing to self" case (only DataMessage/EditMessage
+                // have a Sent form), not a failure — typing and friends
+                // hitting the group path must not log as errors.
+                debug!("message body has no sent transcript form; not syncing group message to self")
             }
         }
 
@@ -1314,58 +1320,232 @@ where
         timestamp: u64,
         send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
     ) -> Option<ContentBody> {
-        use sync_message::sent::UnidentifiedDeliveryStatus;
-        let (message, edit_message) = match content_body {
-            ContentBody::DataMessage(m) => (Some(m), None),
-            ContentBody::EditMessage(m) => (None, Some(m)),
-            content_body => {
-                tracing::trace!(?content_body, "not syncing to self");
-                return None;
-            },
+        sent_transcript_body(
+            recipient,
+            content_body,
+            timestamp,
+            send_message_results,
+        )
+    }
+}
+
+/// Build the `SyncMessage.sent` transcript body for a completed send, or
+/// `None` for bodies that have no sent-transcript form: only DataMessage and
+/// EditMessage can be carried in `SyncMessage.Sent` (official clients never
+/// sync typing/receipt/call/etc. to own devices), so `None` there means
+/// "deliberately not syncing", not a failure.
+fn sent_transcript_body<'a>(
+    recipient: Option<&ServiceId>,
+    content_body: ContentBody,
+    timestamp: u64,
+    send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
+) -> Option<ContentBody> {
+    use sync_message::sent::UnidentifiedDeliveryStatus;
+    let (message, edit_message) = match content_body {
+        ContentBody::DataMessage(m) => (Some(m), None),
+        ContentBody::EditMessage(m) => (None, Some(m)),
+        content_body => {
+            tracing::trace!(?content_body, "not syncing to self");
+            return None;
+        },
+    };
+    let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
+        send_message_results
+            .into_iter()
+            .filter_map(|result| result.as_ref().ok())
+            .map(|sent| {
+                let SentMessage {
+                    recipient,
+                    unidentified,
+                    used_identity_key,
+                    ..
+                } = sent;
+                UnidentifiedDeliveryStatus {
+                    destination_service_id: Some(
+                        recipient.service_id_string(),
+                    ),
+                    destination_service_id_binary: Some(
+                        recipient.service_id_binary(),
+                    ),
+                    unidentified: Some(*unidentified),
+                    destination_pni_identity_key: Some(
+                        used_identity_key.serialize().into(),
+                    ),
+                }
+            })
+            .collect();
+    Some(ContentBody::SynchronizeMessage(SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: recipient
+                .map(ServiceId::service_id_string),
+            destination_service_id_binary: recipient
+                .map(ServiceId::service_id_binary),
+            destination_e164: None,
+            expiration_start_timestamp: message
+                .as_ref()
+                .and_then(|m| m.expire_timer)
+                .map(|_| timestamp),
+            message,
+            edit_message,
+            timestamp: Some(timestamp),
+            unidentified_status,
+            ..Default::default()
+        })),
+        ..SyncMessage::with_padding(&mut rng())
+    }))
+}
+
+#[cfg(test)]
+mod sent_transcript_body_tests {
+    use super::*;
+    use crate::proto::{
+        CallMessage, DataMessage, DecryptionErrorMessage, EditMessage,
+        NullMessage, ReceiptMessage, StoryMessage, TypingMessage,
+    };
+    use libsignal_protocol::{Aci, KeyPair, SenderKeyDistributionMessage};
+
+    fn aci(n: u128) -> Aci {
+        Aci::from(Uuid::from_u128(n))
+    }
+
+    fn identity_key() -> IdentityKey {
+        IdentityKey::decode(&[
+            0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ])
+        .expect("valid test identity key")
+    }
+
+    fn sent_ok(n: u128) -> SendMessageResult {
+        Ok(SentMessage {
+            recipient: ServiceId::from(aci(n)),
+            used_identity_key: identity_key(),
+            unidentified: true,
+            needs_sync: false,
+        })
+    }
+
+    fn sent_body_of(body: Option<ContentBody>) -> sync_message::Sent {
+        match body {
+            Some(ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::Sent(sent)),
+                ..
+            })) => sent,
+            other => panic!("expected Sent transcript body, got {other:?}"),
+        }
+    }
+
+    fn sender_key_distribution_message() -> SenderKeyDistributionMessage {
+        SenderKeyDistributionMessage::new(
+            3,
+            Uuid::from_u128(9),
+            1,
+            0,
+            vec![0x2a; 32],
+            KeyPair::generate(&mut rng()).public_key,
+        )
+        .expect("valid test SKDM")
+    }
+
+    const TS: u64 = 1_700_000_000_000;
+    const EMPTY_RESULTS: &[SendMessageResult] = &[];
+
+    #[test]
+    fn group_data_message_transcript_carries_recipients_and_expiration() {
+        let mut data = DataMessage {
+            expire_timer: Some(60),
+            ..DataMessage::default()
         };
-        let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
-            send_message_results
-                .into_iter()
-                .filter_map(|result| result.as_ref().ok())
-                .map(|sent| {
-                    let SentMessage {
-                        recipient,
-                        unidentified,
-                        used_identity_key,
-                        ..
-                    } = sent;
-                    UnidentifiedDeliveryStatus {
-                        destination_service_id: Some(
-                            recipient.service_id_string(),
-                        ),
-                        destination_service_id_binary: Some(
-                            recipient.service_id_binary(),
-                        ),
-                        unidentified: Some(*unidentified),
-                        destination_pni_identity_key: Some(
-                            used_identity_key.serialize().into(),
-                        ),
-                    }
-                })
-                .collect();
-        Some(ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(sync_message::Content::Sent(sync_message::Sent {
-                destination_service_id: recipient
-                    .map(ServiceId::service_id_string),
-                destination_service_id_binary: recipient
-                    .map(ServiceId::service_id_binary),
-                destination_e164: None,
-                expiration_start_timestamp: message
-                    .as_ref()
-                    .and_then(|m| m.expire_timer)
-                    .map(|_| timestamp),
-                message,
-                edit_message,
-                timestamp: Some(timestamp),
-                unidentified_status,
-                ..Default::default()
-            })),
-            ..SyncMessage::with_padding(&mut rng())
-        }))
+        data.body = Some("hi".to_owned());
+        let results = [sent_ok(1), Err(MessageSenderError::NoMessagesToSend)];
+        let body = sent_transcript_body(
+            None,
+            ContentBody::DataMessage(data.clone()),
+            TS,
+            &results,
+        )
+        .expect("DataMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert_eq!(
+            sent.message.as_ref().map(|m| m.body.as_deref()),
+            Some(Some("hi"))
+        );
+        assert_eq!(sent.timestamp, Some(TS));
+        // expire_timer present -> expiration start pinned to the send timestamp.
+        assert_eq!(sent.expiration_start_timestamp, Some(TS));
+        // Group transcript: no single destination, UDS only for Ok results.
+        assert_eq!(sent.destination_service_id, None);
+        assert_eq!(sent.destination_service_id_binary, None);
+        let uds = sent.unidentified_status;
+        assert_eq!(uds.len(), 1);
+        assert_eq!(
+            uds[0].destination_service_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(uds[0].unidentified, Some(true));
+    }
+
+    #[test]
+    fn self_data_message_transcript_carries_destination() {
+        let own = ServiceId::from(aci(7));
+        let body = sent_transcript_body(
+            Some(&own),
+            ContentBody::DataMessage(DataMessage::default()),
+            TS,
+            EMPTY_RESULTS.iter(),
+        )
+        .expect("DataMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert_eq!(
+            sent.destination_service_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000007")
+        );
+        assert_eq!(
+            sent.destination_service_id_binary,
+            Some(aci(7).service_id_binary())
+        );
+        // No expire_timer -> no expiration start.
+        assert_eq!(sent.expiration_start_timestamp, None);
+        assert!(sent.message.is_some());
+    }
+
+    #[test]
+    fn edit_message_transcript_uses_edit_slot() {
+        let own = ServiceId::from(aci(7));
+        let body = sent_transcript_body(
+            Some(&own),
+            ContentBody::EditMessage(EditMessage::default()),
+            TS,
+            EMPTY_RESULTS.iter(),
+        )
+        .expect("EditMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert!(sent.message.is_none());
+        assert!(sent.edit_message.is_some());
+    }
+
+    #[test]
+    fn non_syncable_bodies_return_none() {
+        let own = ServiceId::from(aci(7));
+        let cases: Vec<ContentBody> = vec![
+            ContentBody::NullMessage(NullMessage::default()),
+            ContentBody::SynchronizeMessage(SyncMessage::default()),
+            ContentBody::CallMessage(CallMessage::default()),
+            ContentBody::ReceiptMessage(ReceiptMessage::default()),
+            ContentBody::TypingMessage(TypingMessage::default()),
+            ContentBody::SenderKeyDistributionMessage(
+                sender_key_distribution_message(),
+            ),
+            ContentBody::DecryptionErrorMessage(DecryptionErrorMessage::default()),
+            ContentBody::StoryMessage(StoryMessage::default()),
+        ];
+        for body in cases {
+            assert!(
+                sent_transcript_body(Some(&own), body.clone(), TS, EMPTY_RESULTS.iter())
+                    .is_none(),
+                "expected None for {body:?}"
+            );
+        }
     }
 }

@@ -233,6 +233,22 @@
   读面（groups.rs）保持 v1 + 裸 Group 解码不动（v1 契约自洽）。双契约以
   活体捕获字节钉入 `groups_v2::manager::live_group_endpoint_fixture`
   单测。
+- `src/sender.rs`（2026-10-17 群消息 sync 转录取证批）— ①转录构造
+  `create_multi_device_sent_transcript_content` 抽 free 纯函数
+  `sent_transcript_body`（无 self 依赖，方法委托行为零变化）；②群路径
+  `could not create sync message from a group message` 与 self 路径
+  `could not create sync message from message to self` 两条 `error!` 降
+  `debug!`——None 是「变体无 Sent 形态、有意不 sync」（仅
+  DataMessage/EditMessage 可转录，官方 wrapWithSyncMessageSend 同语义；
+  typing/receipt/call 等走群路径或多设备恒真时每次都命中 None），error
+  级别把正常 typing 流量刷成报错（活体 2026-10-16T19:4x 窗 12 条成对
+  ERROR 全部来自群 typing start/stop）并淹没真错；控制流/返回值零变化
+  （self 路径 None 仍按上游返回 NoMessagesToSend，引擎侧由 sendTyping
+  isMe 同位闸关闭该流量）。`sent_transcript_body_tests` 四例单测钉定：
+  群 DataMessage Some（无 destination + UDS 只收 Ok 结果 + expire_timer
+  在场钉 expiration_start_timestamp）、self DataMessage Some（destination
+  双形态）、EditMessage Some（Sent.editMessage 槽）、非可转录八变体
+  （Null/Sync/Call/Receipt/Typing/SKDM/DERM/Story）恒 None。
 
 `vendor/presage/`（rev 33dd149）：
 
