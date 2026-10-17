@@ -595,6 +595,14 @@
 - `presage/src/manager/mod.rs`（同批）— `group_refresh_needed` 再导出
   摘除（`group_member_is_admin` 保留，engine 测试门改钉 announcements
   闸单件）。
+- `src/cipher.rs`（2026-10-18 sender key 互操作批复核批）— SKDM side-car
+  处置结果打点（`engine.skdm` 探针，send-latency-probe 词表 additive）：
+  processed（已写入协议存储，原 info 行保留）/ dropped（解析或存储失败），
+  来源设备（aci.device_id）与 distribution_id 随行；控制流与原 `?` 传播
+  逐字同构（Err 臂先打点后 `return Err(error.into())`）。背景：复核证伪
+  「收包面丢弃 SKDM」指控——SKDM-only 信封在 `Content::from_proto` 之前
+  已由 cipher 层消费入协议存储，投影层不投影臂为不可达防御臂；探针为
+  真机观测面（官方客户端是否向我们分发 sender key）。
 
 ## 更新纪律
 

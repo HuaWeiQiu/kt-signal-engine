@@ -6330,6 +6330,62 @@ wire 面：零变化（方法/应答/错误面全部不动；群态强刷语义�
 任何可见结局面——取数时机从「发送前同步」移到「发送后后台」，探针行
 为纯日志）。
 
+### sender key 互操作批复核批（2026-10-18，三缺陷指控取证复核 + 观测探针，
+零 wire 变化【engine-compat】）
+
+背景：对拍官方语义发现官方客户端在含引擎设备的群里报「Not enough
+recipients for Sender Key message」整体回落普通发送，疑为引擎 sender key
+互操作三缺陷。逐一代码实证复核，结论与施工面如下。
+
+**修1 指控「收包面丢弃 SKDM」（src/service/mod.rs projection 臂）——复核
+证伪，零改动**：收包链 presage `receive_messages` →
+`ServiceCipher::open_envelope`（vendored registered.rs）在投影层**之前**
+已把 SKDM side-car 交给 libsignal
+`process_sender_key_distribution_message` 写入协议存储
+（vendored cipher.rs；官方同位——SKDM 走 Content proto 侧车字节位，SKDM-only
+信封 `Content::from_proto` 判 `UnsupportedContent`，projection 层
+`ContentBody::SenderKeyDistributionMessage` 臂为**不可达防御臂**，非处置点）。
+「收到 SKDM 后 sender key store 有该 distributionId 条目」的不变量由
+门禁测试
+`group_mrm::tests::skdm_receive_stores_key_and_group_decrypt_roundtrip` 钉死
+（create→process→load_sender_key 条目在→group_encrypt/group_decrypt 往返）。
+
+**修2 指控「缺 GSE endorsement 上传面」——复核判需求错位，零改动**：
+官方语义 GSE 由**服务端签发**（libsignal zkgroup
+`GroupSendEndorsementsResponse::issue` 需 `ServerSecretParams`，客户端仅持
+`ServerPublicParams`——libsignal tests/group_send_endorsements.rs:33-45），
+随群拉取响应下发（`Cached-Send-Endorsements` 头，Signal-Desktop
+WebAPI.preload.ts:4967-5037）；Signal-Desktop 全仓**无客户端上传
+endorsement 调用面**。引擎已有取回 + kv 缓存面（group_cache.rs，官方
+validateGroupSendEndorsements 同语义失效判定），无上传面可补。
+
+**修3 指控「小群恒回落 → 我们永不向别人分发 sender key」——复核判既有
+面已覆盖**：SKDM 增量分发在 MRM 路径（group_mrm.rs send_mrm SKDM 阶段，
+官方 sendToGroup 步 8 同形，增量成员+覆盖台账+90 天 TTL）与 409/410 修复
+路径；failover 路径不分发与官方语义一致（官方也只对 sender-key 收件人
+分发），且覆盖台账使下一次 MRM 尝试自愈。无施工面。
+
+**官方「Not enough recipients」真语义记档**（真机验证口径锚）：
+Signal-Desktop sendToGroup.preload.ts:424 = 合格 sender-key 收件**账号**
+< 2 即整体 failover——两人群（官方+引擎）恒回落属**官方 by design**，
+与引擎设备是否合格无关；合格判定 isValidSenderKeyRecipient:1303-1338 =
+群成员 ∧ （GSE state 含该成员 ∨ 无 GSE state 时有 profile access key） ∧
+未注销。引擎侧三指控面复核均无缺陷后，真机区分口径 = 三人及以上群仍报
+该错时才指向引擎被判不合格（彼时按官方判定链取对方日志定位：
+hasMember 缺席=对方 GSE 缓存陈旧、access key 缺席=profile 面）。
+
+**探针（send-latency-probe 词表 additive，warn 级，纯日志）**：
+- `engine.skdm`：SKDM side-car 处置结果（vendored cipher.rs 台账补丁），
+  `outcome=processed|dropped` 固定词 + 来源设备（aci.device_id，按来源
+  计数）+ distribution_id——真机直接观测「官方是否向我们分发 sender
+  key、我们是否落库」；
+- `engine.gse`：发送路径 GSE 取回结局，`outcome=present|absent` 固定词
+  + cache 词——absent 区分「服务端未签发我们成员 endorsement」与取回面
+  故障。
+
+wire 面：零变化（纯探针 + 测试 + 文档；vendored cipher.rs 探针补丁行为
+同构——Err 臂先打点后按原 `?` 传播）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩

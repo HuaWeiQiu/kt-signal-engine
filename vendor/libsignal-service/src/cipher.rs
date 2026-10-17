@@ -124,19 +124,63 @@ where
             if let Some(bytes) =
                 &plaintext.message.sender_key_distribution_message
             {
-                let skdm = SenderKeyDistributionMessage::try_from(&bytes[..])?;
+                // KT (sender key interop probe): SKDM 处置结果打点（processed=
+                // 已写入协议存储 / dropped=解析或存储失败被丢弃），来源设备
+                // （aci.device_id）与 distribution_id 随行——真机口径按来源
+                // 设备计数。行为零变化（原 info 行保持）。
                 let sender = plaintext.metadata.protocol_address()?;
-                process_sender_key_distribution_message(
+                let skdm = match SenderKeyDistributionMessage::try_from(&bytes[..])
+                {
+                    Ok(skdm) => skdm,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "engine.skdm",
+                            outcome = "dropped",
+                            sender = %sender,
+                            error = %error,
+                            "send-latency-probe",
+                        );
+                        return Err(error.into());
+                    }
+                };
+                match process_sender_key_distribution_message(
                     &sender,
                     &skdm,
                     &mut self.protocol_store,
                 )
-                .await?;
-                tracing::info!(
-                    distribution_id = %skdm.distribution_id()?,
-                    sender = %sender,
-                    "applied sender key distribution message"
-                );
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            distribution_id = %skdm.distribution_id()?,
+                            sender = %sender,
+                            "applied sender key distribution message"
+                        );
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "engine.skdm",
+                            outcome = "processed",
+                            sender = %sender,
+                            distribution_id = %skdm
+                                .distribution_id()
+                                .map(|id| id.to_string())
+                                .unwrap_or_default(),
+                            "send-latency-probe",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "engine.skdm",
+                            outcome = "dropped",
+                            sender = %sender,
+                            error = %error,
+                            "send-latency-probe",
+                        );
+                        return Err(error.into());
+                    }
+                }
             }
 
             let Some(content) = &plaintext.message.content else {

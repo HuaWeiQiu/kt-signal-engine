@@ -7849,7 +7849,11 @@ async fn project_content_inner(
         }
         ContentBody::NullMessage(_) | ContentBody::DecryptionErrorMessage(_) => return Vec::new(),
         // SKDM（群发 sender-key 分发，C 批）：协议内部握手行，永不投影到
-        // connector（接收侧已在 cipher 层消费）。
+        // connector。接收面实证（sender key 互操作批复核批 2026-10-18）：
+        // SKDM 走 Content proto 侧车字节位，cipher 层在投影之前已消费入
+        // 协议存储（SKDM-only 信封 Content::from_proto 判 UnsupportedContent，
+        // 本臂实际不可达，纯防御；收发往返钉面 =
+        // group_mrm::tests::skdm_receive_stores_key_and_group_decrypt_roundtrip）。
         ContentBody::SenderKeyDistributionMessage(_) => return Vec::new(),
     }
 

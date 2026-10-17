@@ -231,6 +231,19 @@ pub(crate) async fn dispatch_group_message(
         return failover(service, manager, &self_sync, &master_key, body, timestamp).await;
     };
 
+    // KT (sender key interop probe): GSE 取回结局打点（send-latency-probe
+    // 词表 additive，纯日志零行为）。官方语义注记：GSE 由服务端签发随群
+    // 拉取下发（客户端无上传面），absent 词用于真机区分「服务端未签发
+    // 我们成员的 endorsement」与「取回面本身故障」。
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "engine.gse",
+        outcome = if endorsements.is_some() { "present" } else { "absent" },
+        cache = if group_refresh_hit { "hit" } else { "network" },
+        ts_id = timestamp,
+        "send-latency-probe",
+    );
+
     let own_aci = manager.registration_data().service_ids.aci();
     let own_uuid: Uuid = own_aci.into();
     let own_aci = Aci::from(own_uuid);
@@ -1002,5 +1015,68 @@ mod tests {
                 .is_err(),
             "过期 token 验签必拒"
         );
+    }
+
+    /// SKDM 接收落库 + MRM 加解密往返（sender key 互操作批复核钉面）。
+    /// 发送侧 create_sender_key_distribution_message（send_mrm SKDM 阶段
+    /// 同款调用）→ 接收侧 process_sender_key_distribution_message（vendored
+    /// cipher::open_envelope 收包面同款调用，SKDM-only 信封在投影层之前
+    /// 消费，projection 层不投影臂为不可达防御臂）→ 接收侧 sender key
+    /// store 出现 (sender, distribution_id) 条目（修1 验收口径）→
+    /// group_encrypt/group_decrypt 往返成功（能解官方 MRM 群密文）。
+    #[tokio::test]
+    async fn skdm_receive_stores_key_and_group_decrypt_roundtrip() {
+        use presage::libsignal_service::protocol::{
+            group_decrypt, group_encrypt, process_sender_key_distribution_message, IdentityKeyPair,
+            InMemSignalProtocolStore, ProtocolAddress, SenderKeyStore as _,
+        };
+
+        let distribution_id = Uuid::from_u128(0xD15);
+        let sender = ProtocolAddress::new(
+            Uuid::from_u128(0xA11).to_string(),
+            DeviceId::try_from(1).expect("device id"),
+        );
+
+        let alice_pair = IdentityKeyPair::generate(&mut rng());
+        let mut alice = InMemSignalProtocolStore::new(alice_pair, 1).expect("alice protocol store");
+        let bob_pair = IdentityKeyPair::generate(&mut rng());
+        let mut bob = InMemSignalProtocolStore::new(bob_pair, 2).expect("bob protocol store");
+
+        let skdm = create_sender_key_distribution_message(
+            &sender,
+            distribution_id,
+            &mut alice,
+            &mut rng(),
+        )
+        .await
+        .expect("create SKDM");
+
+        // 处理前：接收侧 store 无该条目。
+        assert!(bob
+            .load_sender_key(&sender, distribution_id)
+            .await
+            .expect("load before process")
+            .is_none());
+
+        process_sender_key_distribution_message(&sender, &skdm, &mut bob)
+            .await
+            .expect("process SKDM");
+
+        // 修1 验收口径：处理后条目落库可取回。
+        assert!(bob
+            .load_sender_key(&sender, distribution_id)
+            .await
+            .expect("load after process")
+            .is_some());
+
+        // 互操作不变量：发送侧 MRM 群加密 → 接收侧可解密。
+        let padded = pad_message(b"hello group");
+        let ciphertext = group_encrypt(&mut alice, &sender, distribution_id, &padded, &mut rng())
+            .await
+            .expect("group encrypt");
+        let decrypted = group_decrypt(ciphertext.serialized(), &mut bob, &sender)
+            .await
+            .expect("group decrypt");
+        assert_eq!(decrypted, padded);
     }
 }
