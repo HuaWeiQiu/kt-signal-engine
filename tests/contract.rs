@@ -5902,6 +5902,147 @@ fn request_attachment_backfill_faces_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// lookupOutgoingDispatch 只读面（unknown 出站行引擎真相对账批，compat
+/// §3/§5）：connector 启动对账臂的引擎真面——fake 模式确定形状桩
+/// `{dispatched: false}`（无 serverTimestamp 键，读面不落调度日志零
+/// stderr）；两腿恰一（direct/群）与 sendMessageRequestResponse 同款；
+/// sentTimestamp 正整数、toleranceMs 缺省接受（缺席/null）与
+/// 0/非数/超 60000 帽 fail-closed `-32603`；real 模式未注册账号折叠
+/// `-32603` 不触网。
+#[test]
+fn lookup_outgoing_dispatch_faces_and_param_fail_closed() {
+    use base64::Engine as _;
+    let group_id = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
+    let dir = temp_dir("lookup-outgoing-dispatch");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+
+    // fake 确定形状桩：两腿 + toleranceMs 缺省/显式/null 三接受面，恒
+    // {dispatched: false} 单键（fake 库零出站行 = 从未派发的诚实面）。
+    for params in [
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "sentTimestamp": 1_700_000_000_000u64
+        }),
+        json!({
+            "account": number,
+            "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+            "sentTimestamp": 1_700_000_000_001u64,
+            "toleranceMs": 60_000u64
+        }),
+        json!({
+            "account": number,
+            "groupId": group_id,
+            "sentTimestamp": 1_700_000_000_002u64,
+            "toleranceMs": null
+        }),
+    ] {
+        let ok = engine.request("lookupOutgoingDispatch", params.clone());
+        assert_eq!(
+            ok["result"],
+            json!({ "dispatched": false }),
+            "fake lookupOutgoingDispatch ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状：缺 account/空串、缺 sentTimestamp/0/负/
+    // 非数、toleranceMs 0/负/非数/超 60000 帽、两腿同置/双缺、recipient
+    // 数组、groupId 非 base64/≠32B。
+    let rejects = [
+        json!({ "recipient": "+15555550101", "sentTimestamp": 1 }),
+        json!({ "account": "", "recipient": "+15555550101", "sentTimestamp": 1 }),
+        json!({ "account": number, "recipient": "+15555550101" }),
+        json!({ "account": number, "recipient": "+15555550101", "sentTimestamp": 0 }),
+        json!({ "account": number, "recipient": "+15555550101", "sentTimestamp": -1 }),
+        json!({ "account": number, "recipient": "+15555550101", "sentTimestamp": "1" }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "sentTimestamp": 1,
+            "toleranceMs": 0
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "sentTimestamp": 1,
+            "toleranceMs": -5
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "sentTimestamp": 1,
+            "toleranceMs": "2000"
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "sentTimestamp": 1,
+            "toleranceMs": 60_001u64
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "groupId": group_id,
+            "sentTimestamp": 1
+        }),
+        json!({ "account": number, "sentTimestamp": 1 }),
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "sentTimestamp": 1
+        }),
+        json!({ "account": number, "groupId": "!!!not-base64!!!", "sentTimestamp": 1 }),
+        json!({
+            "account": number,
+            "groupId": base64::engine::general_purpose::STANDARD.encode([0x44u8; 31]),
+            "sentTimestamp": 1
+        }),
+    ];
+    for params in &rejects {
+        let response = engine.request("lookupOutgoingDispatch", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "lookupOutgoingDispatch rejects {params}"
+        );
+    }
+
+    // 读面纪律：零调度日志（version/listGroups 同款——查证零协议上行，
+    // 日志若在即纪律破窗）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    if log_path.exists() {
+        let log = std::fs::read_to_string(&log_path).expect("dispatch log readable");
+        assert!(
+            !log.contains("lookupOutgoingDispatch"),
+            "read face must not land in the dispatch log"
+        );
+    }
+
+    // real 模式未注册账号：打开已注册 manager 前置即内部失败（不触网；
+    // listGroups/send 系同折叠）。
+    let real_dir = temp_dir("lookup-outgoing-dispatch-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "lookupOutgoingDispatch",
+        json!({
+            "account": "+15559990000",
+            "recipient": "+15555550101",
+            "sentTimestamp": 1
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// getUsername（用户名读面，KT 扩展方法）：fake 形状桩 `{}`（未设 = 键
 /// 缺席，不发明 null/空串）+ 参数面 fail-closed（缺 account / 非字符串
 /// -32603）+ real 模式未注册账号 -32603（不触网，注册数据前置）。

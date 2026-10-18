@@ -2076,6 +2076,88 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // lookupOutgoingDispatch（unknown 出站行引擎真相对账只读面，KT
+        // 扩展，compat §5 对账批，engine-compat）：connector 启动对账臂
+        // （connector 契约 1.179 / §4.179）逐行核对 unsettled 出站行——
+        // 引擎库 thread_messages 是否存在「该 destination、sender=本机
+        // ACI、ts 落容差窗」的出站行（引擎是否真的派发过的本地真相）。
+        // params `{account, recipient?|groupId?, sentTimestamp,
+        // toleranceMs?}`：两腿恰一（sendMessageRequestResponse 同款：
+        // direct = recipient 对端 service id 串/号码 resolve_recipient
+        // 双形态解析，群 = groupId 32B 标准 base64 decode_group_id 闸）；
+        // sentTimestamp 正整数 u64；toleranceMs 缺省 2000、硬帽 60000
+        // fail-closed（1..=60000 外整拒——窗即查询界）。应答
+        // `{dispatched, serverTimestamp?}` 只含布尔与命中行落库 ts，
+        // 绝不含正文/号码（内容红线）；读面不落调度日志零 stderr
+        // （version/listGroups 同纪律）；fake：`{dispatched: false}` 桩。
+        "lookupOutgoingDispatch" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let sent_timestamp = params
+                .get("sentTimestamp")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0);
+            let tolerance_ms = match params.get("toleranceMs") {
+                None | Some(Value::Null) => {
+                    Some(crate::service::OUTGOING_DISPATCH_DEFAULT_TOLERANCE_MS)
+                }
+                Some(value) => value.as_u64().filter(|tolerance| {
+                    (1..=crate::service::OUTGOING_DISPATCH_MAX_TOLERANCE_MS).contains(tolerance)
+                }),
+            };
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("groupId").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) if !text.is_empty() => Some(Some(text.clone())),
+                Some(_) => None,
+            };
+            let group = match params.get("groupId") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(MessageRequestTarget::Group))
+                }
+                Some(_) => None,
+            };
+            let target = match (recipient, group) {
+                (Some(Some(text)), None) => Some(MessageRequestTarget::Thread(text)),
+                (None, Some(Some(master_key))) => Some(master_key),
+                _ => None,
+            };
+            match (account, target, sent_timestamp, tolerance_ms) {
+                (Some(account), Some(target), Some(sent_timestamp), Some(tolerance_ms)) => {
+                    match service
+                        .lookup_outgoing_dispatch(account, target, sent_timestamp, tolerance_ms)
+                        .await
+                    {
+                        Ok(lookup) => {
+                            // 应答面只此两键：no-null 纪律，serverTimestamp
+                            // 仅 dispatched=true 在场。
+                            let mut body = serde_json::Map::with_capacity(2);
+                            body.insert("dispatched".to_owned(), json!(lookup.dispatched));
+                            if let Some(server_timestamp) = lookup.server_timestamp {
+                                body.insert("serverTimestamp".to_owned(), json!(server_timestamp));
+                            }
+                            jsonrpc::success_response(id, Value::Object(body))
+                        }
+                        Err(_) => internal_error(id),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // deleteForMeConversation（P15c 项3，官方 deleteConversation 发送面
         // 同位，compat §3 行 + §5 P15c 块）：会话级「为我删除」上行。kind
         // 词表 contact/group（legacyGroup 官方不支持——getConversation

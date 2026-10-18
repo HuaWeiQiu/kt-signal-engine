@@ -159,6 +159,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `markRead` / `markViewed` | `{account, reads?\|viewed?: [{sender(ACI/号码), timestamp(原消息 upstream 时间戳)}]}`（markRead 用 `reads` 键、markViewed 用 `viewed` 键——官方 syncReadMessages/syncView 参数名同形；条目非空数组，列表缺席/空/非数组/条目缺 sender 或 timestamp/timestamp 非数字/sender 非字符串 `-32603`） | `{}` | sender 号码/UUID 不可解析（contacts 兜底后仍失败）`-32603`（整拒不发半批——发送面参数闸纪律）；未注册账号 `-32603` | **2026-10-11 real（KT 扩展，P14 组 6 自发多设备读态写面）**：官方 syncReadMessages/syncView 同构（SendMessage.preload.ts:2097/:2145）——向自己 ACI 发 SyncMessage.read=5/viewed=16（直接 repeated 字段，非 content oneof，多设备同步「这些消息已读/已看」）；ACI binary+string 双写（官方 isProtoBinaryEncodingEnabled 现行面/旧字符串面双兼容，viewOnceOpen 双写先例同构）；100 条/chunk 分信封（官方 syncHelpers.preload.ts:25 CHUNK_SIZE=100 同构）；padded sync message；与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执）双通道独立（官方 markConversationRead.preload.ts:252 注同位）；接收 echo 面 = §3 receive `syncMessage.read/viewed`（D2）；presage self-send 通路与 sendViewOnceOpen 同款；fake：成功 `{}`（落调度日志，reads/viewed 键逐字保留，协议上行面纪律） |
 | `sendMessageRequestResponse` | `{account, recipient(单值，ACI/号码)\|groupId(32B 标准 base64 群 master key), type}`（**两腿恰一**：direct = recipient、群 = groupId，同置/双缺 `-32603`；type = 官方驼峰词六值白名单 `accept\|delete\|block\|blockAndDelete\|spam\|blockAndSpam`，缺席/`unknown`/数字/词表外/大小写漂移 `-32603`） | `{}`（上游钉定面成功答空结果对象同款） | 参数缺失/type 闸/两腿闸/群腿非 base64 或 ≠32B/recipient 数组 `-32603`；未注册账号 `-32603` | **2026-10-06 real（KT 扩展，§4.56 写面债务批）**：官方桌面 getMessageRequestResponseSync 同构——向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary\|threadAci?, groupId?, type}（content oneof messageRequestResponse=14；ACI 可解析 16B 直写 binary 字段=官方 isProtoBinaryEncodingEnabled 现行面，群 master key 原样=官方 groupId Uint8Array 同位；presage self-send 通路，padding 同源）；与 §3 receive 通知面 `syncMessage.messageRequestResponse` 投影对称（本机写 → 多设备 echo 收）；connector §4.56 `conversations.acceptRequest`/`declineRequest` 的引擎面（上游钉定 `sendMessageRequestResponse` params 逐字对齐：connector 上游 recipient 腿 = 其 peer_key 直通本引擎双形态解析、groupId 腿 = 群 master key、type 由宿主盖章 accept/delete）；写结局即返回值、未知结局不重试纪律不变（connector §4.56 SEND_OUTCOME_UNKNOWN 终态语义的引擎侧对应位）；fake：成功 `{}`（落调度日志，协议上行面纪律） |
 | `requestAttachmentBackfill` | `{account, recipient(单值，对端 service id 串/号码)\|groupId(32B 标准 base64 群 master key), author(非空字符串，消息作者 ACI/号码——resolve_author_aci 双形态解析，不可解析 `-32603`), sentTimestamp(正整数 u64 毫秒)}`（**两腿恰一**：同置/双缺/腿形状非法 `-32603`，sendMessageRequestResponse 同款） | `{}`（写面惯例，成功答空结果对象） | 参数闸（account/author/sentTimestamp 缺席·空串·0·负·非数、recipient 数组、groupId 非 base64·≠32B）`-32603`；未注册账号 `-32603` | **2026-10-18 real（KT 扩展，附件回填闭环批，官方对齐 Signal-Desktop，wire additive【engine-compat】）**：官方 `AttachmentBackfill.request` 发送面对位（jobs/helpers/attachmentBackfill.preload.ts:77-109 触发链 + SendMessage.getAttachmentBackfillSyncMessage .preload.ts:1987-2018 构帧）——本地附件字节缺失且无可下载指针面时，向自己 ACI 发 `SyncMessage.content oneof attachmentBackfillRequest=24 {targetMessage: AddressableMessage{authorServiceIdBinary\|authorServiceId?, sentTimestamp}, targetConversation: ConversationIdentifier{threadServiceIdBinary\|threadServiceId?\|threadGroupId}}`（padded sync message；作者 ACI 16B binary 现行面优先、已闸字符串降写 string 面；群腿 32B master key 原样；target 构帧与 deleteForMe 构帧单点同源 = 官方 toAddressableMessage/toConversationIdentifier 同一对辅助函数）。主设备收请求后重上传并回 `attachmentBackfillResponse`（收投影臂 compat §5 attachmentBackfillResponse 块，2026-10-17 已落）——connector 消费面（locator 列落库）随 connector 契约 1.174 闭环。presage self-send 通路与 sendMessageRequestResponse 同款；写结局即返回值、未知结局不重试；协议上行面落调度日志（send 系同纪律）；fake：成功 `{}` |
+| `lookupOutgoingDispatch` | `{account, recipient(单值，对端 service id 串/号码——resolve_recipient 双形态解析，不可解析 `-32603`)\|groupId(32B 标准 base64 群 master key), sentTimestamp(正整数 u64 毫秒——被核对出站发送的引擎时间戳), toleranceMs?(正整数 u64，1..=60000，缺省 2000——sentTimestamp 双侧容差窗毫秒)}`（**两腿恰一**：同置/双缺/腿形状非法 `-32603`，sendMessageRequestResponse 同款） | `{dispatched: bool, serverTimestamp?: u64}`（dispatched=true 时 serverTimestamp 在场 = 命中出站行落库 ts 毫秒；应答**绝不含正文/号码/群名/作者**——内容红线，消息内容只经内存转发，本面只读投影布尔与时间戳） | 参数闸（account/sentTimestamp 缺席·空串·0·负·非数、toleranceMs 缺席归缺省但 0·负·非数·>60000 拒、recipient 数组、groupId 非 base64·≠32B、两腿同置/双缺）`-32603`；未注册账号 `-32603`；对端不可解析（store 无 contacts 面，冷启动窗同 resolve_recipient）`-32603` | **2026-10-18 real（KT 扩展，unknown 出站行引擎真相对账批，官方 outbox 恢复语义对位，wire additive【engine-compat】）**：connector 重启后对 unsettled 出站行（connector 侧 status=unknown）的引擎真相对账只读面——引擎库 thread_messages 是「引擎是否真的派发过」的本地真相（2026-10-18 用户实证：发送在实例重启窗口被打断、connector 落 unknown 后永远 unknown，桌面只能拒绝重发、行成死态；同时刻引擎库零出站行=消息从未发出）。查证 = 该 destination 的 thread 内取 `sender=本机 ACI` 且 ts 落 `[sentTimestamp-toleranceMs, sentTimestamp+toleranceMs]` 的出站行（多条命中取 \|Δts\| 最小者）；timestamp-only 配对 = 官方 receipt 配对同粒度（Retry receipts 亦只按 (发送者,timestamp) 命名原消息），同窗同会话多条出站行的不可分辨性见 §5 批块。presage 落行时机取证（派发成功后才落行）与残留风险窗（ack 后崩溃未落行 → not-found 但已派发）记档 §5。connector 消费面 = connector 契约 1.179（§4.179 启动对账臂）；读面不落调度日志零 stderr（version/listGroups 同纪律）；fake：`{dispatched: false}` 确定形状桩（无 serverTimestamp 键） |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 | `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
 | `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
@@ -6441,6 +6442,64 @@ announcementsOnly 键逐字保留）。测试（只增不减）：unit +1
 wire 字节 field 21 钉死）+ contract +1
 （update_group_announcements_only_fake_shape_and_param_fail_closed：fake
 两臂 + 组合臂 + 四形状拒 + 调度日志七行逐键 + real 未注册折叠）。
+
+### unknown 出站行引擎真相对账批（2026-10-18，`lookupOutgoingDispatch` 只读面，官方 outbox 恢复语义对位，wire additive【engine-compat】）
+
+背景（2026-10-18 用户实证）：一条发送在实例重启窗口被打断，connector
+落账 `status='unknown'`（§4.172 防双投层），此后该行永远 unknown——桌面
+只能拒绝重发（by-design），行成死态；同时刻引擎库 thread_messages 零出站
+行 = 消息从未发出。引擎库是「引擎是否真的派发过」的本地真相，本批把它
+以只读布尔面透出（`lookupOutgoingDispatch`，§3 行），connector 启动对账
+臂消费（connector 契约 1.179 / §4.179）。
+
+**presage 落行时机取证（vendored registered.rs，本仓只读取证零改动）**：
+出站 thread_messages 行一律在**派发调用返回成功之后**才落库——直聊腿
+`send_message_profile_sharing_inner`（:1694-1750）：`sender.send_message`
+（服务器 ack，`?` 上抛即整 send 失败）成功后才构造 Content 并
+`save_message` 落行；群腿 `send_message_to_group_inner`（:2013-2068）：
+逐成员派发尝试完成后（部分失败也落，转录必落库——群黑洞消除批语义）
+`save_message` 落行。即：引擎库有出站行 ⇒ 引擎确曾完成派发调用；引擎库
+无行 ⇒ 派发调用未成功返回（多数=从未出手）。
+
+**残留风险窗（记档，不下绝对断言）**：服务器已接受派发、但进程在
+`save_message` 落行前崩溃/被杀——引擎库无行而消息已派发。此窗内对账
+答 not-found、connector 落 failed、重发即双投。缓解：Signal 收端对
+(destination,timestamp) 重复投递有去重面（收端按 (发送者,timestamp)
+本地查重折叠——presage 收端 `Received::Duplicate` 同源，§3 收信去重块），
+重发若复用同一时间戳可望被收端折叠；但 connector 重发铸造新时间戳
+（retry 面新 send 新 ts），去重不保证覆盖——风险窗概率极小（ack 与落行
+间毫秒级）但非零，记档不闭嘴。反向窗（引擎库有行但消息实际未达收件人）
+不在本面职责：行在=派发调用成功返回，投递结局归收据/回执面。
+
+**容差窗设计**：查证窗 = sentTimestamp 双侧 `[ts-toleranceMs,
+ts+toleranceMs]`（缺省 2000ms，帽 60000ms fail-closed）。窗的存在理由：
+connector unknown 行携带的 sent_at 是**发送准备时刻**（connector 时钟），
+而引擎行 ts 是**派发信封时间戳**（引擎时钟，经账号互斥排队 + 附件 CDN
+上行后），两者天然有偏移；对账臂显式传宽窗（connector §4.179 传
+60000）覆盖排队/上传延迟。窗的代价：同窗同会话多条出站行按
+timestamp-only 不可分辨（命中取 |Δts| 最小者）——官方 receipt 配对同
+粒度（Retry receipts 只按 (发送者,timestamp) 命名原消息，KT DERM
+`sent_message_by_timestamp` 同源语义），把 sibling 行误认为 dispatched=true
+的风险与官方 receipt 同界；窗收紧则召回下降（真派发行落窗外 →
+not-found → failed → 重发双投风险），宽窄权衡记档由调用方定夺（引擎只
+钉 1..=60000 硬帽）。
+
+**应答面内容红线**：`{dispatched, serverTimestamp?}` 只含布尔与命中行
+落库 ts——正文/号码/群名/作者永不入应答（引擎零内容外传纪律；查证经
+presage `messages(thread, range)` trait 原语在内存内过滤，零 vendor 改动，
+行级解码失败跳过不炸面）。serverTimestamp 语义 = 命中行 `ts` 列（客户端
+时间戳——presage 落行时 `server_timestamp` 即回填客户端时间戳、`server_ts`
+列不落写恒 NULL，引擎无独立服务器时刻源，键名沿用调用方命名）。
+
+fake：`{dispatched: false}` 确定形状桩（无 serverTimestamp 键），读面
+不落调度日志零 stderr。测试（只增不减）：unit +2
+（outgoing_dispatch_nearest_hit_window_and_sender_filter：窗内命中/窗外
+不命中/边界含/他人行过滤/多条取最近/空窗诚实缺席）
+（outgoing_dispatch_response_face_has_no_content_keys：应答面只含
+dispatched·serverTimestamp 两键钉形）+ contract +1
+（lookup_outgoing_dispatch_faces_and_param_fail_closed：fake 两腿成功
+形状/11 形状面 -32603 逐条/toleranceMs 缺省接受与 0·超帽拒/读面零调度
+日志/real 未注册折叠不触网）。
 
 ## 6. fake 服务模式（仅测试）
 

@@ -1389,6 +1389,65 @@ pub(crate) enum MessageRequestTarget {
     Group(Vec<u8>),
 }
 
+/// lookupOutgoingDispatch 的应答面（KT 扩展，compat §5 unknown 出站行
+/// 引擎真相对账批）：`dispatched` = 引擎库在该 destination 的 thread 内
+/// 存在「sender=本机 ACI、ts 落容差窗」的出站行（引擎侧派发调用成功
+/// 返回才会落行）；`server_timestamp` = 命中行落库 ts（dispatched=true
+/// 时在场；presage 落行时 server_timestamp 即回填客户端时间戳、server_ts
+/// 列不落写，引擎无独立服务器时刻源，键名沿用调用方命名）。应答面只
+/// 此两键——正文/号码/群名/作者永不入面（内容红线）。
+pub(crate) struct OutgoingDispatchLookup {
+    pub(crate) dispatched: bool,
+    pub(crate) server_timestamp: Option<u64>,
+}
+
+/// lookupOutgoingDispatch 容差窗缺省毫秒（compat §3：sentTimestamp 双侧
+/// 容差窗；窗的存在理由与宽窄权衡见 §5 批块——connector unknown 行的
+/// sent_at 是发送准备时刻，引擎行 ts 是派发信封时间戳，两者天然有偏移）。
+pub(crate) const OUTGOING_DISPATCH_DEFAULT_TOLERANCE_MS: u64 = 2_000;
+
+/// lookupOutgoingDispatch 容差窗硬帽毫秒（fail-closed 上界：窗即查询界，
+/// 帽钉 60s 保持有界；官方 receipt 配对同粒度的 timestamp-only 不可分辨
+/// 性随窗单调放大，上界不放大）。
+pub(crate) const OUTGOING_DISPATCH_MAX_TOLERANCE_MS: u64 = 60_000;
+
+/// 出站派发查证单点（lookupOutgoingDispatch 服务面的纯函数核，容差窗/
+/// 发送者过滤/最近命中在此钉定）：候选行按 `sender == own` 过滤（出站行
+/// 的落库判别——直聊行 destination=对端、群行 destination=本机，sender
+/// 恒为本机 ACI）、按 `|ts - sent_timestamp|` 取最近者。行级解码失败由
+/// 调用方 filter_map 跳过（fail-open 行级不炸面）；空窗诚实
+/// dispatched=false。
+fn nearest_outgoing_dispatch(
+    rows: impl Iterator<Item = presage::libsignal_service::prelude::Content>,
+    own: &ServiceId,
+    sent_timestamp: u64,
+) -> OutgoingDispatchLookup {
+    let mut nearest: Option<(u64, u64)> = None;
+    for content in rows {
+        let ts = content.metadata.client_timestamp.timestamp_millis();
+        let Ok(ts) = u64::try_from(ts) else {
+            continue;
+        };
+        if &content.metadata.sender != own {
+            continue;
+        }
+        let distance = ts.abs_diff(sent_timestamp);
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, ts));
+        }
+    }
+    match nearest {
+        Some((_, ts)) => OutgoingDispatchLookup {
+            dispatched: true,
+            server_timestamp: Some(ts),
+        },
+        None => OutgoingDispatchLookup {
+            dispatched: false,
+            server_timestamp: None,
+        },
+    }
+}
+
 /// sendMessageRequestResponse type 参数词汇 → proto 枚举（方法参数单点
 /// 映射）：词表镜像官方 `Proto.SyncMessage.MessageRequestResponse.Type` 六值
 /// 驼峰词（桌面 conversations.preload.ts syncMessageRequestResponse 直传枚举
@@ -3492,6 +3551,67 @@ impl Service {
             .await
             .map_err(send_error_of)?;
         Ok(())
+    }
+
+    /// lookupOutgoingDispatch（unknown 出站行引擎真相对账只读面，KT 扩展，
+    /// 官方 outbox 恢复语义对位，compat §5 对账批）：引擎库
+    /// thread_messages 是「引擎是否真的派发过」的本地真相（出站行一律在
+    /// 派发调用成功返回后才落库——直聊腿 registered.rs:1694-1750 服务器
+    /// ack 后 save_message、群腿 :2013-2068 逐成员派发尝试后转录必落），
+    /// 本面把它以布尔面透出给 connector 的启动对账臂（connector 契约
+    /// 1.179 / §4.179）：destination 的 thread 内取 sender=本机 ACI 且 ts
+    /// 落 `[sent_timestamp ± tolerance_ms]` 的出站行，多条命中取 |Δts|
+    /// 最小者（timestamp-only 配对 = 官方 receipt 配对同粒度）。应答只含
+    /// 布尔与命中行落库 ts——正文/号码/群名永不出面（内容红线）；查证走
+    /// presage `messages(thread, range)` trait 原语内存内过滤，零 vendor
+    /// 改动。fake：`{dispatched: false}` 确定形状桩。
+    pub(crate) async fn lookup_outgoing_dispatch(
+        self: &Arc<Self>,
+        account: &str,
+        target: MessageRequestTarget,
+        sent_timestamp: u64,
+        tolerance_ms: u64,
+    ) -> Result<OutgoingDispatchLookup, SendError> {
+        if !self.real {
+            return Ok(OutgoingDispatchLookup {
+                dispatched: false,
+                server_timestamp: None,
+            });
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
+        let thread = match target {
+            // thread 腿 = resolve_recipient 双形态解析（号码/UUID）——与发送
+            // 面同一解析单点，保证对账命中的正是发送面当初落行的同一
+            // Thread::Contact；不可解析（contacts 冷启动窗）fail-closed。
+            MessageRequestTarget::Thread(text) => {
+                let service_id = resolve_recipient(&manager, &text)
+                    .await
+                    .ok_or(SendError::Internal)?;
+                presage::store::Thread::Contact(service_id)
+            }
+            // 群腿 = 32B master key（dispatch 层 decode_group_id 已闸形状，
+            // 此处仅类型收敛）——与群发送面同一 Thread::Group 落行键。
+            MessageRequestTarget::Group(key) => {
+                let master_key: [u8; 32] = key.try_into().map_err(|_| SendError::Internal)?;
+                presage::store::Thread::Group(master_key)
+            }
+        };
+        let own = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
+        let lo = sent_timestamp.saturating_sub(tolerance_ms);
+        let hi = sent_timestamp.saturating_add(tolerance_ms);
+        let rows = manager
+            .store()
+            .messages(&thread, lo..=hi)
+            .await
+            .map_err(|_| SendError::Internal)?;
+        Ok(nearest_outgoing_dispatch(
+            rows.filter_map(Result::ok),
+            &own,
+            sent_timestamp,
+        ))
     }
 
     /// deleteForMeConversation（P15c 项3，官方桌面 conversations.preload.ts
@@ -11781,6 +11901,149 @@ mod tests {
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
+
+    /// lookupOutgoingDispatch 纯函数核（compat §5 unknown 出站行引擎真相
+    /// 对账批）：容差窗由调用方 SQL 界承担（messages(thread, lo..=hi)），
+    /// 此处钉定行级判别——sender=本机过滤（他人行/入站行不命中）、多条
+    /// 命中取 |Δts| 最小、空窗诚实 dispatched=false、应答面 serverTimestamp
+    /// = 命中行落库 ts（no-null：缺席与 false 折叠同一无键态）。
+    #[test]
+    fn outgoing_dispatch_nearest_hit_window_and_sender_filter() {
+        use presage::libsignal_service::content::Metadata;
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::DeviceId;
+
+        let own_uuid = "11111111-2222-4333-8444-555555555555";
+        let peer_uuid = "d1b69e7c-1a32-4f3d-9d21-5c4b0a2f7e11";
+        fn aci(uuid: &str) -> ServiceId {
+            ServiceId::Aci(Uuid::parse_str(uuid).unwrap().into())
+        }
+        fn outgoing_of(
+            sender: &ServiceId,
+            client_ts_ms: i64,
+        ) -> presage::libsignal_service::prelude::Content {
+            presage::libsignal_service::prelude::Content {
+                metadata: Metadata {
+                    sender: *sender,
+                    destination: aci("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"),
+                    sender_device: DeviceId::new(1).expect("device id"),
+                    pni_verified: None,
+                    client_timestamp: chrono::DateTime::from_timestamp_millis(client_ts_ms)
+                        .expect("timestamp"),
+                    server_timestamp: chrono::DateTime::from_timestamp_millis(client_ts_ms)
+                        .expect("timestamp"),
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    server_guid: None,
+                    story: None,
+                    ephemeral: None,
+                    urgent: None,
+                    report_spam_token: None,
+                },
+                body: ContentBody::DataMessage(DataMessage::default()),
+            }
+        }
+
+        let own = aci(own_uuid);
+        let sent = 1_700_000_000_000u64;
+
+        // 窗内命中：恰等于 sentTimestamp 的本机出站行。
+        let hit =
+            nearest_outgoing_dispatch([outgoing_of(&own, sent as i64)].into_iter(), &own, sent);
+        assert!(hit.dispatched);
+        assert_eq!(hit.server_timestamp, Some(sent));
+
+        // 多条命中取 |Δts| 最小：-1500 与 +500 并存 → +500 胜（遍历序无
+        // 关——DESC 供入序与 ASC 供入序同答案）。
+        let rows = [
+            outgoing_of(&own, (sent - 1_500) as i64),
+            outgoing_of(&own, (sent + 500) as i64),
+        ];
+        let nearest = nearest_outgoing_dispatch(rows.clone().into_iter(), &own, sent);
+        assert!(nearest.dispatched);
+        assert_eq!(nearest.server_timestamp, Some(sent + 500));
+        let nearest_rev = nearest_outgoing_dispatch(rows.into_iter().rev(), &own, sent);
+        assert_eq!(nearest_rev.server_timestamp, nearest.server_timestamp);
+
+        // 他人行（对端来信）永不命中：出站判别 = sender 恒为本机 ACI。
+        let miss = nearest_outgoing_dispatch(
+            [outgoing_of(&aci(peer_uuid), sent as i64)].into_iter(),
+            &own,
+            sent,
+        );
+        assert!(!miss.dispatched);
+        assert_eq!(miss.server_timestamp, None);
+
+        // 混合行集：本机行与对端行并存，只认本机行。
+        let mixed = nearest_outgoing_dispatch(
+            [
+                outgoing_of(&aci(peer_uuid), (sent + 10) as i64),
+                outgoing_of(&own, (sent - 2_000) as i64),
+            ]
+            .into_iter(),
+            &own,
+            sent,
+        );
+        assert!(mixed.dispatched);
+        assert_eq!(mixed.server_timestamp, Some(sent - 2_000));
+
+        // 空窗诚实缺席：零行 → dispatched=false 且无 serverTimestamp。
+        let empty = nearest_outgoing_dispatch(Vec::new().into_iter(), &own, sent);
+        assert!(!empty.dispatched);
+        assert_eq!(empty.server_timestamp, None);
+    }
+
+    /// lookupOutgoingDispatch 应答面形状钉定（内容红线）：成功应答只含
+    /// dispatched / serverTimestamp 两键——dispatched=false 时单键，
+    /// dispatched=true 时双键；无正文/号码/群名/作者键可挂（methods.rs
+    /// 组装面同款两键 Map，此处在类型层再钉一次 no-null 折叠语义）。
+    #[test]
+    fn outgoing_dispatch_response_face_has_no_content_keys() {
+        let own = ServiceId::Aci(
+            presage::libsignal_service::prelude::Uuid::parse_str(
+                "11111111-2222-4333-8444-555555555555",
+            )
+            .unwrap()
+            .into(),
+        );
+        let lookup = nearest_outgoing_dispatch(Vec::new().into_iter(), &own, 1);
+        // no-null：缺席与 false 折叠同一无键态——序列化面只出
+        // {"dispatched":false}。
+        let face = serde_json::json!({
+            "dispatched": lookup.dispatched,
+            "serverTimestamp": lookup.server_timestamp,
+        });
+        assert_eq!(face["dispatched"], serde_json::json!(false));
+        assert_eq!(face["serverTimestamp"], serde_json::json!(null));
+        // 命中面：serverTimestamp 在场为正整数。
+        let hit = nearest_outgoing_dispatch(
+            [presage::libsignal_service::prelude::Content {
+                metadata: presage::libsignal_service::content::Metadata {
+                    sender: own,
+                    destination: own,
+                    sender_device: presage::libsignal_service::protocol::DeviceId::new(1).unwrap(),
+                    pni_verified: None,
+                    client_timestamp: chrono::DateTime::from_timestamp_millis(42).unwrap(),
+                    server_timestamp: chrono::DateTime::from_timestamp_millis(42).unwrap(),
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    server_guid: None,
+                    story: None,
+                    ephemeral: None,
+                    urgent: None,
+                    report_spam_token: None,
+                },
+                body: ContentBody::DataMessage(DataMessage::default()),
+            }]
+            .into_iter(),
+            &own,
+            42,
+        );
+        assert!(hit.dispatched);
+        assert_eq!(hit.server_timestamp, Some(42));
+    }
 
     /// self 解析两臂（self 解析批 2026-10-16，compat §5）：号码臂=数字位
     /// 等于本机号码（E.164/裸号/排版形态同收敛，空串恒否）→ resolve_
