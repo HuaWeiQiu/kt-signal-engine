@@ -1441,6 +1441,53 @@ fn build_message_request_response_sync(
     }
 }
 
+/// attachmentBackfillRequest 同步构帧（官方
+/// getAttachmentBackfillSyncMessage 同构，SendMessage.preload.ts:1987-2018）：
+/// SyncMessage{content: AttachmentBackfillRequest{targetMessage:
+/// AddressableMessage{authorServiceIdBinary|authorServiceId?, sentTimestamp},
+/// targetConversation: ConversationIdentifier{threadServiceIdBinary|
+/// threadServiceId?|threadGroupId}}，padded sync message。target 面与
+/// deleteForMe 构帧单点同源（官方 toAddressableMessage/toConversation
+/// Identifier 同一对辅助函数）：作者 ACI 16B binary 现行面优先、不可解析
+/// 16B 的已闸字符串降写 string 形态；群腿 = 32B master key 原样。
+fn build_attachment_backfill_sync(
+    target: &MessageRequestTarget,
+    author: &presage::libsignal_service::protocol::ServiceId,
+    sent_timestamp: u64,
+) -> presage::proto::SyncMessage {
+    use presage::proto::addressable_message::Author;
+    use presage::proto::conversation_identifier::Identifier;
+
+    let author = if let Some(bytes) = aci_to_bytes(&author.service_id_string()) {
+        Author::AuthorServiceIdBinary(bytes)
+    } else {
+        Author::AuthorServiceId(author.service_id_string())
+    };
+    let identifier = match target {
+        // Thread 腿 = 对端 service id（connector 侧已解析；UUID 形态写
+        // binary 现行面，其余已闸字符串降写 string 形态——消息请求构帧
+        // 同款双形态纪律）。
+        MessageRequestTarget::Thread(peer) => match aci_to_bytes(peer) {
+            Some(bytes) => Identifier::ThreadServiceIdBinary(bytes),
+            None => Identifier::ThreadServiceId(peer.clone()),
+        },
+        MessageRequestTarget::Group(master_key) => Identifier::ThreadGroupId(master_key.clone()),
+    };
+    let request = presage::proto::sync_message::AttachmentBackfillRequest {
+        target_message: Some(presage::proto::AddressableMessage {
+            author: Some(author),
+            sent_timestamp: Some(sent_timestamp),
+        }),
+        target_conversation: Some(presage::proto::ConversationIdentifier {
+            identifier: Some(identifier),
+        }),
+    };
+    presage::proto::SyncMessage {
+        content: Some(presage::proto::sync_message::Content::AttachmentBackfillRequest(request)),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
+}
+
 /// deleteForMeConversation 会话标识（官方 toConversationIdentifier 三形态，
 /// SendMessage.preload.ts:2915）：service id（ACI/PNI）直写
 /// threadServiceIdBinary 现行 binary 面；E164 直写 threadE164；GV2 群 =
@@ -3387,6 +3434,58 @@ impl Service {
         );
         let body =
             ContentBody::SynchronizeMessage(build_message_request_response_sync(&target, r#type));
+        let envelope_ts = now_ms();
+        manager
+            .send_message(own_aci, body, envelope_ts)
+            .await
+            .map_err(send_error_of)?;
+        Ok(())
+    }
+
+    /// requestAttachmentBackfill（附件回填请求写面，KT 扩展方法，官方
+    /// AttachmentBackfill.request 发送面对位，jobs/helpers/attachmentBackfill
+    /// .preload.ts:77-109 + SendMessage.getAttachmentBackfillSyncMessage
+    /// .preload.ts:1987-2018）：本地附件字节缺失且无可下载指针面时，向自己
+    /// ACI 发 SyncMessage.content oneof attachmentBackfillRequest=24
+    /// {targetMessage: AddressableMessage{author, sentTimestamp},
+    /// targetConversation: ConversationIdentifier}——主设备收请求后重上传并
+    /// 回 attachmentBackfillResponse（收投影臂 compat §5
+    /// attachmentBackfillResponse 块，engine 侧 2026-10-17 已落）。会话腿 =
+    /// MessageRequestTarget 同款两腿恰一（Thread = resolve_recipient 号码/
+    /// UUID 双形态 → ACI binary 现行面；Group = 32B master key 原样）；作者 =
+    /// resolve_author_aci 双形态解析（mark_read_state 同口径，不可解析
+    /// fail-closed 整拒）。padded sync message；presage self-send 通路与
+    /// send_message_request_response 同款。写结局即返回值，未知结局不重试。
+    pub(crate) async fn request_attachment_backfill(
+        self: &Arc<Self>,
+        account: &str,
+        target: MessageRequestTarget,
+        author: &str,
+        sent_timestamp: u64,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let author_aci = resolve_author_aci(manager.store(), author)
+            .await
+            .ok_or(SendError::Internal)?;
+        let author_sid =
+            presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(
+                &author_aci,
+            )
+            .ok_or(SendError::Internal)?;
+        let body = ContentBody::SynchronizeMessage(build_attachment_backfill_sync(
+            &target,
+            &author_sid,
+            sent_timestamp,
+        ));
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
         let envelope_ts = now_ms();
         manager
             .send_message(own_aci, body, envelope_ts)
@@ -13496,6 +13595,105 @@ mod tests {
         assert!(dropped.is_empty());
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// 附件回填请求构帧（附件回填闭环批，官方
+    /// getAttachmentBackfillSyncMessage 对位）：content oneof
+    /// attachmentBackfillRequest=24，targetMessage author binary 现行面 +
+    /// sentTimestamp，targetConversation 三腿（serviceId binary / groupId /
+    /// serviceId string 降写）；padded sync message（padding 位非空）。
+    #[test]
+    fn attachment_backfill_request_sync_frame() {
+        use presage::proto::{addressable_message, conversation_identifier, sync_message};
+
+        let author =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("author aci");
+        // direct 腿（UUID 对端）：author binary 面 + serviceId binary 面。
+        let frame = build_attachment_backfill_sync(
+            &MessageRequestTarget::Thread("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned()),
+            &author,
+            1_690_000_000_000,
+        );
+        let Some(sync_message::Content::AttachmentBackfillRequest(request)) = &frame.content else {
+            panic!("content oneof 须为 attachmentBackfillRequest");
+        };
+        let Some(addressable_message::Author::AuthorServiceIdBinary(bytes)) = request
+            .target_message
+            .as_ref()
+            .and_then(|m| m.author.as_ref())
+        else {
+            panic!("author 须为 binary 现行面");
+        };
+        assert_eq!(
+            ServiceId::parse_from_service_id_binary(bytes)
+                .map(|sid| sid.service_id_string())
+                .as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(
+            request
+                .target_message
+                .as_ref()
+                .and_then(|m| m.sent_timestamp),
+            Some(1_690_000_000_000)
+        );
+        let Some(conversation_identifier::Identifier::ThreadServiceIdBinary(peer)) = request
+            .target_conversation
+            .as_ref()
+            .and_then(|c| c.identifier.as_ref())
+        else {
+            panic!("direct 腿须为 serviceId binary 面");
+        };
+        assert_eq!(
+            ServiceId::parse_from_service_id_binary(peer)
+                .map(|sid| sid.service_id_string())
+                .as_deref(),
+            Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        assert!(!frame.padding.is_none(), "padded sync message");
+
+        // 群腿：threadGroupId 原样 32B。
+        let frame = build_attachment_backfill_sync(
+            &MessageRequestTarget::Group(vec![0xAB_u8; 32]),
+            &author,
+            1_690_000_000_001,
+        );
+        let Some(sync_message::Content::AttachmentBackfillRequest(request)) = &frame.content else {
+            panic!("content oneof 须为 attachmentBackfillRequest");
+        };
+        assert!(
+            matches!(
+                request
+                    .target_conversation
+                    .as_ref()
+                    .and_then(|c| c.identifier.as_ref()),
+                Some(conversation_identifier::Identifier::ThreadGroupId(key))
+                    if key == &vec![0xAB_u8; 32]
+            ),
+            "群腿须为 threadGroupId 原样"
+        );
+
+        // 非 UUID 对端（E.164 降写面）：threadServiceId string 腿。
+        let frame = build_attachment_backfill_sync(
+            &MessageRequestTarget::Thread("+15555550101".to_owned()),
+            &author,
+            1_690_000_000_002,
+        );
+        let Some(sync_message::Content::AttachmentBackfillRequest(request)) = &frame.content else {
+            panic!("content oneof 须为 attachmentBackfillRequest");
+        };
+        assert!(
+            matches!(
+                request
+                    .target_conversation
+                    .as_ref()
+                    .and_then(|c| c.identifier.as_ref()),
+                Some(conversation_identifier::Identifier::ThreadServiceId(text))
+                    if text == "+15555550101"
+            ),
+            "非 UUID 对端降写 threadServiceId string 面"
+        );
     }
 
     /// P14 组 6：Keys 整臂收投影——mediaRootBackupKey 标准 base64（非空才

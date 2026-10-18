@@ -45,7 +45,10 @@ use serde_json::{json, Value};
 pub(crate) const DEVICE_CAPABILITIES: DeviceCapabilities = DeviceCapabilities {
     storage: true,
     transfer: false,
-    attachment_backfill: false,
+    // 附件回填闭环批（2026-10-18）：引擎已实现 backfill 请求发送面
+    // （requestAttachmentBackfill）+ 响应收投影臂，按官方桌面「已实现
+    // backfill 恒 true」口径翻位；compat §5 偏差登记同步翻正。
+    attachment_backfill: true,
     spqr: true,
     profiles_v2: false,
     username_change_sync_message: true,
@@ -56,11 +59,13 @@ pub(crate) const DEVICE_CAPABILITIES: DeviceCapabilities = DeviceCapabilities {
 /// 设备面注册位镜像（官方 `CapabilitiesUploadType` 四位，
 /// `ts/types/Capabilities.std.ts`；`PUT /v1/devices/capabilities` body
 /// 逐键同形）：spqr/usernameChangeSyncMessage 与账号属性面同位 true；
-/// attachmentBackfill 官方桌面恒 true（已实现 backfill），引擎未实现
-/// backfill 接收语义宁缺勿错声明 false（compat §5 偏差登记）；optional
-/// _phoneNumber 状态位同 DEVICE_CAPABILITIES 口径 false。
+/// attachmentBackfill 官方桌面恒 true——附件回填闭环批（2026-10-18）起
+/// 引擎同声明 true（请求发送面 + 响应收投影臂均已落库）；link 面
+/// （LinkCapabilities::default()，vendored 恒 false）不在本镜像内，偏差
+/// 登记 compat §5。optional_phoneNumber 状态位同 DEVICE_CAPABILITIES
+/// 口径 false。
 pub(crate) const DEVICE_CAPABILITIES_UPLOAD: CapabilitiesUpload = CapabilitiesUpload {
-    attachment_backfill: false,
+    attachment_backfill: true,
     spqr: true,
     username_change_sync_message: true,
     optional_phone_number: false,
@@ -70,13 +75,13 @@ pub(crate) const DEVICE_CAPABILITIES_UPLOAD: CapabilitiesUpload = CapabilitiesUp
 const _: () = {
     assert!(DEVICE_CAPABILITIES.storage);
     assert!(!DEVICE_CAPABILITIES.transfer);
-    assert!(!DEVICE_CAPABILITIES.attachment_backfill);
+    assert!(DEVICE_CAPABILITIES.attachment_backfill);
     assert!(DEVICE_CAPABILITIES.spqr);
     assert!(!DEVICE_CAPABILITIES.profiles_v2);
     assert!(DEVICE_CAPABILITIES.username_change_sync_message);
     assert!(!DEVICE_CAPABILITIES.versioned_expiration_timer);
     assert!(!DEVICE_CAPABILITIES.optional_phone_number);
-    assert!(!DEVICE_CAPABILITIES_UPLOAD.attachment_backfill);
+    assert!(DEVICE_CAPABILITIES_UPLOAD.attachment_backfill);
     assert!(DEVICE_CAPABILITIES_UPLOAD.spqr);
     assert!(DEVICE_CAPABILITIES_UPLOAD.username_change_sync_message);
     assert!(!DEVICE_CAPABILITIES_UPLOAD.optional_phone_number);
@@ -139,9 +144,17 @@ mod tests {
     fn mirror_agrees_with_live_vendor_constructors() {
         let link = LinkCapabilities::default();
         assert_eq!(link.spqr, DEVICE_CAPABILITIES.spqr);
-        assert_eq!(
+        // 附件回填闭环批（2026-10-18）：账号属性面翻 true 后 link 面
+        // （vendored LinkCapabilities::default() 恒 false）与本位刻意分叉——
+        // 官方 link 面语义 = 链接时协商位，vendor Default 改动走 vendor 台账，
+        // 本镜像只钉「link 面不受账号面翻位牵连」。
+        assert_ne!(
             link.attachment_backfill,
             DEVICE_CAPABILITIES.attachment_backfill
+        );
+        assert!(
+            !link.attachment_backfill,
+            "link 面翻位须走 vendor README 台账并同步本断言"
         );
         assert_eq!(
             link.username_change_sync_message,
@@ -237,7 +250,9 @@ mod tests {
         assert_eq!(device["spqr"], json!(true));
         assert_eq!(device["storage"], json!(true));
         assert_eq!(device["transfer"], json!(false));
-        assert_eq!(device["attachmentBackfill"], json!(false));
+        // 附件回填闭环批（2026-10-18）：已实现 backfill（请求发送面 +
+        // 响应收投影臂）按官方桌面口径恒 true。
+        assert_eq!(device["attachmentBackfill"], json!(true));
         assert_eq!(device["profiles_v2"], json!(false));
         assert_eq!(device["usernameChangeSyncMessage"], json!(true));
         assert_eq!(device["versionedExpirationTimer"], json!(false));
@@ -256,7 +271,7 @@ mod tests {
         );
         assert_eq!(upload["spqr"], json!(true));
         assert_eq!(upload["usernameChangeSyncMessage"], json!(true));
-        assert_eq!(upload["attachmentBackfill"], json!(false));
+        assert_eq!(upload["attachmentBackfill"], json!(true));
         assert_eq!(upload["optionalPhoneNumber"], json!(false));
 
         let link = obj["linkCapabilities"].as_object().expect("object");

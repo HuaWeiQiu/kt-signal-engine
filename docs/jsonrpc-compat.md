@@ -158,6 +158,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `sendViewOnceOpen` | `{account, senderAci(ACI/号码), timestamp(原消息 upstream 时间戳)}` | `{}` | 同 send；senderAci 不可解析/参数缺失或形状错 `-32603` | **P2 real（2026-10-04 阅后即焚扩面）**：官方 syncViewOnceOpen 同构——向自己 ACI 发 SyncMessage.ViewOnceOpen{senderAci, timestamp}（content oneof viewOnceOpen=11，padded；多设备同步「该阅后即焚已被本机打开」），presage self-send 通路验证可行（§5，含钉定 rev 同内容二次转录重发怪癖）；与 sendViewedReceipt（作者面回执）双通道独立；fake：成功 `{}` |
 | `markRead` / `markViewed` | `{account, reads?\|viewed?: [{sender(ACI/号码), timestamp(原消息 upstream 时间戳)}]}`（markRead 用 `reads` 键、markViewed 用 `viewed` 键——官方 syncReadMessages/syncView 参数名同形；条目非空数组，列表缺席/空/非数组/条目缺 sender 或 timestamp/timestamp 非数字/sender 非字符串 `-32603`） | `{}` | sender 号码/UUID 不可解析（contacts 兜底后仍失败）`-32603`（整拒不发半批——发送面参数闸纪律）；未注册账号 `-32603` | **2026-10-11 real（KT 扩展，P14 组 6 自发多设备读态写面）**：官方 syncReadMessages/syncView 同构（SendMessage.preload.ts:2097/:2145）——向自己 ACI 发 SyncMessage.read=5/viewed=16（直接 repeated 字段，非 content oneof，多设备同步「这些消息已读/已看」）；ACI binary+string 双写（官方 isProtoBinaryEncodingEnabled 现行面/旧字符串面双兼容，viewOnceOpen 双写先例同构）；100 条/chunk 分信封（官方 syncHelpers.preload.ts:25 CHUNK_SIZE=100 同构）；padded sync message；与 sendReadReceipt/sendViewedReceipt（作者面 ReceiptMessage 回执）双通道独立（官方 markConversationRead.preload.ts:252 注同位）；接收 echo 面 = §3 receive `syncMessage.read/viewed`（D2）；presage self-send 通路与 sendViewOnceOpen 同款；fake：成功 `{}`（落调度日志，reads/viewed 键逐字保留，协议上行面纪律） |
 | `sendMessageRequestResponse` | `{account, recipient(单值，ACI/号码)\|groupId(32B 标准 base64 群 master key), type}`（**两腿恰一**：direct = recipient、群 = groupId，同置/双缺 `-32603`；type = 官方驼峰词六值白名单 `accept\|delete\|block\|blockAndDelete\|spam\|blockAndSpam`，缺席/`unknown`/数字/词表外/大小写漂移 `-32603`） | `{}`（上游钉定面成功答空结果对象同款） | 参数缺失/type 闸/两腿闸/群腿非 base64 或 ≠32B/recipient 数组 `-32603`；未注册账号 `-32603` | **2026-10-06 real（KT 扩展，§4.56 写面债务批）**：官方桌面 getMessageRequestResponseSync 同构——向自己 ACI 发 SyncMessage.messageRequestResponse{threadAciBinary\|threadAci?, groupId?, type}（content oneof messageRequestResponse=14；ACI 可解析 16B 直写 binary 字段=官方 isProtoBinaryEncodingEnabled 现行面，群 master key 原样=官方 groupId Uint8Array 同位；presage self-send 通路，padding 同源）；与 §3 receive 通知面 `syncMessage.messageRequestResponse` 投影对称（本机写 → 多设备 echo 收）；connector §4.56 `conversations.acceptRequest`/`declineRequest` 的引擎面（上游钉定 `sendMessageRequestResponse` params 逐字对齐：connector 上游 recipient 腿 = 其 peer_key 直通本引擎双形态解析、groupId 腿 = 群 master key、type 由宿主盖章 accept/delete）；写结局即返回值、未知结局不重试纪律不变（connector §4.56 SEND_OUTCOME_UNKNOWN 终态语义的引擎侧对应位）；fake：成功 `{}`（落调度日志，协议上行面纪律） |
+| `requestAttachmentBackfill` | `{account, recipient(单值，对端 service id 串/号码)\|groupId(32B 标准 base64 群 master key), author(非空字符串，消息作者 ACI/号码——resolve_author_aci 双形态解析，不可解析 `-32603`), sentTimestamp(正整数 u64 毫秒)}`（**两腿恰一**：同置/双缺/腿形状非法 `-32603`，sendMessageRequestResponse 同款） | `{}`（写面惯例，成功答空结果对象） | 参数闸（account/author/sentTimestamp 缺席·空串·0·负·非数、recipient 数组、groupId 非 base64·≠32B）`-32603`；未注册账号 `-32603` | **2026-10-18 real（KT 扩展，附件回填闭环批，官方对齐 Signal-Desktop，wire additive【engine-compat】）**：官方 `AttachmentBackfill.request` 发送面对位（jobs/helpers/attachmentBackfill.preload.ts:77-109 触发链 + SendMessage.getAttachmentBackfillSyncMessage .preload.ts:1987-2018 构帧）——本地附件字节缺失且无可下载指针面时，向自己 ACI 发 `SyncMessage.content oneof attachmentBackfillRequest=24 {targetMessage: AddressableMessage{authorServiceIdBinary\|authorServiceId?, sentTimestamp}, targetConversation: ConversationIdentifier{threadServiceIdBinary\|threadServiceId?\|threadGroupId}}`（padded sync message；作者 ACI 16B binary 现行面优先、已闸字符串降写 string 面；群腿 32B master key 原样；target 构帧与 deleteForMe 构帧单点同源 = 官方 toAddressableMessage/toConversationIdentifier 同一对辅助函数）。主设备收请求后重上传并回 `attachmentBackfillResponse`（收投影臂 compat §5 attachmentBackfillResponse 块，2026-10-17 已落）——connector 消费面（locator 列落库）随 connector 契约 1.174 闭环。presage self-send 通路与 sendMessageRequestResponse 同款；写结局即返回值、未知结局不重试；协议上行面落调度日志（send 系同纪律）；fake：成功 `{}` |
 | `getUserStatus` | `{account, recipient}` | `{"isRegistered": true}` | 解绑态 `-32603`（§3 头原文）；未注册账号/其他失败 `-32603` | **P2 real**：whoami 轻量鉴权探测（401→解绑原文，网络失败不误报解绑）；fake 恒已注册 |
 | `getStickerPackManifest` | `{packId(hex 32 小写), packKey(base64 32B)}`（匿名 CDN 只读，无 account） | `{title, author, cover?: {id, emoji?, contentType?} \| null, stickers: [{id, emoji?, contentType?}], stickerCount}`（官方 parseStickerPackManifest 同构：≤1024 截断；cover 官方缺省 null 由端上兜底 stickers[0]；cover 与 stickers 都空 malformed） | 参数缺失/packId 非 32 位小写 hex/packKey 非 32B base64、解密 MAC 失败（与密文损坏密码学不可区分）→ `STICKER_PACK_KEY_INVALID`；CDN 失败 → `STICKER_PACK_FETCH_FAILED`；padding/proto 解码失败 → `STICKER_PACK_MALFORMED`；均 `-1` + message 码位（connector 1.36 白名单逐字，§4.32） | **P4 real**：cdn.signal.org `stickers/{packId}/manifest.proto` 匿名 GET + attachment_cipher 解密；fake：参数面 fail-closed 后 `STICKER_PACK_FETCH_FAILED` |
 | `getStickerImage` | `{packId, packKey, stickerId}` | `{dataBase64, contentType, size}` | 同 getStickerPackManifest，另单图 >300KB → `STICKER_IMAGE_TOO_LARGE` | **P4 real**：`stickers/{packId}/{stickerId}` 匿名 GET + 解密 + WHATWG mimesniff image 魔数嗅探 contentType（未识别回退 `image/webp`）；fake 同 getStickerPackManifest |
@@ -3507,12 +3508,16 @@ afterEveryLinkedStartup → `registerCapabilities`，端点
   口径）；② 新 KT 扩展方法 `engine.deviceCapabilities {account}`（宿
   主可查询/手动重发，成功回 `{account, registered, capabilities}` 上
   传面，错误面 = getUserStatus 同款解绑原文/折叠）。
-- **偏差登记**：① `attachmentBackfill` 引擎设备面声明 false，官方桌
-  面恒 true（desktop 已实现 backfill 语义）——引擎未实现 backfill 接
-  收，宁缺勿错不声明未实现的特性（服务器不再向本设备派发 backfill
-  面，恰为引擎所需）；② 设备面 body 复用四键官方形状，不携带账号属
-  性面六位（官方两面本就不同型，不并面）；③ optionalPhoneNumber 状
-  态位引擎无用户号共享模型，恒 false（账号号码共享态如实声明）。
+- **偏差登记**：① `attachmentBackfill` 引擎设备面声明 ~~false~~ **true
+  （附件回填闭环批 2026-10-18 翻位）**——引擎已实现 backfill 闭环（请求
+  发送面 `requestAttachmentBackfill` 本批落 + 响应收投影臂 2026-10-17 已
+  落），按官方桌面「已实现恒 true」口径声明；翻位前旧登记（宁缺勿错声明
+  false）由本批废止；② link 面（`LinkCapabilities::default()`，vendored
+  链接时协商位）**不随账号面翻位**——vendor Default 改动走 vendor 台账，
+  账号属性面与 link 面在本批起刻意分叉（自证面单测钉定）；③ 设备面
+  body 复用四键官方形状，不携带账号属性面六位（官方两面本就不同型，不
+  并面）；④ optionalPhoneNumber 状态位引擎无用户号共享模型，恒 false
+  （账号号码共享态如实声明）。
 - **fork 台账**：本批 vendor 面（libsignal-service `websocket/account.rs`
   结构体+注册端点、presage `manager/confirmation.rs` 注册链构造点）已
   补登 `vendor/README.md` fork 改动清单；同批补登的还有此前漏登的
@@ -4150,11 +4155,14 @@ additive 接投影，官方 dispatch 七位同位（MessageReceiver.preload.ts
   消费（AttachmentDownloadManager.handleBackfillResponse）。即该请求的
   **接收消费方是手机端（Signal-Android）**，引擎角色 = 桌面（linked
   device），无对应接收消费职责。引擎现状行为与官方桌面收侧一致：
-  `Content::AttachmentBackfillRequest` 落兜底臂整信封丢（零投影）。发送
-  侧亦不实现（引擎元数据投影无媒体落盘缺失场景；`engine.
-  protocolCapabilities` 的 attachmentBackfill 位 = linked-device 能力
-  声明面，与此请求消费面无关，勿混淆）。后续若 connector 提出媒体回填
-  消费需求再立项。
+  `Content::AttachmentBackfillRequest` 落兜底臂整信封丢（零投影）。
+  ~~发送侧亦不实现~~ **发送侧已由附件回填闭环批（2026-10-18）实现：
+  `requestAttachmentBackfill`（§3 行；官方 AttachmentBackfill.request 对
+  位）**——「引擎元数据投影无媒体落盘缺失场景」之判据随 connector 媒体
+  ingest 链落地已不成立（桌面/连接器字节缺失场景实证，connector 契约
+  1.174 闭环批）；`engine.protocolCapabilities` 的 attachmentBackfill 位
+  已随本批翻 true（上 D5 块偏差登记①）。接收消费方仍是手机端，引擎角色
+  = 桌面（linked device），收侧维持零消费与官方桌面一致。
 
 ### P15b 批（2026-10-11，时序自愈审计 + 状态收敛审计落地窗，wire additive）
 
@@ -6076,9 +6084,13 @@ T19 十二条），任务假设「群文本 sent transcript 未发送 → 链接
 - data 臂缺席 → 整信封丢弃（官方 strictAssert 同判）；error/未知枚举值
   投 `UNKNOWN` 词（官方兜 0 同口径，宁收勿丢）。
 
-**消费后续（记档）**：connector 现无消费面（暂以引擎投影事件为准落
- observation）——下游消费（按 targetMessage 定位行更新附件状态）另行
-立项；词表即事件面，先到先消费。
+**消费后续（记档）**：~~connector 现无消费面~~ **已由附件回填闭环批
+（2026-10-18，connector 契约 1.174）闭合**——connector 收臂按
+targetMessage+targetConversation 定位行、把 `attachment` 词条的 locator
+指针面落 schema-19 live 列（status 词条与 error 臂不毁行），桌面重试
+`attachments.download` 即走 §4.54 transit CDN 链；请求侧
+`requestAttachmentBackfill`（§3 行）同批落地，官方 request→response→
+download 三段环全通。
 
 ### verified 发送面对齐收尾（2026-10-17，官方对齐 Signal-Desktop abe80d3 SendMessage.getVerificationSync，wire additive（信封体内填充位）/ 前提勘误【engine-compat】）
 

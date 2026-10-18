@@ -2010,6 +2010,72 @@ async fn dispatch(
                 _ => internal_error(id),
             }
         }
+        // requestAttachmentBackfill（附件回填请求写面，KT 扩展方法，官方
+        // AttachmentBackfill.request 发送面对位，compat §5 附件回填闭环批，
+        // engine-compat）：本地附件字节缺失且无可下载指针面时，向自己
+        // ACI 发 SyncMessage.content oneof attachmentBackfillRequest=24
+        // {targetMessage{author, sentTimestamp}, targetConversation}，主设备
+        // 回 attachmentBackfillResponse 经收投影臂回落（connector 消费面）。
+        // params `{account, recipient?|groupId?, author, sentTimestamp}`：
+        // 两腿恰一（sendMessageRequestResponse 同款：direct = recipient 对端
+        // service id 串，群 = groupId 32B 标准 base64）；author 非空字符串
+        // （消息作者 ACI/号码，resolve_author_aci 双形态解析，不可解析
+        // fail-closed）；sentTimestamp 正整数 u64。参数闸 fail-closed
+        // （-32603）；协议上行面落调度日志（send 系同纪律）；成功答空结果
+        // 对象；未知结局不重试。
+        "requestAttachmentBackfill" => {
+            state.lock().await.append_dispatch(method, params);
+            let account = params.get("account").and_then(Value::as_str);
+            let author = params
+                .get("author")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let sent_timestamp = params
+                .get("sentTimestamp")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0);
+            let recipient = match params.get("recipient") {
+                None | Some(Value::Null) => {
+                    if params.get("groupId").is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) if !text.is_empty() => Some(Some(text.clone())),
+                Some(_) => None,
+            };
+            let group = match params.get("groupId") {
+                None | Some(Value::Null) => {
+                    if recipient.is_some() {
+                        None
+                    } else {
+                        Some(None)
+                    }
+                }
+                Some(Value::String(text)) => {
+                    Some(crate::service::decode_group_id(text).map(MessageRequestTarget::Group))
+                }
+                Some(_) => None,
+            };
+            let target = match (recipient, group) {
+                (Some(Some(text)), None) => Some(MessageRequestTarget::Thread(text)),
+                (None, Some(Some(master_key))) => Some(master_key),
+                _ => None,
+            };
+            match (account, target, author, sent_timestamp) {
+                (Some(account), Some(target), Some(author), Some(sent_timestamp)) => {
+                    match service
+                        .request_attachment_backfill(account, target, author, sent_timestamp)
+                        .await
+                    {
+                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Err(error) => send_error(id, error),
+                    }
+                }
+                _ => internal_error(id),
+            }
+        }
         // deleteForMeConversation（P15c 项3，官方 deleteConversation 发送面
         // 同位，compat §3 行 + §5 P15c 块）：会话级「为我删除」上行。kind
         // 词表 contact/group（legacyGroup 官方不支持——getConversation

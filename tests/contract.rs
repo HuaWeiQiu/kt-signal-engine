@@ -5654,6 +5654,171 @@ fn send_message_request_response_faces_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// requestAttachmentBackfill 写面（附件回填闭环批，compat §3/§5）：官方
+/// AttachmentBackfill.request 发送面对位——本地附件字节缺失且无可下载
+/// 指针面时向自己 ACI 发 SyncMessage.content oneof
+/// attachmentBackfillRequest=24。params `{account, recipient?|groupId?,
+/// author, sentTimestamp}`：两腿恰一（sendMessageRequestResponse 同款）、
+/// author 非空字符串（消息作者 ACI/号码）、sentTimestamp 正整数 u64。
+/// fake 模式合法面成功 `{}`；形状面 fail-closed `-32603`；协议上行面落
+/// 调度日志（send 系同纪律）；real 模式未注册账号折叠 `-32603` 不触网。
+#[test]
+fn request_attachment_backfill_faces_and_param_fail_closed() {
+    use base64::Engine as _;
+    let group_id = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+    let dir = temp_dir("attachment-backfill-request");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let uri = engine.request("startLink", json!({}))["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let number = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    )["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+
+    // fake 合法面：direct 腿（号码作者 + UUID 作者）+ 群腿，成功答空结果
+    // 对象（写面惯例）。
+    for params in [
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "author": "+15555550101",
+            "sentTimestamp": 1_700_000_000_000u64
+        }),
+        json!({
+            "account": number,
+            "recipient": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+            "author": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+            "sentTimestamp": 1_700_000_000_001u64
+        }),
+        json!({
+            "account": number,
+            "groupId": group_id,
+            "author": "+15555550101",
+            "sentTimestamp": 1_700_000_000_002u64
+        }),
+    ] {
+        let ok = engine.request("requestAttachmentBackfill", params.clone());
+        assert_eq!(
+            ok["result"],
+            json!({}),
+            "fake requestAttachmentBackfill ok: {params}"
+        );
+    }
+
+    // 参数面 fail-closed 逐形状：缺 author/author 空串/缺 sentTimestamp/0/
+    // 负/非数、两腿同置/双缺、recipient 数组、groupId 非 base64/≠32B。
+    let rejects = [
+        json!({ "account": number, "recipient": "+15555550101", "sentTimestamp": 1 }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "author": "",
+            "sentTimestamp": 1
+        }),
+        json!({ "account": number, "recipient": "+15555550101", "author": "+15555550101" }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "author": "+15555550101",
+            "sentTimestamp": 0
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "author": "+15555550101",
+            "sentTimestamp": -1
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "author": "+15555550101",
+            "sentTimestamp": "1"
+        }),
+        json!({
+            "account": number,
+            "recipient": "+15555550101",
+            "groupId": group_id,
+            "author": "+15555550101",
+            "sentTimestamp": 1
+        }),
+        json!({ "account": number, "author": "+15555550101", "sentTimestamp": 1 }),
+        json!({
+            "account": number,
+            "recipient": ["+15555550101"],
+            "author": "+15555550101",
+            "sentTimestamp": 1
+        }),
+        json!({
+            "account": number,
+            "groupId": "!!!not-base64!!!",
+            "author": "+15555550101",
+            "sentTimestamp": 1
+        }),
+        json!({
+            "account": number,
+            "groupId": base64::engine::general_purpose::STANDARD.encode([0x22u8; 31]),
+            "author": "+15555550101",
+            "sentTimestamp": 1
+        }),
+    ];
+    for params in &rejects {
+        let response = engine.request("requestAttachmentBackfill", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "requestAttachmentBackfill rejects {params}"
+        );
+    }
+
+    // 调度日志：author/sentTimestamp/腿参数逐字保留（协议上行面纪律，send
+    // 系同款）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let direct = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "requestAttachmentBackfill"
+                && entry["params"].get("recipient").is_some()
+        })
+        .expect("direct-leg backfill logged");
+    assert_eq!(direct["params"]["author"], json!("+15555550101"));
+    assert_eq!(
+        direct["params"]["sentTimestamp"],
+        json!(1_700_000_000_000u64)
+    );
+    let group = entries
+        .iter()
+        .find(|entry| {
+            entry["method"] == "requestAttachmentBackfill"
+                && entry["params"].get("groupId").is_some()
+        })
+        .expect("group-leg backfill logged");
+    assert_eq!(group["params"]["groupId"], json!(group_id));
+
+    // real 模式未注册账号：打开已注册 manager 前置即内部失败（不触网；
+    // send 系同折叠）。
+    let real_dir = temp_dir("attachment-backfill-request-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "requestAttachmentBackfill",
+        json!({
+            "account": "+15559990000",
+            "recipient": "+15555550101",
+            "author": "+15555550101",
+            "sentTimestamp": 1
+        }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// getUsername（用户名读面，KT 扩展方法）：fake 形状桩 `{}`（未设 = 键
 /// 缺席，不发明 null/空串）+ 参数面 fail-closed（缺 account / 非字符串
 /// -32603）+ real 模式未注册账号 -32603（不触网，注册数据前置）。
@@ -6318,7 +6483,9 @@ fn engine_protocol_capabilities_self_report_shape() {
         assert_eq!(device["spqr"], json!(true));
         assert_eq!(device["storage"], json!(true));
         assert_eq!(device["transfer"], json!(false));
-        assert_eq!(device["attachmentBackfill"], json!(false));
+        // 附件回填闭环批（2026-10-18）：引擎已实现 backfill（请求发送面 +
+        // 响应收投影臂），按官方桌面口径恒 true。
+        assert_eq!(device["attachmentBackfill"], json!(true));
         assert_eq!(device["profiles_v2"], json!(false));
         assert_eq!(device["usernameChangeSyncMessage"], json!(true));
         assert_eq!(device["versionedExpirationTimer"], json!(false));
@@ -6342,7 +6509,7 @@ fn engine_protocol_capabilities_self_report_shape() {
         );
         assert_eq!(upload["spqr"], json!(true));
         assert_eq!(upload["usernameChangeSyncMessage"], json!(true));
-        assert_eq!(upload["attachmentBackfill"], json!(false));
+        assert_eq!(upload["attachmentBackfill"], json!(true));
         assert_eq!(upload["optionalPhoneNumber"], json!(false));
 
         let link = obj["linkCapabilities"].as_object().expect("link object");
@@ -6351,6 +6518,8 @@ fn engine_protocol_capabilities_self_report_shape() {
             ["attachmentBackfill", "spqr", "usernameChangeSyncMessage"]
         );
         assert_eq!(link["spqr"], json!(true));
+        // link 面 = vendored LinkCapabilities::default()（链接时协商位），
+        // 账号面翻位不牵连——刻意分叉记档 compat §5 附件回填闭环批。
         assert_eq!(link["attachmentBackfill"], json!(false));
         assert_eq!(link["usernameChangeSyncMessage"], json!(true));
 
@@ -6510,7 +6679,7 @@ fn engine_device_capabilities_register_and_report() {
         ]
     );
     assert_eq!(capabilities["spqr"], json!(true));
-    assert_eq!(capabilities["attachmentBackfill"], json!(false));
+    assert_eq!(capabilities["attachmentBackfill"], json!(true));
     assert_eq!(capabilities["usernameChangeSyncMessage"], json!(true));
     assert_eq!(capabilities["optionalPhoneNumber"], json!(false));
     drop(fake_engine);
