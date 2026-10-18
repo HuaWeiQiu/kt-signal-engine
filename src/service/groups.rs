@@ -199,7 +199,11 @@ pub(crate) fn build_terminate_change(revision: u32) -> presage::proto::group_cha
 /// 官方 buildAccessControlAddFromInviteLinkChange/buildNewGroupLinkChange
 /// 同字段）；link-password 在场 = modify_invite_link_password（原始 16B，
 /// 官方 buildInviteLinkPasswordChange `Bytes.fromBase64` 同位——engine 面
-/// handler 已解 base64，此处不再编码）。一次调用单 Actions 多 action 单次
+/// handler 已解 base64，此处不再编码）；announcements-only 在场 =
+/// modify_announcements_only（明文 bool，官方
+/// buildAnnouncementsOnlyChange/groups.preload.ts:895-904 同形——与
+/// title/timer 加密 blob 族不同，该 action 服务器线面即裸布尔）。
+/// 一次调用单 Actions 多 action 单次
 /// PATCH（§5 群头像上行面批合成裁定；P13/任务2 链接两面顺延同口径）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_update_change(
@@ -210,6 +214,7 @@ pub(crate) fn build_update_change(
     avatar_path: Option<String>,
     add_from_invite_link_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
     invite_link_password: Option<Vec<u8>>,
+    announcements_only: Option<bool>,
     randomness: [u8; 32],
 ) -> presage::proto::group_change::Actions {
     let mut actions = presage::proto::group_change::Actions {
@@ -260,6 +265,13 @@ pub(crate) fn build_update_change(
         actions.modify_invite_link_password = Some(
             presage::proto::group_change::actions::ModifyInviteLinkPasswordAction {
                 invite_link_password: password,
+            },
+        );
+    }
+    if let Some(announcements_only) = announcements_only {
+        actions.modify_announcements_only = Some(
+            presage::proto::group_change::actions::ModifyAnnouncementsOnlyAction {
+                announcements_only,
             },
         );
     }
@@ -927,6 +939,9 @@ pub(crate) struct GroupUpdateWrite {
         Option<presage::libsignal_service::groups_v2::AccessRequired>,
     /// 链接密码写面（P13/任务2，标准 base64 由 handler 解码为原始 16B）。
     pub(crate) invite_link_password: Option<Vec<u8>>,
+    /// 公告群写面（admin 写面批）：modify_announcements_only 直写位
+    /// （明文 bool，非加密 blob——官方 buildAnnouncementsOnlyChange 同形）。
+    pub(crate) announcements_only: Option<bool>,
 }
 
 /// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
@@ -1032,6 +1047,7 @@ pub(crate) async fn update_group_change(
         remove_members,
         add_from_invite_link_access,
         invite_link_password,
+        announcements_only,
     } = write;
     let title = title.as_deref();
     use presage::libsignal_service::groups_v2::GroupMemberCandidate;
@@ -1044,6 +1060,7 @@ pub(crate) async fn update_group_change(
         && remove_members.is_empty()
         && add_from_invite_link_access.is_none()
         && invite_link_password.is_none()
+        && announcements_only.is_none()
     {
         // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
         return Err(TerminateError::UnknownGroup);
@@ -1169,6 +1186,7 @@ pub(crate) async fn update_group_change(
         avatar_path,
         add_from_invite_link_access,
         invite_link_password,
+        announcements_only,
         randomness,
     );
     if !candidates.is_empty() {
@@ -2189,6 +2207,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             randomness,
         );
         assert_eq!(actions.version, 42);
@@ -2251,6 +2270,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             randomness,
         );
         let plaintext = secret_params
@@ -2278,6 +2298,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 randomness
             )
             .version,
@@ -2288,6 +2309,7 @@ mod tests {
                 &secret_params,
                 u32::MAX,
                 Some(60),
+                None,
                 None,
                 None,
                 None,
@@ -2315,6 +2337,7 @@ mod tests {
             &secret_params,
             7,
             Some(60),
+            None,
             None,
             None,
             None,
@@ -3039,6 +3062,7 @@ mod tests {
             Some("avatars/AbCdEf.g".to_owned()),
             None,
             None,
+            None,
             [0u8; 32],
         );
         assert_eq!(replace.version, 42);
@@ -3069,6 +3093,7 @@ mod tests {
             None,
             None,
             Some(String::new()),
+            None,
             None,
             None,
             [0u8; 32],
@@ -3104,6 +3129,7 @@ mod tests {
                 Some("k".to_owned()),
                 None,
                 None,
+                None,
                 [0u8; 32]
             )
             .version,
@@ -3127,6 +3153,7 @@ mod tests {
             Some(3_600),
             None,
             Some("avatars/Key1".to_owned()),
+            None,
             None,
             None,
             [0x78u8; 32],
@@ -3161,7 +3188,17 @@ mod tests {
 
         // 双缺 = 仅 version（零 action 空体；handler 面已闸，此处只钉
         // 合成函数不发明 action）。
-        let empty = build_update_change(&secret_params, 5, None, None, None, None, None, [0u8; 32]);
+        let empty = build_update_change(
+            &secret_params,
+            5,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [0u8; 32],
+        );
         assert_eq!(empty.version, 6);
         assert!(empty.modify_disappearing_message_timer.is_none());
         assert!(empty.modify_avatar.is_none());
@@ -3184,6 +3221,7 @@ mod tests {
             12,
             None,
             Some("新群名"),
+            None,
             None,
             None,
             None,
@@ -3235,6 +3273,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             [0x7au8; 32],
         );
         assert_eq!(combo.version, 6);
@@ -3266,6 +3305,7 @@ mod tests {
             None,
             None,
             Some(AccessRequired::Any),
+            None,
             None,
             [0x7bu8; 32],
         );
@@ -3303,6 +3343,7 @@ mod tests {
             None,
             None,
             Some(password.clone()),
+            None,
             [0x7cu8; 32],
         );
         assert_eq!(reset.version, 4);
@@ -3340,6 +3381,7 @@ mod tests {
             None,
             Some(AccessRequired::Unsatisfiable),
             Some(vec![1, 2, 3, 4]),
+            None,
             [0x7du8; 32],
         );
         assert_eq!(new_link.version, 1);
@@ -3358,6 +3400,118 @@ mod tests {
                 .expect("password 在场")
                 .invite_link_password,
             vec![1, 2, 3, 4]
+        );
+    }
+
+    /// 公告群 change（admin 写面批）：modify_announcements_only 明文 bool
+    /// 直入（非加密 blob——官方 buildAnnouncementsOnlyChange
+    /// groups.preload.ts:895-904 同形）；true/false 两臂都是真写意图；
+    /// wire 字节钉死字段编号（modify_announcements_only = field 21 wire 2，
+    /// 内部 announcements_only bool = field 1 wire 0）；缺席 = action 不在
+    /// 场（合法缺席臂）。
+    #[test]
+    fn announcements_only_change_action_shape() {
+        let master_key = [0x4cu8; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+
+        // true 臂：公告群开启。
+        let enable = build_update_change(
+            &secret_params,
+            7,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            [0x7eu8; 32],
+        );
+        assert_eq!(enable.version, 8);
+        assert!(
+            enable
+                .modify_announcements_only
+                .as_ref()
+                .expect("announcements action 在场")
+                .announcements_only
+        );
+
+        // wire 面：version=8 头（tag 0x10 + 0x08）+ field 21 双字节 tag
+        // 0xaa 0x01 + len 2 + {field 1 varint tag 0x08 + 0x01}，无尾随字段。
+        let bytes = enable.encode_to_vec();
+        assert_eq!(&bytes[0..2], &[0x10, 0x08], "version=8 字段头");
+        assert_eq!(
+            &bytes[2..4],
+            &[0xaa, 0x01],
+            "modify_announcements_only tag (field 21, wire 2)"
+        );
+        assert_eq!(bytes[4], 2, "内层 (0x08, 0x01) 定长");
+        assert_eq!(&bytes[5..7], &[0x08, 0x01], "bool 子字段 tag + true 值");
+        assert_eq!(bytes.len(), 7, "无尾随字段");
+
+        // false 臂：解除公告群（同一 action 位、值 0——proto3 bool 默认值
+        // 不上线，内层空 message 在场即「写 false」语义；对照 true 臂
+        // 0x08 0x01 子字段）。
+        let disable = build_update_change(
+            &secret_params,
+            3,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            [0x7eu8; 32],
+        );
+        assert_eq!(disable.version, 4);
+        assert!(
+            !disable
+                .modify_announcements_only
+                .as_ref()
+                .expect("announcements action 在场")
+                .announcements_only
+        );
+        assert_eq!(
+            disable.encode_to_vec(),
+            vec![0x10, 0x04, 0xaa, 0x01, 0x00],
+            "proto3 默认值省略：内层空 message = false 写意图"
+        );
+
+        // 缺席 = action 不在场（合法缺席臂，其余 action 同缺）。
+        let absent = build_update_change(
+            &secret_params,
+            5,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [0x7eu8; 32],
+        );
+        assert_eq!(absent.version, 6);
+        assert!(absent.modify_announcements_only.is_none());
+
+        // 与 title 组合：同 version 双 action（单 change 单 PATCH 合成裁定）。
+        let combo = build_update_change(
+            &secret_params,
+            5,
+            None,
+            Some("名"),
+            None,
+            None,
+            None,
+            Some(true),
+            [0x7eu8; 32],
+        );
+        assert_eq!(combo.version, 6);
+        assert!(combo.modify_title.is_some());
+        assert!(
+            combo
+                .modify_announcements_only
+                .as_ref()
+                .expect("组合臂 announcements 在场")
+                .announcements_only
         );
     }
 

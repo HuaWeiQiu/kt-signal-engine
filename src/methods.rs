@@ -3883,6 +3883,16 @@ async fn dispatch(
                 }
                 Some(_) => return internal_error(id),
             };
+            // 公告群写面（admin 写面批）：bool 直读——键在场但
+            // null/字符串/数字恒拒（「合法缺席臂」同纪律；两值都是真写
+            // 意图，false = 解除公告群，与 title/expiration 同权计入变更集）。
+            let announcements_only = match params.get("announcementsOnly") {
+                None => None,
+                Some(value) => match value.as_bool() {
+                    Some(flag) => Some(flag),
+                    None => return internal_error(id),
+                },
+            };
             // expiration 键在场但形状非法（null/字符串/负数/小数/超界）恒拒
             // ——与「合法缺席臂」（键不在场，avatar 在场时放行）区分。title
             // 键在场但 null/非字符串/空串恒拒（空串 = 官方 falsy no-op 语义
@@ -3894,7 +3904,7 @@ async fn dispatch(
                 return internal_error(id);
             }
             // 全缺 = 无操作整拒（不静默 no-op）：expiration/title/avatar/
-            // addMembers/removeMembers/链接两面至少一项在场。
+            // addMembers/removeMembers/链接两面/announcementsOnly 至少一项在场。
             if expiration.is_none()
                 && title.is_none()
                 && avatar.is_none()
@@ -3902,6 +3912,7 @@ async fn dispatch(
                 && remove_members.is_empty()
                 && add_from_invite_link_access.is_none()
                 && invite_link_password.is_none()
+                && announcements_only.is_none()
             {
                 return internal_error(id);
             }
@@ -3916,6 +3927,7 @@ async fn dispatch(
                 remove_members,
                 add_from_invite_link_access,
                 invite_link_password,
+                announcements_only,
             };
             match service
                 .update_group_change(account, master_key, write)

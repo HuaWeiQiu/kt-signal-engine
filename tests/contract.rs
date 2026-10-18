@@ -1528,6 +1528,89 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 }
 
+/// 公告群写面（updateGroup {announcementsOnly}，admin 写面批）：fake 模式
+/// true/false 两臂同形成功 `{status:"sent"}`（落调度日志，协议上行面纪律，
+/// groupId 逐字保留）；参数面 fail-closed（-32603：announcementsOnly
+/// null/字符串/数字形状恒拒；键合法缺席 = 原行为）；与 expiration 组合
+/// 合法（同 change 多 action）；real 模式未注册账号折叠 -32603。
+#[test]
+fn update_group_announcements_only_fake_shape_and_param_fail_closed() {
+    let dir = temp_dir("update-group-announcements-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let group_id = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
+
+    // fake 合法面：开/关两臂同形成功（不触网）。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": true })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": false })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // 与 expiration 组合合法（单 change 多 action 合成面）。
+    assert_eq!(
+        engine.request(
+            "updateGroup",
+            json!({
+                "account": "+15550000000",
+                "groupId": group_id,
+                "announcementsOnly": true,
+                "expiration": 3600
+            })
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    // 参数面 fail-closed 逐形状（null/字符串/数字都不是 bool）。
+    let rejects = [
+        json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": null }),
+        json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": "true" }),
+        json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": 1 }),
+        json!({ "account": "+15550000000", "groupId": group_id, "announcementsOnly": [] }),
+    ];
+    for params in &rejects {
+        let response = engine.request("updateGroup", params.clone());
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "updateGroup rejects {params}"
+        );
+    }
+
+    // 调度日志：成功三条 + 拒绝四条 = 7 行，announcementsOnly 键逐字保留。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let set_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["method"] == "updateGroup")
+        .collect();
+    assert_eq!(set_entries.len(), 7, "成功三条 + 拒绝四条均落日志");
+    assert_eq!(set_entries[0]["params"]["announcementsOnly"], json!(true));
+    assert_eq!(set_entries[1]["params"]["announcementsOnly"], json!(false));
+    assert_eq!(set_entries[2]["params"]["announcementsOnly"], json!(true));
+    assert_eq!(set_entries[2]["params"]["expiration"], json!(3600));
+    assert_eq!(set_entries[0]["params"]["groupId"], json!(group_id));
+
+    // real 模式未注册账号：storage 上下文打不开折叠 -32603（expiration 同款）。
+    let real_dir = temp_dir("update-group-announcements-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    let (code, message) = real_engine.error_of(
+        "updateGroup",
+        json!({ "account": "+15559990000", "groupId": group_id, "announcementsOnly": true }),
+    );
+    assert_eq!((code, message.as_str()), (-32603, "Internal error"));
+}
+
 /// updateGroup 群头像上行面（KT 扩展参数族，官方 buildUpdateAttributesChange
 /// 行为对齐）：fake 两臂——avatar 缺省/null 臂成功 `{status:"sent"}`（PATCH
 /// 形状桩）、data URI 臂失败 `GROUP_AVATAR_UPLOAD_FAILED`（data
