@@ -187,14 +187,14 @@
 - `src/push_service/cdn.rs`（同批）— `get_from_cdn`（附件/头像/贴纸
   CDN GET 流式下载面）改走 `download_request`；上传/resume 面不动。
 - `src/websocket/mod.rs`、`src/push_service/mod.rs`（2026-10-16 ka_diag
-  保活可见性诊断批，**临时插桩可整体回退**）— 纯日志：`run` 保活循环
-  加 8 条 `// KA-DIAG` warn 探针（tick 开火带 pending 计数、keepalive
-  send 失败 info→warn、keepalive 应答非 2xx、全部 break/return 退出
-  路径带字面量 reason、spawn 点 `ka_diag task spawned`），全部固定
-  字面量无内容，不改任何行为逻辑（`?` 传播路径仍由既有
-  `SignalWebSocket: {}` error 行覆盖）。背景：WS 管道服务器侧 1001
-  idle timeout 与保活任务静默死亡无第一手证据（"sending keep-alive"
-  为 debug 级不落 engine-stderr.log）。
+  保活可见性诊断批，**临时插桩，已于 2026-10-18 revert 批整体回退**）—
+  当时为纯日志插桩：`run` 保活循环 8 条 + spawn 点 1 条 `// KA-DIAG`
+  warn 探针（tick 开火带 pending 计数、keepalive send 失败 info→warn、
+  keepalive 应答非 2xx、全部 break/return 退出路径带字面量 reason），
+  438f3c9 自标注「可整体回退」；回退批以 revert 438f3c9 新提交逐条
+  移除（含 info→warn 升级还原），源面零 `ka_diag`/`KA-DIAG` 残留，
+  vendor 回到距上游更近状态。该插桩窗口取得的第一手证据已沉淀为
+  2026-10-17 STALE 哨兵批（见下条）。
 - `src/websocket/slot.rs`（2026-10-16 单连接纪律批，新文件）— 进程级
   per-account websocket 槽位注册表（键 = credentials login）：每账号
   identified/unidentified 各至多一条活连接；重拨前先 terminate 旧连接
@@ -258,7 +258,9 @@
   （`STALE_KEEPALIVE_THRESHOLD`，纯函数 `keepalive_is_stale`，官方
   `isOlderThan` 同判含边界）→ 不在该链路上发送，走既有 failed-keepalives
   关闭路径自关重连（close frame reason 字面量 `"stale"` + warn 字面量 +
-  KA-DIAG 退出探针）。背景：机器休眠唤醒后在死链上照发保活（官方桌面
+  退出路径 warn 行——原 KA-DIAG 探针行，2026-10-18 revert 批去词表
+  改写为 `keepalive task exiting: stale keepalive state`，观测语义
+  零损失）。背景：机器休眠唤醒后在死链上照发保活（官方桌面
   WebsocketResources.preload.ts:508 STALE_THRESHOLD_MS=5min / :612-620
   send 前 stale 检查同位；既有 30s 未应答闸只覆盖「发过没回」，不覆盖
   「应答成功后链路静默死亡」）。`keepalive_stale_tests` 三例单测
