@@ -361,6 +361,20 @@ fn message_record(
     }
     if let Some(pin) = &item.pin_details {
         record["pinnedAtTimestamp"] = serde_json::json!(pin.pinned_at_timestamp);
+        // 官方 PinDetails.pinExpiry（Backups.proto:494-500）：限时 pin 的
+        // 绝对到期时刻 / 永不过期 oneof 原样投影；缺席保持缺席（proto 只
+        // 投影不发明，官方 import 侧 strictAssert 的完整性由备份保证）。
+        match pin.pin_expiry {
+            Some(chat_item::pin_details::PinExpiry::PinExpiresAtTimestamp(timestamp)) => {
+                record["pinExpiry"] = serde_json::json!({
+                    "pinExpiresAtTimestamp": timestamp,
+                });
+            }
+            Some(chat_item::pin_details::PinExpiry::PinNeverExpires(never)) => {
+                record["pinExpiry"] = serde_json::json!({ "pinNeverExpires": never });
+            }
+            None => {}
+        }
     }
     if let Some(start) = item.expire_start_date.filter(|start| *start > 0) {
         record["expireStartDate"] = serde_json::json!(start);
@@ -1575,7 +1589,9 @@ mod tests {
                 })),
                 pin_details: Some(PinDetails {
                     pinned_at_timestamp: 300,
-                    pin_expiry: None,
+                    pin_expiry: Some(chat_item::pin_details::PinExpiry::PinExpiresAtTimestamp(
+                        400,
+                    )),
                 }),
                 ..Default::default()
             })),
@@ -1737,6 +1753,7 @@ mod tests {
         assert_eq!(lines[3]["attachments"][0]["size"], 5);
         assert_eq!(lines[3]["quote"]["text"], "quoted");
         assert_eq!(lines[4]["pinnedAtTimestamp"], 300);
+        assert_eq!(lines[4]["pinExpiry"]["pinExpiresAtTimestamp"], 400);
         assert_eq!(lines[4]["direction"], "outgoing");
         // E 批：计时器变更 update 成行（计入 messages），connector 拿去做 system 行。
         assert_eq!(lines[5]["expirationTimerChange"]["expiresInMs"], 86_400_000);
@@ -1847,6 +1864,52 @@ mod tests {
         });
         assert!(malformed.get("aci").is_none());
         assert!(malformed.get("e164").is_none());
+    }
+
+    /// 官方 `PinDetails.pinExpiry` 三态（Backups.proto:494-500）：限时 pin
+    /// 投影绝对到期时刻，永不过期投影 `pinNeverExpires`，oneof 缺席保持缺席
+    /// （proto 只投影不发明）。`pinnedAtTimestamp` 与 expiry 同帧导出。
+    #[test]
+    fn pin_details_project_expiry_oneof_forms() {
+        let pinned_item = |pin_expiry| ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 350,
+            directional_details: Some(chat_item::DirectionalDetails::Incoming(
+                IncomingMessageDetails::default(),
+            )),
+            item: Some(Item::StandardMessage(StandardMessage {
+                text: Some(Text {
+                    body: "pinned".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            pin_details: Some(PinDetails {
+                pinned_at_timestamp: 300,
+                pin_expiry,
+            }),
+            ..Default::default()
+        };
+
+        let timed = test_record(&pinned_item(Some(
+            chat_item::pin_details::PinExpiry::PinExpiresAtTimestamp(400),
+        )))
+        .expect("timed pin is a row");
+        assert_eq!(timed["pinnedAtTimestamp"], 300);
+        assert_eq!(timed["pinExpiry"]["pinExpiresAtTimestamp"], 400);
+        assert!(timed["pinExpiry"].get("pinNeverExpires").is_none());
+
+        let forever = test_record(&pinned_item(Some(
+            chat_item::pin_details::PinExpiry::PinNeverExpires(true),
+        )))
+        .expect("forever pin is a row");
+        assert_eq!(forever["pinExpiry"]["pinNeverExpires"], true);
+        assert!(forever["pinExpiry"].get("pinExpiresAtTimestamp").is_none());
+
+        let absent = test_record(&pinned_item(None)).expect("pin without expiry is a row");
+        assert_eq!(absent["pinnedAtTimestamp"], 300);
+        assert!(absent.get("pinExpiry").is_none());
     }
 
     /// E 批计时器变更行三面：1:1 变更（含 0=关闭语义）、群变更（批内扫描 +
