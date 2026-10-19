@@ -456,6 +456,10 @@ async fn amain() -> ExitCode {
                     let _ = outbound.send_global(OutboundFrame::notice(response)).await;
                 });
             }
+
+            // A4 干净退出：停全部接收管线并等待收口（在飞信封处理臂完成、
+            // Manager drop 时 SQLite store 刷盘），再退出 LocalSet。
+            service.shutdown_all().await;
         })
         .await;
 

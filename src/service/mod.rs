@@ -41,6 +41,9 @@ use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Not
 
 use crate::state::{AccountEntry, EngineState};
 
+/// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
+/// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
+pub(crate) mod account_metrics;
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
@@ -90,6 +93,9 @@ pub(crate) mod storage_sync;
 pub(crate) mod storage_watch;
 pub(crate) mod storage_write;
 pub(crate) mod stories;
+/// 每账号接收管线 supervisor（稳定性批 2026-10-20，审计 S4/A2）：panic
+/// 隔离 + 账号级 Fibonacci+jitter 重启退避（模块头注载官方锚点/纪律）。
+pub(crate) mod supervision;
 pub(crate) mod username;
 /// 出向语音笔记波形+时长生成（send `;voice=true` 面，2026-10-14 批；
 /// 官方 AttachmentPointer.audioWaveform/audioDurationSeconds 算法对齐，
@@ -1990,8 +1996,9 @@ pub(crate) struct Service {
     /// （见 [`outbound`] 模块头注）。
     outbound: Arc<outbound::OutboundHub>,
     inner: AsyncMutex<Inner>,
-    /// 运行中的接收管线（账号 → 停机旗），delete 时通知退出。
-    pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
+    /// 运行中的接收管线（账号 → 停机旗 + 任务句柄），delete/relink 时
+    /// 通知退出并等待收口（A4：停接收 → drop Manager → 落盘）。
+    pipelines: AsyncMutex<HashMap<String, PipelineHandle>>,
     /// 备份导出任务注册表（进程内存，backup_task 模块契约 §10.3）。
     backup_tasks: Arc<backup_task::BackupTaskRegistry>,
     /// 官方快照导入任务注册表（进程内存，snapshot_import 模块 §11）。
@@ -2030,10 +2037,11 @@ pub(crate) struct Service {
     /// 官方 #iceServersCache 对位件 per-account 分桶版，calling_relays
     /// 模块头注载 TTL/失败保旧纪律）。delete_account 摘除。
     calling_relays_cache: AsyncMutex<HashMap<String, calling_relays::CacheEntry>>,
-    /// 群发 MRM 单请求面（C 批提速）：进程级未鉴权 chat WS 连接单槽缓存
-    /// （PUT /v1/messages/multi_recipient 不带账号凭据，跨账号共用）；
-    /// 传输失败摘除重连一次（group_mrm::send_mrm），惰性建连。
-    mrm_chat: AsyncMutex<Option<libsignal_net::chat::ChatConnection>>,
+    /// 群发 MRM 单请求面（C 批提速）：per-account unauth chat WS 连接池
+    /// （PUT /v1/messages/multi_recipient 不带账号凭据，token 自证；连接
+    /// 按账号隔离——R4：单账号失败/重连只摘本槽，不拖垮其他账号；池上限
+    /// 2 = R2 连接预算，全忙 fail-closed 走 failover）。
+    mrm_pool: group_mrm::MrmPool,
     /// profileSharing 闸 whitelist 位缓存（发送长尾修1）：账号 → (位 map,
     /// 过期时刻)，TTL [`WHITELIST_CACHE_TTL`] + 联系人族写面失效；进程内存
     /// 不落盘不跨重启。delete_account 摘除。
@@ -2042,6 +2050,32 @@ pub(crate) struct Service {
     /// 账号 → 回填位 + 过期时刻，TTL [`own_capabilities::CAPABILITIES_CACHE_TTL`]，
     /// 失败不缓存；进程内存不落盘不跨重启。delete/重链摘除。
     own_capabilities_cache: own_capabilities::CapabilitiesCache,
+}
+
+/// 接收管线停机宽限：停旗发出后等待任务收口（drop Manager → SQLite store
+/// 刷盘）的上限。正常收口是 select 的即时臂（毫秒级）；超时只可能发生在
+/// 传输/落库长尾，按有界宽限继续删除流程（账号删除本身是显式破坏性意图）。
+const PIPELINE_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// 运行中的接收管线句柄：停机旗 + 任务句柄（delete/relink 等待收口）。
+struct PipelineHandle {
+    shutdown: watch::Sender<bool>,
+    done: tokio::task::JoinHandle<()>,
+}
+
+/// 等待管线任务收口（有界宽限；超时只落结构化 warn，账号哈希不落号码）。
+async fn await_pipeline_shutdown(account: String, handle: PipelineHandle) {
+    if tokio::time::timeout(PIPELINE_SHUTDOWN_GRACE, handle.done)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: "engine.supervisor",
+            stage = "pipeline_shutdown_timeout",
+            account = %crate::methods::probe_account8(Some(&account)),
+            "pipeline did not stop within grace; continuing",
+        );
+    }
 }
 
 /// 常驻发送管理器缓存：号码 → 共享互斥管理器（Service 同型，单测可断言）。
@@ -2084,7 +2118,7 @@ impl Service {
             conversation_state_books: StdMutex::new(HashMap::new()),
             send_managers: AsyncMutex::new(HashMap::new()),
             calling_relays_cache: AsyncMutex::new(HashMap::new()),
-            mrm_chat: AsyncMutex::new(None),
+            mrm_pool: group_mrm::MrmPool::new(group_mrm::MRM_CONNECTION_LIMIT),
             whitelist_cache: StdMutex::new(HashMap::new()),
             own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
         })
@@ -2152,15 +2186,59 @@ impl Service {
     }
 
     async fn spawn_pipeline(self: &Arc<Self>, number: String, dir: PathBuf) {
+        // relink 同号：先停旧管线并等待收口（A4：停接收 → drop Manager →
+        // 落盘），再挂新 store 目录的管线。启动路径无旧句柄 = no-op。
+        self.stop_pipeline(&number).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let service = Arc::clone(self);
         let task_number = number.clone();
         // presage 的接收流持有非 Send 状态（ThreadRng/dyn ProtocolStore），
         // 进不了 tokio::spawn；统一走 LocalSet（main 装配提供上下文）。
-        tokio::task::spawn_local(async move {
+        let done = tokio::task::spawn_local(async move {
             receive_pipeline(&service, task_number, dir, shutdown_rx).await;
         });
-        self.pipelines.lock().await.insert(number, shutdown_tx);
+        self.pipelines.lock().await.insert(
+            number,
+            PipelineHandle {
+                shutdown: shutdown_tx,
+                done,
+            },
+        );
+    }
+
+    /// 停一个账号的接收管线并等待收口（有界宽限）。幂等：无句柄 = no-op。
+    async fn stop_pipeline(&self, account: &str) {
+        let handle = self.pipelines.lock().await.remove(account);
+        if let Some(handle) = handle {
+            let _ = handle.shutdown.send(true);
+            await_pipeline_shutdown(account.to_owned(), handle).await;
+        }
+    }
+
+    /// 进程收尾：通知全部接收管线停机并等待收口（stdin EOF 的干净退出路径）。
+    /// 在途信封在其处理臂内完成（select 停旗不打断已开始的臂体），Manager
+    /// drop 时 SQLite store 正常收尾——不丢未结算行。
+    pub(crate) async fn shutdown_all(&self) {
+        let handles: Vec<(String, PipelineHandle)> = {
+            let mut pipelines = self.pipelines.lock().await;
+            pipelines.drain().collect()
+        };
+        for (_, handle) in &handles {
+            let _ = handle.shutdown.send(true);
+        }
+        let waits = handles
+            .into_iter()
+            .map(|(account, handle)| await_pipeline_shutdown(account, handle));
+        futures::future::join_all(waits).await;
+    }
+
+    /// `engine.perfMetrics` 快照（S2a 基线 + A1 per-account 观测 additive）：
+    /// 既有 `{uptimeMs,timings,counters,unknownKeyDropped}` 四键不变，追加
+    /// `accounts`（逐账号接收/重连/崩溃面）与 `outbound`（全局/逐账号在途）。
+    pub(crate) fn perf_metrics_snapshot(&self) -> Value {
+        let mut snapshot = perf_metrics::snapshot_json();
+        account_metrics::extend_snapshot(&mut snapshot, &self.outbound);
+        snapshot
     }
 
     pub(crate) async fn start_link(self: &Arc<Self>) -> Result<String, LinkError> {
@@ -2260,6 +2338,8 @@ impl Service {
             return Ok(LinkedAccount { number, aci: None });
         }
         let pending = inner.pending.take().expect("checked");
+        // 会话槽已收走：后续 store/state/pipeline 收口均不持 inner 锁。
+        drop(inner);
         if !device_name.is_empty() {
             let mut store = open_store(&pending.store_dir)
                 .await
@@ -2289,6 +2369,9 @@ impl Service {
             .map_err(|_| LinkError::Internal)?;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
+        // 同号重链：摘除旧 MRM 连接槽（R4 槽按账号生命周期；新身份下次发送
+        // 惰性重建）。
+        self.mrm_pool.remove(&number);
         // 重链 = 新账号身份（新 ACI/新 profile）：能力位缓存一并摘除，
         // 避免旧链接的 profile capabilities 在 TTL 内冒充新账号。
         self.own_capabilities_cache.invalidate(&number);
@@ -2411,16 +2494,21 @@ impl Service {
                 .and_then(|entry| entry.dir.map(|rel| self.data_dir.join(rel)))
         };
         let had_dir = removed_dir.is_some();
+        // A4 收口顺序（官方 MessageReceiver.stopProcessing → drain 同语义，
+        // `ts/textsecure/MessageReceiver.preload.ts:516-547`）：先停接收并等待
+        // 任务退出（drop Manager → SQLite store 刷盘），再删 store 目录——
+        // 避免在飞投影/落库落在已删除目录上。删除是显式破坏性意图，宽限
+        // 超时仍继续（不阻塞连接器）。
+        self.stop_pipeline(account).await;
         if let Some(dir) = removed_dir {
             let _ = std::fs::remove_dir_all(&dir);
         }
-        // 停掉接收管线（fake/无管线时无操作）。锁序 inner < state < pipelines，
-        // 此处 state → pipelines 与 spawn 路径同向，无环。
-        if let Some(shutdown) = self.pipelines.lock().await.remove(account) {
-            let _ = shutdown.send(true);
-        }
         // 摘除常驻发送管理器（若有在途发送，guard 释放后管理器随 Arc 落弃）。
         self.send_managers.lock().await.remove(account);
+        // MRM 连接槽按账号摘除（R4：其他账号槽不受影响）。
+        self.mrm_pool.remove(account);
+        // A1 观测行随账号生命周期摘除。
+        account_metrics::remove_account(account);
         // F 链路观测簿摘除（账号面随注册表生命周期）。
         self.conversation_state_books
             .lock()
@@ -6677,10 +6765,58 @@ async fn derm_send_distribution_or_null(
         .await;
 }
 
+/// 账号接收管线入口（稳定性批 S4/A2/A4）：证书维护任务挂管线生命周期
+/// （panic 重启不重复 spawn）；账号内层循环由 supervisor 包裹，panic 只
+/// 收口本次运行并按账号级 Fibonacci+jitter 退避重启。
 async fn receive_pipeline(
     service: &Arc<Service>,
     number: String,
     dir: PathBuf,
+    shutdown: watch::Receiver<bool>,
+) {
+    // 发送证书后台预轮换任务（止血批③）：与接收循环同生命周期（shutdown
+    // 即止），周期检查 store 持久证书临期并刷新，发送路径只读缓存。
+    let mut cert_shutdown = shutdown.clone();
+    let cert_dir = dir.clone();
+    tokio::spawn(async move {
+        let mut maintenance = CertificateMaintenance::new();
+        loop {
+            tokio::select! {
+                _ = cert_shutdown.changed() => return,
+                _ = tokio::time::sleep(maintenance.delay()) => {
+                    certificate_maintenance_tick(&cert_dir, &mut maintenance).await;
+                }
+            }
+        }
+    });
+    supervision::run_account_supervisor(
+        shutdown,
+        supervision::AccountCrashBackoff::default(),
+        |run_shutdown| receive_account_loop(service, &number, &dir, run_shutdown),
+        reconnect_backoff_delay,
+        |crashes, step, delay| {
+            // 日志零号码/正文/密钥：账号只落不可逆短哈希；panic payload 不落。
+            account_metrics::record_crash(&number);
+            tracing::warn!(
+                target: "engine.supervisor",
+                stage = "account_restart",
+                account = %crate::methods::probe_account8(Some(number.as_str())),
+                crashes,
+                step,
+                delay_ms = delay.as_millis() as u64,
+                "account receive task panicked; restarting after backoff",
+            );
+        },
+    )
+    .await;
+}
+
+/// 单次账号运行态：流内重连由本循环承载（状态跨流存活），panic 时随
+/// supervisor 重启整体重置。
+async fn receive_account_loop(
+    service: &Arc<Service>,
+    number: &str,
+    dir: &Path,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
@@ -6705,46 +6841,37 @@ async fn receive_pipeline(
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
     // （open store/manager/websocket 失败）按步进退避，连接成功清零。
     let mut backoff_step: u32 = 0;
-    // 发送证书后台预轮换任务（止血批③）：与接收循环同生命周期（shutdown
-    // 即止），周期检查 store 持久证书临期并刷新，发送路径只读缓存。
-    let mut cert_shutdown = shutdown.clone();
-    let cert_dir = dir.clone();
-    tokio::spawn(async move {
-        let mut maintenance = CertificateMaintenance::new();
-        loop {
-            tokio::select! {
-                _ = cert_shutdown.changed() => return,
-                _ = tokio::time::sleep(maintenance.delay()) => {
-                    certificate_maintenance_tick(&cert_dir, &mut maintenance).await;
-                }
-            }
-        }
-    });
     loop {
         if *shutdown.borrow() {
             return;
         }
         let mut serve_rx = shutdown.clone();
-        let outcome = tokio::select! {
-            _ = shutdown.changed() => return,
-            outcome = serve_account_stream(
-                service,
-                &number,
-                &dir,
-                &mut serve_rx,
-                &mut last_contacts_sync,
-                &mut derm_guard,
-                &mut receipts,
-                &mut capabilities_registered,
-                &mut skew_gate,
-            ) => outcome,
-        };
+        // 不在外层 select 取消 serve_account_stream：停旗只在信封臂之间生效
+        // （serve_account_stream 自身的 shutdown 臂），在飞信封处理走完
+        // 当前臂体后才收口——A4 不丢未结算行。停旗期间阻塞等 10s 宽限由
+        // delete/shutdown_all 承担。
+        let outcome = serve_account_stream(
+            service,
+            number,
+            dir,
+            &mut serve_rx,
+            &mut last_contacts_sync,
+            &mut derm_guard,
+            &mut receipts,
+            &mut capabilities_registered,
+            &mut skew_gate,
+        )
+        .await;
+        if *shutdown.borrow() {
+            return;
+        }
         // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
         // 不退避重连；结构化上抛一次（wire additive，compat §5）。
         if outcome == StreamOutcome::Unbound {
             perf_metrics::add(perf_metrics::keys::STREAM_UNBOUND, 1);
+            account_metrics::record_stream(number, account_metrics::StreamEvent::Unbound);
             service
-                .notify(&number, account_unbound_notification(&number))
+                .notify(number, account_unbound_notification(number))
                 .await;
             return;
         }
@@ -6758,9 +6885,11 @@ async fn receive_pipeline(
         // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
         backoff_step = if outcome == StreamOutcome::Connected {
             perf_metrics::add(perf_metrics::keys::STREAM_CONNECTED, 1);
+            account_metrics::record_stream(number, account_metrics::StreamEvent::Connected);
             0
         } else {
             perf_metrics::add(perf_metrics::keys::STREAM_RECOVERABLE, 1);
+            account_metrics::record_stream(number, account_metrics::StreamEvent::Recoverable);
             backoff_step.saturating_add(1)
         };
         let delay = reconnect_jittered_delay(reconnect_backoff_delay(backoff_step));
@@ -6776,9 +6905,16 @@ async fn receive_pipeline(
     }
 }
 
+/// 信封到达 → ack 完成：既有全局计时 + A1 逐账号序列（单点，不复制语义）。
+fn record_receive_envelope(account: &str, started: std::time::Instant) {
+    let us = started.elapsed().as_micros() as u64;
+    perf_metrics::record_us(perf_metrics::keys::RECEIVE_ENVELOPE, us);
+    account_metrics::record_receive(account, us);
+}
+
 /// Fibonacci 退避基值（官方 Desktop BackOff.std.ts 同序列）：1,1,2,3,5,8,
 /// 13,21,34,55，封顶 55s。step=0 → 1s。
-fn reconnect_backoff_delay(step: u32) -> Duration {
+pub(crate) fn reconnect_backoff_delay(step: u32) -> Duration {
     const STEP_MS: u64 = 1_000;
     const CAP_MS: u64 = 55_000;
     let (mut a, mut b) = (0u64, STEP_MS);
@@ -6793,7 +6929,7 @@ fn reconnect_backoff_delay(step: u32) -> Duration {
 /// 退避 jitter（官方 BackOff.get 同语义）：`jitter < result` 才叠加
 /// `random()*jitter` 且单向正值——短拍（≤5s 档，含首拍 1s 与 5s 档）
 /// 恒精确不被 jitter 拖慢，长拍单向上浮消重连峰。
-fn reconnect_jittered_delay(base: Duration) -> Duration {
+pub(crate) fn reconnect_jittered_delay(base: Duration) -> Duration {
     const JITTER_MS: u64 = 5_000;
     if base.as_millis() <= JITTER_MS as u128 {
         return base;
@@ -7092,6 +7228,8 @@ async fn serve_account_stream(
             item = stream.next() => {
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
+                // A1 观测：该账号接收在飞置 1（离开臂体含提前 return 自动归 0）。
+                let _inflight = account_metrics::ReceiveInflight::enter(number);
                 match item {
                 // QueueEmpty：历史队列排空，流继续保持（queue 标记在
                 // messagepipe 层已就地 ack）。G3：排空态 additive 上抛
@@ -7123,10 +7261,7 @@ async fn serve_account_stream(
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
@@ -7151,20 +7286,14 @@ async fn serve_account_stream(
                         derm_handle(&mut manager, sender, failure, derm_guard).await;
                     }
                     quick_seen += 1;
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
                 Some(Received::Duplicate(ack)) => {
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DUPLICATE, 1);
                     quick_seen += 1;
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 // 群取回失败（接收完整性批②，compat §3 additive）：同信封
@@ -7202,10 +7331,7 @@ async fn serve_account_stream(
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                 }
                 // 身份钥变更（B4 身份事件面，compat §5）：解密时 store 侧
                 // identity 被替换（会话按新钥重建，OnNewIdentity::Trust
@@ -7229,6 +7355,13 @@ async fn serve_account_stream(
                             content.metadata.server_timestamp.timestamp_millis(),
                         )
                         .await;
+                    // A1 观测：与 Content 臂同口径的接收延迟。
+                    account_metrics::record_receive_lag(
+                        number,
+                        now_ms().saturating_sub(
+                            content.metadata.server_timestamp.timestamp_millis().max(0) as u64,
+                        ),
+                    );
                     service
                         .notify(
                             number,
@@ -7256,10 +7389,7 @@ async fn serve_account_stream(
                         return StreamOutcome::StdioDead;
                     }
                     quick_seen += 1;
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
@@ -7275,6 +7405,14 @@ async fn serve_account_stream(
                             content.metadata.server_timestamp.timestamp_millis(),
                         )
                         .await;
+                    // A1 观测：服务器入队时刻 → 本地处理时刻（负偏移归 0；
+                    // 时钟偏移本身由上面 ClockSkewGate 独立告警）。
+                    account_metrics::record_receive_lag(
+                        number,
+                        now_ms().saturating_sub(
+                            content.metadata.server_timestamp.timestamp_millis().max(0) as u64,
+                        ),
+                    );
                     // B4 身份事件面：verified 同步下行（多设备信任态收敛）
                     // ——sidecar 权威突变 + receive 事件投影，先于普通投影
                     // 面（该体在 project_content 恒空投影，零冲突）。
@@ -7333,10 +7471,7 @@ async fn serve_account_stream(
                         manifest_debounce.on_fetch(now_ms());
                     }
                     quick_seen += 1;
-                    perf_metrics::record_us(
-                        perf_metrics::keys::RECEIVE_ENVELOPE,
-                        envelope_started.elapsed().as_micros() as u64,
-                    );
+                    record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                     None => {
@@ -11197,9 +11332,10 @@ async fn dispatch_group(
     // C 批提速：sender-key + 单请求 MRM 主路径；目标过少/MRM 链路不可用
     // 时内部 failover 回 vendored 逐收件人路径（官方合法 fallback）。
     let started = std::time::Instant::now();
-    let sent =
-        group_mrm::dispatch_group_message(service, manager, group_id, body, timestamp, self_sync)
-            .await;
+    let sent = group_mrm::dispatch_group_message(
+        service, account, manager, group_id, body, timestamp, self_sync,
+    )
+    .await;
     // S2a 打点：群发送整体耗时（MRM/failover 汇总咽喉；P12 #11 观测面）。
     perf_metrics::record_us(
         perf_metrics::keys::SEND_GROUP_TOTAL,
@@ -15813,6 +15949,78 @@ mod tests {
             rows[0].get("capabilities").is_none(),
             "读不到 profile = 整键缺席，不投 false"
         );
+    }
+
+    /// A4：deleteAccount 的收口顺序 = 停接收 → 等在飞处理单元完成 → drop
+    /// Manager（store 落盘）→ 删目录。停机过程中有在飞帧时，删除等待它
+    /// 结算，目录在结算前不消失（不丢未结算行）。
+    #[tokio::test]
+    async fn delete_account_waits_for_inflight_envelope_before_removing_store() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-delete-drain-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let store_dir = data_dir.join("accounts/lk-drain");
+                std::fs::create_dir_all(&store_dir).expect("store dir");
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                state
+                    .lock()
+                    .await
+                    .add_account(
+                        "+15550009999".to_owned(),
+                        Some("accounts/lk-drain".to_owned()),
+                    )
+                    .expect("add account");
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let settled = std::rc::Rc::new(std::cell::Cell::new(false));
+                let settled_task = std::rc::Rc::clone(&settled);
+                let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+                let done = tokio::task::spawn_local(async move {
+                    // 在飞信封：停旗到达后仍完成当前处理单元（select 停旗
+                    // 不打断已开始的臂体），之后才 drop Manager（此处以
+                    // 置位代替 store 收口）。
+                    started_tx.send(()).expect("started");
+                    let _ = shutdown_rx.changed().await;
+                    let _ = release_rx.await;
+                    settled_task.set(true);
+                });
+                service.pipelines.lock().await.insert(
+                    "+15550009999".to_owned(),
+                    PipelineHandle {
+                        shutdown: shutdown_tx,
+                        done,
+                    },
+                );
+
+                let delete_service = Arc::clone(&service);
+                let delete = tokio::task::spawn_local(async move {
+                    delete_service.delete_account("+15550009999").await
+                });
+                started_rx.await.expect("pipeline running");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(
+                    !delete.is_finished(),
+                    "删除必须等在飞处理单元结算，不得提前返回"
+                );
+                assert!(store_dir.exists(), "结算前 store 目录不得删除");
+
+                release_tx.send(()).expect("release");
+                let removed = delete.await.expect("delete task").expect("delete ok");
+                assert!(removed);
+                assert!(settled.get(), "在飞处理单元已结算后才收口");
+                assert!(!store_dir.exists(), "收口后目录删除");
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
     }
 
     /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid
