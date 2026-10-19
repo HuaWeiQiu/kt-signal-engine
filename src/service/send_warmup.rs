@@ -213,7 +213,7 @@ async fn warm_chunk(dir: &Path, targets: &[ServiceId]) -> (u64, u64) {
 ///
 /// 全失败面静默不上抛（零 stderr 纪律），观测只走本探针行；fake 模式
 /// 早退（与 [`warm_after_profile_refresh`] 同姿态）。正文/号码不入日志，
-/// 账号仅前 8 字符前缀（probe_account8 单点）。
+/// 账号仅投 SHA-256 前 8 hex（probe_account8 单点，不可逆）。
 pub(crate) async fn warm_whitelist_cache(service: &Arc<Service>, account: &str) {
     if !service.real {
         return;

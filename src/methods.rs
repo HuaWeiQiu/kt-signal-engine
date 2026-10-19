@@ -5144,11 +5144,26 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
 /// （接收完整性批②）→ `-1` + `GROUP_SYNC_FAILED` + `data.count`（vendored
 /// 重试环尝试次数，additive，compat §3）；其余（账号不可达/内部
 /// 失败）→ -32603 细节不外泄。
-/// 发送延迟探针账号前缀：前 8 字符（字符界安全截取，非字节切片）。
+/// 发送延迟探针账号前缀：账号的 SHA-256 前 8 个 hex 字符（不可逆）。
+/// 2026-10-20 隐私修复：原实现取前 8 个字符，E.164 账号会把
+/// `+8618827…` 这类号码前缀写进 `engine-stderr.log`；改为哈希后仍可
+/// 在同一账号的日志行之间做相关性，但不可还原为号码。空/缺席保持空串
+/// （与原实现同形，避免日志格式变化）。
 /// pub(crate)：service 侧沉降带探针（send_warmup whitelist 预热行）复用
 /// 同一截取纪律，单点不复制。
 pub(crate) fn probe_account8(account: Option<&str>) -> String {
-    account.unwrap_or_default().chars().take(8).collect()
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let Some(account) = account.filter(|value| !value.is_empty()) else {
+        return String::new();
+    };
+    let digest = Sha256::digest(account.as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.iter() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded.truncate(8);
+    encoded
 }
 
 fn send_error(id: &Value, error: crate::service::SendError) -> Value {
@@ -5241,6 +5256,27 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-20 隐私修复：账号前缀日志必须不可逆。原实现取 E.164 前 8
+    /// 字符（`+8618827…`）直接落盘；改为 SHA-256 前 8 hex 后，同一账号
+    /// 可关联、但无法还原号码。空/缺席保持空串（日志格式不变）。
+    #[test]
+    fn probe_account8_hashes_the_account_and_never_leaks_the_number() {
+        let account = "+8618827970450";
+        let probe = probe_account8(Some(account));
+        assert_eq!(probe.len(), 8);
+        assert!(probe.chars().all(|value| value.is_ascii_hexdigit()));
+        let raw_prefix: String = account.chars().take(8).collect();
+        assert_ne!(probe, raw_prefix, "probe must not be the raw number prefix");
+        assert_eq!(
+            probe,
+            probe_account8(Some(account)),
+            "same account, same probe"
+        );
+        assert_ne!(probe, probe_account8(Some("+8618827970451")));
+        assert_eq!(probe_account8(None), "");
+        assert_eq!(probe_account8(Some("")), "");
+    }
 
     /// sendError 解绑臂形状面：`-32603` + getUserStatus 同款解绑原文
     /// （单一常量，不发明新字符串）。connector 分类器
