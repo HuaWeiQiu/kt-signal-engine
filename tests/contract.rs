@@ -7596,6 +7596,150 @@ fn delete_for_me_conversation_faces_and_param_fail_closed() {
     assert_eq!(logged_local["params"]["localOnly"], json!(true));
 }
 
+/// deleteForMeMessages（leg 3/3，官方 getDeleteForMeSyncMessage
+/// messageDeletes 发送面同位）：fake 成功形状桩 `{status: "sent"}`；参数
+/// fail-closed -32603：会话标识与会话级同源（kind contact/group、
+/// contact service-id/E164、group 32B master key）、entries 必填非空
+/// ≤256、条目 author/timestamp 形状闸；real 模式未注册账号折叠 -32603
+/// （不触网）；协议上行面落调度日志。
+#[test]
+fn delete_for_me_messages_faces_and_param_fail_closed() {
+    let dir = temp_dir("delete-for-me-messages");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let account = "+15550000000";
+    let aci = "11111111-2222-4333-8444-555555555555";
+    let group_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    // contact service-id：批量 entries（两条）成功。
+    assert_eq!(
+        engine.request(
+            "deleteForMeMessages",
+            json!({ "account": account, "kind": "contact", "conversationId": aci,
+                    "entries": [
+                        { "author": aci, "timestamp": 42 },
+                        { "author": "+15555550101", "timestamp": 43 }
+                    ] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // E164 会话 + E164 作者。
+    assert_eq!(
+        engine.request(
+            "deleteForMeMessages",
+            json!({ "account": account, "kind": "contact", "conversationId": "+15555550101",
+                    "entries": [{ "author": "+15555550101", "timestamp": 42 }] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // 群形态（32B master key）。
+    assert_eq!(
+        engine.request(
+            "deleteForMeMessages",
+            json!({ "account": account, "kind": "group", "conversationId": group_id,
+                    "entries": [{ "author": aci, "timestamp": 42 }] }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+    // 帽边界：256 条恰可过。
+    let cap_entries = (0..256)
+        .map(|i| json!({ "author": aci, "timestamp": i + 1 }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        engine.request(
+            "deleteForMeMessages",
+            json!({ "account": account, "kind": "contact", "conversationId": aci,
+                    "entries": cap_entries }),
+        )["result"],
+        json!({ "status": "sent" })
+    );
+
+    let rejects = [
+        // 缺 account / kind / conversationId / entries。
+        json!({ "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact",
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci }),
+        // kind 词表外 / legacyGroup（官方非 GV2 群不支持）。
+        json!({ "account": account, "kind": "bogus", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "legacyGroup", "conversationId": "abc",
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        // contact 标识既非 service-id 也非 E164。
+        json!({ "account": account, "kind": "contact", "conversationId": "not-an-id",
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        // group 非 base64 / ≠32B。
+        json!({ "account": account, "kind": "group", "conversationId": "%%%",
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "group", "conversationId": "AAA=",
+                "entries": [{ "author": aci, "timestamp": 42 }] }),
+        // entries 空批 / null / 非数组 / 超帽 257。
+        json!({ "account": account, "kind": "contact", "conversationId": aci, "entries": [] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci, "entries": null }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci, "entries": "x" }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": (0..257).map(|i| json!({ "author": aci, "timestamp": i + 1 })).collect::<Vec<_>>() }),
+        // 条目形状：author 不可解析/缺失、timestamp 缺失/0/负数/非整数、
+        // 条目非对象。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": "whoami", "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "timestamp": 42 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 0 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": -1 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 1.5 }] }),
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [42] }),
+        // 任一条目坏整批拒（不发半批）。
+        json!({ "account": account, "kind": "contact", "conversationId": aci,
+                "entries": [{ "author": aci, "timestamp": 42 },
+                            { "author": "whoami", "timestamp": 43 }] }),
+    ];
+    for params in &rejects {
+        assert_eq!(
+            engine.error_of("deleteForMeMessages", params.clone()).0,
+            -32603,
+            "deleteForMeMessages reject {params}"
+        );
+    }
+
+    // 调度日志：协议上行面逐字保留（send 系同纪律；无消息正文）。
+    let log_path = dir.join("engine-send-log.jsonl");
+    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line JSON"))
+        .collect();
+    let logged = entries
+        .iter()
+        .find(|entry| entry["method"] == "deleteForMeMessages")
+        .expect("deleteForMeMessages logged");
+    assert_eq!(logged["params"]["kind"], json!("contact"));
+    assert_eq!(
+        logged["params"]["entries"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    // real 模式未注册账号：打开已注册 manager 前置即内部失败（不触网）。
+    let real_dir = temp_dir("delete-for-me-messages-real");
+    let mut real_engine = Engine::spawn(&real_dir);
+    assert_eq!(
+        real_engine.error_of(
+            "deleteForMeMessages",
+            json!({ "account": "+15559990000", "kind": "contact", "conversationId": aci,
+                    "entries": [{ "author": aci, "timestamp": 42 }] }),
+        ),
+        (-32603, "Internal error".to_owned())
+    );
+}
+
 /// history.importCancel（存量历史导入取消，KT 扩展方法）：按账号中止在途
 /// 导入任务（transfer_archive 下载 + 云备份 restore 两腿）并清理半成品与
 /// 快照面。契约面钉定：无在途任务 = `{"cancelled": false}` 幂等成功（不

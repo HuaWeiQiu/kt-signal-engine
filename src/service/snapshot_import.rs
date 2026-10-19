@@ -307,7 +307,6 @@ mod tests {
     use presage::libsignal_service::utils::{phonenumber_from_signal, TryIntoE164};
     use presage::manager::RegistrationData;
     use serde_json::json;
-    use tokio::sync::mpsc;
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
@@ -588,7 +587,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let (outbound, _rx) = crate::service::outbound::test_hub();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         // 注册数据 + AEP 落 store（backup_task.rs 同款 serde 形状）。
@@ -682,7 +681,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let (outbound, _rx) = crate::service::outbound::test_hub();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         {
@@ -775,7 +774,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let (outbound, _rx) = crate::service::outbound::test_hub();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         let idle = service

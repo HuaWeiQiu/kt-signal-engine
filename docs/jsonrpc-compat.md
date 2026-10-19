@@ -236,6 +236,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
 | `engine.perfMetrics` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{uptimeMs, timings, counters, unknownKeyDropped}`（timings 条目 `{count, totalUs, maxUs, lastUs}` 微秒制、键序 BTreeMap 确定性；词表封闭见 §5 S2a 块——未命中的计时/计数键不出现，诚实缺席不发明 0） | 无（只读快照应答，无业务错误面；fake/real 同码路真实答——指标是进程真相，不分模式） | **2026-10-12 real（KT 扩展，S2a 性能基线打点层，【engine-compat】，§5 S2a 块）**：进程内有界指标注册表的只读投影（只测不改立项纪律，`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md` §附四②）；快照进程内存不跨重启；词表外键计 `unknownKeyDropped` 丢弃（有界面）；消费面 = connector 白名单透传（**connector 切片遗留**）+ S2b 直连实测 harness；不落调度日志零 stderr |
 | `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
+| `deleteForMeMessages` | `{account, kind("contact"\|"group"), conversationId, entries: [{author, timestamp}]}`（消息级「为我删除」上行，官方 `getDeleteForMeSyncMessage` 的 `messageDeletes` 发送面同位。会话标识与会话级 `deleteForMeConversation` 完全同源：kind contact = service-id 串（ACI/PNI）\|E164 双形态，group = 32B 标准 base64 master key；legacyGroup 同拒。`entries` 必填非空、≤256 条——官方发送面按 `MAX_MESSAGE_COUNT=500` 分批（SendMessage.preload.ts:1923），引擎单请求 fail-closed 不拆批不静默截断，超帽整批拒。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换），timestamp 非零正整数；任一条目形状错整批拒不发半批） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错、entries 缺席·null·非数组·空批·超 256、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数、条目非对象）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-20 real（KT 扩展，leg 3/3，官方对齐 Signal-Desktop，engine-compat，§5 leg 3/3 块）**：向本账号其他设备同步「这些消息也删掉」——`SyncMessage.deleteForMe.messageDeletes[0]{conversation, messages[]}`（官方 SendMessage.preload.ts:1840-1936 构帧；收方 MessageReceiver.preload.ts:3609-3657 逐条走 delete-message）；session 级与消息级共用 conversation/addressable 构帧单点；padded sync message，self-send 到本账号 ACI；协议上行面落调度日志（send 系同纪律，无消息正文/媒体内容）；fake：成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定） |
 | `getConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup}`（kind 词表与会话引用形状同 setConversationBlocked 面） | `{mutedUntilTimestamp, archived, markedUnread}`（三键恒在；目标记录缺席/无 storage 状态/manifest 404 = 全缺省 `0/false/false`，诚实幂等不报错） | 未注册账号 `-32603`；kind 缺失/词表外、会话不可解析/形状错 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2，状态收敛审计 R1，wire additive，§5 P15b 块）**：真相源 = Storage Service record 字段（非 sync message）——ContactRecord.archived/markedUnread/mutedUntilTimestamp（SignalStorage.proto 11/12/13）与 GV2/GV1 同名位（4/5/6）；MuteExpiration.toProto 语义 = 绝对毫秒、0 = 未静音；fake：恒缺省态（契约测试钉定） |
 | `setConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup, mutedUntilTimestamp?, archived?, markedUnread?}`（部分写意图——缺席位不动；mutedUntilTimestamp = 非负整数毫秒、两位布尔；null/形状错整拒；三 flag 全缺 = 无写意图 `-32603`） | `{mutedUntilTimestamp, archived, markedUnread}`（写后目标三 flag 投影，getConversationState 同形状；官方 upload 成功语义 = 本地写后面为准） | 参数形状错（见左）/kind 词表外/会话不可解析/未注册账号 `-32603`；storage 链路：PUT 失败/409 采纳重放连满 3 次 `STORAGE_WRITE_FAILED`、服务不可达 `STORAGE_UNAVAILABLE`、读取失败 `STORAGE_READ_FAILED`（均 `-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2）**：复用 blocked/sticker 写面既有编排（read 改写 decode→mutate→encode 保真、新 16B item id、WriteOperation version+1、409 采纳重放）；同值幂等无写；目标记录缺席非缺省意图 = 最小记录首建（标识 + 三 flag，fresh_blocked_record 同构）、全缺省不空造记录；noteToSelf kind 不收（官方走 AccountRecord.noteToSelf* 位且无静音位，消费方提出再立项，偏差登记）；fake：缺省态叠意图回显（契约测试钉定） |
 
@@ -6644,6 +6645,72 @@ profile、不回读，jsonRpc 面无供给腿。
   覆盖三种字节转换逐字、空腿缺席、clientUuid 非 16B/全零、conversation/
   targetMessage/author/sentTimestamp 缺失逐条丢、四臂同信封并存、仅无效
   条目时整信封丢。
+
+### deleteForMe messageDeletes 发送面批（leg 3/3，2026-10-20，官方对齐 Signal-Desktop，wire additive【engine-compat】）
+
+DFM 三腿收口：leg 1/3 = attachmentDeletes 收投影（上节）、leg 2/3 =
+connector 消费面（异仓）、leg 3/3 = 本批消息级发送面。此前引擎只有会话级
+`deleteForMeConversation`（整会话清空 / 仅本地），缺官方
+`getDeleteForMeSyncMessage` 的 `messageDeletes` 臂——桌面单条/多选「为我
+删除」无法同步给本账号其他设备。
+
+官方锚点：
+
+- 构帧 `ts/textsecure/SendMessage.preload.ts:1840-1936`：按会话聚合
+  `messageDeletes`，每组 `{conversation, messages:
+  items.map(toAddressableMessage)}`；`messages` 用 `toAddressableMessage`
+  （:2871）与 `conversation` 用 `toConversationIdentifier`（:2915），会话级
+  mostRecent* 与 attachmentDeletes 同源。官方发送侧 `MAX_MESSAGE_COUNT=500`
+  分批（`ts/util/deleteForMe.types.std.ts:4`，超限只 warn 不截断，
+  SendMessage.preload.ts:1923）。
+- 收方 `ts/textsecure/MessageReceiver.preload.ts:3609-3657`：逐条
+  `processAddressableMessage`，conversation/messages 任一不可解析整组丢；
+  有效条目展开为 `delete-message`（每条独立任务）。引擎收投影面
+  （§5 六问批 Q6②）此前已上线，本批只补发送面。
+
+引擎实现：
+
+```jsonc
+// deleteForMeMessages params
+{
+  "account": "+15551234567",
+  "kind": "contact",            // contact | group（legacyGroup 拒）
+  "conversationId": "9d0e5f1a-2b3c-4d5e-8f60-7a8b9c0d1e2f",
+  "entries": [
+    { "author": "6a2cb17f-…", "timestamp": 1699999000000 },
+    { "author": "+15550009999", "timestamp": 1699999000001 }
+  ]
+}
+// success: { "status": "sent" }
+```
+
+- **wire 帧**：`SyncMessage{content: DeleteForMe{messageDeletes: [
+  MessageDeletes{conversation, messages[]}]}}`，padded sync message，经
+  `ContentBody::SynchronizeMessage` self-send 到本账号 ACI（与
+  deleteForMeConversation / sendMessageRequestResponse 同一条 presage
+  通路）。一次 RPC 只服务一个会话，故恰一条 MessageDeletes。
+- **会话标识**：与会话级同源单点（`delete_for_me_conversation_identifier`）
+  ——ACI/PNI service id → `threadServiceIdBinary`、E164 → `threadE164`、
+  GV2 → `threadGroupId` 32B master key 原样；非 GV2 群官方发送面 throw，
+  引擎 API 面同拒。
+- **条目**：`{author, timestamp}` 直通（`delete_for_me_addressable_message`
+  单点，官方 toAddressableMessage 同构）——author service-id/E164 不做号码
+  ↔service id 二次变换（(author, timestamp) 必须与手机端消息行逐字匹配）；
+  timestamp 非零正整数；任一条目坏整批 `-32603`，不发半批。
+- **有界**：`entries` 必填非空且 ≤256（`MAX_DELETE_FOR_ME_MESSAGES`）——
+  官方 500/批是客户端分批上限，引擎单 RPC 不替调用方拆批：超帽 fail-closed
+  整批拒，避免静默截断破坏性意图；256 与 connector 消费投影
+  `MAX_SYNC_DELETE_GROUP_MESSAGES` 同值。
+- **日志**：协议上行参数落调度日志（send 系同纪律；本方法无消息正文或媒体
+  载荷，日志面只有会话标识与 (author, timestamp) 定位元数据）。
+- **错误面**：参数层 `-32603`；未注册账号 `-32603`；发送链错误按
+  `send_error_of` 分类（与 send / deleteForMeConversation 同款）。
+- **fake**：成功 `{status: "sent"}` 形状桩，参数闸在 dispatch 层先于 fake
+  早退（契约测试钉定）。
+- **测试**：service 侧 `delete_for_me_messages_sync_shapes` 钉三形态会话
+  标识与 author binary/E164 字节面、其余三臂空；契约侧
+  `delete_for_me_messages_faces_and_param_fail_closed` 覆盖 fake 成功、
+  256 帽边界、逐参数拒、real 未注册折叠与调度日志。
 
 ## 6. fake 服务模式（仅测试）
 

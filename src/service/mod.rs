@@ -37,7 +37,7 @@ use rand::rng;
 use rand::Rng;
 use reqwest::Method;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 
 use crate::state::{AccountEntry, EngineState};
 
@@ -57,6 +57,9 @@ pub(crate) mod group_cache;
 pub(crate) mod group_link;
 pub(crate) mod groups;
 pub(crate) mod identity;
+/// stdout 出站通道有界化（稳定性批）：全局 writer 队列 + 每账号背压队列
+/// （模块头注载容量/公平/死亡语义）。
+pub(crate) mod outbound;
 /// 本机账号 profile capabilities 读面（回填能力门数据面，2026-10-20 批，
 /// wire additive；模块头注载来源/隐私红线/缓存与预算纪律）。
 pub(crate) mod own_capabilities;
@@ -1576,6 +1579,47 @@ pub(crate) enum DeleteForMeAuthor {
     Phone(String),
 }
 
+/// DeleteForMe 会话标识构帧单点（官方 toConversationIdentifier 三形态，
+/// SendMessage.preload.ts:2915）：service id（ACI/PNI）直写
+/// threadServiceIdBinary 现行 binary 面；E164 直写 threadE164；GV2 群 =
+/// 32B master key 原样 bytes。会话级与消息级两条发送臂共用（官方
+/// getDeleteForMeSyncMessage 对所有 DeleteForMe 条目同调该辅助函数）。
+fn delete_for_me_conversation_identifier(
+    conversation: &DeleteForMeConversation,
+) -> presage::proto::ConversationIdentifier {
+    use presage::proto::conversation_identifier::Identifier;
+
+    let identifier = match conversation {
+        DeleteForMeConversation::Contact(sid) => {
+            Identifier::ThreadServiceIdBinary(sid.service_id_binary())
+        }
+        DeleteForMeConversation::Phone(e164) => Identifier::ThreadE164(e164.clone()),
+        DeleteForMeConversation::Group(master_key) => Identifier::ThreadGroupId(master_key.clone()),
+    };
+    presage::proto::ConversationIdentifier {
+        identifier: Some(identifier),
+    }
+}
+
+/// DeleteForMe 消息条目构帧单点（官方 toAddressableMessage 同构：
+/// author ACI/PNI/E164 三形态 + sentTimestamp；SendMessage.preload.ts:2871）。
+/// 会话级 mostRecent* 与消息级 messages 两臂共用。
+fn delete_for_me_addressable_message(
+    entry: &DeleteForMeEntry,
+) -> presage::proto::AddressableMessage {
+    use presage::proto::addressable_message::Author;
+
+    presage::proto::AddressableMessage {
+        author: Some(match &entry.author {
+            DeleteForMeAuthor::ServiceId(sid) => {
+                Author::AuthorServiceIdBinary(sid.service_id_binary())
+            }
+            DeleteForMeAuthor::Phone(e164) => Author::AuthorE164(e164.clone()),
+        }),
+        sent_timestamp: Some(entry.timestamp),
+    }
+}
+
 /// DeleteForMe 会话级构帧（官方 getDeleteForMeSyncMessage delete-conversation
 /// / delete-local-conversation 两变体同位，SendMessage.preload.ts:1840/
 /// conversations.preload.ts:5640-5663）：全量清空臂 = conversationDeletes[0]
@@ -1589,28 +1633,7 @@ fn build_delete_for_me_conversation_sync(
     most_recent: &[DeleteForMeEntry],
     most_recent_non_expiring: &[DeleteForMeEntry],
 ) -> presage::proto::SyncMessage {
-    use presage::proto::addressable_message::Author;
-    use presage::proto::conversation_identifier::Identifier;
-
-    let identifier = match conversation {
-        DeleteForMeConversation::Contact(sid) => {
-            Identifier::ThreadServiceIdBinary(sid.service_id_binary())
-        }
-        DeleteForMeConversation::Phone(e164) => Identifier::ThreadE164(e164.clone()),
-        DeleteForMeConversation::Group(master_key) => Identifier::ThreadGroupId(master_key.clone()),
-    };
-    let entry_of = |entry: &DeleteForMeEntry| presage::proto::AddressableMessage {
-        author: Some(match &entry.author {
-            DeleteForMeAuthor::ServiceId(sid) => {
-                Author::AuthorServiceIdBinary(sid.service_id_binary())
-            }
-            DeleteForMeAuthor::Phone(e164) => Author::AuthorE164(e164.clone()),
-        }),
-        sent_timestamp: Some(entry.timestamp),
-    };
-    let conversation_identifier = presage::proto::ConversationIdentifier {
-        identifier: Some(identifier),
-    };
+    let conversation_identifier = delete_for_me_conversation_identifier(conversation);
     let delete_for_me = if local_only {
         presage::proto::sync_message::DeleteForMe {
             local_only_conversation_deletes: vec![
@@ -1626,10 +1649,13 @@ fn build_delete_for_me_conversation_sync(
                 presage::proto::sync_message::delete_for_me::ConversationDelete {
                     conversation: Some(conversation_identifier),
                     is_full_delete: Some(true),
-                    most_recent_messages: most_recent.iter().map(entry_of).collect(),
+                    most_recent_messages: most_recent
+                        .iter()
+                        .map(delete_for_me_addressable_message)
+                        .collect(),
                     most_recent_non_expiring_messages: most_recent_non_expiring
                         .iter()
-                        .map(entry_of)
+                        .map(delete_for_me_addressable_message)
                         .collect(),
                 },
             ],
@@ -1639,6 +1665,42 @@ fn build_delete_for_me_conversation_sync(
     presage::proto::SyncMessage {
         content: Some(presage::proto::sync_message::Content::DeleteForMe(
             delete_for_me,
+        )),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
+}
+
+/// deleteForMeMessages 单请求条目帽（官方 SendMessage.preload.ts:1923
+/// 用 MAX_MESSAGE_COUNT=500 分批，每批超限只 warn 不截断；引擎单 RPC
+/// 按破坏性意图 fail-closed：超帽整批拒，不静默截断也不拆批，调用方
+/// 自行分批。取值对齐 connector 消费面
+/// `MAX_SYNC_DELETE_GROUP_MESSAGES = 256`（kt-signal-connector
+/// src/engine.rs），与 attachmentDeletes 收投影帽同值）。
+pub(crate) const MAX_DELETE_FOR_ME_MESSAGES: usize = 256;
+
+/// DeleteForMe 消息级构帧（官方 getDeleteForMeSyncMessage messageDeletes
+/// 臂，SendMessage.preload.ts:1840-1936；收方处理同位
+/// MessageReceiver.preload.ts:3609-3657）：SyncMessage.deleteForMe.
+/// messageDeletes[0]{conversation, messages[]}——官方按会话聚合，
+/// `messages = items.map(toAddressableMessage)`；本方法一次 RPC 只服务
+/// 一个会话，故恰一条 MessageDeletes。padded sync message。
+fn build_delete_for_me_messages_sync(
+    conversation: &DeleteForMeConversation,
+    entries: &[DeleteForMeEntry],
+) -> presage::proto::SyncMessage {
+    let message_deletes = presage::proto::sync_message::delete_for_me::MessageDeletes {
+        conversation: Some(delete_for_me_conversation_identifier(conversation)),
+        messages: entries
+            .iter()
+            .map(delete_for_me_addressable_message)
+            .collect(),
+    };
+    presage::proto::SyncMessage {
+        content: Some(presage::proto::sync_message::Content::DeleteForMe(
+            presage::proto::sync_message::DeleteForMe {
+                message_deletes: vec![message_deletes],
+                ..presage::proto::sync_message::DeleteForMe::default()
+            },
         )),
         ..presage::proto::SyncMessage::with_padding(&mut rng())
     }
@@ -1744,12 +1806,12 @@ async fn pull_storage_manifest(
     if groups.is_err() {
         perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
     }
-    service.notify(storage_pull_notification(
-        account,
-        trigger,
-        contacts.is_ok(),
-        groups.is_ok(),
-    ));
+    service
+        .notify(
+            account,
+            storage_pull_notification(account, trigger, contacts.is_ok(), groups.is_ok()),
+        )
+        .await;
     (contacts, groups)
 }
 
@@ -1923,8 +1985,10 @@ pub(crate) struct Service {
     real: bool,
     state: Arc<AsyncMutex<EngineState>>,
     /// receive 通知出口（与 JSON-RPC 响应同一 stdout writer 队列；帧协议
-    /// 见 main::OutboundFrame——Notice 直通，Flush 背压栅栏）。
-    outbound: mpsc::UnboundedSender<crate::OutboundFrame>,
+    /// 见 main::OutboundFrame——Notice 直通，Flush 背压栅栏）。全局队列
+    /// 有界 + 每账号在途许可有界，`notify` 在账号许可耗尽时对单账号背压
+    /// （见 [`outbound`] 模块头注）。
+    outbound: Arc<outbound::OutboundHub>,
     inner: AsyncMutex<Inner>,
     /// 运行中的接收管线（账号 → 停机旗），delete 时通知退出。
     pipelines: AsyncMutex<HashMap<String, watch::Sender<bool>>>,
@@ -1995,7 +2059,7 @@ impl Service {
     pub(crate) fn new(
         data_dir: PathBuf,
         state: Arc<AsyncMutex<EngineState>>,
-        outbound: mpsc::UnboundedSender<crate::OutboundFrame>,
+        outbound: Arc<outbound::OutboundHub>,
     ) -> Arc<Self> {
         let real = !mode_from_env();
         Arc::new(Self {
@@ -2026,18 +2090,21 @@ impl Service {
         })
     }
 
-    /// stdout 通知入队（fire-and-forget；行序 = 队列序，writer 死亡静默）。
-    pub(crate) fn notify(&self, value: Value) {
-        let _ = self.outbound.send(crate::OutboundFrame::Notice(value));
+    /// stdout 通知入队（账号在途许可 + 全局有界队列；行序 = 队列序）。
+    /// 账号许可耗尽时等待该账号帧被 writer 写出（单账号背压，不阻塞其他
+    /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
+    /// ack 安全性由 flush 栅栏兜底）。
+    pub(crate) async fn notify(&self, account: &str, value: Value) -> bool {
+        self.outbound.notify(account, value).await
     }
 
-    /// flush 背压栅栏（时序审计 G1）：resolve = 此前全部已入队通知已写进
-    /// stdout 并 flush（连接器至少收到字节）；`false` = 出口已死（writer
-    /// 退出/通道关闭）——调用方据此放弃 ack，让服务器队列保留信封待重启
-    /// 重放，连接器侧永不缺投影。
-    pub(crate) async fn flush_barrier(&self) -> bool {
+    /// flush 背压栅栏（时序审计 G1）：resolve = 该账号此前全部已入队通知
+    /// 已写进 stdout 并 flush（连接器至少收到字节）；`false` = 出口已死
+    /// （writer 退出/通道关闭）——调用方据此放弃 ack，让服务器队列保留
+    /// 信封待重启重放，连接器侧永不缺投影。
+    pub(crate) async fn flush_barrier(&self, account: &str) -> bool {
         let started = std::time::Instant::now();
-        let resolved = crate::outbound_flush_barrier(&self.outbound).await;
+        let resolved = self.outbound.flush(account).await;
         // S2a 打点：栅栏时长 + 成败计数（O3 flush_barrier 批量化候选的
         // 基线测量面；只测不改，语义零变化）。
         perf_metrics::record_us(
@@ -3701,6 +3768,42 @@ impl Service {
         Ok(())
     }
 
+    /// deleteForMeMessages（leg 3/3，官方 getDeleteForMeSyncMessage
+    /// messageDeletes 发送面同构，SendMessage.preload.ts:1840-1936）：
+    /// 消息级「为我删除」上行——把一个会话内的若干消息行（author +
+    /// sentTimestamp 定位）同步给本账号其他设备，收方按官方
+    /// MessageReceiver.preload.ts:3609-3657 逐条走 delete-message。
+    /// 向自己 ACI 发 SyncMessage.deleteForMe.messageDeletes[0]
+    /// （content oneof deleteForMe=22，padded sync message；构帧单点
+    /// build_delete_for_me_messages_sync）。fake 成功早退（形状桩）。
+    pub(crate) async fn send_delete_for_me_messages(
+        self: &Arc<Self>,
+        account: &str,
+        conversation: DeleteForMeConversation,
+        entries: Vec<DeleteForMeEntry>,
+    ) -> Result<(), SendError> {
+        if !self.real {
+            return Ok(());
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(SendError::UnknownAccount)?;
+        let mut manager = lock_registered_for_send(&shared).await;
+        let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
+            manager.registration_data().service_ids.aci.into(),
+        );
+        let body = ContentBody::SynchronizeMessage(build_delete_for_me_messages_sync(
+            &conversation,
+            &entries,
+        ));
+        let envelope_ts = now_ms();
+        manager
+            .send_message(own_aci, body, envelope_ts)
+            .await
+            .map_err(send_error_of)?;
+        Ok(())
+    }
+
     /// sendCallMessage 1:1 臂（通话消息面，KT 扩展方法）：官方
     /// Content.callMessage=3 信封。构造面 = build_call_message 单点（opaque
     /// 为 Signal-RTC 层信令负载，引擎不解析只透传，桌面 callingMessage 面
@@ -4955,7 +5058,8 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         let (outcome, observed) = storage_merge::merge_contacts(context, now_ms()).await?;
-        self.publish_conversation_state_observations(account, observed);
+        self.publish_conversation_state_observations(account, observed)
+            .await;
         Ok(outcome)
     }
 
@@ -4972,14 +5076,15 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         let (outcome, observed) = storage_merge::import_groups(context).await?;
-        self.publish_conversation_state_observations(account, observed);
+        self.publish_conversation_state_observations(account, observed)
+            .await;
         Ok(outcome)
     }
 
     /// F 链路观测发布（merge 两族共用单点）：观测批过 per-account 簿差分，
     /// 真实翻转非空才合成一条 `receive.conversationState` 通知（批内合流
     /// + 批帽截断在 storage_watch 内；簿锁内无 await/无 notify）。
-    fn publish_conversation_state_observations(
+    async fn publish_conversation_state_observations(
         &self,
         account: &str,
         observed: Vec<(
@@ -5008,9 +5113,11 @@ impl Service {
         if flips.is_empty() {
             return;
         }
-        self.notify(storage_watch::conversation_state_notification(
-            account, &flips,
-        ));
+        self.notify(
+            account,
+            storage_watch::conversation_state_notification(account, &flips),
+        )
+        .await;
     }
 
     /// F 链路消费方已知态登记（防回声/防冗余单点）：本机写后
@@ -6188,13 +6295,14 @@ impl ClockSkewGate {
         }
     }
 
-    fn observe(&mut self, service: &Arc<Service>, number: &str, server_ts_ms: i64) {
+    async fn observe(&mut self, service: &Arc<Service>, number: &str, server_ts_ms: i64) {
         if let Some(SkewTransition::Alert(skew)) = self.step(server_ts_ms, now_ms() as i64) {
-            service.notify(clock_skew_notification(
-                number,
-                skew,
-                server_ts_ms.max(0) as u64,
-            ));
+            service
+                .notify(
+                    number,
+                    clock_skew_notification(number, skew, server_ts_ms.max(0) as u64),
+                )
+                .await;
         }
     }
 }
@@ -6635,7 +6743,9 @@ async fn receive_pipeline(
         // 不退避重连；结构化上抛一次（wire additive，compat §5）。
         if outcome == StreamOutcome::Unbound {
             perf_metrics::add(perf_metrics::keys::STREAM_UNBOUND, 1);
-            service.notify(account_unbound_notification(&number));
+            service
+                .notify(&number, account_unbound_notification(&number))
+                .await;
             return;
         }
         // StdioDead（时序审计 G1）：stdout 已死（连接器侧断开/半开管道），
@@ -6995,7 +7105,9 @@ async fn serve_account_stream(
                     // 也恒产出、每流恰一次，vendored presage 无条件透传
                     // 不丢弃，武装必达）。
                     skew_gate.arm();
-                    service.notify(queue_emptied_notification(number));
+                    service
+                        .notify(number, queue_emptied_notification(number))
+                        .await;
                 }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
                 // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
@@ -7006,9 +7118,9 @@ async fn serve_account_stream(
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
                     for notification in project_contacts_sync(number, &sync) {
-                        service.notify(notification);
+                        service.notify(number, notification).await;
                     }
-                    if !service.flush_barrier().await {
+                    if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
                     perf_metrics::record_us(
@@ -7026,8 +7138,13 @@ async fn serve_account_stream(
                 // 全链路失败静默，绝不影响 ack。
                 Some(Received::DecryptionError(sender, timestamp, failure, ack)) => {
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DECRYPTION_ERROR, 1);
-                    service.notify(decryption_error_notification(number, &sender, timestamp));
-                    if !service.flush_barrier().await {
+                    service
+                        .notify(
+                            number,
+                            decryption_error_notification(number, &sender, timestamp),
+                        )
+                        .await;
+                    if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
                     if let Some(failure) = failure {
@@ -7068,16 +7185,21 @@ async fn serve_account_stream(
                         base64::engine::general_purpose::STANDARD.encode(master_key);
                     match kind {
                         presage::model::messages::GroupSyncFailureKind::Decode => {
-                            service.notify(group_sync_failed_notification(
-                                number, &group_id, attempts,
-                            ));
+                            service
+                                .notify(
+                                    number,
+                                    group_sync_failed_notification(number, &group_id, attempts),
+                                )
+                                .await;
                         }
                         presage::model::messages::GroupSyncFailureKind::Gone => {
                             service.terminated_groups.register(&group_id);
-                            service.notify(group_gone_notification(number, &group_id));
+                            service
+                                .notify(number, group_gone_notification(number, &group_id))
+                                .await;
                         }
                     }
-                    if !service.flush_barrier().await {
+                    if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
                     perf_metrics::record_us(
@@ -7100,16 +7222,23 @@ async fn serve_account_stream(
                     let _ = identity::mark_identity_replaced(dir, &sid_string, now_ms());
                     // P15b 项8：偏移观测（IdentityChange 臂同 Content 臂；
                     // 积压免疫武装前置——disarmed 时 no-op）。
-                    skew_gate.observe(
-                        service,
-                        number,
-                        content.metadata.server_timestamp.timestamp_millis(),
-                    );
-                    service.notify(identity_changed_notification(
-                        number,
-                        &sender,
-                        content.metadata.client_timestamp.timestamp_millis().max(0) as u64,
-                    ));
+                    skew_gate
+                        .observe(
+                            service,
+                            number,
+                            content.metadata.server_timestamp.timestamp_millis(),
+                        )
+                        .await;
+                    service
+                        .notify(
+                            number,
+                            identity_changed_notification(
+                                number,
+                                &sender,
+                                content.metadata.client_timestamp.timestamp_millis().max(0) as u64,
+                            ),
+                        )
+                        .await;
                     for notification in
                         project_content(
                             number,
@@ -7120,10 +7249,10 @@ async fn serve_account_stream(
                         )
                         .await
                     {
-                        service.notify(notification);
+                        service.notify(number, notification).await;
                     }
                     // G1：ack 前等 flush 栅栏（同 Content 臂）。
-                    if !service.flush_barrier().await {
+                    if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
                     quick_seen += 1;
@@ -7139,18 +7268,20 @@ async fn serve_account_stream(
                     // P15b 项8 时钟偏移闸：服务器时间戳 vs 本地钟（边缘触发
                     // 告警上抛，不拒信封不停车，§5 偏差登记；积压免疫武装
                     // 前置——排水完成前的信封不喂闸，见 ClockSkewGate）。
-                    skew_gate.observe(
-                        service,
-                        number,
-                        content.metadata.server_timestamp.timestamp_millis(),
-                    );
+                    skew_gate
+                        .observe(
+                            service,
+                            number,
+                            content.metadata.server_timestamp.timestamp_millis(),
+                        )
+                        .await;
                     // B4 身份事件面：verified 同步下行（多设备信任态收敛）
                     // ——sidecar 权威突变 + receive 事件投影，先于普通投影
                     // 面（该体在 project_content 恒空投影，零冲突）。
                     if let Some(notification) =
                         project_verified_sync(number, manager.store(), &content, dir).await
                     {
-                        service.notify(notification);
+                        service.notify(number, notification).await;
                     }
                     // 官方契约：解密+落库+投影完成后才 ack（Android
                     // IncomingMessageObserver.kt 事务提交后逐条 ack；
@@ -7175,9 +7306,9 @@ async fn serve_account_stream(
                         )
                         .await
                     {
-                        service.notify(notification);
+                        service.notify(number, notification).await;
                     }
-                    if !service.flush_barrier().await {
+                    if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
                     // D1 自动 delivery receipt 排队闸（官方 handleDataMessage
@@ -15583,8 +15714,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
 
         seed_store_with_aci(
             &data_dir,
@@ -15662,8 +15793,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
         open_store(&data_dir.join("accounts/test-unregistered"))
             .await
             .expect("empty store opens");
@@ -18866,8 +18997,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
 
         let store_dir =
             std::env::temp_dir().join(format!("kt-engine-sps2-{:016x}", mix_seed_step(mix_seed())));
@@ -19486,14 +19617,14 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir, Arc::clone(&state), tx);
+        let (outbound, mut rx) = outbound::test_hub();
+        let service = Service::new(data_dir, Arc::clone(&state), outbound);
 
         let now = now_ms() as i64;
         let stale = now - 25 * 60 * 60 * 1_000; // 数天前入队的积压信封
-        let clockskew_notices = |rx: &mut mpsc::UnboundedReceiver<crate::OutboundFrame>| {
+        let clockskew_notices = |rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundFrame>| {
             let mut notices = Vec::new();
-            while let Ok(crate::OutboundFrame::Notice(value)) = rx.try_recv() {
+            while let Ok(crate::OutboundFrame::Notice { value, .. }) = rx.try_recv() {
                 if value["method"] == json!("receive.clockskew") {
                     notices.push(value);
                 }
@@ -19506,7 +19637,7 @@ mod tests {
             alerted: false,
             armed: false,
         };
-        gate.observe(&service, "acct", stale);
+        gate.observe(&service, "acct", stale).await;
         assert!(
             clockskew_notices(&mut rx).is_empty(),
             "disarmed observe 不上抛"
@@ -19514,7 +19645,7 @@ mod tests {
 
         // ② QueueEmpty 排空标记后（arm）：同一旧时间戳恰一条告警。
         gate.arm();
-        gate.observe(&service, "acct", stale);
+        gate.observe(&service, "acct", stale).await;
         let notices = clockskew_notices(&mut rx);
         assert_eq!(notices.len(), 1, "armed 首越阈恰一条 receive.clockskew");
         assert_eq!(notices[0]["params"]["account"], json!("acct"));
@@ -19523,18 +19654,18 @@ mod tests {
             "skew = 本地 − 服务器，积压信封入队时刻在过去 → 本地「快」为正（假告警形状）"
         );
         // 持续越阈静默：同态再喂零新通知。
-        gate.observe(&service, "acct", stale);
+        gate.observe(&service, "acct", stale).await;
         assert!(clockskew_notices(&mut rx).is_empty());
 
         // ③ 新流 disarm 后喂旧时间戳：零上抛且 alerted 保持；重新武装 +
         // 新鲜时间戳 Rearm 后再越阈照旧重新上抛（边缘触发不变）。
         gate.disarm();
-        gate.observe(&service, "acct", stale);
+        gate.observe(&service, "acct", stale).await;
         assert!(clockskew_notices(&mut rx).is_empty());
         gate.arm();
-        gate.observe(&service, "acct", now);
+        gate.observe(&service, "acct", now).await;
         assert!(clockskew_notices(&mut rx).is_empty(), "回阈内 Rearm 无告警");
-        gate.observe(&service, "acct", stale);
+        gate.observe(&service, "acct", stale).await;
         assert_eq!(clockskew_notices(&mut rx).len(), 1, "重臂后再越阈重新告警");
     }
 
@@ -19553,8 +19684,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir, Arc::clone(&state), tx);
+        let (outbound, mut rx) = outbound::test_hub();
+        let service = Service::new(data_dir, Arc::clone(&state), outbound);
 
         let contact = storage_sync::EngineConversationId::Contact(
             "11111111-2222-4333-8444-555555555555".to_owned(),
@@ -19566,12 +19697,17 @@ mod tests {
         };
 
         // 首批观测 = 种子静默。
-        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(0))]);
+        service
+            .publish_conversation_state_observations("acct", vec![(contact.clone(), flags(0))])
+            .await;
         assert!(rx.try_recv().is_err(), "首观测种子静默");
 
         // 真实翻转 → 恰一条通知帧（批内合流），形状 = 词表第五词钉定面。
-        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))]);
-        let crate::OutboundFrame::Notice(value) = rx.try_recv().expect("flip notifies") else {
+        service
+            .publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))])
+            .await;
+        let crate::OutboundFrame::Notice { value, .. } = rx.try_recv().expect("flip notifies")
+        else {
             panic!("notice frame");
         };
         assert_eq!(value["jsonrpc"], json!("2.0"));
@@ -19590,18 +19726,26 @@ mod tests {
         assert!(rx.try_recv().is_err(), "一次 merge 批合成恰一条");
 
         // 值未变（合并但无翻转）→ 零帧。
-        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))]);
+        service
+            .publish_conversation_state_observations("acct", vec![(contact.clone(), flags(7))])
+            .await;
         assert!(rx.try_recv().is_err(), "值未变不发");
 
         // 本机写/读登记防回声：登记写后态 → 观测同态零帧；观测异态照常。
         service.note_conversation_state_known("acct", contact.clone(), flags(9));
-        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(9))]);
+        service
+            .publish_conversation_state_observations("acct", vec![(contact.clone(), flags(9))])
+            .await;
         assert!(rx.try_recv().is_err(), "本机写不自我通知");
-        service.publish_conversation_state_observations("acct", vec![(contact.clone(), flags(11))]);
+        service
+            .publish_conversation_state_observations("acct", vec![(contact.clone(), flags(11))])
+            .await;
         assert!(rx.try_recv().is_ok(), "他设备真改照常通知");
 
         // 空批零帧。
-        service.publish_conversation_state_observations("acct", Vec::new());
+        service
+            .publish_conversation_state_observations("acct", Vec::new())
+            .await;
         assert!(rx.try_recv().is_err());
 
         // 账号删除摘簿：删后同会话重观测 = 种子静默（非翻转通知）。
@@ -19612,7 +19756,9 @@ mod tests {
             .expect("add account");
         service.note_conversation_state_known("acct", contact.clone(), flags(13));
         service.delete_account("acct").await.expect("delete");
-        service.publish_conversation_state_observations("acct", vec![(contact, flags(16))]);
+        service
+            .publish_conversation_state_observations("acct", vec![(contact, flags(16))])
+            .await;
         assert!(rx.try_recv().is_err(), "摘簿后重观测 = 种子静默");
     }
 
@@ -19730,14 +19876,14 @@ mod tests {
     /// T-9b 结果事件消费方测试替身：通道恰一帧且为 `engine.storagePull`
     /// 通知，方法名/jsonrpc/account/trigger/双腿位逐键验型（形状钉定）。
     fn expect_storage_pull_notice(
-        rx: &mut mpsc::UnboundedReceiver<crate::OutboundFrame>,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::OutboundFrame>,
         account: &str,
         trigger_wire: &str,
         contacts_ok: bool,
         groups_ok: bool,
     ) {
         let frame = rx.try_recv().expect("结果事件恰一帧");
-        let crate::OutboundFrame::Notice(value) = frame else {
+        let crate::OutboundFrame::Notice { value, .. } = frame else {
             panic!("出站帧应为通知帧");
         };
         assert_eq!(value["method"], json!("engine.storagePull"));
@@ -19768,8 +19914,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir, Arc::clone(&state), tx);
+        let (outbound, mut rx) = outbound::test_hub();
+        let service = Service::new(data_dir, Arc::clone(&state), outbound);
         let (legs_ok, expect_legs) = {
             let expect_legs = |outcome: &ManifestPullOutcome| {
                 let (contacts, groups) = outcome;
@@ -19826,8 +19972,8 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(
             EngineState::load(&data_dir).expect("state"),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
-        let service = Service::new(data_dir, Arc::clone(&state), tx);
+        let (outbound, mut rx) = outbound::test_hub();
+        let service = Service::new(data_dir, Arc::clone(&state), outbound);
         let legs_ok = mode_from_env();
 
         let _ = pull_storage_manifest(
@@ -21323,6 +21469,102 @@ mod tests {
                 assert_eq!(e164, "+15550009999");
             }
             other => panic!("author e164, got {other:?}"),
+        }
+    }
+
+    /// leg 3/3 DeleteForMe 消息级构帧：messageDeletes 恰一条
+    /// {conversation, messages[]}（官方 getDeleteForMeSyncMessage 按会话
+    /// 聚合，SendMessage.preload.ts:1912-1930），其余三臂空；三形态会话
+    /// 标识 + 条目 author binary/E164 字节面钉形。
+    #[test]
+    fn delete_for_me_messages_sync_shapes() {
+        let aci = ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+            .expect("aci");
+        let entries = vec![
+            DeleteForMeEntry {
+                author: DeleteForMeAuthor::ServiceId(aci),
+                timestamp: 1_700_000_000_000,
+            },
+            DeleteForMeEntry {
+                author: DeleteForMeAuthor::Phone("+15550009999".to_owned()),
+                timestamp: 1_700_000_000_001,
+            },
+        ];
+        let sync =
+            build_delete_for_me_messages_sync(&DeleteForMeConversation::Contact(aci), &entries);
+        let presage::proto::sync_message::Content::DeleteForMe(delete) =
+            sync.content.as_ref().expect("content")
+        else {
+            panic!("deleteForMe content");
+        };
+        assert!(delete.conversation_deletes.is_empty());
+        assert!(delete.local_only_conversation_deletes.is_empty());
+        assert!(delete.attachment_deletes.is_empty());
+        let [message_deletes] = delete.message_deletes.as_slice() else {
+            panic!("one message deletes group");
+        };
+        match message_deletes
+            .conversation
+            .as_ref()
+            .expect("conversation")
+            .identifier
+            .as_ref()
+            .expect("identifier")
+        {
+            presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes) => {
+                assert_eq!(bytes, &aci.service_id_binary(), "service id binary 面");
+            }
+            other => panic!("thread service id binary, got {other:?}"),
+        }
+        assert_eq!(message_deletes.messages.len(), 2);
+        let first = &message_deletes.messages[0];
+        assert_eq!(first.sent_timestamp, Some(1_700_000_000_000));
+        match first.author.as_ref().expect("author") {
+            presage::proto::addressable_message::Author::AuthorServiceIdBinary(bytes) => {
+                assert_eq!(bytes, &aci.service_id_binary());
+            }
+            other => panic!("author binary, got {other:?}"),
+        }
+        match message_deletes.messages[1].author.as_ref().expect("author") {
+            presage::proto::addressable_message::Author::AuthorE164(e164) => {
+                assert_eq!(e164, "+15550009999");
+            }
+            other => panic!("author e164, got {other:?}"),
+        }
+
+        // 群 master key + E164 会话标识两形态（消息级同一构帧单点）。
+        for (conversation, expected) in [
+            (
+                DeleteForMeConversation::Group(vec![9u8; 32]),
+                presage::proto::conversation_identifier::Identifier::ThreadGroupId(vec![9u8; 32]),
+            ),
+            (
+                DeleteForMeConversation::Phone("+15551234567".to_owned()),
+                presage::proto::conversation_identifier::Identifier::ThreadE164(
+                    "+15551234567".to_owned(),
+                ),
+            ),
+        ] {
+            let sync = build_delete_for_me_messages_sync(&conversation, &entries[..1]);
+            let presage::proto::sync_message::Content::DeleteForMe(delete) =
+                sync.content.as_ref().expect("content")
+            else {
+                panic!("deleteForMe content");
+            };
+            let [message_deletes] = delete.message_deletes.as_slice() else {
+                panic!("one message deletes group");
+            };
+            assert_eq!(
+                message_deletes
+                    .conversation
+                    .as_ref()
+                    .expect("conversation")
+                    .identifier
+                    .as_ref()
+                    .expect("identifier"),
+                &expected,
+            );
+            assert_eq!(message_deletes.messages.len(), 1);
         }
     }
 

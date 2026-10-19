@@ -399,7 +399,12 @@ async fn amain() -> ExitCode {
     // ——连接器至少收到字节——才解决 oneshot）。receive 管线 ack 前等栅栏
     // （时序审计 G1：ack 晚于「连接器可读」，连接器死亡窗口内引擎崩溃也不
     // 丢已投影消息——服务器队列未耗，重启重放）。
-    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundFrame>();
+    // 全局队列有界（稳定性批，2026-10-20）：连接器读得慢时 writer 反压
+    // 到 send().await，而不是把响应/投影堆进无界内存；每账号队列的隔离
+    // 背压见 service::outbound。
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel::<OutboundFrame>(service::outbound::OUTBOUND_GLOBAL_CAPACITY);
+    let outbound = service::outbound::OutboundHub::new(outbound_tx);
     let writer = tokio::spawn(run_outbound_writer(
         outbound_rx,
         tokio::io::BufWriter::new(tokio::io::stdout()),
@@ -439,23 +444,25 @@ async fn amain() -> ExitCode {
     local
         .run_until(async {
             let service =
-                service::Service::new(args.data_dir, Arc::clone(&state), outbound_tx.clone());
+                service::Service::new(args.data_dir, Arc::clone(&state), Arc::clone(&outbound));
             service.spawn_receive_pipelines().await;
 
             while let Some(inbound) = inbound_rx.recv().await {
                 let state = Arc::clone(&state);
                 let service = Arc::clone(&service);
-                let outbound = outbound_tx.clone();
+                let outbound = Arc::clone(&outbound);
                 tokio::task::spawn_local(async move {
                     let response = methods::respond(&inbound, state, service).await;
-                    let _ = outbound.send(OutboundFrame::Notice(response));
+                    let _ = outbound.send_global(OutboundFrame::notice(response)).await;
                 });
             }
         })
         .await;
 
     // EOF：干净退出 0（在途请求不保证落盘——连接器仅在关闭引擎时断 stdin）。
-    drop(outbound_tx);
+    // abort 丢弃 writer 接收端：在途的通知/响应与等待许可的 notify 立即
+    // 落错，不悬挂（有界队列语义见 service::outbound）。
+    drop(outbound);
     writer.abort();
     ExitCode::SUCCESS
 }
@@ -475,30 +482,52 @@ enum ReadOutcome {
 /// 时序审计 G1 的背压栅栏——writer 在此前全部 Notice 已写并 flush 后解决
 /// oneshot，消费方（receive 管线 ack）据此把「连接器至少收到」变成显式
 /// 等待点。
+///
+/// `permit` 是单账号在途许可（service::outbound 信号量）；writer 写完并
+/// flush 后帧析构才释放，保证单账号洪峰不会无限占用全局队列。响应/测试
+/// 直发帧无许可（`None`）。
 pub(crate) enum OutboundFrame {
-    Notice(Value),
-    Flush(tokio::sync::oneshot::Sender<()>),
+    Notice {
+        value: Value,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
+    Flush {
+        done: tokio::sync::oneshot::Sender<()>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    },
+}
+
+impl OutboundFrame {
+    /// 无账号许可的 Notice（JSON-RPC 响应 / writer 单测直发）。
+    pub(crate) fn notice(value: Value) -> Self {
+        Self::Notice {
+            value,
+            permit: None,
+        }
+    }
 }
 
 /// writer 主循环：Notice 逐条 write+flush（任一步失败即退出，栅栏 oneshot
 /// 随帧弃置自然落在等待方 false）；Flush 就地解决（FIFO 保证此前 Notice
-/// 已 flush）。
-async fn run_outbound_writer<W>(mut rx: mpsc::UnboundedReceiver<OutboundFrame>, mut out: W)
+/// 已 flush）。`permit` 在本臂结束（写完+flush 之后）才随帧释放。
+async fn run_outbound_writer<W>(mut rx: mpsc::Receiver<OutboundFrame>, mut out: W)
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
     while let Some(frame) = rx.recv().await {
         match frame {
-            OutboundFrame::Notice(value) => {
+            OutboundFrame::Notice { value, permit } => {
                 let mut text = serde_json::to_string(&value).expect("line serializes");
                 text.push('\n');
                 if out.write_all(text.as_bytes()).await.is_err() || out.flush().await.is_err() {
                     break;
                 }
+                drop(permit);
             }
-            OutboundFrame::Flush(done) => {
+            OutboundFrame::Flush { done, permit } => {
                 let _ = done.send(());
+                drop(permit);
             }
         }
     }
@@ -507,9 +536,14 @@ where
 /// flush 栅栏的通道侧实现（`Service::flush_barrier` 委托；自由函数便于
 /// 单测直打协议面）。出口关闭立即 false；writer 已死则栅栏 oneshot 随
 /// 接收端弃置，等待落 false。
-pub(crate) async fn outbound_flush_barrier(tx: &mpsc::UnboundedSender<OutboundFrame>) -> bool {
+#[cfg(test)]
+pub(crate) async fn outbound_flush_barrier(tx: &mpsc::Sender<OutboundFrame>) -> bool {
     let (done, wait) = tokio::sync::oneshot::channel();
-    if tx.send(OutboundFrame::Flush(done)).is_err() {
+    if tx
+        .send(OutboundFrame::Flush { done, permit: None })
+        .await
+        .is_err()
+    {
         return false;
     }
     wait.await.is_ok()
@@ -865,7 +899,7 @@ mod tests {
     /// 已出进程。栅栏等待方拿到 true 且字节已在 sink。
     #[tokio::test]
     async fn flush_barrier_resolves_only_after_prior_notices_flushed() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
         let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let writer_sink = std::sync::Arc::clone(&sink);
         let writer = tokio::spawn(async move {
@@ -898,7 +932,8 @@ mod tests {
             }
             run_outbound_writer(rx, Probe(writer_sink, Vec::new())).await
         });
-        tx.send(OutboundFrame::Notice(serde_json::json!({"m": 1})))
+        tx.send(OutboundFrame::notice(serde_json::json!({"m": 1})))
+            .await
             .unwrap();
         assert!(outbound_flush_barrier(&tx).await);
         let written = sink.lock().unwrap().clone();
@@ -912,7 +947,7 @@ mod tests {
     #[tokio::test]
     async fn flush_barrier_fails_when_outbound_dead() {
         // 通道关闭臂：接收端已弃。
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
         drop(rx);
         assert!(!outbound_flush_barrier(&tx).await);
 
@@ -939,9 +974,10 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
         tokio::spawn(run_outbound_writer(rx, BrokenSink));
-        tx.send(OutboundFrame::Notice(serde_json::json!({"m": 1})))
+        tx.send(OutboundFrame::notice(serde_json::json!({"m": 1})))
+            .await
             .unwrap();
         let mut died = false;
         for _ in 0..100 {

@@ -18,7 +18,8 @@ use crate::service::{
     storage_write, CallingRelaysError, DeleteForMeAuthor, DeleteForMeConversation,
     DeleteForMeEntry, DeviceCapabilitiesError, LinkError, MessageRequestTarget, SendMention,
     SendPreview, SendQuote, SendQuoteBodyRange, SendSticker, SendStoryContext, SendTextStyle,
-    Service, UserStatusError, MAX_SEND_TEXT_STYLES, STORY_CAPTION_MAX_BYTES,
+    Service, UserStatusError, MAX_DELETE_FOR_ME_MESSAGES, MAX_SEND_TEXT_STYLES,
+    STORY_CAPTION_MAX_BYTES,
 };
 use crate::state::EngineState;
 
@@ -2250,54 +2251,12 @@ async fn dispatch(
                 Some(Value::Bool(value)) => *value,
                 Some(_) => return internal_error(id),
             };
-            let conversation = match (
-                params.get("kind").and_then(Value::as_str),
-                params.get("conversationId").and_then(Value::as_str),
-            ) {
-                (Some("contact"), Some(text)) if !text.is_empty() => {
-                    if let Some(sid) =
-                        presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(text)
-                    {
-                        DeleteForMeConversation::Contact(sid)
-                    } else if crate::service::is_e164(text) {
-                        DeleteForMeConversation::Phone(text.to_owned())
-                    } else {
-                        return internal_error(id);
-                    }
-                }
-                (Some("group"), Some(text)) => match crate::service::decode_group_id(text) {
-                    Some(master_key) => DeleteForMeConversation::Group(master_key),
-                    None => return internal_error(id),
-                },
-                _ => return internal_error(id),
-            };
-            let parse_entries = |value: Option<&Value>| match value {
-                None | Some(Value::Null) => Some(Vec::new()),
-                Some(Value::Array(items)) => {
-                    let mut out = Vec::with_capacity(items.len());
-                    for item in items {
-                        let author = item.get("author").and_then(Value::as_str)?;
-                        let author =
-                                if let Some(sid) = presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(author) {
-                                    DeleteForMeAuthor::ServiceId(sid)
-                                } else if crate::service::is_e164(author) {
-                                    DeleteForMeAuthor::Phone(author.to_owned())
-                                } else {
-                                    return None;
-                                };
-                        let timestamp = item.get("timestamp").and_then(Value::as_u64)?;
-                        if timestamp == 0 {
-                            return None;
-                        }
-                        out.push(DeleteForMeEntry { author, timestamp });
-                    }
-                    Some(out)
-                }
-                Some(_) => None,
+            let Some(conversation) = parse_delete_for_me_conversation(params) else {
+                return internal_error(id);
             };
             let (Some(most_recent), Some(most_recent_non_expiring)) = (
-                parse_entries(params.get("mostRecentMessages")),
-                parse_entries(params.get("mostRecentNonExpiringMessages")),
+                parse_delete_for_me_entries(params.get("mostRecentMessages")),
+                parse_delete_for_me_entries(params.get("mostRecentNonExpiringMessages")),
             ) else {
                 return internal_error(id);
             };
@@ -2319,6 +2278,39 @@ async fn dispatch(
                     most_recent,
                     most_recent_non_expiring,
                 )
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
+                Err(error) => send_error(id, error),
+            }
+        }
+        // deleteForMeMessages（leg 3/3，官方 getDeleteForMeSyncMessage
+        // messageDeletes 发送面同位，compat §3 行 + §5 leg 3/3 块）：消息级
+        // 「为我删除」上行——会话标识与会话级同源（kind/conversationId，
+        // contact = service-id/E164、group = 32B master key），entries 必填
+        // 非空 ≤MAX_DELETE_FOR_ME_MESSAGES(256)。官方发送面按
+        // MAX_MESSAGE_COUNT=500 分批（SendMessage.preload.ts:1923），引擎
+        // 单请求 fail-closed：超帽整批拒、不静默截断也不拆批（破坏性意图
+        // 不替调用方决定分批）。条目 {author, timestamp} 与会话级同口径
+        // （author service-id/E164 直通、timestamp 正整数），任一条目坏整批
+        // 拒 -32603 不发半批。协议上行面落调度日志（send 系同纪律；无消息
+        // 正文/媒体内容）。fake：成功 {status:"sent"} 形状桩。
+        "deleteForMeMessages" => {
+            state.lock().await.append_dispatch(method, params);
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(conversation) = parse_delete_for_me_conversation(params) else {
+                return internal_error(id);
+            };
+            let Some(entries) = parse_delete_for_me_entries(params.get("entries")) else {
+                return internal_error(id);
+            };
+            if entries.is_empty() || entries.len() > MAX_DELETE_FOR_ME_MESSAGES {
+                return internal_error(id);
+            }
+            match service
+                .send_delete_for_me_messages(account, conversation, entries)
                 .await
             {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "sent" })),
@@ -4817,6 +4809,68 @@ fn conversation_of(
             conversation_id.to_owned(),
         )),
         _ => None,
+    }
+}
+
+/// deleteForMe 会话标识解析单点（deleteForMeConversation /
+/// deleteForMeMessages 共用）：kind 词表 contact/group + conversationId
+/// 形状闸（官方 toConversationIdentifier 三形态；legacyGroup 官方非 GV2
+/// 群 throw 同拒）。
+fn parse_delete_for_me_conversation(
+    params: &Map<String, Value>,
+) -> Option<DeleteForMeConversation> {
+    match (
+        params.get("kind").and_then(Value::as_str),
+        params.get("conversationId").and_then(Value::as_str),
+    ) {
+        (Some("contact"), Some(text)) if !text.is_empty() => {
+            if let Some(sid) =
+                presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(text)
+            {
+                Some(DeleteForMeConversation::Contact(sid))
+            } else if crate::service::is_e164(text) {
+                Some(DeleteForMeConversation::Phone(text.to_owned()))
+            } else {
+                None
+            }
+        }
+        (Some("group"), Some(text)) => {
+            crate::service::decode_group_id(text).map(DeleteForMeConversation::Group)
+        }
+        _ => None,
+    }
+}
+
+/// deleteForMe 条目列表解析单点（mostRecentMessages / entries 共用）：
+/// 缺席/null = 空批（可选位）；数组逐条 {author, timestamp}，author =
+/// service-id 串或 E164 直通、timestamp 正整数；任一条目形状错整批 None
+/// （fail-closed，不发半批）。
+fn parse_delete_for_me_entries(value: Option<&Value>) -> Option<Vec<DeleteForMeEntry>> {
+    match value {
+        None | Some(Value::Null) => Some(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let author = item.get("author").and_then(Value::as_str)?;
+                let author = if let Some(sid) =
+                    presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(
+                        author,
+                    ) {
+                    DeleteForMeAuthor::ServiceId(sid)
+                } else if crate::service::is_e164(author) {
+                    DeleteForMeAuthor::Phone(author.to_owned())
+                } else {
+                    return None;
+                };
+                let timestamp = item.get("timestamp").and_then(Value::as_u64)?;
+                if timestamp == 0 {
+                    return None;
+                }
+                out.push(DeleteForMeEntry { author, timestamp });
+            }
+            Some(out)
+        }
+        Some(_) => None,
     }
 }
 

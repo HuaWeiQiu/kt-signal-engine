@@ -400,7 +400,6 @@ mod tests {
     use presage::libsignal_service::utils::{phonenumber_from_signal, TryIntoE164};
     use presage::manager::RegistrationData;
     use serde_json::json;
-    use tokio::sync::mpsc;
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::*;
@@ -762,7 +761,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let (outbound, _rx) = crate::service::outbound::test_hub();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         // idle 面：无任务、无工件、无快照。
@@ -846,7 +845,7 @@ mod tests {
             )
             .expect("account registered");
         let state = Arc::new(AsyncMutex::new(state));
-        let (outbound, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let (outbound, _rx) = crate::service::outbound::test_hub();
         let service = super::super::Service::new(data_dir.clone(), state, outbound);
 
         // 注册数据 + AEP 落 store（serde 数据面 = 官方 store 落库格式，
