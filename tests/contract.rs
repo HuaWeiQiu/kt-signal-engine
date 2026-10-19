@@ -239,6 +239,54 @@ fn start_and_finish_link_lifecycle() {
     );
 }
 
+/// listAccounts 回填能力门数据面（2026-10-20 批，wire additive
+/// `capabilities` 键，compat §3 行 + §5 块）：fake 形状桩逐账号投
+/// `{attachmentBackfill: true}`——官方 `isBackfillEnabled` 对
+/// test/mock 环境恒 true（attachmentBackfill.preload.ts:61-63）同向；
+/// 隐私红线只投一位；fake 无 store 的 aci 既有序言零回归。
+#[test]
+fn list_accounts_fake_capabilities_shape() {
+    let dir = temp_dir("list-accounts-capabilities");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    let started = engine.request("startLink", json!({}));
+    let uri = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let finished = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+
+    let accounts = engine.request("listAccounts", json!({}))["result"]
+        .as_array()
+        .expect("accounts array")
+        .clone();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["number"], json!(number));
+    assert_eq!(
+        accounts[0]["capabilities"],
+        json!({ "attachmentBackfill": true })
+    );
+    assert_eq!(
+        accounts[0]["capabilities"]
+            .as_object()
+            .expect("capabilities object")
+            .len(),
+        1,
+        "隐私红线：capabilities 只投 attachmentBackfill 一位"
+    );
+    assert!(
+        accounts[0].get("aci").is_none(),
+        "fake listAccounts 无 aci 键（既有语义不回归）"
+    );
+}
+
 #[test]
 fn real_mode_no_network_error_paths() {
     let dir = temp_dir("real-no-net");
@@ -1667,12 +1715,10 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
         );
     }
 
-    // 参数面 fail-closed 逐形状（-32603）。注：解码超 10MiB 的形状在本引擎
-    // IPC 面不可达——入站帧闸（1MiB 行帽，main.rs MAX_LINE_BYTES）先以
-    // parse error 拒收 >1MiB 的请求帧；超帽拒绝闸由 profile.rs 单测
-    // avatar_data_uri_parse_faces 钉定（parse_avatar_data_uri 同一函数，
-    // 群面/个人面共用）。
-    let rejects = [
+    // 参数面 fail-closed 逐形状（-32603）。帧帽对齐（160MiB）后，解码量
+    // 超 10MiB 的 avatar 形状在 IPC 面已可达（旧 1MiB 行帽会先把请求帧
+    // 吞成 parse error）——这里补上该臂，参数闸必须首拒 -32603。
+    let mut rejects = vec![
         // 非 image 族。
         json!({ "account": "+15550000000", "groupId": group_id, "avatar": "data:text/plain;base64,aGk=" }),
         // 非 base64 形状（无 base64 标志）/ 坏 base64 / 空载荷。
@@ -1687,6 +1733,16 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
         json!({ "account": "+15550000000", "groupId": "not-base64!!", "avatar": null }),
         json!({ "account": "+15550000000", "groupId": "QUJDREVG", "avatar": null }),
     ];
+    // 解码 >10MiB（AVATAR_MAX_BYTES）——IPC 面可达的超帽形状。
+    rejects.push(json!({
+        "account": "+15550000000",
+        "groupId": group_id,
+        "avatar": format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0x41u8; 10 * 1024 * 1024 + 1])
+        ),
+    }));
     for params in &rejects {
         let response = engine.request("updateGroup", params.clone());
         assert_eq!(
@@ -1697,7 +1753,7 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
 
     // 调度日志：avatar data URI 键形状摘要化（零 data URI/base64 字节落盘），
     // groupId/expiration 键照旧逐字保留；成功臂 + 失败臂 + 拒绝臂均落日志
-    //（mutating 面同款：成功 2 + 失败 2 + 拒绝 8 = 12 行 updateGroup 条目）。
+    //（mutating 面同款：成功 2 + 失败 2 + 拒绝 9 = 13 行 updateGroup 条目）。
     let log_path = dir.join("engine-send-log.jsonl");
     let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
     let entries: Vec<Value> = log
@@ -1705,7 +1761,7 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 12, "成功两条 + 失败两条 + 拒绝八条均落日志");
+    assert_eq!(entries.len(), 13, "成功两条 + 失败两条 + 拒绝九条均落日志");
     assert!(
         !log.contains("data:image") && !log.contains("iVBO"),
         "avatar data URI/base64 payload leaked into dispatch log"
@@ -2697,6 +2753,75 @@ fn send_direct_fake_shape_has_no_failures_key_when_empty() {
     assert!(result.get("timestamp").and_then(Value::as_u64).is_some());
     assert_eq!(result.get("results"), Some(&json!([])));
     assert!(result.get("failures").is_none(), "空表键不在（additive）");
+}
+
+/// 事故量级附件发送回归（2026-10-19 4.4MB 视频 faulted 批）：send 的附件
+/// 以 data URI 内联在 JSON-RPC 帧里，4.4MB 视频 ≈ 5.9MB 单帧
+/// （connector 实证 request_bytes=5947588）。入站帧帽 1MiB 时代该帧被
+/// 吞到行尾并以 parse error 拒收；connector 把无 string id 的 parse error
+/// 判为协议故障，标记 engine faulted 并杀掉子进程，在途 send 折叠成
+/// SEND_OUTCOME_UNKNOWN。帧帽对齐 160MiB（connector 帧预算 + 100MB 附件
+/// 契约的 base64 膨胀）后，同一形状必须确定成功、进程继续服务。
+#[test]
+fn incident_sized_attachment_send_survives_and_answers() {
+    use base64::Engine as _;
+
+    let dir = temp_dir("incident-sized-attachment-send");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // 4.4MB 确定性载荷（与事故同量级；不读盘、不随机，失败可复算）。
+    let payload: Vec<u8> = (0..4_400_000u32).map(|index| (index % 251) as u8).collect();
+    let data_uri = format!(
+        "data:video/mp4;filename=clip.mp4;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&payload)
+    );
+    assert!(
+        data_uri.len() > 5 * 1024 * 1024,
+        "fixture frame must exceed the old 1 MiB cap; data uri {} bytes",
+        data_uri.len()
+    );
+
+    let response = engine.request(
+        "send",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "message": "",
+            "attachments": [data_uri],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "incident-sized attachment send must succeed: {response}"
+    );
+    let result = response.get("result").expect("success result");
+    assert!(result.get("timestamp").and_then(Value::as_u64).is_some());
+    assert_eq!(result.get("results"), Some(&json!([])));
+
+    // 进程仍活：后续请求照常应答（faulted 批的核心断言——不是「不 abort
+    // 但已死」，而是读循环已重同步、服务面继续）。
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+
+    // 调度日志只留摘要：5.9MB data URI 不落盘（帧帽对齐后大媒体首次可达
+    // dispatch，落库边界与 updateGroup avatar 摘要同款）。
+    let log =
+        std::fs::read_to_string(dir.join("engine-send-log.jsonl")).expect("dispatch log exists");
+    assert!(
+        !log.contains("data:video/mp4"),
+        "attachment payload leaked into the dispatch log"
+    );
+    assert!(
+        log.contains("[attachment data uri: "),
+        "attachment key must be digested: {log}"
+    );
+    assert!(
+        log.len() < 4096,
+        "dispatch log must stay small, got {} bytes",
+        log.len()
+    );
 }
 
 #[test]
@@ -5473,7 +5598,10 @@ fn malformed_and_overlong_lines_do_not_kill_the_process() {
     let response = engine.next_response_of_frame(String::new());
     assert_eq!(response["error"]["code"], json!(-32700));
 
-    // 超限行（> 1 MiB）：回 -32700 后进程继续服务。
+    // 1 MiB+ 坏帧（帧帽对齐到 160MiB 后不再算超限）：解析失败回 -32700，
+    // 进程继续服务。真正超帽帧的「吞到行尾 + 字节计数 + 重同步」语义由
+    // main.rs 的 bounded_reader_* 单测用小上限钉定（160MiB 帧不进契约
+    // 测试，避免测试进程常驻大内存）。
     let blob = "x".repeat(1024 * 1024 + 16);
     writeln!(engine.stdin, "{blob}").expect("overlong line written");
     let response = engine.next_response_of_frame(String::new());

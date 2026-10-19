@@ -57,6 +57,9 @@ pub(crate) mod group_cache;
 pub(crate) mod group_link;
 pub(crate) mod groups;
 pub(crate) mod identity;
+/// 本机账号 profile capabilities 读面（回填能力门数据面，2026-10-20 批，
+/// wire additive；模块头注载来源/隐私红线/缓存与预算纪律）。
+pub(crate) mod own_capabilities;
 /// S2a 性能基线打点层（只测不改）：进程内有界指标注册表 + `engine.perfMetrics`
 /// 只读投影。零 stderr、零行为语义、词表封闭（模块头注载纪律）。
 pub(crate) mod perf_metrics;
@@ -1971,6 +1974,10 @@ pub(crate) struct Service {
     /// 过期时刻)，TTL [`WHITELIST_CACHE_TTL`] + 联系人族写面失效；进程内存
     /// 不落盘不跨重启。delete_account 摘除。
     whitelist_cache: StdMutex<WhitelistCache>,
+    /// 本机 profile capabilities 位缓存（回填能力门数据面，2026-10-20 批）：
+    /// 账号 → 回填位 + 过期时刻，TTL [`own_capabilities::CAPABILITIES_CACHE_TTL`]，
+    /// 失败不缓存；进程内存不落盘不跨重启。delete/重链摘除。
+    own_capabilities_cache: own_capabilities::CapabilitiesCache,
 }
 
 /// 常驻发送管理器缓存：号码 → 共享互斥管理器（Service 同型，单测可断言）。
@@ -2015,6 +2022,7 @@ impl Service {
             calling_relays_cache: AsyncMutex::new(HashMap::new()),
             mrm_chat: AsyncMutex::new(None),
             whitelist_cache: StdMutex::new(HashMap::new()),
+            own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
         })
     }
 
@@ -2214,6 +2222,9 @@ impl Service {
             .map_err(|_| LinkError::Internal)?;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
+        // 重链 = 新账号身份（新 ACI/新 profile）：能力位缓存一并摘除，
+        // 避免旧链接的 profile capabilities 在 TTL 内冒充新账号。
+        self.own_capabilities_cache.invalidate(&number);
         // 同号重链：旧链接会话的在途存量下载中止 + 导入终态清缺（终态清除
         // 触发器之三）——旧任务若继续跑会写旧目录、复活旧账号名下的快照面。
         let _ = self.transfer_downloads.cancel(&number);
@@ -2254,19 +2265,54 @@ impl Service {
     /// 消费面）：注册表快照后放锁，逐账号 best-effort 读注册数据——sqlite
     /// 打开是盘 IO，不持引擎状态锁做。fake 账号（dir=None）恒无 aci；
     /// 条目整键缺席语义见 account_aci。
+    ///
+    /// 回填能力门数据面（2026-10-20 批，wire additive `capabilities` 键）：
+    /// 真实账号读本机 profile 的 `capabilities.attachmentBackfill`（模块
+    /// `own_capabilities`，缓存 + 整批 2s 预算）；fake 账号无 store，形状桩
+    /// 投影引擎自声明位。取不到 = 该条目整键缺席，**不**连坐列表主结局。
     pub(crate) async fn list_accounts(&self) -> Vec<Value> {
         let accounts: Vec<AccountEntry> = {
             let state = self.state.lock().await;
             state.accounts().to_vec()
         };
+        // 整批预算（逐账号余量递减）：网络拉取只发生在缓存 miss，且不得
+        // 把列表应答拖成慢调用（模块纪律）。
+        let capabilities_deadline =
+            std::time::Instant::now() + own_capabilities::CAPABILITIES_LIST_BUDGET;
         let mut rows = Vec::with_capacity(accounts.len());
         for entry in accounts {
-            let mut row = serde_json::Map::with_capacity(2);
+            let mut row = serde_json::Map::with_capacity(3);
             row.insert("number".to_owned(), json!(entry.number));
             if let Some(rel) = &entry.dir {
-                if let Some(aci) = account_aci(&self.data_dir.join(rel)).await {
+                let dir = self.data_dir.join(rel);
+                if let Some(aci) = account_aci(&dir).await {
                     row.insert("aci".to_owned(), json!(aci));
                 }
+                // 真实位只在 real 面读（fake 模式即使有 store 目录也不触网）。
+                if self.real {
+                    if let Some(attachment_backfill) = own_capabilities::attachment_backfill_cached(
+                        &self.own_capabilities_cache,
+                        &entry.number,
+                        &dir,
+                        capabilities_deadline.saturating_duration_since(std::time::Instant::now()),
+                    )
+                    .await
+                    {
+                        row.insert(
+                            "capabilities".to_owned(),
+                            own_capabilities::wire_capabilities(attachment_backfill),
+                        );
+                    }
+                }
+            }
+            if !self.real {
+                // fake 形状桩（官方 test/mock 环境回填门恒 true 同向）。
+                row.insert(
+                    "capabilities".to_owned(),
+                    own_capabilities::wire_capabilities(
+                        own_capabilities::declared_attachment_backfill(),
+                    ),
+                );
             }
             rows.push(Value::Object(row));
         }
@@ -2317,6 +2363,8 @@ impl Service {
         self.calling_relays_cache.lock().await.remove(account);
         // whitelist 缓存摘除（账号面随注册表生命周期，修1）。
         whitelist_cache_invalidate(&self.whitelist_cache, account);
+        // profile capabilities 缓存摘除（回填能力门数据面，2026-10-20 批）。
+        self.own_capabilities_cache.invalidate(account);
         Ok(had_dir || !self.real)
     }
 
@@ -12429,6 +12477,27 @@ mod tests {
     }
 
     #[test]
+    fn attachment_data_uri_decodes_incident_sized_payload() {
+        use base64::Engine as _;
+
+        // 2026-10-19 实证回归：4.4MB 视频以 data URI 内联进 send 帧
+        // （≈5.9MB 单帧；request_bytes=5947588）。解码面必须完整接受
+        // 该载荷，字节数/长度陈述与官方 upload_attachments 输入对齐。
+        let payload: Vec<u8> = (0..4_400_000u32).map(|index| (index % 251) as u8).collect();
+        let uri = format!(
+            "data:video/mp4;filename=clip.mp4;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&payload)
+        );
+        assert!(uri.len() > 5 * 1024 * 1024, "data uri length {}", uri.len());
+        let parsed = parse_attachment_data_uri(&uri).expect("4.4MB payload parses");
+        assert_eq!(parsed.bytes.len(), payload.len());
+        assert_eq!(parsed.bytes, payload);
+        assert_eq!(parsed.spec.length, payload.len());
+        assert_eq!(parsed.spec.content_type, "video/mp4");
+        assert_eq!(parsed.spec.file_name.as_deref(), Some("clip.mp4"));
+    }
+
+    #[test]
     fn apply_outgoing_caption_spec_face() {
         // 媒体 story caption 置位单点（2026-10-15 批）：Some = 首条正文附件
         // spec 载 caption（vendored upload_attachment spec.caption 直通返回
@@ -15411,8 +15480,10 @@ mod tests {
         );
     }
 
-    /// listAccounts 多账号投影：各账号各带各的 aci（逐 store 读注册数
-    /// 据），fake 账号（dir=None）整键缺席。
+    /// listAccounts 多账号投影：各账号各带各的 aci（逐 store 读注册数据
+    /// 据），fake 账号（dir=None）整键缺席。回填能力门数据面（2026-10-20
+    /// 批）：能力位 per-account 投影（缓存预热 = 单测期不触网，命中路径与
+    /// 生产同一条 `attachment_backfill_cached`）。
     #[tokio::test]
     async fn list_account_rows_carry_per_account_aci() {
         let data_dir = std::env::temp_dir().join(format!(
@@ -15455,20 +15526,72 @@ mod tests {
                 .add_account("+15550003333".to_owned(), None)
                 .expect("add fake");
         }
+        // 预热能力位缓存：本测试钉投影/多账号隔离，不钉网络面（seed 的
+        // 注册数据是假凭据，真 fetch 会打网络且非确定）。a=true、b=false
+        // 同时钉「明确 false 也照实投」。
+        service
+            .own_capabilities_cache
+            .put("+15550001111", true, std::time::Instant::now());
+        service
+            .own_capabilities_cache
+            .put("+15550002222", false, std::time::Instant::now());
 
         let rows = service.list_accounts().await;
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0],
-            json!({"number": "+15550001111", "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"})
+            json!({
+                "number": "+15550001111",
+                "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                "capabilities": {"attachmentBackfill": true},
+            })
         );
         assert_eq!(
             rows[1],
-            json!({"number": "+15550002222", "aci": "11111111-2222-4333-8444-555555555555"})
+            json!({
+                "number": "+15550002222",
+                "aci": "11111111-2222-4333-8444-555555555555",
+                "capabilities": {"attachmentBackfill": false},
+            })
         );
-        // fake 账号：整键缺席（不出 aci:null）。
+        // fake 账号（real 服务下的 dir=None）：aci 与 capabilities 整键缺席。
         assert_eq!(rows[2], json!({"number": "+15550003333"}));
         assert!(rows[2].get("aci").is_none());
+        assert!(rows[2].get("capabilities").is_none());
+    }
+
+    /// 取不到 profile（store 在但无注册数据，链接半途/未注册）→ 条目照常
+    /// 返回、`capabilities` 整键缺席（不投 false、不连坐列表）。本地前置
+    /// 即缺席，零网络。
+    #[tokio::test]
+    async fn list_accounts_absent_capabilities_keeps_row() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-caps-absent-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel::<crate::OutboundFrame>();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), tx);
+        open_store(&data_dir.join("accounts/test-unregistered"))
+            .await
+            .expect("empty store opens");
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550004444".to_owned(),
+                Some("accounts/test-unregistered".to_owned()),
+            )
+            .expect("add account");
+
+        let rows = service.list_accounts().await;
+        assert_eq!(rows, vec![json!({"number": "+15550004444"})]);
+        assert!(
+            rows[0].get("capabilities").is_none(),
+            "读不到 profile = 整键缺席，不投 false"
+        );
     }
 
     /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid

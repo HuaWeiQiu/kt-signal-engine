@@ -43,7 +43,7 @@ mod state;
 // 消费批任务层（service::backup_task，契约 §10.3/§10.4）接线。
 mod backup;
 
-use std::io::Read;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -54,9 +54,17 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use methods::Inbound;
 use state::EngineState;
 
-/// 分帧上限（1 MiB）：connector 侧请求最大为 send 附件前文本，远小于此；
-/// 超限行按 -32700 拒绝并跳到下一行，进程不死。
-const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// 入站单帧字节上限（160 MiB，含行尾换行）：与 connector 的帧预算对齐
+/// （`DEFAULT_HOST_FRAME_LIMIT` / `DEFAULT_UPSTREAM_LINE_LIMIT` = 160 MiB，
+/// 其契约要求一条最大附件的 base64 恒能装进单个请求帧）。send 的附件
+/// 以 `data:` URI 内联在 JSON-RPC 帧里（单附件上限 100MB，见
+/// `service::ATTACHMENT_MAX_BYTES`），base64 膨胀 4/3 后约 127 MiB，信封
+/// 余量足够。旧值 1 MiB 与该契约冲突：4.4MB 视频（≈5.9MB 单帧）会被拒成
+/// parse error，connector 把无 id 的 parse error 判为协议故障、标记
+/// engine faulted 并杀掉子进程（2026-10-19 实证）。
+/// 超限行吞到行尾后按 -32700 拒绝（进程不死），拒绝面落结构化 warn
+/// （帧字节数 + 上限，不含任何内容字节）。
+pub(crate) const MAX_LINE_BYTES: usize = 160 * 1024 * 1024;
 
 const USAGE: &str = "usage: kt-signal-engine --data-dir <dir> jsonRpc \
 [--receive-mode <mode>] [--ignore-attachments] [--ignore-stories] [--ignore-stickers]";
@@ -404,19 +412,20 @@ async fn amain() -> ExitCode {
         let mut line: Vec<u8> = Vec::new();
         loop {
             line.clear();
-            match read_bounded_line(&stdin, &mut line) {
+            let mut handle = stdin.lock();
+            match read_bounded_line(&mut handle, &mut line) {
                 ReadOutcome::Eof => break,
                 ReadOutcome::Line => {
                     while matches!(line.last(), Some(b'\n' | b'\r')) {
                         line.pop();
                     }
-                    let text = String::from_utf8_lossy(&line).to_string();
-                    if inbound_tx.send(Inbound::Line(text)).is_err() {
+                    let frame = std::mem::take(&mut line);
+                    if inbound_tx.send(Inbound::Line(frame)).is_err() {
                         break;
                     }
                 }
-                ReadOutcome::Overlong => {
-                    if inbound_tx.send(Inbound::Overlong).is_err() {
+                ReadOutcome::Overlong { bytes } => {
+                    if inbound_tx.send(Inbound::Overlong { bytes }).is_err() {
                         break;
                     }
                 }
@@ -454,7 +463,12 @@ async fn amain() -> ExitCode {
 enum ReadOutcome {
     Line,
     Eof,
-    Overlong,
+    /// 超限帧：吞到行尾后返回。`bytes` 是该帧实际消耗的字节数（含行尾
+    /// 换行），只进拒绝日志；帧内容不进任何 IPC 面（本地读缓冲由下一帧
+    /// 的 clear 复位）。
+    Overlong {
+        bytes: u64,
+    },
 }
 
 /// stdout 出站帧。`Notice` 是一行 JSON（响应或 receive 通知）；`Flush` 是
@@ -501,46 +515,78 @@ pub(crate) async fn outbound_flush_barrier(tx: &mpsc::UnboundedSender<OutboundFr
     wait.await.is_ok()
 }
 
-/// 有界按行读：不预分配无界缓冲；超限行吞到行尾后报 Overlong。
-fn read_bounded_line(stdin: &std::io::Stdin, buf: &mut Vec<u8>) -> ReadOutcome {
-    let mut handle = stdin.lock();
+/// 有界按行读：不预分配无界缓冲；超限行吞到行尾后报 `Overlong`（携带该帧
+/// 实际字节数供拒绝日志）。按 `fill_buf` 分块读写，避免逐字节读取在大帧
+/// （附件 data URI 常达数 MB）上的调用开销。
+fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> ReadOutcome {
+    read_bounded_line_with_limit(reader, buf, MAX_LINE_BYTES)
+}
+
+fn read_bounded_line_with_limit(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> ReadOutcome {
+    let mut total: u64 = 0;
     loop {
-        let mut byte = [0u8; 1];
-        match handle.read(&mut byte) {
-            Ok(0) => {
-                return if buf.is_empty() {
-                    ReadOutcome::Eof
-                } else {
-                    ReadOutcome::Line
-                }
-            }
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    return ReadOutcome::Line;
-                }
-                buf.push(byte[0]);
-                if buf.len() > MAX_LINE_BYTES {
-                    // 丢弃到行尾（或 EOF），让读循环继续下一帧。
-                    let mut sink = [0u8; 4096];
-                    loop {
-                        match handle.read(&mut sink) {
-                            Ok(0) => return ReadOutcome::Overlong,
-                            Ok(n) => {
-                                if sink[..n].contains(&b'\n') {
-                                    return ReadOutcome::Overlong;
-                                }
-                            }
-                            Err(_) => return ReadOutcome::Overlong,
-                        }
-                    }
-                }
-            }
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
                 return if buf.is_empty() {
                     ReadOutcome::Eof
                 } else {
                     ReadOutcome::Line
                 }
+            }
+        };
+        if available.is_empty() {
+            return if buf.is_empty() {
+                ReadOutcome::Eof
+            } else {
+                ReadOutcome::Line
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk = newline.unwrap_or(available.len());
+        total += chunk as u64 + u64::from(newline.is_some());
+        if buf.len().saturating_add(chunk) > limit {
+            let consumed = chunk + usize::from(newline.is_some());
+            reader.consume(consumed);
+            return match newline {
+                Some(_) => ReadOutcome::Overlong { bytes: total },
+                None => drain_to_line_end(reader, total),
+            };
+        }
+        buf.extend_from_slice(&available[..chunk]);
+        let consumed = chunk + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return ReadOutcome::Line;
+        }
+    }
+}
+
+/// 超限帧的丢弃尾段：继续按块吞到行尾（或 EOF），只累计字节数。
+fn drain_to_line_end(reader: &mut impl BufRead, mut total: u64) -> ReadOutcome {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(_) => return ReadOutcome::Overlong { bytes: total },
+        };
+        if available.is_empty() {
+            return ReadOutcome::Overlong { bytes: total };
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                total += newline as u64 + 1;
+                reader.consume(newline + 1);
+                return ReadOutcome::Overlong { bytes: total };
+            }
+            None => {
+                let len = available.len();
+                total += len as u64;
+                reader.consume(len);
             }
         }
     }
@@ -906,5 +952,126 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(died, "barrier must fail once the writer has died");
+    }
+
+    // —— 入站有界读帧（帧帽对齐批：超帽帧吞到行尾 + 字节计数 + 重同步）——
+
+    use super::{read_bounded_line_with_limit, ReadOutcome};
+    use std::io::Cursor;
+
+    /// 按固定块长吐数据的 BufRead：让超限帧跨多次 fill_buf，钉定字节计数
+    /// 与丢弃尾段在分块边界上的行为。
+    struct Chunked<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl std::io::Read for Chunked<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let len = self.data.len().min(self.chunk).min(out.len());
+            out[..len].copy_from_slice(&self.data[..len]);
+            self.data = &self.data[len..];
+            Ok(len)
+        }
+    }
+
+    impl std::io::BufRead for Chunked<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let len = self.data.len().min(self.chunk);
+            Ok(&self.data[..len])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.data = &self.data[amount.min(self.data.len())..];
+        }
+    }
+
+    #[test]
+    fn bounded_reader_accepts_a_line_at_the_limit_and_reads_the_next() {
+        let mut input = Cursor::new(b"abcd\nnext\n".to_vec());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut input, &mut buf, 4),
+            ReadOutcome::Line
+        ));
+        assert_eq!(buf, b"abcd");
+        buf.clear();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut input, &mut buf, 4),
+            ReadOutcome::Line
+        ));
+        assert_eq!(buf, b"next");
+    }
+
+    #[test]
+    fn bounded_reader_reports_overlong_frame_bytes_and_resyncs() {
+        let mut input = Cursor::new(b"abcdeXYZ\nok\n".to_vec());
+        let mut buf = Vec::new();
+        match read_bounded_line_with_limit(&mut input, &mut buf, 4) {
+            ReadOutcome::Overlong { bytes } => assert_eq!(bytes, 9),
+            _ => panic!("expected an overlong frame"),
+        }
+        // 该形状下同一块内已见行尾，超限帧内容未被写入 buf。
+        assert!(buf.is_empty());
+        buf.clear();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut input, &mut buf, 4),
+            ReadOutcome::Line
+        ));
+        assert_eq!(buf, b"ok");
+    }
+
+    #[test]
+    fn bounded_reader_counts_overlong_bytes_across_chunk_boundaries() {
+        let mut reader = Chunked {
+            data: b"abcdefghij\nok\n",
+            chunk: 3,
+        };
+        let mut buf = Vec::new();
+        match read_bounded_line_with_limit(&mut reader, &mut buf, 5) {
+            ReadOutcome::Overlong { bytes } => assert_eq!(bytes, 11),
+            _ => panic!("expected an overlong frame"),
+        }
+        buf.clear();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut reader, &mut buf, 5),
+            ReadOutcome::Line
+        ));
+        assert_eq!(buf, b"ok");
+    }
+
+    #[test]
+    fn bounded_reader_eof_partial_line_and_overlong_tail_at_eof() {
+        let mut empty = Cursor::new(Vec::new());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut empty, &mut buf, 4),
+            ReadOutcome::Eof
+        ));
+
+        // 无换行尾行照常投递（stdin EOF 语义与原实现一致）。
+        let mut partial = Cursor::new(b"abc".to_vec());
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut partial, &mut buf, 4),
+            ReadOutcome::Line
+        ));
+        assert_eq!(buf, b"abc");
+        buf.clear();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut partial, &mut buf, 4),
+            ReadOutcome::Eof
+        ));
+
+        // EOF 前一直无换行的超限帧：报 Overlong（字节数 = 已吞字节）。
+        let mut tail = Cursor::new(b"abcdef".to_vec());
+        match read_bounded_line_with_limit(&mut tail, &mut buf, 2) {
+            ReadOutcome::Overlong { bytes } => assert_eq!(bytes, 6),
+            _ => panic!("expected an overlong frame at eof"),
+        }
+        buf.clear();
+        assert!(matches!(
+            read_bounded_line_with_limit(&mut tail, &mut buf, 2),
+            ReadOutcome::Eof
+        ));
     }
 }

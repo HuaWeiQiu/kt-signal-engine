@@ -299,9 +299,10 @@ kt-desktop / Android 真机
 ```
 
 理由：①备份模块刻意零 store 依赖（§7），消息真相源在 connector sqlite，
-引擎侧无从直读；②引擎 JSON-RPC 单行帽 1 MiB（compat §1），内联全量消息
-RPC 不可行；③文件工件有 backup5 `history-import.ndjson` 先例（引擎出方向、
-connector 消费，connector 契约 §4.38），本批是同一通道的反方向，先例形状
+引擎侧无从直读；②引擎 JSON-RPC 单帧帽 160 MiB（compat §2）按单条消息
+设计，内联全量消息 RPC 不可行；③文件工件有 backup5
+`history-import.ndjson` 先例（引擎出方向、connector 消费，connector 契约
+§4.38），本批是同一通道的反方向，先例形状
 （存在性判定 + 诚实计数 + 轮询状态面）整套复用。
 
 ### 10.2 输入工件（过渡性，硬边界）
@@ -344,7 +345,7 @@ connector 消费，connector 契约 §4.38），本批是同一通道的反方�
 
 | 帽 | 值 | 依据 |
 |---|---|---|
-| 单行字节（含换行前） | 1 MiB = 1,048,576 B | 128 KiB body 的 JSON 转义最坏膨胀（~6×）后仍有余量；与引擎 JSON-RPC 行帽同量级 |
+| 单行字节（含换行前） | 1 MiB = 1,048,576 B | 128 KiB body 的 JSON 转义最坏膨胀（~6×）后仍有余量；独立于引擎 JSON-RPC 帧帽（160 MiB，compat §2），只约束本 NDJSON 工件 |
 | 总行数 | 4,000,000 行 | connector store 有界保留（2000 行/会话 ×8 会话帽 ×冗余系数）之上的纯 fail-closed 闸 |
 | 工件总字节 | 2 GiB = 2,147,483,648 B | 同上， runaway 文件熔断 |
 | chat_item body | 128 KiB = 131,072 B | frames.rs validator 前置（§7 API） |

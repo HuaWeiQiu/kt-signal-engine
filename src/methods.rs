@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::jsonrpc::{self, ParseOutcome, Request, RpcError};
@@ -77,8 +77,60 @@ const NO_RECIPIENTS_MESSAGE: &str =
     "Failed to send message: No recipients in group. (NoRecipientsException)";
 
 pub(crate) enum Inbound {
-    Line(String),
-    Overlong,
+    /// 原始帧字节（不先转 String：160MiB 帧帽下大附件帧的 UTF-8 副本
+    /// 是纯峰值内存开销；解析面本就接受 &[u8]）。
+    Line(Vec<u8>),
+    /// 入站帧超过 `crate::MAX_LINE_BYTES`（已吞到行尾，内容不保留）；
+    /// `bytes` 是该帧实际字节数，只进结构化拒绝日志。
+    Overlong { bytes: u64 },
+}
+
+/// 调度日志大媒体载荷摘要化（帧帽对齐批 companion）：`send` 的
+/// `attachments[]`、`sendStory` 的 `attachment` 以及两族的 `previewImage`
+/// 都是内联 data URI。帧帽 1 MiB→160 MiB 后这些键可以承载多 MB 明文媒体，
+/// 原样落盘会把引擎变成媒体明文落库点（违反「消息内容只经内存转发」边界），
+/// 并把未轮转的 `engine-send-log.jsonl` 撑爆。
+///
+/// 闸位刻意取旧帧帽 1 MiB：**旧帧帽下可达的请求逐字节保持原日志面**
+/// （既有契约「参数形状逐字保留」对小型附件不变，connector 侧断言零冲击），
+/// 只有帧帽对齐后才新可达的大载荷换成字节数摘要（形状与 updateGroup 的
+/// avatar 键同款 `[<key> data uri: N bytes]`）。大值按长度直接造摘要、
+/// 不先 clone 再覆盖——避免在峰值路径上多复制一整份 base64 字符串。
+const DISPATCH_MEDIA_DIGEST_BYTES: usize = 1024 * 1024;
+
+fn redacted_dispatch_params(method: &str, params: &Map<String, Value>) -> Map<String, Value> {
+    let digest = |key: &str, uri: &str| {
+        if uri.len() > DISPATCH_MEDIA_DIGEST_BYTES {
+            Some(json!(format!("[{key} data uri: {} bytes]", uri.len())))
+        } else {
+            None
+        }
+    };
+    let mut logged = Map::with_capacity(params.len());
+    for (key, value) in params {
+        let redacted = match (method, key.as_str()) {
+            ("send", "attachments") => match value {
+                Value::Array(entries) => Some(Value::Array(
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            match entry.as_str().and_then(|uri| digest("attachment", uri)) {
+                                Some(digest) => digest,
+                                None => entry.clone(),
+                            }
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            },
+            ("send" | "sendStory", "attachment" | "previewImage") => {
+                value.as_str().and_then(|uri| digest(key, uri))
+            }
+            _ => None,
+        };
+        logged.insert(key.clone(), redacted.unwrap_or_else(|| value.clone()));
+    }
+    logged
 }
 
 pub(crate) async fn respond(
@@ -87,8 +139,18 @@ pub(crate) async fn respond(
     service: Arc<Service>,
 ) -> Value {
     match inbound {
-        Inbound::Overlong => jsonrpc::parse_error_response(Value::Null),
-        Inbound::Line(line) => match jsonrpc::parse_line(line.as_bytes()) {
+        Inbound::Overlong { bytes } => {
+            // 超帽帧以前完全静默（只有 id 为 null 的 parse error），connector
+            // 侧把无 id 应答判为协议故障并杀掉引擎时，engine-stderr 没有任何
+            // 线索。这里落一条 warn：帧字节数 + 上限，零内容字节。
+            tracing::warn!(
+                frame_bytes = *bytes,
+                frame_limit = crate::MAX_LINE_BYTES,
+                "inbound frame exceeds the line limit; answered with a parse error"
+            );
+            jsonrpc::parse_error_response(Value::Null)
+        }
+        Inbound::Line(line) => match jsonrpc::parse_line(line) {
             ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id),
             ParseOutcome::Request(request) => {
                 // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
@@ -247,7 +309,10 @@ async fn dispatch(
             }
         }
         "send" => {
-            state.lock().await.append_dispatch(method, params);
+            state
+                .lock()
+                .await
+                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params.get("account").and_then(Value::as_str);
             let message = params.get("message").and_then(Value::as_str);
             let group = params.get("groupId").and_then(Value::as_str);
@@ -1670,7 +1735,10 @@ async fn dispatch(
         // 1059-1061）。attachment 缺席 = text story 现状零变化；group 与
         // 内容两腿正交（官方群 story text/media 双臂同源 getStoryMessage）。
         "sendStory" => {
-            state.lock().await.append_dispatch(method, params);
+            state
+                .lock()
+                .await
+                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -5494,5 +5562,76 @@ mod tests {
         // 无键态）。
         let text = serde_json::to_string(&bare).expect("serialize");
         assert!(!text.contains("null"), "no-null：{text}");
+    }
+
+    /// 调度日志大媒体摘要面（帧帽对齐批 companion）：>1MiB（旧帧帽闸位）的
+    /// data URI 落盘前换成字节数摘要（形状同 updateGroup avatar），小载荷与
+    /// 其余键逐字保留（connector 侧既有断言零冲击）；非 send 系方法零变化。
+    #[test]
+    fn dispatch_log_large_media_payloads_are_digested_small_ones_verbatim() {
+        // 小载荷（旧帧帽下可达）：逐字保留。
+        let small_video = "data:video/mp4;base64,AAAA";
+        let small_image = "data:image/png;base64,BBBB";
+        let send = json!({
+            "account": "+15550000000",
+            "message": "hi",
+            "attachments": [small_video, 42],
+            "previewImage": small_image,
+        });
+        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
+        assert_eq!(logged["attachments"], json!([small_video, 42]));
+        assert_eq!(logged["previewImage"], json!(small_image));
+        assert_eq!(logged["message"], json!("hi"));
+        assert_eq!(logged["account"], json!("+15550000000"));
+
+        // 大载荷（>1MiB，帧帽对齐后才可达）：摘要化（非字符串条目原样）。
+        let big_video = format!("data:video/mp4;base64,{}", "A".repeat(1024 * 1024));
+        let big_image = format!("data:image/png;base64,{}", "B".repeat(1024 * 1024));
+        let send = json!({
+            "account": "+15550000000",
+            "message": "hi",
+            "attachments": [big_video, 42],
+            "previewImage": big_image,
+        });
+        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
+        assert_eq!(
+            logged["attachments"],
+            json!([
+                format!("[attachment data uri: {} bytes]", big_video.len()),
+                42
+            ])
+        );
+        assert_eq!(
+            logged["previewImage"],
+            json!(format!(
+                "[previewImage data uri: {} bytes]",
+                big_image.len()
+            ))
+        );
+
+        let story = json!({
+            "account": "+15550000000",
+            "attachment": big_video,
+            "previewImage": big_image,
+        });
+        let logged = redacted_dispatch_params("sendStory", story.as_object().expect("object"));
+        assert_eq!(
+            logged["attachment"],
+            json!(format!("[attachment data uri: {} bytes]", big_video.len()))
+        );
+        assert_eq!(
+            logged["previewImage"],
+            json!(format!(
+                "[previewImage data uri: {} bytes]",
+                big_image.len()
+            ))
+        );
+
+        let other = json!({
+            "account": "+15550000000",
+            "attachment": big_video,
+        });
+        let logged = redacted_dispatch_params("sendReaction", other.as_object().expect("object"));
+        assert_eq!(json!(logged), other, "非 send 系方法零变化");
     }
 }

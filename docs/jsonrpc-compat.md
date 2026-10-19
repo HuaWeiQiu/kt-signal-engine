@@ -98,7 +98,9 @@ fixture 同款）：
 - 响应：`{"jsonrpc":"2.0","id":...}` + `result` / `error` 二选一。
 - 通知（无 id）：`{"jsonrpc":"2.0","method":"receive","params":{...}}`。
 - 行超长/非法 JSON：回 `-32700`（id 可知则带 id，不可知不带），继续服务，
-  不退出。
+  不退出。入站单帧上限 160 MiB（含换行；与 connector 帧预算及 100MB 附件
+  的 base64 膨胀对齐，超帽帧吞到行尾后拒绝并落结构化 warn，见 §5 帧帽
+  对齐批）。
 - 未知方法：`-32601`（上游真实行为；fixture 对未知方法回显 `{method}` 是
   夹具宽容，引擎不效仿，见 §5）。
 
@@ -135,7 +137,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version}`（双字符串键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答 |
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
-| `listAccounts` | `{}` | `[{"number", "aci"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录） |
+| `listAccounts` | `{}` | `[{"number", "aci"?, "capabilities"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批；capabilities additive 2026-10-20，回填能力门数据面，§5 块——`{attachmentBackfill: bool}` 单键对象，取不到时整键缺席）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录）；**2026-10-20 real/fake（回填能力门数据面批，wire additive，engine-compat，§5 块）**：条目 additive `capabilities` 键 = 本机 profile 的 `capabilities.attachmentBackfill`（官方 `isBackfillEnabled` 消费位，attachmentBackfill.preload.ts:57-72），有界缓存 + 整批 2s 预算，读面失败/超时/未注册 = 整键缺席（不投 false、不连坐列表）；fake 形状桩投引擎自声明位 |
 | `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在） |
 | `profiles.refreshContacts` | `{account}`（字符串必需，缺席/非字符串 fail-closed `-32603`——phoneLookup 同款参数纪律；无逐联系人物品参数——本方法不接受目标清单，目标集恒由 store 推导，调用方无法借它探测任意 uuid 的 profile） | `{refreshed, failed, skipped}`（三计数恒在，u32 字面；只计数不含任何身份/号码/名字内容——引擎零联系人外传纪律同向）。refreshed = 本次实际发起 profile 拉取且成功；failed = 拉取失败**或**整批时限到期未尝试（含拉取成功但服务器侧名字材料仍空——计数语义是「刷新动作结局」而非「名字出现」）；skipped = 无需刷新（无 profile_key / 名字材料已在库 / contacts.name 非空） | 未注册账号 `-32603`；无账号库可达同折叠 | **2026-10-16 real（KT 扩展，profile 名字刷新批，wire additive，engine-compat，§5 块）**：登录绑定完成后的自动批（60s 一次性纪律同门，+10s 联系人沉降）与本显式方法共用同一刷新单点（`refresh_contact_profiles`）：目标集 = store contacts 中 profile_key 在库且名字材料为空者，presage `retrieve_profile_by_uuid` 同路径拉取（vendored registered.rs 同路：缓存查 → 服务器拉 → ProfileCipher 解密 → `save_profile` 落 **profiles 表**——落表查证结论：不是 contacts.name），并发 ≤3（独立 manager 各自持 websocket 槽）、单联系人失败不中断批次、整批时限 20s（到期未尝试计 failed）；presage 侧 profile 缓存（查到即回、无网络）使重复刷新零流量幂等；fake：`{refreshed:0, failed:0, skipped:0}`（形状桩，不落调度日志，读面纪律） |
 | `listGroups` | `{account, groupId?: [32B 标准 base64 群 master key…]（可选过滤，P15b 审计项5 单群读投影：数组非空、条目 decode_group_id 闸；坏形状——非数组/空数组/条目非字符串·坏 base64·≠32B——fail-closed `-32603`（fake 面同口径）；well-formed 但 store 不在 → 掉出结果不报错（结果可空，connector fold 侧 `first()` → 空集诚实降级）；缺席/null = 全表旧行为）}` | `[{id(base64), name, revision, description?(Some 时在场), announcementsOnly, expireTimerSeconds(0 = 关), isMember(计算值：own ACI ∈ members), members:[{number, role}], pendingMembers:[{number, addedBy, timestamp}], requestingMembers:[{number, timestamp}], bannedMembers:[{number, timestamp}], accessControl?{attributes, members, addFromInviteLink, memberLabel}(词表 UNKNOWN/ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE，Some 时在场), terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现）；**2026-10-11 real（群写面 P5 投影批，§5 块）**：投影族扩展（description/announcementsOnly/expireTimerSeconds/revision/members[].role/pending/requesting/banned 三成员面/accessControl 四族——vendored presage `Group` 补 `banned_members` 位，README fork 清单登记）；**isMember 诚实化修正**：改计算值（own ACI ∈ members）——早期「入库即成员恒 true」口径废止，被移出群的本地残留投影即 false（§5 登记偏差）；单群投影抽纯函数 `project_group_list_entry` 单测钉形；**2026-10-11 real（P15b 审计项5，§5 块）**：可选 `groupId` 过滤（单群读投影）——connector §4.53/§4.57/§4.62 三处 fold 读已派发 `listGroups {account, groupId: [id]}` 数组形并取 `first()` 当目标群，引擎此前忽略该参数返回全表，多群账号下 `first()` 读到任意群（requesting/pending 集合错群危害）；过滤判定抽纯函数 `group_key_passes_filter` 单测钉形 |
@@ -1612,11 +1614,25 @@ uploadAvatar/uploadGroupAvatar 行为对齐，KT 扩展参数族；expiration �
   `GROUP_AVATAR_UPLOAD_FAILED`——fake 无 CDN/服务器上行面，上行链不可达
   即错误面（stickers「fake 模式走错误面」先例），成功/失败两臂均在 fake
   契约层可测。
-- **入站帧闸层间事实（登记）**：引擎入站有界读帧帽 1MiB
-  （main.rs `MAX_LINE_BYTES`，超帽帧以 parse error 拒收）——经 IPC 面
-  avatar 解码量物理上限 ≈786KB，参数面 10MiB 超帽闸在 IPC 面不可达（该
-  形状由 `parse_avatar_data_uri` 单测钉定，profile/群两族共用同一函数与
-  闸位）；契约层 oversize 用例不再收（入站闸先拦，非 -32603 码位）。
+- **入站帧闸（帧帽，2026-10-20 对齐批）**：引擎入站有界读帧帽
+  **160 MiB**（main.rs `MAX_LINE_BYTES` = 167,772,160 B，含行尾换行）。
+  依据：send 的附件以 `data:` URI 内联在单帧里（单附件上限 100MB，
+  `service::ATTACHMENT_MAX_BYTES`），base64 膨胀 4/3 后约 127 MiB；该值
+  与 connector 的帧预算一致（`DEFAULT_HOST_FRAME_LIMIT` /
+  `DEFAULT_UPSTREAM_LINE_LIMIT` = 160 MiB，其契约要求一条最大附件的
+  base64 恒能装进单行/单帧）。超帽帧吞到行尾后以 parse error 拒收（进程
+  不死、读循环重同步），并在 `engine-stderr.log` 落一条结构化 warn
+  （`frame_bytes` + `frame_limit`，零内容字节）。旧帧帽 1 MiB 与上述契约
+  冲突：2026-10-19 一次 4.4MB 视频发送（≈5.9MB 单帧）被拒成 **无 id 的**
+  parse error，connector 将无 string id 的应答判为协议故障、标记 engine
+  faulted 并杀掉子进程，在途 send 折叠成 `SEND_OUTCOME_UNKNOWN`——帧帽
+  对齐后同一形状正常入站。同一批的调度日志配套：`send` 的
+  `attachments[]`、`sendStory` 的 `attachment` 与两族 `previewImage`
+  中**超过 1 MiB（旧帧帽闸位）**的 data URI 落盘前摘要化
+  （`[<key> data uri: N bytes]`，updateGroup avatar 同款）——旧帧帽下
+  可达的请求（小载荷）日志面逐字节不变，只会让帧帽对齐后新可达的大媒体
+  不再把原始 data URI 写进无轮转的 `engine-send-log.jsonl`（媒体明文
+  只经内存转发的落库边界）。
 - **receive 投影边界（登记不做）**：成员侧收到的 avatar change 继续跳过
   （宁缺勿错，expiration/terminate 最小面纪律）——头像变更投影与群头像
   缓存失效联动另行立项；本端写后 listGroups/getAvatar 以下一次群态读面
@@ -6501,6 +6517,68 @@ dispatched·serverTimestamp 两键钉形）+ contract +1
 形状/11 形状面 -32603 逐条/toleranceMs 缺省接受与 0·超帽拒/读面零调度
 日志/real 未注册折叠不触网）。
 
+### listAccounts 回填能力门数据面批（2026-10-20，本机 profile capabilities 透出，wire additive【engine-compat】）
+
+回填能力门（connector/桌面判「本账号能否请求附件回填」）的真值源是
+**自己 profile 的 capabilities**：官方 `isBackfillEnabled()`
+（`ts/jobs/helpers/attachmentBackfill.preload.ts:57-72`）读
+`getOurConversation()?.get('capabilities')?.attachmentBackfill === true`，
+our conversation 的值由 profile 同步写面落位（`ts/services/
+profiles.preload.ts:713-718`：`profile.capabilities != null` 时
+`c.set({ capabilities: profile.capabilities })`）。引擎此前只写自己
+profile、不回读，jsonRpc 面无供给腿。
+
+**wire 面（`listAccounts` 条目 additive `capabilities` 键，缺席键不在）**：
+
+```jsonc
+[
+  { "number": "+86188…", "aci": "…", "capabilities": { "attachmentBackfill": true } }
+]
+```
+
+- **只投一位**：`attachmentBackfill` = 本机 profile `capabilities.
+  attachmentBackfill`（vendor `DeviceCapabilities` 同位，libsignal-service
+  websocket/profile.rs:68）。**隐私红线**：不整包透出 vendor 结构——其余
+  能力位与未来新增字段不上 wire，消费方无从依赖引擎未承诺的位。
+- **来源与读取路径**：presage `Manager::retrieve_profile` 返回的 `Profile`
+  五字段结构（libsignal-service account_manager.rs:89-95）**丢弃
+  capabilities**，不能复用 `profiles.refreshContacts` 的拉取面；引擎走
+  同一条服务器读面的 HTTP 腿——认证 `GET v1/profile/{aci}/
+  {profileKeyVersion}`（vendored websocket/profile.rs:95-110 同端点同 URL
+  构造；`ProfileKeyVersion` 的 `AsRef<str>` 即 hex ASCII 形），响应
+  `capabilities` 对象 = 官方 `ProfileType.capabilities`
+  （Signal-Desktop ts/textsecure/WebAPI.preload.ts:989）。零 vendor 改动
+  （字段已在 vendor 结构内）。
+- **缺席语义（整键缺席，不出 null）**：未注册/注册数据缺席/网络失败/
+  超时/响应无 `capabilities` 对象 = 该条目 `capabilities` 键不在场，**不
+  投 false**。官方 `capabilities === undefined` 与 `attachmentBackfill:
+  false` 在回填门同义（都关闭），但缺席让上层能区分「未知」与「明确不
+  支持」；`capabilities` 对象在场而位缺省按 vendor serde 缺省 = false
+  （明确不支持，照实投）。
+- **缓存与预算**：per-account 进程内存缓存，TTL 600s（`own_capabilities::
+  CAPABILITIES_CACHE_TTL`，不落盘不跨重启；delete/重链摘除），失败不
+  缓存（下一读面重试）；`listAccounts` 整批 2s 预算
+  （`own_capabilities::CAPABILITIES_LIST_BUDGET`，逐账号余量递减，缓存
+  命中零网络），超时/预算耗尽即缺席。读面是列表投影旁路，任何失败
+  **不得**让 `listAccounts` 整体失败（`Option` 折叠，条目照常返回）。
+- **fake**：形状桩无 store/无网络，逐账号投
+  `{"attachmentBackfill": true}`（引擎自声明位
+  `capabilities::DEVICE_CAPABILITIES.attachment_backfill`；官方
+  `isBackfillEnabled` 对 test/mock 环境恒 true，同文件 :61-63 同向）。
+- **测试（只增不减）**：unit 侧 `own_capabilities` 模块 7 例——缓存命中
+  探针计数（cache_hit_skips_repeated_fetch_probe）、失败不缓存重试
+  （failed_fetch_is_not_cached_and_retried）、超时缺席不缓存
+  （fetch_timeout_yields_absent_and_is_not_cached）、预算耗尽不拉取
+  （exhausted_budget_skips_fetch）、TTL 边界/per-account 隔离
+  （cache_ttl_boundary_and_per_account_isolation）、响应解析臂
+  （profile_body_capability_arms）+ wire 单键钉形
+  （wire_payload_projects_single_bit_only）；service 侧
+  list_account_rows_carry_per_account_aci（多账号各带各的位、明确 false
+  照实投、dir=None 双键缺席）与 list_accounts_absent_capabilities_keeps_row
+  （取不到 profile → 键缺席、条目仍返回）；contract +1
+  （list_accounts_fake_capabilities_shape：fake 条目带
+  capabilities.attachmentBackfill=true、对象恰一键、aci 缺席不回归）。
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
@@ -6516,3 +6594,8 @@ dispatched·serverTimestamp 两键钉形）+ contract +1
 dispatch 参数解析层，先于服务层 fake 早退。服务层闸（open_group_sender 群态刷新/
 announcements/terminated、收件人解析、profileSharing 白名单）仅 real
 模式生效，fake 形状桩一律早退成功。
+
+`listAccounts` 条目的 `capabilities` 键（2026-10-20 回填能力门数据面批）
+在 fake 面亦为形状桩：无 store/无网络，逐账号投
+`{"attachmentBackfill": true}`（引擎自声明位；官方 `isBackfillEnabled`
+对 test/mock 环境恒 true 同向），真实位只在 real 面读服务器 profile。
