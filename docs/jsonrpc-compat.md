@@ -1307,7 +1307,9 @@ docs/backup-export-contract.md §11 为完整裁定，此处登记 RPC 面边界
   §10 导出面共用密钥派生链（§3）与快照目录形态（§5），方向互逆。
 - **帧循环单点**：`history::export_frames_loop`（transfer archive 导出与
   快照导入同一帧循环）——NDJSON 行形状逐字一致，connector 两遍有界导入
-  零改动消费。
+  沿同一形状消费。`ChatItem.pinDetails` 投影 `pinnedAtTimestamp` +
+  `pinExpiry`（`pinExpiresAtTimestamp` / `pinNeverExpires` oneof 原样）；
+  connector 契约 1.197 §4.197 消费该面。
 - **原子落盘**：临时名 `history-import.ndjson-tmp` 写全后 rename 原子替换
   （POSIX rename 不打断并发读）；任务失败删半成品、既有 NDJSON 不动——
   失败形态即 NDJSON 缺席或旧内容，connector 按文件存在性判定。
