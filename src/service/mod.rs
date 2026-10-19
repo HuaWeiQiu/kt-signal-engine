@@ -7738,16 +7738,18 @@ async fn project_content_inner(
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
                 }
-                // Q6② + P15a 项1：deleteForMe 收包投影（SyncContent.
-                // deleteForMe=22，本机「为我删除」多设备同步）：vendored 接收
-                // 面已对 presage store 做 messageDeletes 消费（registered.rs
-                // save_message 臂）且 Received::Content 无条件上抛，引擎投影
-                // 给 connector 供其删自有库行。P15a 项1 补整会话清除族两臂
-                // （官方 handleDeleteForMeSync conversationDeletes/
+                // Q6② + P15a 项1 + attachmentDeletes leg 1/3：deleteForMe
+                // 收包投影（SyncContent.deleteForMe=22，本机「为我删除」多
+                // 设备同步）：vendored 接收面已对 presage store 做
+                // messageDeletes 消费（registered.rs save_message 臂）且
+                // Received::Content 无条件上抛，引擎投影给 connector 供其删
+                // 自有库行。P15a 项1 补整会话清除族两臂（官方
+                // handleDeleteForMeSync conversationDeletes/
                 // localOnlyConversationDeletes 同位，桌面会话清除同步面）；
-                // attachmentDeletes 臂仍不投（§5 gap 登记）。作者不可解析条
-                // 目丢弃（vendored store 面 warn-and-continue 同口径）；无有
-                // 效条目整信封丢弃。
+                // 本批补第四类型 attachmentDeletes（官方 :3724-3790 同位；
+                // leg 1/3 = 引擎投影先行，connector/桌面消费待后续批）。
+                // 作者不可解析条目丢弃（vendored store 面 warn-and-continue
+                // 同口径）；无有效条目整信封丢弃。
                 Some(presage::proto::sync_message::Content::DeleteForMe(delete)) => {
                     let Some(projection) = project_delete_for_me(delete) else {
                         return Vec::new();
@@ -9514,19 +9516,23 @@ fn contact_field_type_word(field_type: Option<i32>) -> &'static str {
     }
 }
 
-/// DeleteForMe 投影（Q6② + P15a 项1，compat 批块）：messageDeletes 臂逐组
-/// 投影——`[{conversationId?, messages: [{author, timestamp}]}]`（组无
-/// conversation 照投、conversationId 键省略——Q6② 既有口径不动）；
-/// conversationDeletes 臂（官方 handleDeleteForMeSync 同位
-/// MessageReceiver.preload.ts:3658-3697）——`[{conversationId,
+/// DeleteForMe 投影（Q6② + P15a 项1 + attachmentDeletes leg 1/3，compat
+/// 批块）：messageDeletes 臂逐组投影——`[{conversationId?, messages:
+/// [{author, timestamp}]}]`（组无 conversation 照投、conversationId 键省略
+/// ——Q6② 既有口径不动）；conversationDeletes 臂（官方 handleDeleteForMeSync
+/// 同位 MessageReceiver.preload.ts:3658-3697）——`[{conversationId,
 /// isFullDelete, mostRecentMessages, mostRecentNonExpiringMessages}]`，
 /// conversation 缺席或 mostRecentMessages 清空整组丢（官方 warn-drop 同
 /// 口径），isFullDelete 官方 Boolean() 恒布尔；localOnlyConversationDeletes
-/// 臂（:3699-3722）——`[{conversationId}]`，conversation 缺席丢。
-/// attachmentDeletes 臂不投（§5 gap 登记）。author 二进制（ACI/PNI 16/17B）
-/// 优先、字符串/e164 直通；author 不可解析条目丢弃（vendored store 面
-/// warn-and-continue 同口径）。全部臂皆无有效条目 → None（调用方整信封
-/// 丢弃，官方「Nothing found in sync message」throw 同口径）。
+/// 臂（:3699-3722）——`[{conversationId}]`，conversation 缺席丢；
+/// attachmentDeletes 臂（:3724-3790，leg 1/3）——
+/// `[{conversationId, targetMessage: {author, timestamp}, clientUuid?,
+/// fallbackDigest?, fallbackPlaintextHash?}]`，conversation/targetMessage
+/// 不可解析或三腿全缺整条丢（见 [`project_delete_for_me_attachment`]）。
+/// author 二进制（ACI/PNI 16/17B）优先、字符串/e164 直通；author 不可解析
+/// 条目丢弃（vendored store 面 warn-and-continue 同口径）。四臂皆无有效
+/// 条目 → None（调用方整信封丢弃，官方「Nothing found in sync message」
+/// throw 同口径）。
 fn project_delete_for_me(delete: &presage::proto::sync_message::DeleteForMe) -> Option<Value> {
     let mut face = serde_json::Map::new();
 
@@ -9610,7 +9616,91 @@ fn project_delete_for_me(delete: &presage::proto::sync_message::DeleteForMe) -> 
         );
     }
 
+    let attachment_deletes: Vec<Value> = delete
+        .attachment_deletes
+        .iter()
+        .take(MAX_DELETE_FOR_ME_ATTACHMENT_DELETES)
+        .filter_map(project_delete_for_me_attachment)
+        .collect();
+    if !attachment_deletes.is_empty() {
+        face.insert("attachmentDeletes".into(), Value::Array(attachment_deletes));
+    }
+
     (!face.is_empty()).then_some(Value::Object(face))
+}
+
+/// attachmentDeletes 条目帽：对齐 connector 消费面
+/// `MAX_SYNC_DELETE_GROUP_MESSAGES`（kt-signal-connector src/engine.rs:1953，
+/// =256；该符号定义在 connector，引擎侧无同名常量，按同值做恶意批量兜底）。
+/// 官方接收面不设帽、真实批量是「每次用户操作一条」，超帽仅可能命中恶意
+/// 面；超出条目丢弃（逐条独立，不改变保留条目的删除语义）。
+const MAX_DELETE_FOR_ME_ATTACHMENT_DELETES: usize = 256;
+
+/// DeleteForMe attachmentDeletes 条目投影（leg 1/3，compat §5）：官方
+/// handleDeleteForMeSync attachmentDeletes 臂（MessageReceiver.preload.ts:
+/// 3724-3790）同构——conversation 不可解析整条丢（官方「No target
+/// conversation」warn-drop，:3744）；targetMessage 不可解析整条丢
+/// （官方「No target message」，:3750；author/sentTimestamp 双闸 =
+/// processAddressableMessage :4415-4429，此处比既有 messageDeletes 臂的
+/// 「timestamp 缺省 0」更严——破坏性单附件删除不接受无时刻锚点）；
+/// clientUuid/fallbackDigest/fallbackPlaintextHash 三腿全缺整条丢
+/// （:3765-3767）；各腿空字节 = 缺席（官方 `?.length` 同构）。字节转换同构：
+/// clientUuid = bytesToUuid（16B 且非全零才投，uuidToBytes.std.ts:21-36）、
+/// fallbackDigest = Bytes.toBase64（标准 base64）、fallbackPlaintextHash =
+/// Bytes.toHex（小写 hex）。
+fn project_delete_for_me_attachment(
+    delete: &presage::proto::sync_message::delete_for_me::AttachmentDelete,
+) -> Option<Value> {
+    use base64::Engine as _;
+
+    let conversation = delete_for_me_conversation_id(&delete.conversation)?;
+    let target = delete.target_message.as_ref()?;
+    let target_message = project_delete_for_me_message(target)?;
+    // 官方 processAddressableMessage 的 sentTimestamp warn-drop（:4423-4429）
+    // ——见函数注释：本臂不继承 messageDeletes 臂的缺省 0。
+    target.sent_timestamp?;
+
+    let client_uuid = delete
+        .client_uuid
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+        .and_then(|bytes| {
+            presage::libsignal_service::prelude::Uuid::from_slice(bytes)
+                .ok()
+                .filter(|uuid| !uuid.is_nil())
+                .map(|uuid| uuid.to_string())
+        });
+    let fallback_digest = delete
+        .fallback_digest
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+    let fallback_plaintext_hash = delete
+        .fallback_plaintext_hash
+        .as_deref()
+        .filter(|bytes| !bytes.is_empty())
+        .map(hex_encode);
+
+    if client_uuid.is_none() && fallback_digest.is_none() && fallback_plaintext_hash.is_none() {
+        return None;
+    }
+
+    let mut item = serde_json::Map::new();
+    item.insert("conversationId".into(), json!(conversation));
+    item.insert("targetMessage".into(), target_message);
+    if let Some(client_uuid) = client_uuid {
+        item.insert("clientUuid".into(), json!(client_uuid));
+    }
+    if let Some(fallback_digest) = fallback_digest {
+        item.insert("fallbackDigest".into(), json!(fallback_digest));
+    }
+    if let Some(fallback_plaintext_hash) = fallback_plaintext_hash {
+        item.insert(
+            "fallbackPlaintextHash".into(),
+            json!(fallback_plaintext_hash),
+        );
+    }
+    Some(Value::Object(item))
 }
 
 /// DeleteForMe AddressableMessage 投影单点：{author, timestamp}（author
@@ -21788,6 +21878,272 @@ mod tests {
                         local_only_conversation_deletes: vec![LocalOnlyConversationDelete {
                             conversation: None,
                         }],
+                        ..sync_message::DeleteForMe::default()
+                    },
+                )),
+                ..SyncMessage::default()
+            }),
+            metadata,
+        );
+        assert!(project_content("acct", &store, &content, &registry, None)
+            .await
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// attachmentDeletes 收投影（leg 1/3）：官方 handleDeleteForMeSync
+    /// attachmentDeletes 臂同构——clientUuid→UUID 逐字、digest→标准
+    /// base64、plaintextHash→小写 hex；conversation/targetMessage/author/
+    /// sentTimestamp 不可解析、clientUuid 非 16B 或全零、三腿全缺均整条
+    /// 丢；与其余三臂同信封并存；只有无效条目时整信封丢。
+    #[tokio::test]
+    async fn sync_projects_delete_for_me_attachment_faces() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::proto::sync_message::delete_for_me::{
+            AttachmentDelete, ConversationDelete, LocalOnlyConversationDelete, MessageDeletes,
+        };
+        use presage::proto::{
+            sync_message, AddressableMessage, ConversationIdentifier, SyncMessage,
+        };
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-dfm-attachments-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let aci = |text: &str| {
+            ServiceId::parse_from_service_id_string(text)
+                .unwrap()
+                .raw_uuid()
+                .as_bytes()
+                .to_vec()
+        };
+        let conversation = |bytes: Vec<u8>| ConversationIdentifier {
+            identifier: Some(
+                presage::proto::conversation_identifier::Identifier::ThreadServiceIdBinary(bytes),
+            ),
+        };
+        let target = |bytes: Option<Vec<u8>>, ts: Option<u64>| AddressableMessage {
+            author: bytes.map(presage::proto::addressable_message::Author::AuthorServiceIdBinary),
+            sent_timestamp: ts,
+        };
+        let attachment =
+            |conversation: Option<ConversationIdentifier>,
+             target_message: Option<AddressableMessage>,
+             client_uuid: Option<Vec<u8>>,
+             fallback_digest: Option<Vec<u8>>,
+             fallback_plaintext_hash: Option<Vec<u8>>| AttachmentDelete {
+                conversation,
+                target_message,
+                client_uuid,
+                fallback_digest,
+                fallback_plaintext_hash,
+            };
+
+        let conversation_aci = "9d0e5f1a-2b3c-4d5e-8f60-7a8b9c0d1e2f";
+        let author_aci = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let client_uuid = "11111111-2222-4333-8444-555555555555";
+        let digest = vec![0x00_u8, 0xff, 0x10];
+        let plaintext_hash = vec![0xde_u8, 0xad, 0xbe, 0xef];
+
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe {
+                        message_deletes: vec![MessageDeletes {
+                            conversation: Some(conversation(aci(conversation_aci))),
+                            messages: vec![target(Some(aci(author_aci)), Some(1_699_999_000_000))],
+                        }],
+                        conversation_deletes: vec![ConversationDelete {
+                            conversation: Some(conversation(aci(conversation_aci))),
+                            most_recent_messages: vec![target(
+                                Some(aci(author_aci)),
+                                Some(1_699_999_000_000),
+                            )],
+                            is_full_delete: Some(true),
+                            most_recent_non_expiring_messages: vec![],
+                        }],
+                        local_only_conversation_deletes: vec![LocalOnlyConversationDelete {
+                            conversation: Some(conversation(aci(conversation_aci))),
+                        }],
+                        attachment_deletes: vec![
+                            // 三腿齐全：逐字验证三种字节转换。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_000))),
+                                Some(
+                                    presage::libsignal_service::prelude::Uuid::parse_str(
+                                        client_uuid,
+                                    )
+                                    .unwrap()
+                                    .as_bytes()
+                                    .to_vec(),
+                                ),
+                                Some(digest.clone()),
+                                Some(plaintext_hash.clone()),
+                            ),
+                            // 仅 digest 腿（空 clientUuid = 缺席）。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_001))),
+                                Some(vec![]),
+                                Some(digest.clone()),
+                                None,
+                            ),
+                            // 仅 plaintextHash 腿。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_002))),
+                                None,
+                                None,
+                                Some(plaintext_hash.clone()),
+                            ),
+                            // clientUuid 非 16B（官方 bytesToUuid 拒绝）且
+                            // 其余两腿缺席 → 三腿全缺，整条丢。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_003))),
+                                Some(vec![0x11; 15]),
+                                None,
+                                None,
+                            ),
+                            // 全零 16B = bytesToUuid 的 nil 面，同样丢。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_004))),
+                                Some(vec![0; 16]),
+                                None,
+                                None,
+                            ),
+                            // conversation 缺席 → 丢（官方 No target conversation）。
+                            attachment(
+                                None,
+                                Some(target(Some(aci(author_aci)), Some(1_699_999_000_005))),
+                                None,
+                                Some(digest.clone()),
+                                None,
+                            ),
+                            // targetMessage 缺席 → 丢（官方 No target message）。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                None,
+                                None,
+                                Some(digest.clone()),
+                                None,
+                            ),
+                            // target author 缺席 → 丢（processAddressableMessage 同判）。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(None, Some(1_699_999_000_006))),
+                                None,
+                                Some(digest.clone()),
+                                None,
+                            ),
+                            // target sentTimestamp 缺席 → 丢（官方严格面，本臂
+                            // 不继承 messageDeletes 的缺省 0）。
+                            attachment(
+                                Some(conversation(aci(conversation_aci))),
+                                Some(target(Some(aci(author_aci)), None)),
+                                None,
+                                Some(digest.clone()),
+                                None,
+                            ),
+                        ],
+                    },
+                )),
+                ..SyncMessage::default()
+            }),
+            metadata.clone(),
+        );
+        let envelope = pop_unwrap(
+            project_content("acct", &store, &content, &registry, None).await,
+            "deleteForMe attachments project",
+        )["params"]["envelope"]
+            .clone();
+        let face = &envelope["syncMessage"]["deleteForMe"];
+        // 四臂同信封并存。
+        assert!(face["messageDeletes"].as_array().is_some());
+        assert!(face["conversationDeletes"].as_array().is_some());
+        assert!(face["localOnlyConversationDeletes"].as_array().is_some());
+        let attachments = face["attachmentDeletes"].as_array().expect("attachments");
+        assert_eq!(attachments.len(), 3, "无效条目逐条丢弃");
+        assert_eq!(
+            attachments[0],
+            json!({
+                "conversationId": conversation_aci,
+                "targetMessage": {
+                    "author": author_aci,
+                    "timestamp": 1_699_999_000_000_u64
+                },
+                "clientUuid": client_uuid,
+                "fallbackDigest": base64::engine::general_purpose::STANDARD.encode(&digest),
+                "fallbackPlaintextHash": "deadbeef",
+            })
+        );
+        assert_eq!(
+            attachments[1],
+            json!({
+                "conversationId": conversation_aci,
+                "targetMessage": {
+                    "author": author_aci,
+                    "timestamp": 1_699_999_000_001_u64
+                },
+                "fallbackDigest": base64::engine::general_purpose::STANDARD.encode(&digest),
+            })
+        );
+        assert_eq!(
+            attachments[2],
+            json!({
+                "conversationId": conversation_aci,
+                "targetMessage": {
+                    "author": author_aci,
+                    "timestamp": 1_699_999_000_002_u64
+                },
+                "fallbackPlaintextHash": "deadbeef",
+            })
+        );
+        assert!(
+            attachments[1].get("clientUuid").is_none(),
+            "空 clientUuid = 缺席，不投空串"
+        );
+
+        // 只有无效 attachmentDeletes → 四臂全空，整信封丢弃。
+        let content = Content::from_body(
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::DeleteForMe(
+                    sync_message::DeleteForMe {
+                        attachment_deletes: vec![attachment(
+                            Some(conversation(aci(conversation_aci))),
+                            Some(target(Some(aci(author_aci)), Some(1_699_999_000_007))),
+                            Some(vec![]),
+                            None,
+                            None,
+                        )],
                         ..sync_message::DeleteForMe::default()
                     },
                 )),
