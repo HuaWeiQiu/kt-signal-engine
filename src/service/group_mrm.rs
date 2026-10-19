@@ -17,8 +17,9 @@
 //! fetch；服务器 403（token 过期/成员面漂移）→ 缓存废弃 → 群态+GSE 重取
 //! 一次 → 重试（官方 didRefreshGroupState 同型），再失败 failover。
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use bytes::Bytes;
 use chrono::TimeZone as _;
@@ -172,10 +173,93 @@ enum MrmSendFailure {
     Fatal,
 }
 
+/// MRM unauth 连接池上限（R2 资源公平：进程级连接上限 2）。
+///
+/// 审计 §9.6 R4：`mrm_chat` 原为进程级单槽未鉴权共享连接，一个账号的失败
+/// 会摘除所有账号的连接；R4 修法 = 按账号隔离。上限 2 是 R2 的引擎连接
+/// 预算（审计「engine 连接池上限 2」）：超出时**fail closed**（该次群发走
+/// vendored 逐收件人 failover，正确性不变），不排队阻塞、不驱逐使用中的
+/// 连接。
+///
+/// 官方对应面：Desktop 单账号 `SocketManager` 只有一个 unauth 槽
+/// （`ts/textsecure/SocketManager.preload.ts:733` 起），无多账号池；per-account
+/// 池是 `[KT 适配]`。
+pub(crate) const MRM_CONNECTION_LIMIT: usize = 2;
+
+/// 单个账号的 MRM 连接槽（按账号隔离；连接惰性建、失败只摘本槽）。
+pub(crate) struct MrmSlot {
+    generation: u64,
+    connection: tokio::sync::Mutex<Option<ChatConnection>>,
+}
+
+/// MRM 连接池：账号 → 槽；最多 [`MRM_CONNECTION_LIMIT`] 个活槽。
+pub(crate) struct MrmPool {
+    limit: usize,
+    slots: StdMutex<HashMap<String, Arc<MrmSlot>>>,
+    next_generation: AtomicU64,
+}
+
+impl MrmPool {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            slots: StdMutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// 取账号槽：命中即复用；未满则新建；已满且存在**空闲**槽（仅池持有
+    /// 引用、互斥锁可立即取到）则淘汰该槽让位；否则 None（fail-closed）。
+    ///
+    /// 空闲判定只看 `Arc::strong_count == 1`：有在途发送（持槽 Arc 或等锁）
+    /// 的槽永不被淘汰，避免打断其他账号的 MRM 请求。
+    pub(crate) fn slot_for(&self, account: &str) -> Option<Arc<MrmSlot>> {
+        let mut slots = self.slots.lock().expect("mrm pool lock");
+        if let Some(slot) = slots.get(account) {
+            return Some(Arc::clone(slot));
+        }
+        if slots.len() >= self.limit {
+            // 空闲槽按代次最旧优先淘汰（代次 = 创建序，确定性可测）。
+            let evicted = slots
+                .iter()
+                .filter(|(_, slot)| Arc::strong_count(slot) == 1)
+                .filter(|(_, slot)| slot.connection.try_lock().is_ok())
+                .min_by_key(|(_, slot)| slot.generation)
+                .map(|(key, _)| key.clone());
+            slots.remove(&evicted?);
+        }
+        let slot = Arc::new(MrmSlot {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            connection: tokio::sync::Mutex::new(None),
+        });
+        slots.insert(account.to_owned(), Arc::clone(&slot));
+        Some(slot)
+    }
+
+    /// 账号删除/重链：摘除该账号槽（在途发送持的 Arc 自然走完并落弃）。
+    pub(crate) fn remove(&self, account: &str) {
+        self.slots.lock().expect("mrm pool lock").remove(account);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.lock().expect("mrm pool lock").len()
+    }
+}
+
+impl MrmSlot {
+    /// 槽代次（观测/测试用：淘汰后新槽代次不同）。
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// 群发入口：MRM 主路径 + vendored failover（设计冻结：不做并行 fan-out
 /// 半吊子中间态——要么单请求 MRM，要么逐收件人，两条路都是官方合法形态）。
 pub(crate) async fn dispatch_group_message(
     service: &Arc<super::Service>,
+    account: &str,
     manager: &mut Manager<SqliteStore, Registered>,
     group_id: &str,
     body: DataMessage,
@@ -459,7 +543,7 @@ pub(crate) async fn dispatch_group_message(
         );
 
         let wire_t0 = std::time::Instant::now();
-        let wire_result = send_mrm(service, &payload, timestamp, token.clone()).await;
+        let wire_result = send_mrm(service, account, &payload, timestamp, token.clone()).await;
         // KT (send latency probe): wire 段打点——deliver-group 细分第三段 =
         // MRM 单请求 WS/HTTPS 往返（失败轮 outcome=err，修复/刷新后重试照付）。
         tracing::warn!(
@@ -707,15 +791,20 @@ fn build_group_send_token(
         .into_full_token(expiration))
 }
 
-/// 单请求 MRM 发送（Service 级 unauth 连接缓存，传输失败摘除重连一次）。
+/// 单请求 MRM 发送（per-account 连接槽：传输失败只摘除本账号连接重连一次，
+/// 不影响其他账号；池满且无空闲槽 = fail-closed 走 failover）。
 async fn send_mrm(
     service: &Arc<super::Service>,
+    account: &str,
     payload: &[u8],
     timestamp: u64,
     token: zkgroup::groups::GroupSendFullToken,
 ) -> Result<libsignal_net_chat::api::messages::MultiRecipientMessageResponse, MrmSendFailure> {
+    let Some(slot) = service.mrm_pool.slot_for(account) else {
+        return Err(MrmSendFailure::Fatal);
+    };
     for attempt in 0..2 {
-        let mut guard = service.mrm_chat.lock().await;
+        let mut guard = slot.connection.lock().await;
         if guard.is_none() {
             *guard = Some(
                 connect_production_chat()
@@ -746,7 +835,8 @@ async fn send_mrm(
                 return Err(MrmSendFailure::Unauthorized);
             }
             Err(_) => {
-                // 传输层失败：摘除缓存连接重连一次；仍失败 → failover。
+                // 传输层失败：摘除本账号缓存连接重连一次；仍失败 → failover。
+                // 只摘本槽——其他账号的连接与在途请求不受影响（R4）。
                 *guard = None;
                 if attempt == 1 {
                     return Err(MrmSendFailure::Fatal);
@@ -884,6 +974,48 @@ mod tests {
         let back: SenderKeyInfo = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.distribution_id, info.distribution_id);
         assert_eq!(back.created_at_ms, info.created_at_ms);
+    }
+
+    /// R4：MRM 连接按账号隔离——同账号复用同一槽，异账号各自独立槽。
+    #[test]
+    fn mrm_pool_isolates_accounts() {
+        let pool = MrmPool::new(MRM_CONNECTION_LIMIT);
+        let a = pool.slot_for("+15550000001").expect("slot a");
+        let a_again = pool.slot_for("+15550000001").expect("slot a reuse");
+        let b = pool.slot_for("+15550000002").expect("slot b");
+        assert!(Arc::ptr_eq(&a, &a_again), "同账号复用连接槽");
+        assert!(!Arc::ptr_eq(&a, &b), "异账号互不共享");
+        assert_eq!(pool.len(), 2);
+        let a_generation = a.generation();
+        drop((a, a_again, b));
+        pool.remove("+15550000001");
+        assert_eq!(pool.len(), 1);
+        // 摘除后重建：新槽代次（不复活旧连接）。
+        let rebuilt = pool.slot_for("+15550000001").expect("rebuilt slot");
+        assert_ne!(rebuilt.generation(), a_generation);
+    }
+
+    /// R4/R2：池达上限后，使用中的槽不被驱逐；全忙 = fail-closed（None，
+    /// 调用方走 failover）。空闲槽可被淘汰让位。
+    #[test]
+    fn mrm_pool_caps_connections_and_fails_closed_when_all_busy() {
+        let pool = MrmPool::new(2);
+        let a = pool.slot_for("a").expect("slot a");
+        let b = pool.slot_for("b").expect("slot b");
+        assert_eq!(pool.len(), 2);
+
+        // 两槽都被调用方持有（模拟在途发送）→ 第三个账号 fail-closed。
+        assert!(pool.slot_for("c").is_none());
+        assert_eq!(pool.len(), 2);
+
+        // 释放 a 的引用 → a 成为空闲槽，可被 c 淘汰。
+        let a_generation = a.generation();
+        drop(a);
+        let c = pool.slot_for("c").expect("idle slot evicted");
+        assert_eq!(pool.len(), 2);
+        assert!(c.generation() != a_generation);
+        // b 仍在池中（未被误淘汰）。
+        assert!(Arc::ptr_eq(&pool.slot_for("b").expect("b survives"), &b));
     }
 
     /// 群 Sent 转录字段钉面（批次 T，官方 sendToGroup → wrapWithSyncMessageSend

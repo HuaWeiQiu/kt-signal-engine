@@ -234,7 +234,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
 | `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
-| `engine.perfMetrics` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{uptimeMs, timings, counters, unknownKeyDropped}`（timings 条目 `{count, totalUs, maxUs, lastUs}` 微秒制、键序 BTreeMap 确定性；词表封闭见 §5 S2a 块——未命中的计时/计数键不出现，诚实缺席不发明 0） | 无（只读快照应答，无业务错误面；fake/real 同码路真实答——指标是进程真相，不分模式） | **2026-10-12 real（KT 扩展，S2a 性能基线打点层，【engine-compat】，§5 S2a 块）**：进程内有界指标注册表的只读投影（只测不改立项纪律，`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md` §附四②）；快照进程内存不跨重启；词表外键计 `unknownKeyDropped` 丢弃（有界面）；消费面 = connector 白名单透传（**connector 切片遗留**）+ S2b 直连实测 harness；不落调度日志零 stderr |
+| `engine.perfMetrics` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{uptimeMs, timings, counters, unknownKeyDropped, accounts, outbound}`（timings 条目 `{count, totalUs, maxUs, lastUs}` 微秒制、键序 BTreeMap 确定性；词表封闭见 §5 S2a 块——未命中的计时/计数键不出现，诚实缺席不发明 0；稳定性批 2026-10-20 additive：`accounts` = 逐账号 `{inflight, receive{count,totalUs,maxUs,lastUs,p50Us,p95Us}, receiveLag{...Ms}, streamConnected, streamRecoverable, streamUnbound, crashes}`，`outbound` = `{globalDepth, globalCapacity, accounts{account: 在途帧数}}`，见 §5 稳定性批块） | 无（只读快照应答，无业务错误面；fake/real 同码路真实答——指标是进程真相，不分模式） | **2026-10-12 real（KT 扩展，S2a 性能基线打点层，【engine-compat】，§5 S2a 块）**：进程内有界指标注册表的只读投影（只测不改立项纪律，`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md` §附四②）；快照进程内存不跨重启；词表外键计 `unknownKeyDropped` 丢弃（有界面）；消费面 = connector 白名单透传（**connector 切片遗留**）+ S2b 直连实测 harness；不落调度日志零 stderr。**2026-10-20 稳定性批（A1，wire additive【engine-compat】）**：追加 `accounts`/`outbound` 两键（审计 §9.13.2 A1：mailbox 深度/在飞/p50·p95/接收延迟/重连次数）；基础四键形状与词表零变化，见 §5 稳定性批块 |
 | `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
 | `deleteForMeMessages` | `{account, kind("contact"\|"group"), conversationId, entries: [{author, timestamp}]}`（消息级「为我删除」上行，官方 `getDeleteForMeSyncMessage` 的 `messageDeletes` 发送面同位。会话标识与会话级 `deleteForMeConversation` 完全同源：kind contact = service-id 串（ACI/PNI）\|E164 双形态，group = 32B 标准 base64 master key；legacyGroup 同拒。`entries` 必填非空、≤256 条——官方发送面按 `MAX_MESSAGE_COUNT=500` 分批（SendMessage.preload.ts:1923），引擎单请求 fail-closed 不拆批不静默截断，超帽整批拒。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换），timestamp 非零正整数；任一条目形状错整批拒不发半批） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错、entries 缺席·null·非数组·空批·超 256、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数、条目非对象）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-20 real（KT 扩展，leg 3/3，官方对齐 Signal-Desktop，engine-compat，§5 leg 3/3 块）**：向本账号其他设备同步「这些消息也删掉」——`SyncMessage.deleteForMe.messageDeletes[0]{conversation, messages[]}`（官方 SendMessage.preload.ts:1840-1936 构帧；收方 MessageReceiver.preload.ts:3609-3657 逐条走 delete-message）；session 级与消息级共用 conversation/addressable 构帧单点；padded sync message，self-send 到本账号 ACI；协议上行面落调度日志（send 系同纪律，无消息正文/媒体内容）；fake：成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定） |
 | `getConversationState` | `{account, conversationId, kind: contact\|group\|legacyGroup}`（kind 词表与会话引用形状同 setConversationBlocked 面） | `{mutedUntilTimestamp, archived, markedUnread}`（三键恒在；目标记录缺席/无 storage 状态/manifest 404 = 全缺省 `0/false/false`，诚实幂等不报错） | 未注册账号 `-32603`；kind 缺失/词表外、会话不可解析/形状错 `-32603`；storage 链路：服务/auth 不可达 `STORAGE_UNAVAILABLE`、读取/解密失败 `STORAGE_READ_FAILED`（`-1` + message，blocked 面同款） | **2026-10-11 real（KT 扩展，P15b 项2，状态收敛审计 R1，wire additive，§5 P15b 块）**：真相源 = Storage Service record 字段（非 sync message）——ContactRecord.archived/markedUnread/mutedUntilTimestamp（SignalStorage.proto 11/12/13）与 GV2/GV1 同名位（4/5/6）；MuteExpiration.toProto 语义 = 绝对毫秒、0 = 未静音；fake：恒缺省态（契约测试钉定） |
@@ -6732,3 +6732,91 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
 在 fake 面亦为形状桩：无 store/无网络，逐账号投
 `{"attachmentBackfill": true}`（引擎自声明位；官方 `isBackfillEnabled`
 对 test/mock 环境恒 true 同向），真实位只在 real 面读服务器 profile。
+
+### 稳定性批（2026-10-20，S4/A2/A4/R4/D5/A1；wire additive 仅 `engine.perfMetrics`）
+
+审计锚点：`SIGNAL-PARITY-PIPELINE.md` §9.13.2/§9.13.6（W8）。官方语义铁律：
+每项先给 upstream `file:line`；Desktop 单账号进程无对应面的多账号/引擎适配
+一律标 `[KT 适配]`；无协议证据不新增字段。
+
+- **S4 actor/panic 隔离 + A2 每账号崩溃退避**（`src/service/supervision.rs`）：
+  - 官方锚点：`ts/util/BackOff.std.ts:7-9`（`FIBONACCI = [1,2,3,5,8,13,21,34,55]`）、
+    `:47-83`（`get`/`getAndIncrement`/`reset`；jitter 小于基值才叠加）。引擎既有
+    重连序列 `1,1,2,3,5…55s + 0..5s 单向 jitter`（`service::reconnect_backoff_delay`
+    / `reconnect_jittered_delay`）继续作为唯一退避实现，本批不新增节奏。
+  - 实现：单账号接收任务由 `run_account_supervisor` 以
+    `AssertUnwindSafe(...).catch_unwind()` 包裹；panic 只收口本次运行，账号级
+    崩溃计数 +1 后按上述序列退避重启，其余账号任务与进程继续。一次运行存活
+    ≥30s 视为恢复，退避步进清零（累计崩溃计数保留作观测）。
+  - 日志：只落 `stage=account_restart` + 账号 SHA-256 前 8 hex + 崩溃次数/
+    步进/等待毫秒；panic payload、号码、正文、密钥零落盘。
+  - `[KT 适配]`：Desktop 单账号进程无 per-account supervisor；官方
+    `BackOff.reset()` 的「链路恢复清零」语义以运行存活时长近似。
+  - 边界：`panic=abort` 编译/部署形态下 `catch_unwind` 不生效（进程级 abort
+    由部署层 watchdog 兜底）；默认 panic hook 仍会把 panic 摘要写 stderr
+    （Rust 运行时行为，非本层日志面）。
+
+- **A4 按账号 graceful shutdown**（`Service::stop_pipeline` / `shutdown_all`）：
+  - 官方锚点：`ts/textsecure/MessageReceiver.preload.ts:516-519`
+    `stopProcessing()` 先置停止处理旗；`:525-547` `drain()` 把等待任务排进
+    incoming/encrypted/decrypted 队列，等在飞工作完成；进程离线路径
+    `ts/background.preload.ts:1789` 先 `drain()` 再摘 handler。
+  - 实现：`deleteLocalAccountData`/relink 先停该账号接收管线并等待任务退出
+    （select 停旗不打断已开始的信封处理臂；Manager drop 时 SQLite store
+    正常收口），再删 store 目录；等待有 10s 宽限（超时落结构化 warn 后继续
+    显式删除）。stdin EOF 的干净退出路径调用 `Service::shutdown_all()`
+    等待全部管线收口后再退出。
+  - `[KT 适配]`：官方单账号无「按账号」删除面；顺序语义（stop → drain →
+    drop store）与官方同位。
+
+- **R4 MRM 共享连接隔离 + R2 连接上限**（`src/service/group_mrm.rs`）：
+  - 官方锚点：`ts/textsecure/SocketManager.preload.ts:733`（unauth socket
+    close）、`:764-786`（`#dropUnauthenticated` 单槽摘除）、`:808-849`
+    （unauth 过期定时器关闭后重连）。官方仅一个 unauth 槽，无多账号池。
+  - 实现：`mrm_chat` 单槽改为 `MrmPool`（账号 → `Arc<MrmSlot>`），每个账号
+    独立 `AsyncMutex<Option<ChatConnection>>`；单账号传输失败只摘本槽重连
+    一次，其他账号连接与在途请求不受影响。池上限 `MRM_CONNECTION_LIMIT=2`
+    （审计 R2 连接预算）：满员时按创建序淘汰**空闲**槽（池外无引用且锁可
+    立即取到）；全忙则 `fail-closed` 返回 `Fatal`，该次群发走既有 vendored
+    逐收件人 failover（正确性不变，不排队阻塞）。
+  - `[KT 适配]`：多账号池无官方对应面；单连接内协议行为（PUT
+    `/v1/messages/multi_recipient` + GSE token）零变化。账号删除/重链时
+    摘除该账号槽。
+
+- **D5 EngineState 跨账号串行**（`src/state.rs`）：
+  - 现状核实：`EngineState` 只经 `Arc<AsyncMutex<EngineState>>` 访问，
+    link/delete 的内存变更与 `persist()` 全在锁内，跨账号天然串行；落盘
+    保持「同目录 tmp + rename」原子替换，本批把固定 tmp 名改为
+    `engine-state.json.<pid>.<seq>.tmp`，并发 persist 不再共用半写文件
+    （最后 rename 赢，读者永远看到完整 JSON）。
+  - `[KT 适配]`：官方单账号无跨账号并发面；锁 + 原子替换是既有实现的
+    显式化，无新格式/新文件。
+
+- **A1 per-account 观测**（`src/service/account_metrics.rs`，扩展既有
+  `engine.perfMetrics`，**不新增 JSON-RPC 方法**）：
+  - 快照 additive 两键：
+    - `accounts`：逐账号 `{inflight, receive{count,totalUs,maxUs,lastUs,
+      p50Us,p95Us}, receiveLag{count,totalMs,maxMs,lastMs,p50Ms,p95Ms},
+      streamConnected, streamRecoverable, streamUnbound, crashes}`。分位取
+      最近 256 个样本的最近秩（nearest-rank）；未采样键诚实缺席。
+    - `outbound`：`{globalDepth, globalCapacity, accounts{account: 在途帧数}}`
+      （全局 writer 队列占用 + 每账号已占出站许可）。
+  - 语义：`receive` = 信封到达 → ack 完成（与既有 `receive_envelope` 同一
+    起止）；`receiveLag` = 信封 `server_timestamp` → 本地处理时刻（仅
+    Content/IdentityChange 臂有服务器时间戳，负偏移归 0；时钟偏移本身仍由
+    ClockSkewGate 独立告警）；`streamRecoverable` 即「重连次数」。
+  - `[KT 适配]`：S1 actor-per-account 未落地，引擎没有「每账号 mailbox」；
+    本批不发明队列，用接收在飞 0/1 + 出站逐账号在途/全局深度逼近「深度/
+    在飞」。账号键为 wire 明文（与 `listAccounts` 同级）；日志面仍只允许
+    不可逆短哈希。内存有界：账号数 × 两条 256 样本环，不随运行增长。
+  - 消费面：既有 `engine.perfMetrics` 直连 harness/契约测试；connector
+    白名单透传属既有切片遗留，本批不改 connector。
+
+- **本批未做（余力边界）**：R2 的「每账号 fd/线程/SQLite cache 预算」需要
+  S1 actor 化或账号数硬上限（产品决策），本批只落 MRM 连接上限 2（见上）；
+  云备份 restore/upload 仍为进程级单槽，跨账号排队/公平调度需要队列与逐
+  账号进度模型，属独立设计批，未改。
+- **门禁面**：新增单测覆盖 panic 隔离/双账号互不影响/退避序列与恢复清零/
+  退避中停机、删除等待在飞帧、MRM 池隔离与 fail-closed、并发 link/delete
+  串行与 tmp 无残留、分位/环形缓冲/在飞守卫；契约测试钉定
+  `engine.perfMetrics` 六键形状（基础四键 + additive 两键）。

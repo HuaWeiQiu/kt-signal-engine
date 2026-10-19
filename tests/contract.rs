@@ -6952,22 +6952,37 @@ fn version_self_report_shape() {
     assert_shape(&fake_engine.request("version", json!({}))["result"]);
 }
 
-/// engine.perfMetrics（S2a 性能基线打点层，KT 扩展方法）：进程内指标快照
-/// 只读投影——零参数、账号无关、零网络；`{uptimeMs, timings, counters,
-/// unknownKeyDropped}` 四键恒在；`rpc_dispatch` 计时随请求数单调（respond
-/// 分派咽喉每笔请求后落点，快照构建先于本笔落点）；读面不落调度日志。
+/// engine.perfMetrics（S2a 性能基线打点层 + A1 per-account 观测，KT 扩展
+/// 方法）：进程内指标快照只读投影——零参数、账号无关、零网络；基础四键
+/// `{uptimeMs, timings, counters, unknownKeyDropped}` + 稳定性批 additive
+/// 两键 `{accounts, outbound}` 恒在；`rpc_dispatch` 计时随请求数单调
+/// （respond 分派咽喉每笔请求后落点，快照构建先于本笔落点）；读面不落调度
+/// 日志。
 #[test]
 fn engine_perf_metrics_snapshot_shape() {
     let assert_shape = |result: &Value| {
         let obj = result.as_object().expect("result object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["counters", "timings", "unknownKeyDropped", "uptimeMs"]
+            [
+                "accounts",
+                "counters",
+                "outbound",
+                "timings",
+                "unknownKeyDropped",
+                "uptimeMs",
+            ]
         );
         assert!(obj["uptimeMs"].is_u64(), "uptimeMs u64");
         assert!(obj["timings"].is_object(), "timings object");
         assert!(obj["counters"].is_object(), "counters object");
+        assert!(obj["accounts"].is_object(), "accounts object");
+        assert!(obj["outbound"].is_object(), "outbound object");
         assert_eq!(obj["unknownKeyDropped"], json!(0));
+        assert!(
+            obj["outbound"]["globalCapacity"].is_u64(),
+            "outbound globalCapacity u64"
+        );
     };
 
     // real 模式 + 全新数据目录：账号无关可应答（未绑定账号边界）；

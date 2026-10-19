@@ -95,6 +95,33 @@ impl OutboundHub {
         wait.await.is_ok()
     }
 
+    /// 出站 mailbox 观测快照（A1 per-account 观测，2026-10-20 稳定性批）：
+    /// `globalDepth` = 全局 writer 队列当前占用（容量 - 可用容量）；
+    /// `accounts` = 逐账号在途帧数（已占用的账号许可；writer 写完并 flush
+    /// 才释放）。纯读数，不建信号量、不改队列状态。
+    pub(crate) fn depth_json(&self) -> serde_json::Value {
+        let global_capacity = self.global.max_capacity();
+        let global_depth = global_capacity.saturating_sub(self.global.capacity());
+        let accounts = {
+            let accounts = self.accounts.lock().expect("outbound accounts lock");
+            let mut rows = serde_json::Map::with_capacity(accounts.len());
+            for (account, semaphore) in accounts.iter() {
+                rows.insert(
+                    account.clone(),
+                    serde_json::json!(
+                        OUTBOUND_ACCOUNT_CAPACITY.saturating_sub(semaphore.available_permits())
+                    ),
+                );
+            }
+            serde_json::Value::Object(rows)
+        };
+        serde_json::json!({
+            "globalDepth": global_depth,
+            "globalCapacity": global_capacity,
+            "accounts": accounts,
+        })
+    }
+
     /// 取账号信号量（惰性建；账号数由账号表界定，条目随账号数有界）。
     fn account_semaphore(&self, account: &str) -> Arc<Semaphore> {
         let mut accounts = self.accounts.lock().expect("outbound accounts lock");
@@ -227,6 +254,39 @@ mod tests {
             .await
             .expect("flush resolves")
             .expect("flush task"));
+    }
+
+    /// A1 观测面：出站深度读数——账号在途 = 已占许可数，全局深度 = 队列
+    /// 当前占用；接收端取走帧并析构后归零。纯读数不改队列。
+    #[tokio::test]
+    async fn depth_snapshot_reports_global_and_per_account_inflight() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(OUTBOUND_GLOBAL_CAPACITY);
+        let hub = OutboundHub::new(tx);
+
+        let empty = hub.depth_json();
+        assert_eq!(empty["globalDepth"], 0);
+        assert_eq!(empty["globalCapacity"], OUTBOUND_GLOBAL_CAPACITY);
+        assert!(empty["accounts"]
+            .as_object()
+            .expect("accounts object")
+            .is_empty());
+
+        assert!(hub.notify("a", json!({ "n": 1 })).await);
+        assert!(hub.notify("a", json!({ "n": 2 })).await);
+        assert!(hub.notify("b", json!({ "n": 3 })).await);
+        let depth = hub.depth_json();
+        assert_eq!(depth["globalDepth"], 3);
+        assert_eq!(depth["accounts"]["a"], 2);
+        assert_eq!(depth["accounts"]["b"], 1);
+
+        // 取走并析构帧 → 许可释放。a 两帧 + b 一帧。
+        for _ in 0..3 {
+            drop(rx.recv().await.expect("frame"));
+        }
+        let depth = hub.depth_json();
+        assert_eq!(depth["globalDepth"], 0);
+        assert_eq!(depth["accounts"]["a"], 0);
+        assert_eq!(depth["accounts"]["b"], 0);
     }
 
     /// 出口死亡（接收端丢弃）后 notify/flush 立即落错，不悬挂；重复

@@ -4593,7 +4593,9 @@ async fn dispatch(
         // fake/real 同码路——指标是进程真相，不分模式。不落调度日志
         // （engine.protocolCapabilities 同纪律）。消费面：connector 白名单
         // 透传属 connector 切片遗留；S2b 实测前由直连 harness/契约测试消费。
-        "engine.perfMetrics" => jsonrpc::success_response(id, perf_metrics::snapshot_json()),
+        // 稳定性批（2026-10-20，A1）additive：追加 `accounts`（逐账号接收
+        // 在飞/分位延迟/建流结局/崩溃）与 `outbound`（全局 + 逐账号在途）。
+        "engine.perfMetrics" => jsonrpc::success_response(id, service.perf_metrics_snapshot()),
         // engine.deviceCapabilities（D5 设备面能力注册）：PUT
         // /v1/devices/capabilities（官方 registerCapabilities 同端点）并回
         // 读上传面。触网方法（fake 恒已注册，getUserStatus 同款）；仅 401
