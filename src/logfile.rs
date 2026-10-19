@@ -26,11 +26,20 @@
 //! 文本为只读透传。初始化失败（目录创建/文件打开）= 无日志静默降级——
 //! 不 panic、不写 stderr、IPC 服务不受影响。
 
+// WIP（临终现场保全批，非本批工作）：`dump_last_moments` 与三个计数探针
+// 尚未接线，故意保留在本文件等待该批完成。为避免阻断其他批次的
+// clippy `-D warnings` 门禁，这里临时允许 dead_code；接线批次完成后删除
+// 本属性并补上调用点（`record_pipeline_*` / `record_rpc_*` / panic hook）。
+#![allow(dead_code)]
+
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
@@ -49,6 +58,110 @@ const MAX_LEVEL: LevelFilter = LevelFilter::WARN;
 
 /// 日志文件名（data 目录下 logs/ 子目录内）。
 const LOG_FILE_NAME: &str = "engine-stderr.log";
+
+// —— 临终现场保全（现场保全批 2026-10-17）——
+// 背景：2026-10-17 20:16 退化窗（读调用 2.5s 失败/15s 超时、群发 26.5s、
+// 信封错误风暴）后进程重启，engine-stderr.log 被整体截断——根因现场丢失。
+// 修法 = 订阅器内嵌「最近 warn+ 环形缓冲」+ 进程临终三路径（panic hook /
+// supervisor SIGTERM/SIGINT / ——）把缓冲 + 连接状态快照落 sidecar 文件
+// `engine-last-moments-<ts>.log`：截断主日志不动，sidecar 不丢。全部静态
+// 同步态——panic hook 内可安全读（无 await、无 async 锁）；任何失败静默
+// （不 panic、不写 stderr，compat §1 同源纪律）。SIGKILL 不可钩（内核语义），
+// 该面记档为已知界。
+
+/// 环形缓冲容量（warn+ 行数）：退化窗（信封错误风暴）下 warn 行密、15 分钟
+/// 数千行量级——1024 行足以覆盖「最近 N 分钟」现场且内存有界（单行远小于
+/// 1 KiB）。
+const LAST_MOMENTS_RING_LINES: usize = 1024;
+
+static LAST_MOMENTS_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// sidecar 落点目录（`init` 时置位；未置位 = dump 静默 no-op）。
+static LAST_MOMENTS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 每进程至多 dump 一次（panic 与 SIGTERM 竞态时先到的赢——最接近临终的
+/// 现场；重复 dump 只会用更晚但更少上下文的缓冲覆盖更早的快照）。
+static LAST_MOMENTS_DUMPED: AtomicBool = AtomicBool::new(false);
+/// 活跃接收管线数（receive_pipeline spawn/退出计数；panic 快照可读）。
+static PIPELINES_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// 在飞 JSON-RPC 请求数（main dispatch spawn_local 计数；panic 快照可读）。
+static RPCS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// 最近 ka_diag（vendor websocket keepalive 诊断，websocket/mod.rs KA-DIAG
+/// 批）事件时间戳（毫秒）与整行——连接退化第一证据，订阅器顺手沉淀。
+static LAST_KA_DIAG_AT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_KA_DIAG_LINE: Mutex<String> = Mutex::new(String::new());
+/// 进程起始时刻（uptime 快照用）。
+static STARTED_AT: OnceLock<Instant> = OnceLock::new();
+
+/// 接收管线 spawn 计数（service::spawn_pipeline 挂载）。
+pub(crate) fn record_pipeline_spawned() {
+    PIPELINES_ACTIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 接收管线退出计数（receive_pipeline future 收口挂载）。
+pub(crate) fn record_pipeline_exited() {
+    PIPELINES_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// 在飞 RPC 进入计数（main dispatch spawn_local 挂载）。
+pub(crate) fn record_rpc_entered() {
+    RPCS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 在飞 RPC 收口计数。
+pub(crate) fn record_rpc_exited() {
+    RPCS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// 临终现场落盘：sidecar 文件 `engine-last-moments-<ts>.log`（0o600，目录
+/// 即主日志同 `logs/`）。头部 = 原因 + 时间戳 + uptime + 连接状态快照
+/// （活跃管线数/在飞 RPC/最近 ka_diag），正文 = 环形缓冲内全部 warn+ 行
+/// （旧→新）。每进程至多一次；任何失败静默（compat §1 纪律）。
+pub(crate) fn dump_last_moments(reason: &str) {
+    if LAST_MOMENTS_DUMPED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Ok(dir_guard) = LAST_MOMENTS_DIR.lock() else {
+        return;
+    };
+    let Some(dir) = dir_guard.clone() else {
+        return;
+    };
+    drop(dir_guard);
+    // 文件名时间戳：RFC3339 的 `:` 在 Windows 文件名非法，统一换 `-`。
+    let stamp = timestamp().replace(':', "-");
+    let path = dir.join(format!("engine-last-moments-{stamp}.log"));
+    let Some(mut file) = open_log_file(&path) else {
+        return;
+    };
+    let mut out = String::with_capacity(64 * 1024);
+    out.push_str(&format!("last-moments reason={reason}\n"));
+    out.push_str(&format!(
+        "dumped_at={} uptime_secs={}\n",
+        timestamp(),
+        STARTED_AT.get().map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    ));
+    out.push_str(&format!(
+        "pipelines_active={} rpcs_in_flight={}\n",
+        PIPELINES_ACTIVE.load(Ordering::Relaxed),
+        RPCS_IN_FLIGHT.load(Ordering::Relaxed)
+    ));
+    let (ka_at, ka_line) = (
+        LAST_KA_DIAG_AT_MS.load(Ordering::Relaxed),
+        LAST_KA_DIAG_LINE
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default(),
+    );
+    out.push_str(&format!("last_ka_diag_at_ms={ka_at} line={ka_line}\n"));
+    out.push_str("--- ring (warn+ events, oldest first) ---\n");
+    if let Ok(ring) = LAST_MOMENTS_RING.lock() {
+        for line in ring.iter() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    let _ = file.write_all(out.as_bytes());
+    let _ = file.flush();
+}
 
 /// 订阅器内部状态：`file: None` = 打开失败静默降级（永不重试——data 目录
 /// 启动期不可写通常进程级不可写，逐行重试只会放大失败）。
@@ -155,6 +268,24 @@ impl Subscriber for RollingFileSubscriber {
             line.push('=');
             line.push_str(&value);
         }
+        // 临终现场环形缓冲 + ka_diag 沉淀（现场保全批）：warn+ 每行顺手
+        // 进 ring（克隆代价可忽略——warn 级稀疏）；ka_diag 行另记时间戳与
+        // 整行作连接退化第一证据。锁顺序：ring/ka 锁与 state 锁互不嵌套。
+        if let Ok(mut ring) = LAST_MOMENTS_RING.lock() {
+            if ring.len() >= LAST_MOMENTS_RING_LINES {
+                ring.pop_front();
+            }
+            ring.push_back(line.clone());
+        }
+        if line.contains("ka_diag") {
+            LAST_KA_DIAG_AT_MS.store(
+                chrono::Utc::now().timestamp_millis() as u64,
+                Ordering::Relaxed,
+            );
+            if let Ok(mut last) = LAST_KA_DIAG_LINE.lock() {
+                *last = line.clone();
+            }
+        }
         if let Ok(mut state) = self.state.lock() {
             state.write_line(&line);
         }
@@ -218,7 +349,7 @@ pub(crate) fn init(data_dir: &Path) {
         let size = fs::metadata(&current).map(|meta| meta.len()).unwrap_or(0);
         let file = open_log_file(&current)?;
         Some(LogState {
-            dir,
+            dir: dir.clone(),
             current,
             file: Some(file),
             size,
@@ -229,6 +360,30 @@ pub(crate) fn init(data_dir: &Path) {
     let _ = tracing::subscriber::set_global_default(RollingFileSubscriber {
         state: Mutex::new(state),
     });
+    // 临终现场保全：sidecar 目录与起始时刻置位（dump 失败静默的既有纪律）。
+    let _ = STARTED_AT.set(Instant::now());
+    if let Ok(mut dir_slot) = LAST_MOMENTS_DIR.lock() {
+        *dir_slot = Some(dir);
+    }
+}
+
+/// 测试隔离辅助：重置 dump 一次旗 + 环形缓冲 + 快照静态（进程内静态态，
+/// 并行测试间必须显式复位保证确定性）。
+#[cfg(test)]
+fn reset_last_moments_for_test() {
+    LAST_MOMENTS_DUMPED.store(false, Ordering::SeqCst);
+    LAST_KA_DIAG_AT_MS.store(0, Ordering::SeqCst);
+    PIPELINES_ACTIVE.store(0, Ordering::SeqCst);
+    RPCS_IN_FLIGHT.store(0, Ordering::SeqCst);
+    if let Ok(mut ring) = LAST_MOMENTS_RING.lock() {
+        ring.clear();
+    }
+    if let Ok(mut last) = LAST_KA_DIAG_LINE.lock() {
+        *last = String::new();
+    }
+    if let Ok(mut dir_slot) = LAST_MOMENTS_DIR.lock() {
+        *dir_slot = None;
+    }
 }
 
 #[cfg(test)]
