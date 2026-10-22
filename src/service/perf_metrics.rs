@@ -116,11 +116,13 @@ pub(crate) mod keys {
     pub const STREAM_CONNECTED: &str = "stream_outcome_connected";
     pub const STREAM_UNBOUND: &str = "stream_outcome_unbound";
     pub const STREAM_STDIO_DEAD: &str = "stream_outcome_stdio_dead";
-    /// 4409（connected elsewhere）外部夺走臂（单连接纪律批）：进程内无其它
-    /// 活 identified 连接 → 按退避重连。
+    /// 接收流以官方「不重连」close code（1000/4409）结束：停环等显式重链。
+    pub const STREAM_CLOSED_NO_RECONNECT: &str = "stream_outcome_closed_no_reconnect";
+    /// 遗留键（单连接纪律批）：2026-10-21 对齐官方后 4409 统一走
+    /// `STREAM_CLOSED_NO_RECONNECT` 停环，本键保留仅为词表/wire 兼容，不再
+    /// 递增。
     pub const STREAM_CLOSE_4409_EXTERNAL: &str = "stream_close_4409_external";
-    /// 4409 自家互搏残影臂（单连接纪律批）：进程内仍有其它活 identified
-    /// 连接 → 不立刻重拨，退避步进清账先行。
+    /// 遗留键（同上）：4409 自家互搏残影臂已并入统一停环语义，不再递增。
     pub const STREAM_CLOSE_4409_SELF: &str = "stream_close_4409_self";
 }
 
@@ -170,6 +172,7 @@ const KNOWN_KEYS: &[&str] = &[
     keys::STREAM_CONNECTED,
     keys::STREAM_UNBOUND,
     keys::STREAM_STDIO_DEAD,
+    keys::STREAM_CLOSED_NO_RECONNECT,
     keys::STREAM_CLOSE_4409_EXTERNAL,
     keys::STREAM_CLOSE_4409_SELF,
 ];

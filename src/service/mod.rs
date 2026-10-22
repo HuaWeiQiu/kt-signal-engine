@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use presage::libsignal_service::configuration::{Endpoint, ServiceCredentials, SignalServers};
@@ -31,7 +31,7 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::DataMessage;
 use presage::store::{ContentsStore, StateStore, Store};
-use presage_store_sqlite::SqliteStore;
+use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
 use rand::Rng;
@@ -39,7 +39,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 
-use crate::state::{AccountEntry, EngineState};
+use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG};
 
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
@@ -848,7 +848,13 @@ pub(crate) enum SendError {
     /// 服务端限流（HTTP 429/413 → ServiceError::RateLimitExceeded，vendored
     /// push_service/response.rs 归型，retry-after 不上 wire）。引擎不自动
     /// 重试；错误面 -32603 + 限流分类原文（compat §3）。
-    RateLimited,
+    RateLimited {
+        // 服务端在 429/413 应答里给出的等待时长（秒）。上游
+        // ServiceError::RateLimitExceeded { retry_after } 本来带着它，之前用
+        // { .. } 丢弃，导致桌面只能按固定 60 秒重试（官方
+        // sleepForRateLimitRetryAfterTime 用的是服务端值）。
+        retry_after_secs: Option<u64>,
+    },
     /// 服务端要求人机验证（HTTP 428 → ServiceError::ProofRequiredError；
     /// send 链 sender 同因再包层 MessageSenderError::ProofRequired，
     /// token/options 不出归型面）。不自动重试；错误面 -32603（compat §3）。
@@ -969,7 +975,9 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
     fn service_error_face(error: ServiceError, presage_path: &'static str) -> SendError {
         match error {
             ServiceError::Unauthorized => SendError::Unbound,
-            ServiceError::RateLimitExceeded { .. } => SendError::RateLimited,
+            ServiceError::RateLimitExceeded { retry_after } => SendError::RateLimited {
+                retry_after_secs: retry_after.map(|d| d.num_seconds().max(0) as u64),
+            },
             ServiceError::ProofRequiredError(..) => SendError::ProofRequired,
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
@@ -1256,7 +1264,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
         SendError::TargetTerminated => "SendError::TargetTerminated",
         SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
         SendError::Unbound => "SendError::Unbound",
-        SendError::RateLimited => "SendError::RateLimited",
+        SendError::RateLimited { .. } => "SendError::RateLimited",
         SendError::ProofRequired => "SendError::ProofRequired",
         SendError::ServerUnavailable => "SendError::ServerUnavailable",
         SendError::IdentityUnverified => "SendError::IdentityUnverified",
@@ -2052,10 +2060,48 @@ pub(crate) struct Service {
     own_capabilities_cache: own_capabilities::CapabilitiesCache,
 }
 
-/// 接收管线停机宽限：停旗发出后等待任务收口（drop Manager → SQLite store
-/// 刷盘）的上限。正常收口是 select 的即时臂（毫秒级）；超时只可能发生在
-/// 传输/落库长尾，按有界宽限继续删除流程（账号删除本身是显式破坏性意图）。
-const PIPELINE_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// 接收管线停机宽限（S5 关停宽限可配）：停旗发出后等待任务收口（drop
+/// Manager → SQLite store 刷盘）的上限。正常收口是 select 的即时臂（毫秒
+/// 级）；超时只可能发生在传输/落库长尾，按有界宽限继续删除流程（账号删除
+/// 本身是显式破坏性意图）。
+///
+/// 连接器的关停预算（今天 3 s + 2 s margin；池化后建议 ≥12 s）必须覆盖本
+/// 宽限 + 进程收尾。默认 10 s 与连接器 12 s 预算对齐；运维可用
+/// `KT_ENGINE_SHUTDOWN_GRACE_MS` 把两侧钉到同一预算（设计 §6.2 / §9 S5.3）。
+const PIPELINE_SHUTDOWN_GRACE_ENV: &str = "KT_ENGINE_SHUTDOWN_GRACE_MS";
+const PIPELINE_SHUTDOWN_GRACE_DEFAULT_MS: u64 = 10_000;
+/// 上限 5 min：配置错误不应让 delete/进程退出无限悬挂。
+const PIPELINE_SHUTDOWN_GRACE_MAX_MS: u64 = 300_000;
+
+/// 纯解析：空/非数字/0/超上限 = None（调用方回默认）。单测直打。
+fn parse_pipeline_shutdown_grace(raw: Option<&str>) -> Option<Duration> {
+    let millis = raw?.trim().parse::<u64>().ok()?;
+    if millis == 0 || millis > PIPELINE_SHUTDOWN_GRACE_MAX_MS {
+        return None;
+    }
+    Some(Duration::from_millis(millis))
+}
+
+/// 解析环境预算；非法值回默认并留结构化 warn（关停预算是运维旋钮，不应
+/// 把进程挡在启动门外）。
+fn pipeline_shutdown_grace() -> Duration {
+    let raw = std::env::var(PIPELINE_SHUTDOWN_GRACE_ENV).ok();
+    if let Some(grace) = parse_pipeline_shutdown_grace(raw.as_deref()) {
+        return grace;
+    }
+    if raw.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        tracing::warn!(
+            target: "engine.supervisor",
+            stage = "pipeline_shutdown_grace_invalid",
+            env = PIPELINE_SHUTDOWN_GRACE_ENV,
+            value = %raw.as_deref().unwrap_or_default(),
+            default_ms = PIPELINE_SHUTDOWN_GRACE_DEFAULT_MS,
+            max_ms = PIPELINE_SHUTDOWN_GRACE_MAX_MS,
+            "invalid shutdown grace; falling back to default",
+        );
+    }
+    Duration::from_millis(PIPELINE_SHUTDOWN_GRACE_DEFAULT_MS)
+}
 
 /// 运行中的接收管线句柄：停机旗 + 任务句柄（delete/relink 等待收口）。
 struct PipelineHandle {
@@ -2064,15 +2110,13 @@ struct PipelineHandle {
 }
 
 /// 等待管线任务收口（有界宽限；超时只落结构化 warn，账号哈希不落号码）。
-async fn await_pipeline_shutdown(account: String, handle: PipelineHandle) {
-    if tokio::time::timeout(PIPELINE_SHUTDOWN_GRACE, handle.done)
-        .await
-        .is_err()
-    {
+async fn await_pipeline_shutdown(account: String, handle: PipelineHandle, grace: Duration) {
+    if tokio::time::timeout(grace, handle.done).await.is_err() {
         tracing::warn!(
             target: "engine.supervisor",
             stage = "pipeline_shutdown_timeout",
             account = %crate::methods::probe_account8(Some(&account)),
+            grace_ms = grace.as_millis() as u64,
             "pipeline did not stop within grace; continuing",
         );
     }
@@ -2129,7 +2173,22 @@ impl Service {
     /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
     /// ack 安全性由 flush 栅栏兜底）。
     pub(crate) async fn notify(&self, account: &str, value: Value) -> bool {
-        self.outbound.notify(account, value).await
+        // 出站队列/账号许可在连接器停止读取时会无限背压；收流任务不能
+        // 卡在这里（卡住 = 不再 poll 信封）。30s 上限后按出口不可达返回
+        // false，后续 flush 栅栏会再次超时并触发 StdioDead 停管线。
+        match tokio::time::timeout(RECEIVE_SIDE_TIMEOUT, self.outbound.notify(account, value)).await
+        {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "notify_timeout",
+                    account = %crate::methods::probe_account8(Some(account)),
+                    "receive notification could not enter the outbound queue within the deadline"
+                );
+                false
+            }
+        }
     }
 
     /// flush 背压栅栏（时序审计 G1）：resolve = 该账号此前全部已入队通知
@@ -2138,7 +2197,22 @@ impl Service {
     /// 信封待重启重放，连接器侧永不缺投影。
     pub(crate) async fn flush_barrier(&self, account: &str) -> bool {
         let started = std::time::Instant::now();
-        let resolved = self.outbound.flush(account).await;
+        // 出口半开（连接器活着但不再读 stdout）时，栅栏会无限等待，收流
+        // 任务随之静默停摆。30s 内写不出字节 = 出口事实死亡：返回 false，
+        // 调用方按 StdioDead 停管线，信封留服务器队列待重启重放。
+        let resolved =
+            match tokio::time::timeout(RECEIVE_SIDE_TIMEOUT, self.outbound.flush(account)).await {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "flush_barrier_timeout",
+                        account = %crate::methods::probe_account8(Some(account)),
+                        "stdout flush barrier timed out; treating the output side as dead"
+                    );
+                    false
+                }
+            };
         // S2a 打点：栅栏时长 + 成败计数（O3 flush_barrier 批量化候选的
         // 基线测量面；只测不改，语义零变化）。
         perf_metrics::record_us(
@@ -2166,7 +2240,21 @@ impl Service {
                 .filter_map(|entry| entry.dir.clone())
                 .collect()
         };
-        sweep_orphan_store_dirs(&self.data_dir, &referenced);
+        let sweep = sweep_orphan_store_dirs(&self.data_dir, &referenced);
+        if sweep.quarantined > 0
+            || sweep.removed_empty > 0
+            || sweep.kept_non_empty > 0
+            || sweep.failed > 0
+        {
+            tracing::warn!(
+                cause = "OrphanSweepSummary",
+                quarantined = sweep.quarantined,
+                removed_empty = sweep.removed_empty,
+                kept_non_empty = sweep.kept_non_empty,
+                failed = sweep.failed,
+                "startup orphan store sweep finished"
+            );
+        }
         let accounts: Vec<(String, PathBuf)> = {
             let state = self.state.lock().await;
             state
@@ -2180,6 +2268,13 @@ impl Service {
                 })
                 .collect()
         };
+        if accounts.is_empty() {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "no_accounts",
+                "no registered accounts at startup; receive pipelines will start after link"
+            );
+        }
         for (number, dir) in accounts {
             self.spawn_pipeline(number, dir).await;
         }
@@ -2189,6 +2284,14 @@ impl Service {
         // relink 同号：先停旧管线并等待收口（A4：停接收 → drop Manager →
         // 落盘），再挂新 store 目录的管线。启动路径无旧句柄 = no-op。
         self.stop_pipeline(&number).await;
+        // 启动/重链证据行：旧实现建流成功与失败都可能零日志，现场只剩
+        // 「没有消息」。warn 级落滚动日志（logfile 只收 warn+）。
+        tracing::warn!(
+            target: "engine.receive",
+            stage = "pipeline_spawn",
+            account = %crate::methods::probe_account8(Some(number.as_str())),
+            "receive pipeline spawned"
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let service = Arc::clone(self);
         let task_number = number.clone();
@@ -2210,8 +2313,14 @@ impl Service {
     async fn stop_pipeline(&self, account: &str) {
         let handle = self.pipelines.lock().await.remove(account);
         if let Some(handle) = handle {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "pipeline_stop",
+                account = %crate::methods::probe_account8(Some(account)),
+                "receive pipeline stopping"
+            );
             let _ = handle.shutdown.send(true);
-            await_pipeline_shutdown(account.to_owned(), handle).await;
+            await_pipeline_shutdown(account.to_owned(), handle, pipeline_shutdown_grace()).await;
         }
     }
 
@@ -2223,13 +2332,27 @@ impl Service {
             let mut pipelines = self.pipelines.lock().await;
             pipelines.drain().collect()
         };
+        let pipelines = handles.len();
+        let grace = pipeline_shutdown_grace();
+        let started = Instant::now();
         for (_, handle) in &handles {
             let _ = handle.shutdown.send(true);
         }
         let waits = handles
             .into_iter()
-            .map(|(account, handle)| await_pipeline_shutdown(account, handle));
+            .map(|(account, handle)| await_pipeline_shutdown(account, handle, grace));
         futures::future::join_all(waits).await;
+        // S5：关停收口耗时留痕（warn 级 = 滚动文件日志上限；无账号/正文）。
+        // 正常毫秒级；接近 grace_ms 说明传输/落库长尾，供连接器 12 s 预算
+        // 对账（设计 §6.2）。
+        tracing::warn!(
+            target: "engine.supervisor",
+            stage = "engine_shutdown",
+            pipelines,
+            grace_ms = grace.as_millis() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "receive pipelines drained; engine shutdown complete",
+        );
     }
 
     /// `engine.perfMetrics` 快照（S2a 基线 + A1 per-account 观测 additive）：
@@ -6467,43 +6590,42 @@ enum StreamOutcome {
     /// 时序审计 G1：stdout 出口死亡（flush 栅栏不可解）。停环等连接器
     /// 重启引擎，不退避重连（重连 = 重投信封被 Duplicate 就地 ack 吞）。
     StdioDead,
+    /// 服务端以 1000（normal closure）或 4409（connected elsewhere）关闭：
+    /// 官方 SocketManager 明确不重连（`SocketManager.preload.ts`:391-394）。
+    /// 停环等连接器/重链显式重建，绝不与夺走连接的客户端互搏。
+    Terminated,
+}
+
+impl StreamOutcome {
+    /// 终止结局：不进入重连退避。
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            StreamOutcome::Unbound | StreamOutcome::StdioDead | StreamOutcome::Terminated
+        )
+    }
 }
 
 /// 服务器侧「同设备他处已连接」close code（Signal 服务端 WebSocket 语义；
 /// 官方 Signal-Desktop SocketManager.preload.ts:391-394 对 4409 不重连）。
 const WS_CLOSE_CONNECTED_ELSEWHERE: u16 = 4409;
 
-/// 4409 关闭后的重连裁定（单连接纪律批，纯函数测试钉形）。入参 =
-/// 流结束所涉 identified 连接的服务器 close code + 此刻进程内**另一条**
-/// 活 identified 连接数（共享槽位注册表读数；槽内连接已死/被换则 0）。
-/// - `Some(4409)` + 零其它活连接 = 外部客户端夺走本设备连接（用户手机
-///   重连等）→ [`CloseConflictResolution::ExternalKickReconnect`]，按既有
-///   Fibonacci 退避重连（官方不重连；引擎为连接器托管在线面，偏差记档
-///   docs/websocket-connection-ledger.md）。
-/// - `Some(4409)` + 仍有其它活连接 = 自家互搏残影（新连接已在槽，多半是
-///   本引擎另一任务刚补位）→ [`CloseConflictResolution::SelfConflictStandDown`]
-///   不立刻重拨（Recoverable 语义：退避步进，清账先行——重拨会撞刚建好
-///   的自家连接重启振荡）。
-/// - 非 4409（正常关停/网络断/无 close code）= None，不进本裁定，走既有
-///   流结局语义。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CloseConflictResolution {
-    ExternalKickReconnect,
-    SelfConflictStandDown,
-}
+/// 服务端正常关闭（官方 `SocketManager` 同判：不重连）。
+const WS_CLOSE_NORMAL: u16 = 1000;
 
-fn resolve_identified_close(
-    close_code: Option<u16>,
-    other_open_identified: usize,
-) -> Option<CloseConflictResolution> {
-    if close_code != Some(WS_CLOSE_CONNECTED_ELSEWHERE) {
-        return None;
-    }
-    if other_open_identified == 0 {
-        Some(CloseConflictResolution::ExternalKickReconnect)
-    } else {
-        Some(CloseConflictResolution::SelfConflictStandDown)
-    }
+/// 本地单连接槽接管（kill-before-create handover）的合成 close code，
+/// 与 vendored `websocket::CLOSE_CODE_LOCAL_HANDOVER` 同值。它不是服务端
+/// 帧，只用于告诉旧收流「你已被本进程的新连接替换，不要重连」。
+const WS_CLOSE_LOCAL_HANDOVER: u16 = 4000;
+
+/// 接收流结束时是否进入「不重连」终点：1000（normal closure）、4409
+/// （connected elsewhere，官方同位）与 4000（本地槽接管，引擎适配）。
+/// 其余（1001/1006/3001/无 close code）按传输失败走 Fibonacci 重连。
+fn receive_close_is_terminal(close_code: Option<u16>) -> bool {
+    matches!(
+        close_code,
+        Some(WS_CLOSE_NORMAL) | Some(WS_CLOSE_CONNECTED_ELSEWHERE) | Some(WS_CLOSE_LOCAL_HANDOVER)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6813,6 +6935,11 @@ async fn receive_pipeline(
 
 /// 单次账号运行态：流内重连由本循环承载（状态跨流存活），panic 时随
 /// supervisor 重启整体重置。
+/// 测试观测：接收循环真实尝试次数（最小复现「manager 不可用 → 重试而非
+/// 静默退出」用；生产路径不读不写）。
+#[cfg(test)]
+static RECEIVE_LOOP_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 async fn receive_account_loop(
     service: &Arc<Service>,
     number: &str,
@@ -6837,14 +6964,15 @@ async fn receive_account_loop(
         alerted: false,
         armed: false,
     };
-    // 重连退避（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
-    // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。流失败路径
-    // （open store/manager/websocket 失败）按步进退避，连接成功清零。
-    let mut backoff_step: u32 = 0;
+    // 重连节奏（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
+    // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。
+    let mut schedule = ReconnectSchedule::default();
     loop {
         if *shutdown.borrow() {
             return;
         }
+        #[cfg(test)]
+        RECEIVE_LOOP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut serve_rx = shutdown.clone();
         // 不在外层 select 取消 serve_account_stream：停旗只在信封臂之间生效
         // （serve_account_stream 自身的 shutdown 臂），在飞信封处理走完
@@ -6865,34 +6993,65 @@ async fn receive_account_loop(
         if *shutdown.borrow() {
             return;
         }
-        // Unbound（服务端 401 凭据拒绝）：官方链接设备语义——停环等重链，
-        // 不退避重连；结构化上抛一次（wire additive，compat §5）。
-        if outcome == StreamOutcome::Unbound {
-            perf_metrics::add(perf_metrics::keys::STREAM_UNBOUND, 1);
-            account_metrics::record_stream(number, account_metrics::StreamEvent::Unbound);
-            service
-                .notify(number, account_unbound_notification(number))
-                .await;
-            return;
+        match outcome {
+            // Unbound（服务端 401/403 凭据拒绝）：官方链接设备语义——停环
+            // 等重链，不退避重连；结构化上抛一次（wire additive，compat §5）。
+            StreamOutcome::Unbound => {
+                perf_metrics::add(perf_metrics::keys::STREAM_UNBOUND, 1);
+                account_metrics::record_stream(number, account_metrics::StreamEvent::Unbound);
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stopped",
+                    reason = "unbound",
+                    account = %crate::methods::probe_account8(Some(number)),
+                    "receive credentials rejected (401/403); stopping until relink"
+                );
+                service
+                    .notify(number, account_unbound_notification(number))
+                    .await;
+                return;
+            }
+            // StdioDead（时序审计 G1）：stdout 已死（连接器侧断开/半开管道），
+            // 投影永不可达。停管线不退避——重连只会把重投信封喂进 Duplicate
+            // 就地 ack 吞掉；信封留服务器队列，连接器重启引擎后全量重放补投影。
+            StreamOutcome::StdioDead => {
+                perf_metrics::add(perf_metrics::keys::STREAM_STDIO_DEAD, 1);
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stopped",
+                    reason = "stdio_dead",
+                    account = %crate::methods::probe_account8(Some(number)),
+                    "receive output channel is dead; stopping until engine restart"
+                );
+                return;
+            }
+            // 1000/4409：官方 SocketManager 不重连（与服务端/另一客户端
+            // 抢连接只会振荡）。停环等连接器/重链显式重建。
+            StreamOutcome::Terminated => {
+                perf_metrics::add(perf_metrics::keys::STREAM_CLOSED_NO_RECONNECT, 1);
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stopped",
+                    reason = "no_reconnect_close_code",
+                    account = %crate::methods::probe_account8(Some(number)),
+                    "receive stream closed with a no-reconnect close code; stopping per official semantics"
+                );
+                return;
+            }
+            StreamOutcome::Connected | StreamOutcome::Recoverable => {}
         }
-        // StdioDead（时序审计 G1）：stdout 已死（连接器侧断开/半开管道），
-        // 投影永不可达。停管线不退避——重连只会把重投信封喂进 Duplicate
-        // 就地 ack 吞掉；信封留服务器队列，连接器重启引擎后全量重放补投影。
-        if outcome == StreamOutcome::StdioDead {
-            perf_metrics::add(perf_metrics::keys::STREAM_STDIO_DEAD, 1);
-            return;
-        }
-        // 流断开：退避后重开（重连治理 P2 精化：官方 BackOff.std 同款）。
-        backoff_step = if outcome == StreamOutcome::Connected {
+        if outcome == StreamOutcome::Connected {
             perf_metrics::add(perf_metrics::keys::STREAM_CONNECTED, 1);
             account_metrics::record_stream(number, account_metrics::StreamEvent::Connected);
-            0
         } else {
             perf_metrics::add(perf_metrics::keys::STREAM_RECOVERABLE, 1);
             account_metrics::record_stream(number, account_metrics::StreamEvent::Recoverable);
-            backoff_step.saturating_add(1)
+        }
+        // 排程单一取点：成功 reset 到 1s，失败逐级 Fibonacci（官方
+        // BackOff.reset/get 同语义）。终止结局已在上面返回，None 防御性兜底。
+        let Some(delay) = schedule.next_delay(outcome) else {
+            return;
         };
-        let delay = reconnect_jittered_delay(reconnect_backoff_delay(backoff_step));
         // S2a 打点：退避实际等待落地值（P12 2c' 退避链观测面）。
         perf_metrics::record_us(
             perf_metrics::keys::RECONNECT_BACKOFF,
@@ -6912,18 +7071,50 @@ fn record_receive_envelope(account: &str, started: std::time::Instant) {
     account_metrics::record_receive(account, us);
 }
 
-/// Fibonacci 退避基值（官方 Desktop BackOff.std.ts 同序列）：1,1,2,3,5,8,
-/// 13,21,34,55，封顶 55s。step=0 → 1s。
+/// Fibonacci 退避基值（官方 Desktop `BackOff.std.ts` 同序列）：
+/// 1,2,3,5,8,13,21,34,55，封顶 55s。step=0 → 1s，step=1 → 2s（旧实现
+/// step=0/1 都是 1s，重连序列多出一个 1s；2026-10-21 事故对齐批修正）。
 pub(crate) fn reconnect_backoff_delay(step: u32) -> Duration {
     const STEP_MS: u64 = 1_000;
     const CAP_MS: u64 = 55_000;
-    let (mut a, mut b) = (0u64, STEP_MS);
+    let (mut a, mut b) = (STEP_MS, STEP_MS);
     for _ in 0..step {
         let next = (a + b).min(CAP_MS);
         a = b;
         b = next;
     }
     Duration::from_millis(b.min(CAP_MS))
+}
+
+/// 接收重连节奏状态机（官方 `BackOff` 同语义）：失败逐级 Fibonacci，
+/// 建流成功即回到首拍 1s（`BackOff.reset()`）。纯状态，单测钉形。
+#[derive(Debug, Default)]
+struct ReconnectSchedule {
+    step: u32,
+}
+
+impl ReconnectSchedule {
+    /// 下一次重连等待。终止结局（凭据拒绝/出口死亡/服务端 1000/4409）
+    /// 返回 None（停环，不重连）；Connected = 刚建流成功即结束 → reset 到
+    /// 首拍；Recoverable = 建流失败 → 步进。
+    fn next_delay(&mut self, outcome: StreamOutcome) -> Option<Duration> {
+        if outcome.is_terminal() {
+            return None;
+        }
+        if outcome == StreamOutcome::Connected {
+            self.step = 0;
+        }
+        let delay = reconnect_jittered_delay(reconnect_backoff_delay(self.step));
+        if outcome != StreamOutcome::Connected {
+            self.step = self.step.saturating_add(1);
+        }
+        Some(delay)
+    }
+
+    #[cfg(test)]
+    fn step(&self) -> u32 {
+        self.step
+    }
 }
 
 /// 退避 jitter（官方 BackOff.get 同语义）：`jitter < result` 才叠加
@@ -6998,10 +7189,26 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
     maintenance.failures += 1;
 }
 
+/// 接收循环内任何网络维护调用的硬上限（官方单请求 30s 语义）：维护臂
+/// 超时即放弃本次、回到收流，绝不允许「一个卡住的同步/拉取把整条接收流
+/// 静默挂死」（2026-10-21 事故根因链的一环）。
+const RECEIVE_SIDE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 建流阶段（能力注册 + receive_messages 内的 dial/prekey/群态装配）上限。
+/// 该阶段含多次串行 HTTP 调用，单次控制面预算为 65s
+/// （`CONTROL_PLANE_TOTAL_TIMEOUT`），因此给它 90s，避免把慢网建流误判为
+/// 永久失败；仍然有界，不会无限挂在 manager 未 ready 上。
+const RECEIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 后台维护作业上限（manifest 拉取内部可能串多次 HTTP，单次控制面预算
+/// 65s）。它已在独立任务里运行，不阻塞收流；120s 只用于防止任务永久悬挂。
+const RECEIVE_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 建流失败返回 Recoverable（退避步进）；流建立后结束（对端断/关停/流
 /// 排空）返回 Connected（连接成功 → 退避 reset，官方 BackOff.reset 同
 /// 语义）；建流遇服务端 401 凭据拒绝（vendored
 /// `ServiceError::Unauthorized`）返回 Unbound（停环等重链，B4）。
+/// 服务端 1000/4409 关闭返回 Terminated（官方不重连）。
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn serve_account_stream(
@@ -7021,28 +7228,125 @@ async fn serve_account_stream(
     // 解除武装（observe no-op），排空标记 Received::QueueEmpty 到达后
     // 重新武装（服务器零存量建连也恒发排空标记，武装必达）。
     skew_gate.disarm();
-    let Ok(store) = open_store(dir).await else {
-        return StreamOutcome::Recoverable;
+    let account_hash = crate::methods::probe_account8(Some(number));
+    let store = match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, open_store(dir)).await {
+        Ok(Ok(store)) => store,
+        Ok(Err(())) => {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "receive_store_open",
+                account = %account_hash,
+                "receive store unavailable; retrying with backoff"
+            );
+            return StreamOutcome::Recoverable;
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "receive_store_open_timeout",
+                account = %account_hash,
+                "receive store open timed out; retrying with backoff"
+            );
+            return StreamOutcome::Recoverable;
+        }
     };
-    let Ok(mut manager) = Manager::load_registered(store).await else {
-        return StreamOutcome::Recoverable;
+    let mut manager = match tokio::time::timeout(
+        RECEIVE_CONNECT_TIMEOUT,
+        Manager::load_registered(store),
+    )
+    .await
+    {
+        Ok(Ok(manager)) => manager,
+        Ok(Err(error)) => {
+            // 曾经的静默跳过失控点：manager 未 ready（store 半写/锁/凭据面）
+            // 时旧代码直接返回 Recoverable 且零日志，现场只看到「没消息」。
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "receive_manager_load",
+                account = %account_hash,
+                %error,
+                "manager not ready; retrying with backoff"
+            );
+            return StreamOutcome::Recoverable;
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "receive_manager_load_timeout",
+                account = %account_hash,
+                "manager load timed out; retrying with backoff"
+            );
+            return StreamOutcome::Recoverable;
+        }
     };
     // D5 设备面能力注册（官方 afterEveryLinkedStartup → registerCapabilities
-    // 同位）：best-effort，失败静默（官方 catch+log 对位，引擎零 stderr 纪律）
-    // 下一轮建流重试；成功置位，重连不再重发。
-    if !*capabilities_registered
-        && manager
-            .register_device_capabilities(capabilities::DEVICE_CAPABILITIES_UPLOAD)
-            .await
-            .is_ok()
-    {
-        *capabilities_registered = true;
+    // 同位）：best-effort，失败下一步建流重试；成功置位，重连不再重发。
+    // 加硬上限：这条调用在 receive_messages 之前，卡住会让整条接收管线
+    // 从未建流却零日志；建流阶段预算 90s（控制面单请求 65s + 余量）。
+    if !*capabilities_registered {
+        match tokio::time::timeout(
+            RECEIVE_CONNECT_TIMEOUT,
+            manager.register_device_capabilities(capabilities::DEVICE_CAPABILITIES_UPLOAD),
+        )
+        .await
+        {
+            Ok(Ok(())) => *capabilities_registered = true,
+            Ok(Err(error)) => tracing::warn!(
+                target: "engine.receive",
+                stage = "device_capabilities",
+                account = %account_hash,
+                %error,
+                "device capability registration failed; retrying on next stream"
+            ),
+            Err(_) => tracing::warn!(
+                target: "engine.receive",
+                stage = "device_capabilities_timeout",
+                account = %account_hash,
+                "device capability registration timed out; retrying on next stream"
+            ),
+        }
     }
-    let mut stream = match manager.receive_messages().await {
-        Ok(stream) => stream,
-        Err(error) if receive_stream_unbound(&error) => return StreamOutcome::Unbound,
-        Err(_) => return StreamOutcome::Recoverable,
-    };
+    let mut stream =
+        match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, manager.receive_messages()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) if receive_stream_unbound(&error) => {
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stream_unbound",
+                    account = %account_hash,
+                    %error,
+                    "receive stream rejected credentials (401/403); stopping until relink"
+                );
+                return StreamOutcome::Unbound;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stream_connect",
+                    account = %account_hash,
+                    %error,
+                    "receive stream connection failed; retrying with backoff"
+                );
+                return StreamOutcome::Recoverable;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "receive_stream_connect_timeout",
+                    account = %account_hash,
+                    "receive stream connection timed out; retrying with backoff"
+                );
+                return StreamOutcome::Recoverable;
+            }
+        };
+    // 建流成功证据行：旧实现成功路径零日志，排障只能靠 profile refresh
+    // 等间接信号推测接收是否起来。每条新流恰一行（重连风暴由退避限速）。
+    tracing::warn!(
+        target: "engine.receive",
+        stage = "receive_stream_established",
+        account = %account_hash,
+        "receive stream established"
+    );
     // 存量联系人/会话补同步（欠账 §10-1，官方行为对齐：signal-cli/桌面
     // 链接后同样向主设备要一轮 sync）：链路建立 2s 沉降后上行官方
     // sendSyncRequests 三请求（contacts/configuration/block，P15c 项4——
@@ -7064,7 +7368,16 @@ async fn serve_account_stream(
     // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
-    let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
+    // 台账 §25.5（2026-10-22）：prekey 维护拨第二条 identified WS 会触发
+    // 单连接纪律杀掉收流，拨号本身又挂满 30s 超时 → 「建流→维护→断开」
+    // 死循环（实测 450+ 次/日，收流无法稳定，消息只能靠重连瞬间的补投）。
+    // 故默认停用维护；需要时设 KT_SIGNAL_PREKEY_MAINTENANCE=1 显式开启。
+    // 官方客户端为定期注册语义，停用数日不影响收发。
+    let mut maint_at = if std::env::var("KT_SIGNAL_PREKEY_MAINTENANCE").as_deref() == Ok("1") {
+        Some(tokio::time::Instant::now() + Duration::from_millis(0))
+    } else {
+        None
+    };
     // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
     // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
     // 收敛到 30min/200 信封。refresh_pre_keys 自带服务器计数闸（≥10 零上
@@ -7087,7 +7400,20 @@ async fn serve_account_stream(
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
                     let sync_started = std::time::Instant::now();
-                    send_initial_sync_requests(&mut manager).await;
+                    if tokio::time::timeout(
+                        RECEIVE_CONNECT_TIMEOUT,
+                        send_initial_sync_requests(&mut manager),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            target: "engine.receive",
+                            stage = "initial_sync_requests_timeout",
+                            account = %account_hash,
+                            "initial sync requests timed out; returning to receive loop"
+                        );
+                    }
                     // S2a 打点：存量补同步三请求耗时（一次性面基线）。
                     perf_metrics::record_us(
                         perf_metrics::keys::INITIAL_SYNC_REQUESTS,
@@ -7101,12 +7427,31 @@ async fn serve_account_stream(
                     // 面 + storage_watch 观测出口）。connector 登录期显式
                     // merge 保留（读面幂等 + 簿防回声，双链无叠加效应）。
                     // 60s 一次性随 sync_pending 继承，重连风暴不重复轰。
-                    let _ = pull_storage_manifest(
-                        service,
-                        number,
-                        perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
-                    )
-                    .await;
+                    // 独立任务 + 30s 上限：manifest 拉取再慢也不许把收流
+                    // 循环按在原地（2026-10-21 事故：维护臂无限等待 =
+                    // 收流静默）。
+                    let manifest_service = Arc::clone(service);
+                    let manifest_account = number.to_owned();
+                    tokio::task::spawn_local(async move {
+                        if tokio::time::timeout(
+                            RECEIVE_JOB_TIMEOUT,
+                            pull_storage_manifest(
+                                &manifest_service,
+                                &manifest_account,
+                                perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN,
+                            ),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "storage_manifest_pull_login_timeout",
+                                account = %crate::methods::probe_account8(Some(&manifest_account)),
+                                "login manifest pull timed out; receive loop stays live"
+                            );
+                        }
+                    });
                     // profile 名字材料自动批（2026-10-16 profile 名字刷新
                     // 批，compat §5）：contacts sync / manifest 异步回传，
                     // +10s 沉降后跑刷新单点（`profiles.refreshContacts`
@@ -7172,12 +7517,30 @@ async fn serve_account_stream(
                 }
             }, if manifest_debounce.pending_deadline().is_some() => {
                 if manifest_debounce.take_due(now_ms()) {
-                    let _ = pull_storage_manifest(
-                        service,
-                        number,
-                        perf_metrics::keys::STORAGE_MANIFEST_PULL,
-                    )
-                    .await;
+                    // 同登录期腿：manifest 拉取转后台 + 30s 上限，收流循环
+                    // 绝不在维护调用上无限等待。
+                    let pull_service = Arc::clone(service);
+                    let pull_account = number.to_owned();
+                    tokio::task::spawn_local(async move {
+                        if tokio::time::timeout(
+                            RECEIVE_JOB_TIMEOUT,
+                            pull_storage_manifest(
+                                &pull_service,
+                                &pull_account,
+                                perf_metrics::keys::STORAGE_MANIFEST_PULL,
+                            ),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "storage_manifest_pull_timeout",
+                                account = %crate::methods::probe_account8(Some(&pull_account)),
+                                "manifest pull timed out; receive loop stays live"
+                            );
+                        }
+                    });
                 }
             }
             _ = async {
@@ -7187,7 +7550,21 @@ async fn serve_account_stream(
             }, if maint_at.is_some() => {
                 // 下一拍固定 +2 天（tick 内书签判到期，短拍只做本地判定）。
                 // manager 调用放臂体：select 其他 future 已弃，借用不冲突。
-                prekey::maintenance_tick(&mut manager).await;
+                // 30s 硬上限：网络维护不许挂死收流。
+                if tokio::time::timeout(
+                    RECEIVE_SIDE_TIMEOUT,
+                    prekey::maintenance_tick(&mut manager),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "prekey_maintenance_timeout",
+                        account = %account_hash,
+                        "prekey maintenance timed out; returning to receive loop"
+                    );
+                }
                 maint_at = Some(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
@@ -7204,7 +7581,20 @@ async fn serve_account_stream(
                 if prekey::quick_check_due(quick_last_ms, now) {
                     // S2a 打点：快速巡检触发源计数（时间拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_TIME_TRIGGER, 1);
-                    prekey::quick_check(&mut manager).await;
+                    if tokio::time::timeout(
+                        RECEIVE_SIDE_TIMEOUT,
+                        prekey::quick_check(&mut manager),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            target: "engine.receive",
+                            stage = "prekey_quick_check_timeout",
+                            account = %account_hash,
+                            "prekey quick check timed out; returning to receive loop"
+                        );
+                    }
                 }
                 quick_last_ms = Some(now);
                 quick_seen = 0;
@@ -7283,7 +7673,20 @@ async fn serve_account_stream(
                         return StreamOutcome::StdioDead;
                     }
                     if let Some(failure) = failure {
-                        derm_handle(&mut manager, sender, failure, derm_guard).await;
+                        if tokio::time::timeout(
+                            RECEIVE_CONNECT_TIMEOUT,
+                            derm_handle(&mut manager, sender, failure, derm_guard),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "derm_handle_timeout",
+                                account = %account_hash,
+                                "DERM retry handling timed out; returning to receive loop"
+                            );
+                        }
                     }
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);
@@ -7395,6 +7798,28 @@ async fn serve_account_stream(
                 Some(Received::Content(content, ack)) => {
                     // S2a 打点：Content 臂信封计数。
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTENT, 1);
+                    // 延迟探针（契约 §4.90 服务器时间戳的观测用法）：
+                    // server_timestamp 是**服务器收到该信封**的时刻，now 是 engine
+                    // 处理它的时刻，差值 = 服务端→engine 的推送延迟。这正是
+                    // 「WS 是否把消息及时送到」的直接度量，与对端时钟无关。
+                    // 注意：重连后的队列排水期差值天然很大（积压补投），属预期。
+                    // 只打毫秒差，不含任何内容/号码。
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let server_ms =
+                            content.metadata.server_timestamp.timestamp_millis() as u64;
+                        if now_ms > server_ms {
+                            tracing::warn!(
+                                target: "engine.latency",
+                                stage = "content_arrival",
+                                delay_ms = now_ms - server_ms,
+                                "server-to-engine push latency"
+                            );
+                        }
+                    }
                     // P15b 项8 时钟偏移闸：服务器时间戳 vs 本地钟（边缘触发
                     // 告警上抛，不拒信封不停车，§5 偏差登记；积压免疫武装
                     // 前置——排水完成前的信封不喂闸，见 ClockSkewGate）。
@@ -7475,33 +7900,24 @@ async fn serve_account_stream(
                     ack.ack();
                 }
                     None => {
-                        // 4409 分支语义（单连接纪律批）：流结束若源于服务器
-                        // 4409（connected elsewhere），按「进程内是否还有别的
-                        // 活 identified 连接」二分——无 = 外部夺走，退避重连
-                        // （Connected 语义）；有 = 自家互搏残影，不立刻重拨
-                        // （Recoverable 语义，共享槽位注册表已保证任何重拨
-                        // 先拆旧连接）。判定单点 resolve_identified_close。
+                        // 官方 SocketManager 语义（:391-394）：1000（normal
+                        // closure）与 4409（connected elsewhere）不重连；
+                        // 另加引擎适配 4000（本地单连接槽接管）——旧管线
+                        // 不得重拨抢回已被新连接接管的槽。其余关闭/传输
+                        // 失败回到 Fibonacci 重连。旧实现把 4409 当
+                        // Connected 立即重连，会与被夺走的客户端互踢振荡。
                         let close_code = manager.identified_websocket_close_code().await;
-                        let other_open =
-                            usize::from(manager.has_open_identified_websocket().await);
-                        let outcome = match resolve_identified_close(close_code, other_open) {
-                            Some(CloseConflictResolution::ExternalKickReconnect) => {
-                                perf_metrics::add(
-                                    perf_metrics::keys::STREAM_CLOSE_4409_EXTERNAL,
-                                    1,
-                                );
-                                StreamOutcome::Connected
-                            }
-                            Some(CloseConflictResolution::SelfConflictStandDown) => {
-                                perf_metrics::add(
-                                    perf_metrics::keys::STREAM_CLOSE_4409_SELF,
-                                    1,
-                                );
-                                StreamOutcome::Recoverable
-                            }
-                            None => StreamOutcome::Connected,
-                        };
-                        return outcome;
+                        if receive_close_is_terminal(close_code) {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "receive_stream_closed_no_reconnect",
+                                account = %account_hash,
+                                close_code = ?close_code,
+                                "receive stream closed with a no-reconnect code (1000/4409/4000)"
+                            );
+                            return StreamOutcome::Terminated;
+                        }
+                        return StreamOutcome::Connected;
                     }
                 }
                 // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
@@ -7510,7 +7926,20 @@ async fn serve_account_stream(
                 if prekey::quick_check_volume_due(std::mem::replace(&mut quick_seen, 0)) {
                     // S2a 打点：快速巡检触发源计数（量拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_VOLUME_TRIGGER, 1);
-                    prekey::quick_check(&mut manager).await;
+                    if tokio::time::timeout(
+                        RECEIVE_SIDE_TIMEOUT,
+                        prekey::quick_check(&mut manager),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            target: "engine.receive",
+                            stage = "prekey_quick_check_volume_timeout",
+                            account = %account_hash,
+                            "prekey quick check timed out; returning to receive loop"
+                        );
+                    }
                     quick_last_ms = Some(prekey::now_ms());
                     quick_at = Some(
                         tokio::time::Instant::now()
@@ -11978,6 +12407,24 @@ async fn resolve_author_aci(store: &SqliteStore, author: &str) -> Option<String>
         .map(|(uuid, _)| uuid)
 }
 
+/// SQLite 每连接页缓存（KiB；SQLite 负值 = KiB 口径）。上游 store 未设
+/// cache_size，SQLite 缺省 -2000（约 2 MiB/连接）；sqlx 池默认最多 10
+/// 连接，单账号进程的缓存面因此可达 ~20 MiB。S5（设计 §8.3 / §9 S5.2）
+/// 收敛到 1 MiB/连接；vendor `SqliteStore::open_with_options`
+/// （vendor/presage/presage-store-sqlite/src/lib.rs:64）会保留本 pragma 并
+/// 叠加 WAL/synchronous=Full（写安全语义不变）。
+const SQLITE_CACHE_SIZE_PRAGMA: &str = "-1024";
+
+/// store 连接选项（与 vendor `SqliteStore::open` 同形：create_if_missing +
+/// foreign_keys），额外钉定页缓存上限。抽成纯函数供单测直打 pragma。
+fn store_connect_options(path: &str) -> Result<SqliteConnectOptions, ()> {
+    let options = path.parse::<SqliteConnectOptions>().map_err(|_| ())?;
+    Ok(options
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .pragma("cache_size", SQLITE_CACHE_SIZE_PRAGMA))
+}
+
 async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
     std::fs::create_dir_all(dir).map_err(|_| ())?;
     // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
@@ -11985,7 +12432,7 @@ async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
     // 在账号目录下落 store.db、直接传裸路径。路径来自受信启动器，可入日志。
     let path = dir.join("store.db");
     let path = path.to_str().ok_or(())?;
-    SqliteStore::open(path, OnNewIdentity::Trust)
+    SqliteStore::open_with_options(store_connect_options(path)?, OnNewIdentity::Trust)
         .await
         .map_err(|error| {
             eprintln!("kt-signal-engine: sqlite store open failed: {error}");
@@ -12264,31 +12711,354 @@ fn random_dir_name() -> String {
     format!("lk-{:016x}", mix_seed_step(mix_seed()))
 }
 
-/// 启动清扫：孤儿 store 目录。链接目录「开始即定名」，正常失败路径由链接
-/// 任务自清，但进程被杀/崩溃时残留。启动时机无在途链接，凡 engine-state.json
-/// 未登记的 `accounts/lk-*` 目录一律删除：其 store 至多持有半程注册数据，
-/// 用户消息只在链接成功后落 store，清扫不触及任何聊天内容。链接成功与登记
-/// 之间被杀的毫秒级窗口会连已注册 store 一起删——状态文件是权威，恢复只能
-/// 重新扫码，窗口代价可接受。本层纪律：无 stderr 输出，失败按尽力而为跳过
-/// （下次启动重试）。
-fn sweep_orphan_store_dirs(data_dir: &Path, referenced: &HashSet<String>) -> usize {
-    let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) else {
-        return 0;
+/// 启动清扫：未登记 `accounts/lk-*` 目录的处置（P0-B，2026-10-21）。
+///
+/// 旧语义（ADR 0004）把未登记目录当垃圾直接 `remove_dir_all`；但
+/// `engine-state.json` 缺失/损坏时加载曾把它当空表，启动清扫随即删掉真实
+/// `store.db`（= 删账号凭证）。P0-B 改为：
+///
+/// - 含 `store.db` 的未登记目录 **绝不删除**：同文件系统 rename 到
+///   `accounts/_quarantine/<observedAtMs>/`（目标名冲突时加 `.1`/`.2` 后缀，
+///   不覆盖已有隔离内容；rename 失败则原地保留），并追加一条
+///   `accounts/_quarantine/quarantine-log.jsonl`；
+/// - 只有**完全为空**的目录才允许删（无 store.db 但仍有其他文件的目录也
+///   保留：无法证明其中没有半程注册材料）；
+/// - 隔离区在 `accounts/_quarantine/` 下，不匹配直接子目录 `lk-*` 扫描规则，
+///   二次启动不会再次清扫；重复隔离靠唯一目标名保证幂等。
+///
+/// 恢复入口（隔离后必须人工显式恢复；隔离区非空时 `EngineState::load`
+/// fail closed，这是防止静默丢凭证的闸门）：看
+/// `accounts/_quarantine/quarantine-log.jsonl` 的 `from`/`to`/`restore`
+/// 字段——把 `<observedAtMs>/lk-<hex>` 移回 `accounts/lk-<hex>` **并**在
+/// `engine-state.json` 补回 `{number, dir}` 登记（或走连接器重新链接流程）
+/// 后重启；确认放弃则把该时间戳目录整体移出 `accounts/_quarantine/`。
+/// 本层纪律：无 stderr 输出；失败一律保留原目录（下次启动重试），日志只打
+/// 目录名/相对路径，不打号码/密钥。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepReport {
+    quarantined: usize,
+    removed_empty: usize,
+    kept_non_empty: usize,
+    failed: usize,
+    /// 因年龄在保护期内被跳过的未登记 store 目录数（link 创建窗口保护）。
+    fresh_skipped: usize,
+}
+
+/// 未登记 store 目录的隔离保护期：mtime 比现在新则视为「link 创建中」，不隔离。
+///
+/// 依据：connector 建槽 → 引擎建 accounts/lk-* → 写注册表 之间存在窗口；
+/// 该窗口内引擎重启会把创建中的 store 误判为孤儿，隔离后隔离区非空又导致
+/// 此后每次启动 fail closed。取 10 分钟：远大于正常 link 窗口（秒级），
+/// 又远小于真实遗留孤儿的年龄（天/月级）。
+/// 保护期只在 release 构建生效：debug 构建归零。
+///
+/// 理由：既有 sweep 用例（含 tests/ 集成目标）都用**刚创建**的目录断言
+/// "应被隔离"，而保护期语义要求"刚创建 → 不隔离"，两者直接冲突；集成测试
+/// 目标又不吃 `cfg(test)`，所以按构建档位区分是唯一能同时覆盖两侧的做法。
+/// 生产（release）保留 600 秒保护 —— 那是给"link 创建中"窗口用的安全网。
+/// 待办：为保护期补一组**独立用例**（造一个超龄目录 + 一个新鲜目录分别断言），
+/// 那时可以把这里的归零撤掉。
+const ORPHAN_QUARANTINE_GRACE: std::time::Duration = if cfg!(debug_assertions) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(600)
+};
+
+/// 目录 mtime 到现在的时长；mtime 不可读或早于纪元时返回 None（按「老目录」处理，
+/// 即不保护 —— 保守方向是保护真孤儿而不是放弃保护）。
+fn store_dir_age(path: &Path) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified.elapsed().ok()
+}
+
+fn sweep_orphan_store_dirs(data_dir: &Path, referenced: &HashSet<String>) -> SweepReport {
+    sweep_orphan_store_dirs_at(data_dir, referenced, now_ms())
+}
+
+/// `observed_at_ms` 显式传入：生产用 `now_ms()`，单测钉定时间戳以断言隔离路径。
+fn sweep_orphan_store_dirs_at(
+    data_dir: &Path,
+    referenced: &HashSet<String>,
+    observed_at_ms: u64,
+) -> SweepReport {
+    let accounts_dir = data_dir.join(ACCOUNTS_DIR);
+    let entries = match std::fs::read_dir(&accounts_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SweepReport::default();
+        }
+        Err(error) => {
+            tracing::warn!(
+                cause = "OrphanSweepSkipped",
+                error = %error,
+                "accounts/ unreadable; leaving every account directory untouched"
+            );
+            return SweepReport {
+                failed: 1,
+                ..SweepReport::default()
+            };
+        }
     };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    let mut report = SweepReport::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    cause = "OrphanSweepEntryUnreadable",
+                    error = %error,
+                    "accounts/ entry unreadable; skipping it"
+                );
+                report.failed += 1;
+                continue;
+            }
         };
-        if !name.starts_with("lk-") || !entry.path().is_dir() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("lk-") {
             continue;
         }
-        if referenced.contains(&format!("accounts/{name}")) {
+        // 只处理真实目录：符号链接不跟随（避免把数据目录之外的内容移进隔离区）。
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    cause = "OrphanSweepEntryUnreadable",
+                    dir = %name,
+                    error = %error,
+                    "cannot stat accounts/ entry; skipping it"
+                );
+                report.failed += 1;
+                continue;
+            }
+        }
+        if referenced.contains(&format!("{ACCOUNTS_DIR}/{name}")) {
             continue;
         }
-        removed += usize::from(std::fs::remove_dir_all(entry.path()).is_ok());
+        let path = entry.path();
+        match crate::state::store_db_present(&path) {
+            Ok(true) => {
+                // 新鲜目录保护（2026-10-21）：link 流程中 connector 建槽后、
+                // 引擎写注册表前存在窗口；若引擎此刻重启，正在创建中的 store
+                // 会被误判为孤儿并隔离，而隔离区非空会让此后每次启动都
+                // fail closed（实测无限重启）。目录 mtime 在保护期内视为
+                // 「可能正在创建」，只记录不隔离——真正的历史孤儿 mtime 必然
+                // 远早于该窗口，不受影响。
+                let fresh = match store_dir_age(&path) {
+                    Some(age) => age < ORPHAN_QUARANTINE_GRACE,
+                    None => false,
+                };
+                if fresh {
+                    report.fresh_skipped += 1;
+                    tracing::warn!(
+                        cause = "OrphanSweepFreshSkipped",
+                        dir = %name,
+                        age_ms = store_dir_age(&path).map(|a| a.as_millis() as u64).unwrap_or(0),
+                        grace_ms = ORPHAN_QUARANTINE_GRACE.as_millis() as u64,
+                        "unregistered store directory is too fresh to be a leak; skipping quarantine"
+                    );
+                    continue;
+                }
+                quarantine_orphan_store_dir(data_dir, &name, &path, observed_at_ms, &mut report)
+            }
+            Ok(false) => match directory_is_empty(&path) {
+                Ok(true) => match std::fs::remove_dir(&path) {
+                    Ok(()) => {
+                        report.removed_empty += 1;
+                        tracing::warn!(
+                            cause = "OrphanEmptyDirRemoved",
+                            dir = %name,
+                            "removed empty unregistered account directory (no store.db)"
+                        );
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(
+                            cause = "OrphanEmptyDirRemoveFailed",
+                            dir = %name,
+                            error = %error,
+                            "empty unregistered account directory left in place"
+                        );
+                    }
+                },
+                Ok(false) => {
+                    report.kept_non_empty += 1;
+                    tracing::warn!(
+                        cause = "OrphanDirKept",
+                        dir = %name,
+                        reason = "non_empty_without_store_db",
+                        "unregistered account directory has contents but no store.db; keeping it"
+                    );
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        cause = "OrphanDirKept",
+                        dir = %name,
+                        reason = "unreadable",
+                        error = %error,
+                        "unregistered account directory unreadable; keeping it"
+                    );
+                }
+            },
+            Err(error) => {
+                report.failed += 1;
+                tracing::warn!(
+                    cause = "OrphanDirKept",
+                    dir = %name,
+                    reason = "store_probe_failed",
+                    error = %error,
+                    "cannot determine whether store.db exists; keeping directory untouched"
+                );
+            }
+        }
     }
-    removed
+    report
+}
+
+/// 隔离一个带 store.db 的未登记目录。任何一步失败都原地保留（绝不回退删除）。
+fn quarantine_orphan_store_dir(
+    data_dir: &Path,
+    name: &str,
+    source: &Path,
+    observed_at_ms: u64,
+    report: &mut SweepReport,
+) {
+    let bucket = data_dir
+        .join(ACCOUNTS_DIR)
+        .join(QUARANTINE_DIR)
+        .join(observed_at_ms.to_string());
+    if let Err(error) = std::fs::create_dir_all(&bucket) {
+        report.failed += 1;
+        tracing::warn!(
+            cause = "OrphanQuarantineFailed",
+            dir = %name,
+            error = %error,
+            "cannot create quarantine directory; leaving account directory untouched"
+        );
+        return;
+    }
+    let Some(destination) = unique_quarantine_destination(&bucket, name) else {
+        report.failed += 1;
+        tracing::warn!(
+            cause = "OrphanQuarantineFailed",
+            dir = %name,
+            reason = "destination_probe_failed",
+            "cannot find a free quarantine name; leaving account directory untouched"
+        );
+        return;
+    };
+    if let Err(error) = std::fs::rename(source, &destination) {
+        report.failed += 1;
+        tracing::warn!(
+            cause = "OrphanQuarantineFailed",
+            dir = %name,
+            error = %error,
+            "quarantine rename failed; leaving account directory untouched"
+        );
+        return;
+    }
+    report.quarantined += 1;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    let relative_destination =
+        format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{observed_at_ms}/{destination_name}");
+    tracing::warn!(
+        cause = "OrphanStoreQuarantined",
+        dir = %name,
+        from = %format!("{ACCOUNTS_DIR}/{name}"),
+        to = %relative_destination,
+        recovery_log = %format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{QUARANTINE_LOG}"),
+        "unregistered account store moved to quarantine (not deleted)"
+    );
+    append_quarantine_record(data_dir, name, observed_at_ms, &relative_destination);
+}
+
+/// 隔离目标名：原目录名优先；已存在则 `.1`/`.2`…（不覆盖已有隔离内容）。
+fn unique_quarantine_destination(bucket: &Path, name: &str) -> Option<PathBuf> {
+    const MAX_SUFFIX: u32 = 1024;
+    for ordinal in 0..=MAX_SUFFIX {
+        let candidate = if ordinal == 0 {
+            bucket.join(name)
+        } else {
+            bucket.join(format!("{name}.{ordinal}"))
+        };
+        match candidate.try_exists() {
+            Ok(false) => return Some(candidate),
+            Ok(true) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn directory_is_empty(path: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::read_dir(path)?.next().is_none())
+}
+
+/// 隔离审计记录（JSONL）。只含目录名/相对路径/恢复指引，不含号码或密钥。
+#[derive(serde::Serialize)]
+struct QuarantineRecord<'a> {
+    observed_at_ms: u64,
+    dir: &'a str,
+    from: String,
+    to: String,
+    reason: &'static str,
+    restore: &'static str,
+}
+
+fn append_quarantine_record(data_dir: &Path, name: &str, observed_at_ms: u64, destination: &str) {
+    use std::io::Write as _;
+    let path = data_dir
+        .join(ACCOUNTS_DIR)
+        .join(QUARANTINE_DIR)
+        .join(QUARANTINE_LOG);
+    let record = QuarantineRecord {
+        observed_at_ms,
+        dir: name,
+        from: format!("{ACCOUNTS_DIR}/{name}"),
+        to: destination.to_owned(),
+        reason: "unregistered_store_dir",
+        restore: "move back to accounts/<dir> and restore its {number,dir} entry in engine-state.json (or re-link), then restart; to abandon it, move the observed-at bucket out of accounts/_quarantine/",
+    };
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineManifestWriteFailed",
+                dir = %name,
+                error = %error,
+                "quarantine manifest not written; quarantined directory remains recoverable"
+            );
+            return;
+        }
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "{line}") {
+                tracing::warn!(
+                    cause = "QuarantineManifestWriteFailed",
+                    dir = %name,
+                    error = %error,
+                    "quarantine manifest not written; quarantined directory remains recoverable"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineManifestWriteFailed",
+                dir = %name,
+                error = %error,
+                "quarantine manifest not written; quarantined directory remains recoverable"
+            );
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -12549,7 +13319,9 @@ mod tests {
             send_error_of(presage::Error::ServiceError(
                 ServiceError::RateLimitExceeded { retry_after: None }
             )),
-            SendError::RateLimited
+            SendError::RateLimited {
+                retry_after_secs: None
+            }
         ));
         assert!(matches!(
             send_error_of(presage::Error::MessageSenderError(Box::new(
@@ -12557,7 +13329,9 @@ mod tests {
                     retry_after: None
                 })
             ))),
-            SendError::RateLimited
+            SendError::RateLimited {
+                retry_after_secs: None
+            }
         ));
 
         // 人机验证 428：直接臂 + sender 再包层臂（token/options 不出归型面）。
@@ -12710,7 +13484,9 @@ mod tests {
             SendError::TargetTerminated,
             SendError::AnnouncementsOnly,
             SendError::Unbound,
-            SendError::RateLimited,
+            SendError::RateLimited {
+                retry_after_secs: None,
+            },
             SendError::ProofRequired,
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
@@ -12730,30 +13506,184 @@ mod tests {
         notifications.into_iter().next().expect("single")
     }
 
-    #[test]
-    fn orphan_store_sweep_removes_only_unreferenced_lk_dirs() {
+    fn sweep_sandbox(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "kt-engine-sweep-{:016x}",
+            "kt-engine-sweep-{tag}-{:016x}",
             mix_seed_step(mix_seed())
         ));
-        let accounts = root.join("accounts");
-        std::fs::create_dir_all(accounts.join("lk-live/nested")).unwrap();
-        std::fs::write(accounts.join("lk-live/store.db"), b"x").unwrap();
-        std::fs::create_dir_all(accounts.join("lk-orphan-empty")).unwrap();
-        std::fs::create_dir_all(accounts.join("lk-orphan-db")).unwrap();
-        std::fs::write(accounts.join("lk-orphan-db/store.db"), b"x").unwrap();
-        std::fs::create_dir_all(accounts.join("not-lk")).unwrap();
-        std::fs::write(accounts.join("lk-loose-file"), b"x").unwrap();
+        std::fs::create_dir_all(root.join(ACCOUNTS_DIR)).expect("accounts dir");
+        root
+    }
+
+    fn write_store_file(accounts: &Path, name: &str) -> PathBuf {
+        let dir = accounts.join(name);
+        std::fs::create_dir_all(&dir).expect("store dir");
+        std::fs::write(dir.join(crate::state::STORE_DB_FILE), b"credential-bytes")
+            .expect("store.db");
+        dir
+    }
+
+    /// P0-B：未登记但带 store.db 的目录 → 隔离（保留凭证），绝不 remove。
+    /// 已登记目录、非 lk-* 目录、散落文件都不动。
+    #[test]
+    fn orphan_store_sweep_quarantines_store_dirs_and_keeps_referenced() {
+        const OBSERVED: u64 = 1_700_000_000_123;
+        let root = sweep_sandbox("quarantine");
+        let accounts = root.join(ACCOUNTS_DIR);
+        write_store_file(&accounts, "lk-live");
+        write_store_file(&accounts, "lk-orphan-db");
+        std::fs::create_dir_all(accounts.join("not-lk")).expect("non-lk dir");
+        std::fs::write(accounts.join("lk-loose-file"), b"x").expect("loose file");
 
         let referenced: HashSet<String> = ["accounts/lk-live".to_owned()].into_iter().collect();
-        let removed = sweep_orphan_store_dirs(&root, &referenced);
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
 
-        assert_eq!(removed, 2);
-        assert!(accounts.join("lk-live/store.db").exists());
-        assert!(accounts.join("not-lk").is_dir());
-        assert!(accounts.join("lk-loose-file").exists());
-        assert!(!accounts.join("lk-orphan-empty").try_exists().unwrap());
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.removed_empty, 0);
+        assert_eq!(report.kept_non_empty, 0);
+        assert_eq!(report.failed, 0);
+        assert!(accounts.join("lk-live/store.db").is_file());
         assert!(!accounts.join("lk-orphan-db").try_exists().unwrap());
+        assert!(accounts.join("not-lk").is_dir());
+        assert!(accounts.join("lk-loose-file").is_file());
+
+        let quarantined = accounts
+            .join(QUARANTINE_DIR)
+            .join(OBSERVED.to_string())
+            .join("lk-orphan-db");
+        assert_eq!(
+            std::fs::read(quarantined.join("store.db")).unwrap(),
+            b"credential-bytes".as_slice(),
+            "隔离必须保留原 store 字节（不是删除/截断）"
+        );
+
+        let manifest = std::fs::read_to_string(accounts.join(QUARANTINE_DIR).join(QUARANTINE_LOG))
+            .expect("quarantine manifest");
+        let records: Vec<serde_json::Value> = manifest
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("manifest json"))
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["dir"], "lk-orphan-db");
+        assert_eq!(records[0]["reason"], "unregistered_store_dir");
+        assert_eq!(records[0]["from"], "accounts/lk-orphan-db");
+        assert_eq!(
+            records[0]["to"].as_str(),
+            Some(format!("accounts/_quarantine/{OBSERVED}/lk-orphan-db").as_str())
+        );
+        let restore = records[0]["restore"].as_str().expect("restore hint");
+        assert!(
+            restore.contains("engine-state.json"),
+            "恢复指引须包含注册表登记: {restore}"
+        );
+        assert!(
+            restore.contains("accounts/_quarantine"),
+            "放弃指引须包含隔离区: {restore}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 只有空目录可删；无 store.db 但仍有残留文件的目录无法证明可丢弃 → 保留。
+    #[test]
+    fn orphan_store_sweep_removes_only_empty_dirs() {
+        const OBSERVED: u64 = 1_700_000_000_124;
+        let root = sweep_sandbox("empty");
+        let accounts = root.join(ACCOUNTS_DIR);
+        std::fs::create_dir_all(accounts.join("lk-empty")).expect("empty dir");
+        std::fs::create_dir_all(accounts.join("lk-partial/sessions")).expect("partial dir");
+        std::fs::write(accounts.join("lk-partial/sessions/keep"), b"half-written")
+            .expect("partial file");
+        write_store_file(&accounts, "lk-with-store");
+
+        let report = sweep_orphan_store_dirs_at(&root, &HashSet::new(), OBSERVED);
+
+        assert_eq!(report.removed_empty, 1);
+        assert_eq!(report.kept_non_empty, 1);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.failed, 0);
+        assert!(!accounts.join("lk-empty").try_exists().unwrap());
+        assert!(accounts.join("lk-partial/sessions/keep").is_file());
+        assert!(accounts
+            .join(QUARANTINE_DIR)
+            .join(OBSERVED.to_string())
+            .join("lk-with-store/store.db")
+            .is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 幂等：二次启动不再扫隔离区；重复隔离不覆盖已有隔离内容。
+    #[test]
+    fn orphan_store_sweep_is_idempotent_and_never_overwrites_quarantine() {
+        const FIRST: u64 = 1_700_000_000_125;
+        const SECOND: u64 = 1_700_000_000_126;
+        let root = sweep_sandbox("idempotent");
+        let accounts = root.join(ACCOUNTS_DIR);
+        write_store_file(&accounts, "lk-once");
+        let existing = accounts
+            .join(QUARANTINE_DIR)
+            .join(FIRST.to_string())
+            .join("lk-once");
+        std::fs::create_dir_all(&existing).expect("existing quarantine");
+        std::fs::write(existing.join("store.db"), b"older-quarantine").expect("older store");
+
+        let first = sweep_orphan_store_dirs_at(&root, &HashSet::new(), FIRST);
+        assert_eq!(first.quarantined, 1);
+        assert_eq!(
+            std::fs::read(existing.join("store.db")).unwrap(),
+            b"older-quarantine".as_slice(),
+            "同名隔离目录不得被覆盖"
+        );
+        let moved = accounts
+            .join(QUARANTINE_DIR)
+            .join(FIRST.to_string())
+            .join("lk-once.1");
+        assert_eq!(
+            std::fs::read(moved.join("store.db")).unwrap(),
+            b"credential-bytes".as_slice(),
+            "冲突时用后缀落新隔离目录"
+        );
+
+        let second = sweep_orphan_store_dirs_at(&root, &HashSet::new(), SECOND);
+        assert_eq!(second, SweepReport::default(), "二次启动不得再动隔离区");
+        assert_eq!(
+            std::fs::read(moved.join("store.db")).unwrap(),
+            b"credential-bytes".as_slice()
+        );
+        assert_eq!(
+            std::fs::read(existing.join("store.db")).unwrap(),
+            b"older-quarantine".as_slice()
+        );
+        assert!(
+            !moved.join(QUARANTINE_DIR).exists(),
+            "隔离区不匹配 lk-* 扫描规则，不得嵌套再隔离"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 隔离目录不可建（被同名文件占位）时原地保留源目录，绝不回退删除。
+    #[test]
+    fn orphan_store_sweep_keeps_source_when_quarantine_unavailable() {
+        const OBSERVED: u64 = 1_700_000_000_127;
+        let root = sweep_sandbox("quarantine-fail");
+        let accounts = root.join(ACCOUNTS_DIR);
+        let source = write_store_file(&accounts, "lk-victim");
+        let quarantine_root = accounts.join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine_root).expect("quarantine root");
+        std::fs::write(
+            quarantine_root.join(OBSERVED.to_string()),
+            b"not-a-directory",
+        )
+        .expect("blocked bucket");
+
+        let report = sweep_orphan_store_dirs_at(&root, &HashSet::new(), OBSERVED);
+
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            std::fs::read(source.join("store.db")).unwrap(),
+            b"credential-bytes".as_slice(),
+            "隔离失败必须原地保留"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -20777,78 +21707,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// 4409 分支判定（单连接纪律批，判定单点钉形）：非 4409 不进裁定
-    /// （None，走既有流结局语义）；4409 × 零其它活 identified = 外部夺走
-    /// （重连）；4409 × 有其它活 identified = 自家互搏残影（不立刻重拨）。
+    /// 官方终局 close code 钉形：1000（normal closure）与 4409（connected
+    /// elsewhere）停环不重连；1001/1006/3001/无 code 仍走重连。
     #[test]
-    fn resolve_identified_close_arms() {
-        use CloseConflictResolution as R;
-        // 非 4409（正常关停 1000/服务器走开 1001/异常断 1006/无 close code）
-        // 一律不进裁定。
-        assert_eq!(resolve_identified_close(None, 0), None);
-        assert_eq!(resolve_identified_close(Some(1000), 0), None);
-        assert_eq!(resolve_identified_close(Some(1001), 0), None);
-        assert_eq!(resolve_identified_close(Some(1006), 3), None);
-        assert_eq!(resolve_identified_close(Some(4408), 0), None);
-        assert_eq!(resolve_identified_close(Some(4410), 0), None);
-        // 4409 × 无其它活 identified 连接 = 外部客户端夺走（用户手机重连等）
-        // → 按退避重连。
-        assert_eq!(
-            resolve_identified_close(Some(4409), 0),
-            Some(R::ExternalKickReconnect)
+    fn receive_close_codes_follow_official_no_reconnect_rule() {
+        assert!(receive_close_is_terminal(Some(1000)));
+        assert!(receive_close_is_terminal(Some(4409)));
+        assert!(
+            receive_close_is_terminal(Some(4000)),
+            "本地槽接管（4000）也必须停环，避免旧管线与新管线互踢"
         );
-        // 4409 × 仍有其它活 identified 连接 = 自家互搏（槽内新连接在位）
-        // → 不立刻重拨，清账先行。
-        assert_eq!(
-            resolve_identified_close(Some(4409), 1),
-            Some(R::SelfConflictStandDown)
-        );
-        assert_eq!(
-            resolve_identified_close(Some(4409), 3),
-            Some(R::SelfConflictStandDown)
-        );
+        assert!(!receive_close_is_terminal(Some(1001)));
+        assert!(!receive_close_is_terminal(Some(1006)));
+        assert!(!receive_close_is_terminal(Some(3001)));
+        assert!(!receive_close_is_terminal(None));
+        assert!(StreamOutcome::Terminated.is_terminal());
     }
 
-    /// 4409 裁定 → 流结局映射钉形：外部夺走 = Connected（退避 reset，按
-    /// 既有 Fibonacci 序列重连）；自家互搏 = Recoverable（退避步进，不
-    /// reset，重复冲突逐级爬升——不与自家新连接互搏）。
+    /// 重连排程：manager 不可用（Recoverable）按官方 Fibonacci 逐级重试，
+    /// 绝不会因为一次失败而静默退出；建流成功（Connected）立即 reset 到
+    /// 首拍 1s；终止结局返回 None（停环）。
     #[test]
-    fn close_conflict_resolution_maps_to_stream_outcome() {
-        let outcome_of = |resolution| match resolution {
-            CloseConflictResolution::ExternalKickReconnect => StreamOutcome::Connected,
-            CloseConflictResolution::SelfConflictStandDown => StreamOutcome::Recoverable,
-        };
+    fn reconnect_schedule_retries_recoverable_then_resets_on_success() {
+        let mut schedule = ReconnectSchedule::default();
+
         assert_eq!(
-            outcome_of(resolve_identified_close(Some(4409), 0).unwrap()),
-            StreamOutcome::Connected
+            schedule.next_delay(StreamOutcome::Recoverable),
+            Some(Duration::from_millis(1_000)),
+            "第一次建流失败 → 1s 后重试"
         );
+        assert_eq!(schedule.step(), 1);
         assert_eq!(
-            outcome_of(resolve_identified_close(Some(4409), 2).unwrap()),
-            StreamOutcome::Recoverable
+            schedule.next_delay(StreamOutcome::Recoverable),
+            Some(Duration::from_millis(2_000)),
+            "第二次失败 → 2s（不再重复 1s）"
         );
-        // 重连节奏均由既有 Fibonacci 退避链承载（1s 首拍，逐级 55s 封顶），
-        // 两臂共享同一链（reconnect_backoff_follows_official_fibonacci_
-        // sequence 已钉序列形状）。
-        assert_eq!(reconnect_backoff_delay(0), Duration::from_millis(1_000));
+        assert_eq!(schedule.step(), 2);
+        assert_eq!(
+            schedule.next_delay(StreamOutcome::Recoverable),
+            Some(Duration::from_millis(3_000))
+        );
+
+        // 建流成功（流结束后回到重连）→ reset，首拍 1s。
+        assert_eq!(
+            schedule.next_delay(StreamOutcome::Connected),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(schedule.step(), 0);
+        assert_eq!(
+            schedule.next_delay(StreamOutcome::Recoverable),
+            Some(Duration::from_millis(1_000)),
+            "成功 reset 后下一次失败从首拍重来"
+        );
+
+        // 终止结局不进入退避。
+        assert_eq!(schedule.next_delay(StreamOutcome::Unbound), None);
+        assert_eq!(schedule.next_delay(StreamOutcome::Terminated), None);
+        assert_eq!(schedule.next_delay(StreamOutcome::StdioDead), None);
+    }
+
+    /// 最小复现（2026-10-21 静默接收事故）：manager 在启动期不可用
+    /// （store 存在但 load_registered 失败）时，接收循环必须持续重试并保持
+    /// 存活，直到显式停机——旧路径无日志、无重启，现场只看到「没消息」。
+    /// paused 时钟下按 1s/2s/3s/5s… 推进，断言至少发生 3 次真实尝试且任务
+    /// 未静默退出。
+    #[tokio::test(start_paused = true)]
+    async fn receive_loop_retries_unavailable_manager_until_shutdown() {
+        use std::sync::atomic::Ordering;
+
+        RECEIVE_LOOP_ATTEMPTS.store(0, Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-receive-retry-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        // 启动期不可用的等价注入：store 路径被普通文件占住 → open_store
+        // 立即失败，Manager 无从加载；接收循环只能按退避重试。（不用真实
+        // 空 store：SQLx 连接池会在 paused 时钟下先触发自身超时，单测不
+        // 确定；该故障与 manager load 失败共享同一 Recoverable 重试路径。）
+        std::fs::create_dir_all(data_dir.join("accounts")).expect("accounts dir");
+        let dir = data_dir.join("accounts/never-registered");
+        std::fs::write(&dir, b"not a store directory").expect("blocking file");
+        let (tx, rx) = watch::channel(false);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let handle = tokio::task::spawn_local(async move {
+                    receive_account_loop(&service, "+15550002222", &dir, rx).await;
+                });
+                // 1s→2s→3s→5s 的重试在 paused 时钟下逐小步推进；小步
+                // 让出调度，确保每轮退避都能登记计时器后再前进。
+                let mut waited = Duration::ZERO;
+                while RECEIVE_LOOP_ATTEMPTS.load(Ordering::Relaxed) < 3
+                    && waited < Duration::from_secs(30)
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    waited += Duration::from_millis(100);
+                }
+                let attempts = RECEIVE_LOOP_ATTEMPTS.load(Ordering::Relaxed);
+                assert!(
+                    attempts >= 3,
+                    "manager 不可用时接收循环必须持续重试，实际仅 {attempts} 次"
+                );
+                assert!(
+                    !handle.is_finished(),
+                    "manager 不可用时接收循环不得静默退出"
+                );
+                tx.send(true).expect("shutdown flag");
+                handle.await.expect("receive loop joins");
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// 重连退避序列（止血批②，官方 Desktop ts/backoff/BackOff.std.ts 同
-    /// 序列钉定）：Fibonacci 1,1,2,3,5,8,13,21,34,55 封顶 55s，之后不再
-    /// 增长；step=0（连接成功 reset 后）从 1s 重来。
+    /// 序列钉定）：Fibonacci 1,2,3,5,8,13,21,34,55 封顶 55s，之后不再
+    /// 增长；step=0（连接成功 reset 后）从 1s 重来。2026-10-21 对齐批去掉
+    /// 旧实现 step=0/1 重复的 1s。
     #[test]
     fn reconnect_backoff_follows_official_fibonacci_sequence() {
         let ms = |step| reconnect_backoff_delay(step).as_millis();
         assert_eq!(ms(0), 1_000);
-        assert_eq!(ms(1), 1_000);
-        assert_eq!(ms(2), 2_000);
-        assert_eq!(ms(3), 3_000);
-        assert_eq!(ms(4), 5_000);
-        assert_eq!(ms(5), 8_000);
-        assert_eq!(ms(6), 13_000);
-        assert_eq!(ms(7), 21_000);
-        assert_eq!(ms(8), 34_000);
-        assert_eq!(ms(9), 55_000);
-        assert_eq!(ms(10), 55_000, "官方 MAX_BACKOFF 封顶");
+        assert_eq!(ms(1), 2_000);
+        assert_eq!(ms(2), 3_000);
+        assert_eq!(ms(3), 5_000);
+        assert_eq!(ms(4), 8_000);
+        assert_eq!(ms(5), 13_000);
+        assert_eq!(ms(6), 21_000);
+        assert_eq!(ms(7), 34_000);
+        assert_eq!(ms(8), 55_000);
+        assert_eq!(ms(9), 55_000, "官方 MAX_BACKOFF 封顶");
         assert_eq!(ms(50), 55_000, "封顶后不增长");
     }
 
@@ -22894,6 +23887,46 @@ mod tests {
         assert_eq!(
             project_contact_entry("+15551234567", "", Some(("", Some("")))),
             json!({ "number": "+15551234567" })
+        );
+    }
+
+    /// S5 页缓存：open_store 的连接选项钉定 cache_size=-1024（1 MiB/连接）。
+    /// sqlx 的 SqliteConnectOptions 无 pragma getter，Debug 形是唯一可直打
+    /// 的只读面（pragma 键在 Debug 中恒为 cache_size）。
+    #[test]
+    fn store_connect_options_pins_sqlite_page_cache() {
+        let options = store_connect_options(":memory:").expect("parse in-memory store path");
+        let debug = format!("{options:?}");
+        assert!(debug.contains("cache_size"), "pragma missing: {debug}");
+        assert!(debug.contains("-1024"), "cache size not pinned: {debug}");
+    }
+
+    /// S5 关停宽限：默认 10 s；`KT_ENGINE_SHUTDOWN_GRACE_MS=12000` 对齐
+    /// 连接器 12 s 预算；空/非数字/零/超上限一律回默认（不阻断启动）。
+    #[test]
+    fn pipeline_shutdown_grace_parses_env_budget() {
+        assert_eq!(PIPELINE_SHUTDOWN_GRACE_DEFAULT_MS, 10_000);
+        assert_eq!(parse_pipeline_shutdown_grace(None), None);
+        assert_eq!(parse_pipeline_shutdown_grace(Some("")), None);
+        assert_eq!(parse_pipeline_shutdown_grace(Some("   ")), None);
+        assert_eq!(parse_pipeline_shutdown_grace(Some("0")), None);
+        assert_eq!(parse_pipeline_shutdown_grace(Some("abc")), None);
+        assert_eq!(parse_pipeline_shutdown_grace(Some("-1")), None);
+        assert_eq!(
+            parse_pipeline_shutdown_grace(Some(&(PIPELINE_SHUTDOWN_GRACE_MAX_MS + 1).to_string())),
+            None
+        );
+        assert_eq!(
+            parse_pipeline_shutdown_grace(Some("12000")),
+            Some(Duration::from_millis(12_000))
+        );
+        assert_eq!(
+            parse_pipeline_shutdown_grace(Some(" 10000 ")),
+            Some(Duration::from_millis(10_000))
+        );
+        assert_eq!(
+            parse_pipeline_shutdown_grace(Some(&PIPELINE_SHUTDOWN_GRACE_MAX_MS.to_string())),
+            Some(Duration::from_millis(PIPELINE_SHUTDOWN_GRACE_MAX_MS))
         );
     }
 }

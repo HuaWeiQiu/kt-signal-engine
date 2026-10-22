@@ -31,6 +31,17 @@ fixture 同款）：
   贴纸 metadata-only 投影（字节永不下载）、story transient 投影不落库（§5
   story 块）、附件 locator 指针投影（§5 附件 locator 勘误，metadata-only
   立项红线，字节按需归 connector §4.54 transit 链）。
+- `KT_ENGINE_SHUTDOWN_GRACE_MS`（S5，可选）：接收管线收口宽限（毫秒），
+  默认 `10000`，有效区间 `1..=300000`；非法/零/超上限回默认并落结构化 warn。
+  连接器池化后把自身关停预算提到 ≥12 s 时，两侧可按同一预算收口；引擎退出
+  日志保留 `stage="engine_shutdown" grace_ms=… elapsed_ms=… pipelines=…`
+  （服务层仍不写 stderr；该行落滚动文件日志）。
+- `KT_ENGINE_SINGLE_ACCOUNT=1`（S5，可选）：单账号护栏。注册表 >1 账号时
+  启动失败（exit 1），在清扫/服务装配之前退出、不动任何账号目录；stderr 打
+  一条固定形状
+  `kt-signal-engine: ERROR event=startup_failed code=SingleAccountRegistryViolation accounts=N limit=1 …`，
+  滚动日志落 `engine.startup` 结构化 error（`stage`/`code`/`accounts`/`limit`）。
+  未设置或非 `1` 保持既有行为（多账号兼容路径）。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
 - stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除两处启动期输出外
@@ -38,7 +49,9 @@ fixture 同款）：
   <direct|explicit-env|std-env|system-http|system-socks> <地址或说明>`，恰
   一条）与 `KT_SIGNAL_SOCKS_PROXY` 非法时的错误行（exit 2 前打印）。connector
   watchdog 只把「websocketioexception 或 websocket+失败关键词」形状的行判为
-  接收面死活信号，INFO 行刻意避开该形状；除此之外引擎不得再写 stderr。
+  接收面死活信号，INFO 行刻意避开该形状；除此之外引擎不得再写 stderr
+  （S5 单账号护栏失败行是唯一例外，固定 `kt-signal-engine: ERROR
+  event=startup_failed code=…` 形状，仅在启动失败路径出现）。
   日志纪律：不落消息正文/号码/URI/密钥（代理 host:port 属网络配置，允许）。
   **引擎自身滚动文件日志（2026-10-16 send 链可观测批，§5）**：引擎进程内
   tracing 事件（vendor 传输栈 warn/error + 引擎自有失败证据行）镜像写入

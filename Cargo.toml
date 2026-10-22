@@ -142,6 +142,10 @@ ogg = "0.9"
 opus-decoder = "0.1"
 
 [dev-dependencies]
+# 接收重连/维护超时单测用 paused 时钟（tokio test-util；仅测试编译面合并，
+# 不进运行时依赖图）。
+tokio = { version = "1", features = ["test-util"] }
+
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false, features = ["test-util"] }

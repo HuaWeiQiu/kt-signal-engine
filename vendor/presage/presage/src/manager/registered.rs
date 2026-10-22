@@ -2126,7 +2126,12 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     async fn account_manager(&self) -> Result<AccountManager, Error<S::Error>> {
-        let identified_websocket = self.identified_websocket(true).await?;
+        // KT (single-connection): reuse the live identified websocket instead
+        // of dialing a fresh one — the slot would terminate the receive pipe
+        // on handover, killing the stream mid-maintenance (observed as the
+        // 48s reconnect loop). Responses are multiplexed by request id in
+        // the websocket process, so sharing the connection is safe.
+        let identified_websocket = self.identified_websocket(false).await?;
         Ok(AccountManager::new(
             self.identified_push_service(),
             identified_websocket,

@@ -265,6 +265,22 @@
   send 前 stale 检查同位；既有 30s 未应答闸只覆盖「发过没回」，不覆盖
   「应答成功后链路静默死亡」）。`keepalive_stale_tests` 三例单测
   （阈值钉形 / 超阈含边界判 stale / 新鲜应答不误伤）。
+- `src/websocket/mod.rs`（2026-10-21 接收静默根治批）— 保活/请求超时
+  与官方 `WebsocketResources` 对齐：①1s 粒度 watchdog（`KeepAliveState`）
+  取代 30s interval 内的条件判断：单条 keepalive 30s 无应答立即
+  close(3001)，不再等下一拍；5min 无成功应答仍立即 close；成功应答
+  `last_alive_at=now` 并重置 30s 时钟。②所有 frame 写入加 30s 上限
+  （`send_frame`）；写入失败/超时 = 链路死亡，warn + 有界 close(3001)
+  + 退出（旧实现 keepalive 发送失败只落 info 且不 close）。③应用请求
+  30s 无应答即 close(3001)，wake 挂在该请求上的接收任务。④close 握手
+  2s 上限，死 socket 不能把 I/O pump 永久挂住。任何关闭路径都先落 warn
+  （`cause=`），并 drop request responders，收流端必然观察到流结束并按
+  Fibonacci 重连。⑤本地单连接槽接管（`terminate()`）记合成 close code
+  `CLOSE_CODE_LOCAL_HANDOVER=4000`（不上 wire），引擎侧按 1000/4409 同
+  语义停环，旧管线不得重拨抢回。`keepalive_tests` 十例（30s 应答闸/5min
+  stale/成功 reset/发送失败与超时判死/请求 30s/关闭路径穷尽）。背景：2026-10-21
+  引擎接收流建流成功后 I/O pump 静默挂死，7 分钟零入站、零 close 日志；
+  root cause = 无超时的 send/response 等待 + 同一 pump 内的保活被饿死。
 - `src/websocket/directory.rs`、`src/websocket/slot.rs`（同批
   `cargo fmt` 收口）— 稳定通道 rustfmt 子集重排，语义零变化。
 

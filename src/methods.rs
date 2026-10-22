@@ -5228,6 +5228,12 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
     let (code, message) = send_error_face(&error);
     let data = match &error {
         crate::service::SendError::GroupSyncFailed { count } => Some(json!({ "count": count })),
+        // 契约 §4.222：限流时把服务端给的等待时长（秒）带给宿主。官方
+        // sleepForRateLimitRetryAfterTime 用它决定下一次重试；缺席时宿主
+        // 回落到官方默认 60 秒。
+        crate::service::SendError::RateLimited {
+            retry_after_secs: Some(secs),
+        } => Some(json!({ "retryAfterSecs": secs })),
         _ => None,
     };
     let rpc_error = match data {
@@ -5289,7 +5295,7 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::TargetTerminated => (-1, "SEND_TARGET_TERMINATED"),
         SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
         SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
-        SendError::RateLimited => (-32603, RATE_LIMITED_MESSAGE),
+        SendError::RateLimited { .. } => (-32603, RATE_LIMITED_MESSAGE),
         SendError::ProofRequired => (-32603, PROOF_REQUIRED_MESSAGE),
         SendError::ServerUnavailable => (-32603, SERVER_UNAVAILABLE_MESSAGE),
         SendError::IdentityUnverified => (-32603, IDENTITY_UNVERIFIED_MESSAGE),
@@ -5363,7 +5369,9 @@ mod tests {
             SendError::TargetTerminated,
             SendError::AnnouncementsOnly,
             SendError::Unbound,
-            SendError::RateLimited,
+            SendError::RateLimited {
+                retry_after_secs: None,
+            },
             SendError::ProofRequired,
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
@@ -5479,7 +5487,9 @@ mod tests {
     fn send_error_structured_faces_wire_shape() {
         let cases = [
             (
-                crate::service::SendError::RateLimited,
+                crate::service::SendError::RateLimited {
+                    retry_after_secs: None,
+                },
                 RATE_LIMITED_MESSAGE,
                 "(RateLimitExceeded)",
             ),

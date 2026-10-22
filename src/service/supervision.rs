@@ -138,21 +138,21 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
 
-    /// 崩溃退避复用既有 Fibonacci + jitter：1,1,2,3,5…55s 封顶（>5s 档
+    /// 崩溃退避复用既有 Fibonacci + jitter：1,2,3,5,8…55s 封顶（>5s 档
     /// 叠加 0..5s 单向上浮）；恢复后从首拍清零，累计计数保留。
     #[test]
     fn crash_backoff_reuses_fibonacci_and_resets_after_recovery() {
         let mut backoff = AccountCrashBackoff::default();
         assert_eq!(backoff.on_crash(), Duration::from_millis(1_000));
-        assert_eq!(backoff.on_crash(), Duration::from_millis(1_000));
         assert_eq!(backoff.on_crash(), Duration::from_millis(2_000));
         assert_eq!(backoff.on_crash(), Duration::from_millis(3_000));
+        assert_eq!(backoff.on_crash(), Duration::from_millis(5_000));
         assert_eq!(backoff.crashes(), 4);
 
-        // 长拍叠加 jitter：基值 5s 档（step=4）→ [5s, 10s)。
+        // 长拍叠加 jitter：基值 8s 档（step=4）→ [8s, 13s)。
         let delay = backoff.on_crash();
-        assert!(delay >= Duration::from_millis(5_000));
-        assert!(delay < Duration::from_millis(10_000));
+        assert!(delay >= Duration::from_millis(8_000));
+        assert!(delay < Duration::from_millis(13_000));
 
         // 封顶：推进到 55s 档后继续崩溃，基值保持 55s，jitter 上界 +5s。
         for _ in 0..6 {

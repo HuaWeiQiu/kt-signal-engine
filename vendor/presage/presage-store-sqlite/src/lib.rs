@@ -23,6 +23,7 @@ mod protocol;
 pub use error::SqliteStoreError;
 pub use presage::model::identity::OnNewIdentity;
 pub use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::error::SqlxErrorExt;
 
@@ -68,7 +69,17 @@ impl SqliteStore {
         let options = options
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full);
-        let db = SqlitePool::connect_with(options).await?;
+        // KT: 单连接，对齐官方 better-sqlite3 的单连接语义。
+        //
+        // SQLite 的写锁是全库唯一的。池里多连接会同时争这一把锁：写事务排队、
+        // 连接无法归还 → 池耗尽 → 其它请求 acquire 阻塞（真机实测
+        // acquired_after_secs=9.97，正好是一次消息落库的等待）。
+        // 官方用 better-sqlite3（同步 API、进程内单连接）从结构上不存在该问题；
+        // 这里用 max_connections(1) 取得同语义：写操作在池内串行，不再互相踩锁。
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
 
         sqlx::migrate!().run(&db).await?;
         Ok(Self {

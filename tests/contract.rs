@@ -7,7 +7,7 @@
 //! real 模式只测无网络路径（无会话 finishLink、未知账号 send）。
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
@@ -122,6 +122,35 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn engine_command(data_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-engine"));
+    command.arg("--data-dir").arg(data_dir).args([
+        "jsonRpc",
+        "--receive-mode",
+        "on-start",
+        "--ignore-attachments",
+        "--ignore-stories",
+        "--ignore-stickers",
+    ]);
+    command
+}
+
+/// 跑到进程退出（用于断言启动期 fail-closed；stdin 直接 EOF）。
+fn run_engine_to_completion(data_dir: &Path, envs: &[(&str, &str)]) -> std::process::Output {
+    engine_command(data_dir)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .expect("engine runs")
+}
+
+fn write_account_store(dir: &Path, name: &str) -> PathBuf {
+    let store_dir = dir.join("accounts").join(name);
+    std::fs::create_dir_all(&store_dir).expect("store dir");
+    std::fs::write(store_dir.join("store.db"), b"credential-bytes").expect("store.db");
+    store_dir
+}
+
 fn assert_e164_number(number: &str) {
     assert!(number.starts_with('+'), "number {number} lacks E.164 plus");
     assert!(
@@ -162,6 +191,152 @@ fn invalid_argv_fails_fast_with_usage_exit() {
             "usage text expected on stderr for {argv:?}"
         );
     }
+}
+
+/// P0-B：首次运行（无注册表、无 accounts）必须正常启动。
+#[test]
+fn first_run_without_registry_or_accounts_starts_cleanly() {
+    let dir = temp_dir("first-run-contract");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+    drop(engine);
+    let log = std::fs::read_to_string(dir.join("logs/engine-stderr.log")).expect("engine log");
+    assert!(
+        log.contains("RegistryAbsentFirstRun"),
+        "首次运行日志: {log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P0-B：损坏注册表 → 启动失败，且真实 store 目录/字节原样保留（旧语义会
+/// 把它当空表并启动清扫删掉）。
+#[test]
+fn corrupt_registry_fails_startup_and_preserves_store_dirs() {
+    let dir = temp_dir("corrupt-registry-contract");
+    let store = write_account_store(&dir, "lk-keep");
+    std::fs::write(dir.join("engine-state.json"), b"{broken").expect("corrupt registry");
+
+    let output = run_engine_to_completion(&dir, FAKE_SERVICE);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "坏注册表必须 fail closed；stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(store.join("store.db")).unwrap(),
+        b"credential-bytes".as_slice(),
+        "凭证目录不得被删除/移动"
+    );
+    assert!(
+        !dir.join("accounts").join("_quarantine").exists(),
+        "加载失败时不得发生清扫/隔离"
+    );
+    let log = std::fs::read_to_string(dir.join("logs/engine-stderr.log")).expect("engine log");
+    assert!(log.contains("RegistryCorrupt"), "fail-closed 日志: {log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P0-B：注册表缺失但 accounts/ 下仍有带 store.db 的 lk-*（被删/恢复不完整）
+/// → 启动失败，不得给空表后清扫。
+#[test]
+fn missing_registry_with_store_fails_startup_and_preserves_dirs() {
+    let dir = temp_dir("missing-registry-contract");
+    let store = write_account_store(&dir, "lk-keep");
+
+    let output = run_engine_to_completion(&dir, FAKE_SERVICE);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "缺失注册表 + store 必须 fail closed；stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(store.join("store.db")).unwrap(),
+        b"credential-bytes".as_slice(),
+        "凭证目录不得被删除/移动"
+    );
+    assert!(
+        !dir.join("accounts").join("_quarantine").exists(),
+        "加载失败时不得发生清扫/隔离"
+    );
+    let log = std::fs::read_to_string(dir.join("logs/engine-stderr.log")).expect("engine log");
+    assert!(
+        log.contains("RegistryMissingWithStores"),
+        "fail-closed 日志: {log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P0-B：正常启动清扫把「未登记但带 store.db」的目录隔离而非删除，并写
+/// 审计日志（恢复入口）。
+#[test]
+fn unregistered_store_is_quarantined_not_deleted_on_startup() {
+    let dir = temp_dir("quarantine-contract");
+    let store = write_account_store(&dir, "lk-orphan");
+    std::fs::write(
+        dir.join("engine-state.json"),
+        br#"{"version":2,"accounts":[]}"#,
+    )
+    .expect("empty registry");
+
+    let mut engine = Engine::spawn(&dir);
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+
+    assert!(
+        !store.try_exists().unwrap(),
+        "未登记目录应被移出 accounts/ 直接子目录"
+    );
+    let quarantine_root = dir.join("accounts").join("_quarantine");
+    let buckets: Vec<PathBuf> = std::fs::read_dir(&quarantine_root)
+        .expect("quarantine root")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(buckets.len(), 1, "恰一个 observedAt 桶");
+    let moved = buckets[0].join("lk-orphan");
+    assert_eq!(
+        std::fs::read(moved.join("store.db")).unwrap(),
+        b"credential-bytes".as_slice(),
+        "隔离必须保留 store 字节"
+    );
+    let manifest =
+        std::fs::read_to_string(quarantine_root.join("quarantine-log.jsonl")).expect("manifest");
+    assert!(
+        manifest.contains(r#""dir":"lk-orphan""#),
+        "manifest: {manifest}"
+    );
+    assert!(
+        !manifest.contains("+1555"),
+        "manifest 不得含账号号码: {manifest}"
+    );
+
+    // 隔离后重启必须 fail closed（恢复闸门），隔离内容不得被二次启动破坏。
+    drop(engine);
+    let restart = run_engine_to_completion(&dir, &[]);
+    assert_eq!(
+        restart.status.code(),
+        Some(1),
+        "隔离区非空须 fail closed；stderr: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        std::fs::read(moved.join("store.db")).unwrap(),
+        b"credential-bytes".as_slice(),
+        "重启不得破坏隔离内容"
+    );
+    let log = std::fs::read_to_string(dir.join("logs/engine-stderr.log")).expect("engine log");
+    assert!(log.contains("QuarantinePresent"), "恢复闸门日志: {log}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

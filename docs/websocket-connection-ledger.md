@@ -68,26 +68,28 @@
   （`registered.rs:82-85` 注），`identified_websocket()` /
   `unidentified_websocket()`（`registered.rs:240,268`）改走 slot。
 
-## 3. 4409 分支语义（引擎侧）
+## 3. 1000/4409 分支语义（引擎侧，2026-10-21 对齐官方）
 
-- 服务器 4409 close frame → vendored 进程记 close code（`websocket/mod.rs:354`）
+- 服务器 close frame → vendored 进程记 close code（`websocket/mod.rs`）
   并落 warn 字面量日志（含 4409 释义行）。
-- receive 流结束臂读判定面（`src/service/mod.rs:6288`）：
-  `manager.identified_websocket_close_code()`（`registered.rs:286`）+
-  `manager.has_open_identified_websocket()`（`registered.rs:294`）→
-  纯函数判定单点 `resolve_identified_close`
-  （`src/service/mod.rs:5436`，测试钉形 `src/service/mod.rs:18054`）：
-  - `Some(4409)` + 进程内**无**其它活 identified = 外部客户端夺走（用户
-    手机重连等）→ `StreamOutcome::Connected`（退避 reset，按既有
-    Fibonacci 1→55s + jitter 重连）；
-  - `Some(4409)` + 仍有其它活 identified = 自家互搏残影 →
-    `StreamOutcome::Recoverable`（退避步进，不立刻重拨；共享槽位保证
-    重拨必先拆旧）；
-  - 非 4409 → 不进裁定，走既有流结局语义。
-- 官方「4409 不重连」偏差记档：引擎为连接器托管在线面，外部夺走后必须
-  重连恢复接收（否则死连接）；自家互搏臂已按官方语义 stand down。
-  计数面 `stream_close_4409_external` / `stream_close_4409_self`
-  （`src/service/perf_metrics.rs`）供 `engine.perfReport` 观测。
+- receive 流结束臂读 `manager.identified_websocket_close_code()`
+  （`registered.rs`），纯函数判定单点 `receive_close_is_terminal`
+  （`src/service/mod.rs`，测试钉形）：
+  - `Some(1000)`（normal closure）或 `Some(4409)`（connected elsewhere）
+    → `StreamOutcome::Terminated`：停环、**不重连**，与官方
+    `SocketManager.preload.ts:391-394` 一致；warn 行带 close_code 与
+    账号短哈希；
+  - `Some(4000)`（`CLOSE_CODE_LOCAL_HANDOVER`，本地单连接槽接管：
+    新拨号 `terminate()` 旧连接）→ 同样停环。4000 只写进
+    `SignalWebSocketInner.last_close_code`，不上 wire；旧管线不得重拨
+    抢回已被新连接接管的槽；
+  - 其余（1001/1006/3001/无 close code）→ `StreamOutcome::Connected`，
+    按 Fibonacci 1,2,3,5…55s + jitter 重连。
+- 旧偏差（本批废止）：4409 外部夺走曾映射 `Connected` 立即重连，等于与
+  夺走连接的客户端互踢振荡。现在停环等连接器/重链显式重建。
+- 计数面：`stream_outcome_closed_no_reconnect`（1000/4409 停环）；
+  历史 `stream_close_4409_external` / `stream_close_4409_self` 键保留
+  但不再递增（wire 词表兼容）。
 
 ## 4. 残余风险与后续
 
@@ -100,28 +102,35 @@
 - KA-DIAG 临时探针仍在（diag 分支引入，本批未摘）——现场观察任务结束
   后由上级决定整体回退批次。
 
-## 5. 保活 STALE 哨兵（2026-10-17 批，零 wire 变化）
+## 5. 保活/请求超时（2026-10-21 接收静默根治批）
 
-官方语义（Signal-Desktop `WebsocketResources.preload.ts:508`
-`STALE_THRESHOLD_MS = 5min` / `:612-620` `send()` 开头检查）：每次保活
-发送前检查上次成功保活应答时刻，距今超 5 分钟（典型为机器休眠唤醒）→
-不在该链路上发送，直接 close 自关强制重连。官方 30s 未应答闸只覆盖
-「发过没回」，此哨兵补「应答成功后链路静默死亡」——两者互补。
+官方语义：
 
-引擎实现（vendor fork 面，`vendor/libsignal-service/src/websocket/mod.rs`，
-台账见 `vendor/README.md` 保活 STALE 哨兵批条目）：
+- `WebsocketResources.preload.ts:504-514/544-580/609-640`：keepalive 每
+  30s；单请求 30s 无应答 → close(3001)；5min 无成功应答 → 立即 close；
+  成功 → `lastAliveAt=now` 并重置 30s 计时。
+- `SocketManager.preload.ts:98/256-296/363/391-394`：重连 Fibonacci
+  1,2,3,5,8,13,21,34,55s + 0..5s jitter；成功 `reset()`；1000/4409 与
+  401/403 不重连。
 
-- `SignalWebSocketProcess.last_alive_at`：构造时初始化 `Instant::now()`
-  （官方 `#lastAliveAt = Date.now()` 同位），`process_frame` 保活应答
-  2xx 臂刷新。
-- tick 发送前 `keepalive_is_stale` 纯函数判定（官方 `isOlderThan` 同判，
-  elapsed ≥ 阈值含边界，`STALE_KEEPALIVE_THRESHOLD = 5min`）→ 命中走既有
-  failed-keepalives 关闭路径：warn 字面量（含 `stale`）+ close frame
-  reason 字面量 `"stale"` + `ka_diag task exiting: stale keepalive
-  state` 退出探针 → 进程退出、receive 流按既有退避重连。
-- 事件序列：休眠唤醒后首个保活 tick（≤30s）即自关，不再向死链发送
-  keepalive 或业务请求；与单连接纪律（§0-§3）正交——重连仍走
-  kill-before-create + dial_lock 串行。
+引擎实现（`vendor/libsignal-service/src/websocket/mod.rs`，台账见
+`vendor/README.md` 2026-10-21 批）：
 
-单测：`websocket::keepalive_stale_tests` 三例（阈值钉形 5min / 超阈含
-边界判 stale / 新鲜应答不误伤）。
+- `KeepAliveState`（纯状态，单测钉形）：30s 发一次；成功应答刷新
+  `last_alive_at` 并把下次发送推到 +30s；在飞 keepalive 满 30s →
+  `CloseUnanswered`。
+- 1s 粒度 watchdog 与 30s 保活解耦：到期立即动作，不等下一拍。
+- 所有 frame 写入 `send_frame` 带 30s 上限；失败/超时 → warn +
+  `close_link`（3001，close 握手另限 2s）→ 进程退出。旧实现发送失败只
+  落 info 且不 close，死链上收流永无结束事件。
+- 应用请求 30s 无应答 → `CloseRequestTimeout`（3001）。这条是「同步/
+  manifest 等维护请求挂死 → 收流任务永不回到 `stream.next()`」的直接
+  断路器。
+- 每条关闭路径先落 warn（`cause=` 固定词表），再 drop 所有 request
+  responders：挂起的 manager 调用以 `WsClosing` 返回，收流端观察到流
+  结束并按 Fibonacci 重连。
+- 5min stale 哨兵保留（休眠唤醒场景），同样走上述关闭路径。
+
+单测：`websocket::keepalive_tests` 十例（阈值 / 30s 应答闸 / 5min
+stale / 成功 reset / 发送失败与超时判死 / 请求 30s / 关闭路径穷尽 /
+watchdog 粒度）。

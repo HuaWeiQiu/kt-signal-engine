@@ -370,7 +370,47 @@ fn main() -> ExitCode {
     amain()
 }
 
-#[tokio::main]
+/// 单账号护栏开关（S5）：池化后每个引擎只应承载一个账号，防止误把多账号
+/// data-dir 指给池槽（设计 §9 S5.4 / 失败模式 I3）。仅显式 `=1` 开启；
+/// 其他值/缺席视为关闭（保留今天多账号兼容路径）。
+const SINGLE_ACCOUNT_ENV: &str = "KT_ENGINE_SINGLE_ACCOUNT";
+
+/// 纯判定：开关打开且注册表账号数 > 1 才拒绝启动。
+fn single_account_guard_violation(enabled: bool, account_count: usize) -> bool {
+    enabled && account_count > 1
+}
+
+/// 开关解析（去空白后恒等 `"1"`；与 `KT_ENGINE_FAKE_SERVICE` 同款严格口径）。
+fn single_account_guard_enabled_from(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+fn single_account_guard_enabled() -> bool {
+    single_account_guard_enabled_from(std::env::var(SINGLE_ACCOUNT_ENV).ok().as_deref())
+}
+
+/// 启动期单账号护栏失败：结构化落滚动日志 + 一条固定形状 stderr 错误
+/// （connector 会转发 stderr；不含号码/正文/密钥）。退出码 1 = 致命状态。
+fn report_single_account_violation(accounts: usize) {
+    tracing::error!(
+        target: "engine.startup",
+        stage = "single_account_guard",
+        code = "SingleAccountRegistryViolation",
+        accounts,
+        limit = 1,
+        "KT_ENGINE_SINGLE_ACCOUNT=1 but the registry contains more than one account; refusing to start"
+    );
+    eprintln!(
+        "kt-signal-engine: ERROR event=startup_failed code=SingleAccountRegistryViolation accounts={accounts} limit=1 (KT_ENGINE_SINGLE_ACCOUNT=1 expects one account per data-dir)"
+    );
+}
+
+// S5：池化后每个引擎一账号，多线程 runtime 的 per-core worker 是纯固定成本
+// （空引擎 20–21 线程）。装配本来就是单线程 LocalSet + 一个 stdout writer /
+// 一个证书维护 tokio::spawn 任务（均为 Send future），current_thread 足以
+// 驱动；阻塞 stdin 读仍在独立 std::thread。长任务与收流共享同一线程是已知
+// 取舍（设计 §13 决策 8）。
+#[tokio::main(flavor = "current_thread")]
 async fn amain() -> ExitCode {
     let args = match parse_launch_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
@@ -390,9 +430,17 @@ async fn amain() -> ExitCode {
     })
     .expect("perf hook installs exactly once per process");
     let state = match EngineState::load(&args.data_dir) {
-        Ok(state) => Arc::new(AsyncMutex::new(state)),
+        Ok(state) => state,
         Err(_) => return ExitCode::from(1),
     };
+    // S5 单账号护栏：注册表 >1 账号 = 该 data-dir 属于多账号进程，池槽
+    // 误指会破坏「一账号一进程」的隔离前提，fail closed（P0-B 的清扫逻辑
+    // 不参与：这里在清扫之前退出，不动任何账号目录）。
+    if single_account_guard_violation(single_account_guard_enabled(), state.accounts().len()) {
+        report_single_account_violation(state.accounts().len());
+        return ExitCode::from(1);
+    }
+    let state = Arc::new(AsyncMutex::new(state));
 
     // stdout writer：响应与 receive 通知的唯一出口（行序 = 队列序）。Notice
     // 逐条写+flush；Flush 是背压栅栏（此前全部 Notice 已写进 stdout 并 flush
@@ -635,10 +683,42 @@ mod tests {
     use super::socks_proxy_url;
     use super::{
         outbound_flush_barrier, parse_scutil_proxy, resolve_proxy_chain, run_outbound_writer,
-        standard_proxy_env_hit, OutboundFrame, ProxyDecision,
+        single_account_guard_enabled_from, single_account_guard_violation, standard_proxy_env_hit,
+        OutboundFrame, ProxyDecision,
     };
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    /// S5 单账号护栏：只有「显式 =1 且注册表 >1 账号」才拒绝启动；
+    /// 关闭态/单账号/空表均保持既有行为（多账号兼容路径不被误伤）。
+    #[test]
+    fn single_account_guard_only_rejects_multi_account_when_enabled() {
+        assert!(!single_account_guard_violation(false, 0));
+        assert!(!single_account_guard_violation(false, 2));
+        assert!(!single_account_guard_violation(true, 0));
+        assert!(!single_account_guard_violation(true, 1));
+        assert!(single_account_guard_violation(true, 2));
+        assert!(single_account_guard_violation(true, 9));
+    }
+
+    #[test]
+    fn single_account_guard_env_is_strict_one() {
+        assert!(single_account_guard_enabled_from(Some("1")));
+        assert!(single_account_guard_enabled_from(Some(" 1 ")));
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("2"),
+        ] {
+            assert!(
+                !single_account_guard_enabled_from(raw),
+                "raw={raw:?} must not enable the guard"
+            );
+        }
+    }
 
     #[test]
     fn socks_proxy_url_accepts_host_port() {
