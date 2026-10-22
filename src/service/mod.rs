@@ -7368,16 +7368,11 @@ async fn serve_account_stream(
     // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
-    // 台账 §25.5（2026-10-22）：prekey 维护拨第二条 identified WS 会触发
-    // 单连接纪律杀掉收流，拨号本身又挂满 30s 超时 → 「建流→维护→断开」
-    // 死循环（实测 450+ 次/日，收流无法稳定，消息只能靠重连瞬间的补投）。
-    // 故默认停用维护；需要时设 KT_SIGNAL_PREKEY_MAINTENANCE=1 显式开启。
-    // 官方客户端为定期注册语义，停用数日不影响收发。
-    let mut maint_at = if std::env::var("KT_SIGNAL_PREKEY_MAINTENANCE").as_deref() == Ok("1") {
-        Some(tokio::time::Instant::now() + Duration::from_millis(0))
-    } else {
-        None
-    };
+    // 台账 §25.5→§26：维护拨第二条 identified WS 曾与单连接纪律互斥
+    // （纪律终止收流、拨号挂 30s、断连循环 450+ 次/日）。根修：presage
+    // account_manager 改为复用活动 WS（registered.rs account_manager 传
+    // require_unused=false），不再拨第二条——维护恢复默认开启。
+    let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
     // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
     // 收敛到 30min/200 信封。refresh_pre_keys 自带服务器计数闸（≥10 零上
