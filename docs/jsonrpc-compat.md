@@ -151,7 +151,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
 | `listAccounts` | `{}` | `[{"number", "aci"?, "capabilities"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批；capabilities additive 2026-10-20，回填能力门数据面，§5 块——`{attachmentBackfill: bool}` 单键对象，取不到时整键缺席）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录）；**2026-10-20 real/fake（回填能力门数据面批，wire additive，engine-compat，§5 块）**：条目 additive `capabilities` 键 = 本机 profile 的 `capabilities.attachmentBackfill`（官方 `isBackfillEnabled` 消费位，attachmentBackfill.preload.ts:57-72），有界缓存 + 整批 2s 预算，读面失败/超时/未注册 = 整键缺席（不投 false、不连坐列表）；fake 形状桩投引擎自声明位 |
-| `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在） |
+| `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}, isHidden?, profileSharing?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在）。**2026-10-24 real（消息请求 B 批，wire additive，engine-compat，§5 块）**：条目 additive `isHidden` / `profileSharing`——官方 `isConversationAccepted` 的 `isInSystemContacts`（hidden 取反）与 `profileSharing` trusted-contact 因子；contacts 表同步行 `isHidden:false`、非通讯录 profile 行 `isHidden:true`；`profileSharing` 读 Storage Service 联系人 whitelist 位（发送链同一 map/缓存），记录缺席 = 键缺席（诚实未知），读面失败空 map = 全键缺席（fail-open）；connector `mrr_factors_stamp` 消费腿零改动 |
 | `profiles.refreshContacts` | `{account}`（字符串必需，缺席/非字符串 fail-closed `-32603`——phoneLookup 同款参数纪律；无逐联系人物品参数——本方法不接受目标清单，目标集恒由 store 推导，调用方无法借它探测任意 uuid 的 profile） | `{refreshed, failed, skipped}`（三计数恒在，u32 字面；只计数不含任何身份/号码/名字内容——引擎零联系人外传纪律同向）。refreshed = 本次实际发起 profile 拉取且成功；failed = 拉取失败**或**整批时限到期未尝试（含拉取成功但服务器侧名字材料仍空——计数语义是「刷新动作结局」而非「名字出现」）；skipped = 无需刷新（无 profile_key / 名字材料已在库 / contacts.name 非空） | 未注册账号 `-32603`；无账号库可达同折叠 | **2026-10-16 real（KT 扩展，profile 名字刷新批，wire additive，engine-compat，§5 块）**：登录绑定完成后的自动批（60s 一次性纪律同门，+10s 联系人沉降）与本显式方法共用同一刷新单点（`refresh_contact_profiles`）：目标集 = store contacts 中 profile_key 在库且名字材料为空者，presage `retrieve_profile_by_uuid` 同路径拉取（vendored registered.rs 同路：缓存查 → 服务器拉 → ProfileCipher 解密 → `save_profile` 落 **profiles 表**——落表查证结论：不是 contacts.name），并发 ≤3（独立 manager 各自持 websocket 槽）、单联系人失败不中断批次、整批时限 20s（到期未尝试计 failed）；presage 侧 profile 缓存（查到即回、无网络）使重复刷新零流量幂等；fake：`{refreshed:0, failed:0, skipped:0}`（形状桩，不落调度日志，读面纪律） |
 | `listGroups` | `{account, groupId?: [32B 标准 base64 群 master key…]（可选过滤，P15b 审计项5 单群读投影：数组非空、条目 decode_group_id 闸；坏形状——非数组/空数组/条目非字符串·坏 base64·≠32B——fail-closed `-32603`（fake 面同口径）；well-formed 但 store 不在 → 掉出结果不报错（结果可空，connector fold 侧 `first()` → 空集诚实降级）；缺席/null = 全表旧行为）}` | `[{id(base64), name, revision, description?(Some 时在场), announcementsOnly, expireTimerSeconds(0 = 关), isMember(计算值：own ACI ∈ members), members:[{number, role}], pendingMembers:[{number, addedBy, timestamp}], requestingMembers:[{number, timestamp}], bannedMembers:[{number, timestamp}], accessControl?{attributes, members, addFromInviteLink, memberLabel}(词表 UNKNOWN/ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE，Some 时在场), terminated(bool)}]` | 未注册账号 `-32603` | **P2 real**：presage 群组投影（id = master key 标准 base64，send 可回传）；`terminated` 位 2026-10-06 扩（KT 扩展批：进程内登记 + 服务器群态读面，§5 群终止批；fake 恒空列表该键不出现）；**2026-10-11 real（群写面 P5 投影批，§5 块）**：投影族扩展（description/announcementsOnly/expireTimerSeconds/revision/members[].role/pending/requesting/banned 三成员面/accessControl 四族——vendored presage `Group` 补 `banned_members` 位，README fork 清单登记）；**isMember 诚实化修正**：改计算值（own ACI ∈ members）——早期「入库即成员恒 true」口径废止，被移出群的本地残留投影即 false（§5 登记偏差）；单群投影抽纯函数 `project_group_list_entry` 单测钉形；**2026-10-11 real（P15b 审计项5，§5 块）**：可选 `groupId` 过滤（单群读投影）——connector §4.53/§4.57/§4.62 三处 fold 读已派发 `listGroups {account, groupId: [id]}` 数组形并取 `first()` 当目标群，引擎此前忽略该参数返回全表，多群账号下 `first()` 读到任意群（requesting/pending 集合错群危害）；过滤判定抽纯函数 `group_key_passes_filter` 单测钉形 |
 | `deleteLocalAccountData` | `{account}` | `{}` | — | **P1b real**：注册表摘除 + store 目录删除 + 接收管线停机 |
@@ -6835,3 +6835,25 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
   退避中停机、删除等待在飞帧、MRM 池隔离与 fail-closed、并发 link/delete
   串行与 tmp 无残留、分位/环形缓冲/在飞守卫；契约测试钉定
   `engine.perfMetrics` 六键形状（基础四键 + additive 两键）。
+
+### 消息请求 trusted-contact 因子导出批（2026-10-24，wire additive【engine-compat】）
+
+官方锚（Signal-Desktop AGPL 只读零抄码）：`isConversationAccepted.preload.ts:21-82`
+的 trusted-contact 两权重 `profileSharing` / `isInSystemContacts`；桌面
+`conversations.dom.ts:1346-1365 isMissingRequiredProfileSharing` 与
+`MandatoryProfileSharingActions.dom.tsx:103-141` 是消费面。
+
+- `listContacts` 每条 additive `isHidden`：contacts 表同步行 = `false`（系统
+  通讯录来源）；§29.4 非通讯录 profile 行 = `true`。
+- `listContacts` 每条 additive `profileSharing`：读
+  `profile_sharing_whitelist`（发送链 P9 同一 Storage Service 位 map 与
+  TTL 缓存）；记录缺席 = 键缺席（诚实未知，绝不发明 `false`）；Storage
+  读失败 = 空 map = 全键缺席（fail-open，与发送链语义同向）。
+- 读序：whitelist 在 `lock_registered_for_send` 之前取（冷缓存 Storage
+  往返不占发送管理器锁）；TTL 内命中零网络。
+- fake 面：`listContacts` 仍返回 `[]`（零形状变化）。
+- 消费方：kt-signal-connector `mrr_factors_stamp`（键名 `isHidden` /
+  `profileSharing`）零改动；connector 契约 1.221 §4.231 把两位投影为摘要
+  `profileSharing` / `inSystemContacts`。
+- 测试：`project_contact_entry_shapes`（新签名、两键在场/缺席、非通讯录行
+  hidden=true）；wire 形状逐键钉定。

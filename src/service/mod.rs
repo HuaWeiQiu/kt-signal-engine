@@ -4385,6 +4385,17 @@ impl Service {
     /// 表（`profiles.refreshContacts` 拉取落库面；键形状与 signal-cli 同形，
     /// connector supervisor 消费腿同形状）；名字键缺席纪律见
     /// `project_contact_entry`（no-null：非空才出现）。
+    ///
+    /// 请求判定来源（2026-10-24 消息请求 B 批，wire additive，§5 块）：
+    /// 条目 additive `isHidden` / `profileSharing`——官方
+    /// `isConversationAccepted` 的 `isInSystemContacts`（hidden 取反）与
+    /// `profileSharing` 两个 trusted-contact 因子在本引擎的诚实数据源。
+    /// contacts 表行 = 手机通讯录同步行 → `isHidden:false`；§29.4 非通讯录
+    /// profile 行 = 不在通讯录 → `isHidden:true`。`profileSharing` 读
+    /// Storage Service 联系人 whitelist 位（发送链同一份 map，TTL 缓存），
+    /// 记录缺席 = 键缺席（诚实未知，绝不发明 false）；读面失败空 map =
+    /// 全体键缺席（fail-open，connector 记 probed-absent 后不再反复探测）。
+    /// signal-cli 同名键逐字（connector `mrr_factors_stamp` 消费腿既有）。
     pub(crate) async fn list_contacts(
         self: &Arc<Self>,
         account: &str,
@@ -4392,6 +4403,9 @@ impl Service {
         if !self.real {
             return Ok(Vec::new());
         }
+        // P9 whitelist 读面先于 manager 锁：Storage 往返（冷缓存）不得
+        // 压在发送常驻管理器锁上；TTL 内命中零网络（发送链同源单点）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
@@ -4414,7 +4428,16 @@ impl Service {
             let profile = profile
                 .as_ref()
                 .map(|(given, family)| (given.as_str(), family.as_deref()));
-            out.push(project_contact_entry(&number, &contact.name, profile));
+            let sharing = whitelist
+                .get(&contact.uuid.to_string().to_lowercase())
+                .copied();
+            out.push(project_contact_entry(
+                &number,
+                &contact.name,
+                profile,
+                Some(false),
+                sharing,
+            ));
         }
         // additive 投影（2026-10-23 目标集扩展批，台账 §29.4 剩余项②）：
         // profiles 表有名字材料的非通讯录对端作为 contact 条目（uuid +
@@ -12050,6 +12073,8 @@ async fn non_contact_profile_entries(
                 &uuid.to_string(),
                 "",
                 Some((&given, family.as_deref())),
+                Some(true),
+                None,
             ));
         }
     }
@@ -12061,10 +12086,24 @@ async fn non_contact_profile_entries(
 /// `{givenName?, familyName?}`——两件全空 = 整键不在，单件空 = 该键不在
 /// （no-null 纪律，缺席与 null 折叠同一无键态）；键名与 signal-cli 同形
 /// （connector supervisor 消费腿 profile.givenName/familyName 同形状）。
-fn project_contact_entry(number: &str, name: &str, profile: Option<(&str, Option<&str>)>) -> Value {
+/// 请求判定面（2026-10-24 消息请求 B 批）：`isHidden` / `profileSharing`
+/// 两键仅在调用方持有真实材料时出现（None = 键缺席，绝不发明 false）。
+fn project_contact_entry(
+    number: &str,
+    name: &str,
+    profile: Option<(&str, Option<&str>)>,
+    hidden: Option<bool>,
+    profile_sharing: Option<bool>,
+) -> Value {
     let mut entry = json!({ "number": number });
     if !name.is_empty() {
         entry["name"] = json!(name);
+    }
+    if let Some(hidden) = hidden {
+        entry["isHidden"] = json!(hidden);
+    }
+    if let Some(profile_sharing) = profile_sharing {
+        entry["profileSharing"] = json!(profile_sharing);
     }
     if let Some((given, family)) = profile {
         let given_non_empty = !given.is_empty();
@@ -24143,44 +24182,62 @@ mod tests {
     /// listContacts 条目投影（profile 名字刷新批 additive 面，纯函数）：
     /// number 恒在；name/profile 两键非空才出现（no-null）；profile 内
     /// givenName/familyName 单件空 = 该键不在；两件全空 = profile 整键
-    /// 不在；键集形状钉定（不得发明）。
+    /// 不在；键集形状钉定（不得发明）。请求判定面（消息请求 B 批）：
+    /// isHidden/profileSharing 仅在调用方持有材料时出现，None = 键缺席。
     #[test]
     fn project_contact_entry_shapes() {
         // 仅 number（未刷新库零变化：应答逐字节同形）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", None),
+            project_contact_entry("+15551234567", "", None, None, None),
             json!({
                 "number": "+15551234567",
+            })
+        );
+
+        // contacts 行：通讯录同步行 isHidden=false；whitelist 位在手才出。
+        assert_eq!(
+            project_contact_entry("+15551234567", "", None, Some(false), Some(true)),
+            json!({
+                "number": "+15551234567",
+                "isHidden": false,
+                "profileSharing": true,
             })
         );
 
         // contacts 名照旧；profile 材料在 → givenName/familyName 全出。
         assert_eq!(
-            project_contact_entry("+15551234567", "Alice", Some(("Ada", Some("Lee")))),
+            project_contact_entry(
+                "+15551234567",
+                "Alice",
+                Some(("Ada", Some("Lee"))),
+                Some(false),
+                None,
+            ),
             json!({
                 "number": "+15551234567",
                 "name": "Alice",
                 "profile": { "givenName": "Ada", "familyName": "Lee" },
+                "isHidden": false,
             })
         );
 
         // 单件空：given 缺 / family 缺（no-null，缺席键不在）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", Some("Lee")))),
+            project_contact_entry("+15551234567", "", Some(("", Some("Lee"))), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "familyName": "Lee" },
             })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("Ada", None))),
+            project_contact_entry("+15551234567", "", Some(("Ada", None)), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "givenName": "Ada" },
             })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("Ada", Some("")))),
+            project_contact_entry("+15551234567", "", Some(("Ada", Some(""))), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "givenName": "Ada" },
@@ -24189,12 +24246,23 @@ mod tests {
 
         // 两件全空 = profile 整键不在（服务器侧空 profile 名不算材料）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", None))),
+            project_contact_entry("+15551234567", "", Some(("", None)), None, None),
             json!({ "number": "+15551234567" })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", Some("")))),
+            project_contact_entry("+15551234567", "", Some(("", Some(""))), None, None),
             json!({ "number": "+15551234567" })
+        );
+
+        // 非通讯录 profile 行：isHidden=true，未见 whitelist 记录 = 键缺席
+        // （诚实未知，绝不发明 false）。
+        assert_eq!(
+            project_contact_entry("uuid-peer", "", Some(("Dave", None)), Some(true), None),
+            json!({
+                "number": "uuid-peer",
+                "profile": { "givenName": "Dave" },
+                "isHidden": true,
+            })
         );
     }
 
