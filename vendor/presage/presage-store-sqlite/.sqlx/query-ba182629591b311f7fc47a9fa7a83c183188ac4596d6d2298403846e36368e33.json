@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT uuid, key FROM profile_keys ORDER BY uuid",
+  "describe": {
+    "columns": [
+      {
+        "name": "uuid",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "profile_keys",
+            "name": "uuid"
+          }
+        }
+      },
+      {
+        "name": "key",
+        "ordinal": 1,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "profile_keys",
+            "name": "key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ba182629591b311f7fc47a9fa7a83c183188ac4596d6d2298403846e36368e33"
+}

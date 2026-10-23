@@ -23,10 +23,19 @@
 //!   [`REFRESH_BATCH_DEADLINE_MS`]（到期未尝试计 failed——诚实语义））。
 //! - wire 返回 `{refreshed, failed, skipped}` 三计数，**只计数不含任何
 //!   身份/号码/名字内容**（引擎零联系人外传纪律同向）。
+//! - 目标集（2026-10-23 目标集扩展批，未知联系人根因批）：contacts sync
+//!   集合 ∪ profile_keys 全表 uuid（已收到过消息/已建立会话的对端，键必
+//!   在）——不在手机通讯录的群成员/会话对端自此进刷新目标（官方对非通讯
+//!   录群成员同样拉 profile 的行为对齐；批时限内未尝试的留下一批，刷新
+//!   幂等，材料在库者下批 skip）。
+//! - skip 原因可观测性（同批 additive）：debug 级
+//!   `skip_no_key/skip_named/skip_material` 三计数（仍零身份/号码/名字
+//!   内容）；wire 三计数语义不变。
 //! - presage 侧 profile 缓存（查到即回、零网络）使重复刷新幂等。
 //! - 名字权威面：contacts.name 非空的联系人不刷新（手机 contacts sync
 //!   权威，engine 不发明 system/nickname 面，storage_merge 同纪律）。
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +133,115 @@ pub(crate) fn chunk_targets<T>(targets: Vec<T>, max_chunks: usize) -> Vec<Vec<T>
     chunks
 }
 
+/// skip 原因计数（2026-10-23 目标集扩展批 additive，debug 可观测性面）：
+/// 只计数不含任何身份/号码/名字内容；wire `skipped` = 三臂总和。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkipReasonCounts {
+    pub(crate) no_key: u32,
+    pub(crate) named: u32,
+    pub(crate) material_present: u32,
+}
+
+/// 目标收集结果（目标集扩展批）：targets = 待拉取 (uuid, key) 有序集
+/// （contacts 源在前、profile_keys 源在后，各自保序）；counts.skipped =
+/// 两源 skip 总和（wire 面）；原因计数与源行数走 debug 日志面。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CollectedTargets {
+    pub(crate) targets: Vec<(Uuid, ProfileKey)>,
+    pub(crate) counts: RefreshCounts,
+    pub(crate) skips: SkipReasonCounts,
+    pub(crate) contacts_rows: u32,
+    pub(crate) profile_key_rows: u32,
+    /// profile_keys 全表枚举是否成功（失败 = 仅 contacts 源批；读面
+    /// fail-open 不炸整批，尝试面会暴露真失败）。
+    pub(crate) profile_keys_enum_ok: bool,
+}
+
+/// profiles 表既有名字材料判定（store 读 + [`profile_name_has_material`]
+/// 单点；读面失败 = 无材料保守估计，尝试面会再核实）。
+async fn stored_has_name_material(store: &SqliteStore, uuid: Uuid, key: ProfileKey) -> bool {
+    store
+        .profile(uuid, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.name)
+        .map(|name| profile_name_has_material(&name))
+        .unwrap_or(false)
+}
+
+fn record_skip_reason(skips: &mut SkipReasonCounts, decision: RefreshDecision) {
+    match decision {
+        RefreshDecision::Refresh => {}
+        RefreshDecision::SkipNoProfileKey => skips.no_key += 1,
+        RefreshDecision::SkipContactNamed => skips.named += 1,
+        RefreshDecision::SkipMaterialPresent => skips.material_present += 1,
+    }
+}
+
+/// 目标收集单点（本地零网络）。源 1 = contacts sync 集合（contact.name
+/// 权威参与判定，既有语义）；源 2 = profile_keys 全表 uuid（目标集扩展
+/// 批——已收到过消息/已建立会话的对端，键必在；无 contact 行名字按空
+/// 判定，材料在库照常 skip）。双源以 contacts uuid 全集去重（含源 1 已
+/// skip 的——名字权威/键缺席判定对同一 uuid 两源同真，源 2 不重判）。
+/// contacts 读失败按既有语义整批 UnknownAccount；profile_keys 枚举失败
+/// fail-open 仅退 contacts 源。
+pub(crate) async fn collect_refresh_targets(
+    store: &SqliteStore,
+) -> Result<CollectedTargets, RefreshError> {
+    let mut out = CollectedTargets::default();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let contacts = store
+        .contacts()
+        .await
+        .map_err(|_| RefreshError::UnknownAccount)?;
+    for contact in contacts.filter_map(Result::ok) {
+        out.contacts_rows += 1;
+        seen.insert(contact.uuid);
+        let Some(key) = store
+            .profile_key(&ServiceId::Aci(Aci::from(contact.uuid)))
+            .await
+            .ok()
+            .flatten()
+        else {
+            out.counts.skipped += 1;
+            out.skips.no_key += 1;
+            continue;
+        };
+        let stored_has_material = stored_has_name_material(store, contact.uuid, key).await;
+        let decision = decide_refresh(&contact.name, true, stored_has_material);
+        if decision == RefreshDecision::Refresh {
+            out.targets.push((contact.uuid, key));
+        } else {
+            out.counts.skipped += 1;
+            record_skip_reason(&mut out.skips, decision);
+        }
+    }
+    match store.profile_keys().await {
+        Ok(keys) => {
+            out.profile_keys_enum_ok = true;
+            for (uuid, key) in keys {
+                out.profile_key_rows += 1;
+                if !seen.insert(uuid) {
+                    // contacts 源已判定（去重，含已 skip 的 contact uuid）。
+                    continue;
+                }
+                let stored_has_material = stored_has_name_material(store, uuid, key).await;
+                // 无 contact 行：名字按空、键必在——只剩材料在库与否两臂。
+                let decision = decide_refresh("", true, stored_has_material);
+                if decision == RefreshDecision::Refresh {
+                    out.targets.push((uuid, key));
+                } else {
+                    out.counts.skipped += 1;
+                    record_skip_reason(&mut out.skips, decision);
+                }
+            }
+        }
+        Err(_) => out.profile_keys_enum_ok = false,
+    }
+    Ok(out)
+}
+
 /// 批量刷新单点（显式方法与登录期自动批共用）：目标收集（本地零网络）→
 /// 有界并发拉取（presage 同路径：缓存 → 服务器 → ProfileCipher 解密 →
 /// profiles 表落库）→ 计数聚合。
@@ -168,43 +286,23 @@ pub(crate) async fn refresh_contact_profiles(
         }
     };
 
-    // —— 目标收集：profile_key 权威读（profile_keys 表，join 键同源）+
-    // 材料在库跳过检查（本地读零网络）。contacts/profile_keys/profile
-    // 读失败按该联系人 skip 处理（读面故障不炸整批，尝试面会暴露真失败）。
-    let mut targets: Vec<(Uuid, ProfileKey)> = Vec::new();
-    let mut counts = RefreshCounts::default();
-    let contacts = store
-        .contacts()
-        .await
-        .map_err(|_| RefreshError::UnknownAccount)?;
-    for contact in contacts.filter_map(Result::ok) {
-        let uuid = contact.uuid;
-        let Some(key) = store
-            .profile_key(&ServiceId::Aci(Aci::from(uuid)))
-            .await
-            .ok()
-            .flatten()
-        else {
-            counts.skipped += 1;
-            continue;
-        };
-        let stored_has_material = store
-            .profile(uuid, key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|profile| profile.name)
-            .map(|name| profile_name_has_material(&name))
-            .unwrap_or(false);
-        if !matches!(
-            decide_refresh(&contact.name, true, stored_has_material),
-            RefreshDecision::Refresh
-        ) {
-            counts.skipped += 1;
-            continue;
-        }
-        targets.push((uuid, key));
-    }
+    // —— 目标收集：contacts sync 集合 ∪ profile_keys 全表（2026-10-23
+    // 目标集扩展批——不在手机通讯录的已会话对端/群成员自此进目标），判定
+    // 与 skip 原因单点见 [`collect_refresh_targets`]（本地零网络）。
+    let collected = collect_refresh_targets(&store).await?;
+    // skip 原因 debug 面（同批 additive；只计数零身份/号码/名字内容）。
+    tracing::debug!(
+        targets = collected.targets.len(),
+        contacts_rows = collected.contacts_rows,
+        profile_key_rows = collected.profile_key_rows,
+        profile_keys_enum_ok = collected.profile_keys_enum_ok,
+        skip_no_key = collected.skips.no_key,
+        skip_named = collected.skips.named,
+        skip_material = collected.skips.material_present,
+        "profile refresh target collection",
+    );
+    let mut counts = collected.counts;
+    let targets = collected.targets;
     drop(store);
 
     // —— 有界并发执行：round-robin ≤3 块，每块独立 manager（store 连接
@@ -300,7 +398,128 @@ pub(crate) fn profile_name_pair(name: &ProfileName<String>) -> Option<(&str, Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use presage::libsignal_service::proto::Verified;
     use presage::libsignal_service::Profile;
+    use presage::model::contacts::Contact;
+
+    /// 目标集扩展钉形（2026-10-23 目标集扩展批）：profile_keys 有而
+    /// contacts 无的 uuid 进目标；双源 uuid 去重（contacts 名字权威胜出，
+    /// 源 2 不重判漏网）；skip 原因三计数与 wire skipped 总和对齐；
+    /// profile_keys() 枚举与既有点查同源同形。
+    #[tokio::test]
+    async fn collect_targets_spans_profile_keys_beyond_contacts() {
+        let store_dir =
+            std::env::temp_dir().join(format!("kt-engine-collect-{}", Uuid::new_v4().simple()));
+        let mut store = open_store(&store_dir).await.unwrap();
+        let key = ProfileKey::create([0x11; 32]);
+        let key3 = ProfileKey::create([0x33; 32]);
+        let key4 = ProfileKey::create([0x44; 32]);
+        let uuid_of = |tail: &str| {
+            Uuid::parse_str(&format!("00000000-0000-4000-8000-{tail}")).expect("fixture uuid")
+        };
+        async fn add_contact(store: &mut SqliteStore, uuid: Uuid, name: &str, inbox: u32) {
+            let contact = Contact {
+                uuid,
+                phone_number: None,
+                name: name.to_owned(),
+                verified: Verified::default(),
+                profile_key: vec![0u8; 32],
+                expire_timer: 0,
+                expire_timer_version: 2,
+                inbox_position: inbox,
+                avatar: None,
+            };
+            store.save_contact(&contact).await.unwrap();
+        }
+
+        // 源 1（contacts）：名字权威 → skip_named。
+        let uuid_named = uuid_of("000000000001");
+        add_contact(&mut store, uuid_named, "Alice", 0).await;
+        store.upsert_profile_key(&uuid_named, key).await.unwrap();
+        // 源 1（contacts）：keys 表无行 → skip_no_key。
+        let uuid_nokey = uuid_of("000000000002");
+        add_contact(&mut store, uuid_nokey, "", 1).await;
+        // 源 1（contacts）：材料在库 → skip_material。
+        let uuid_mat = uuid_of("000000000003");
+        add_contact(&mut store, uuid_mat, "", 2).await;
+        store.upsert_profile_key(&uuid_mat, key3).await.unwrap();
+        store
+            .save_profile(
+                uuid_mat,
+                key3,
+                Profile {
+                    name: Some(name_with("Cara", None)),
+                    about: None,
+                    about_emoji: None,
+                    avatar: None,
+                    unrestricted_unidentified_access: false,
+                },
+            )
+            .await
+            .unwrap();
+        // 源 1（contacts）：名空 + 键在 + 无材料 → Refresh 目标。
+        let uuid_target_c = uuid_of("000000000004");
+        add_contact(&mut store, uuid_target_c, "", 3).await;
+        store
+            .upsert_profile_key(&uuid_target_c, key4)
+            .await
+            .unwrap();
+        // 源 2（profile_keys-only）：无 contact 行、无材料 → Refresh 目标。
+        let uuid_peer = uuid_of("000000000005");
+        store.upsert_profile_key(&uuid_peer, key).await.unwrap();
+        // 源 2（profile_keys-only）：材料在库 → skip_material。
+        let uuid_peer_mat = uuid_of("000000000006");
+        store
+            .upsert_profile_key(&uuid_peer_mat, key3)
+            .await
+            .unwrap();
+        store
+            .save_profile(
+                uuid_peer_mat,
+                key3,
+                Profile {
+                    name: Some(name_with("Bob", None)),
+                    about: None,
+                    about_emoji: None,
+                    avatar: None,
+                    unrestricted_unidentified_access: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 枚举面：profile_keys() 与既有点查同源（5 行、键形状同）。
+        let all_keys = store.profile_keys().await.unwrap();
+        assert_eq!(all_keys.len(), 5);
+        assert!(all_keys.iter().any(|(uuid, _)| *uuid == uuid_peer));
+
+        let out = collect_refresh_targets(&store).await.unwrap();
+        assert_eq!(out.contacts_rows, 4);
+        assert_eq!(out.profile_key_rows, 5);
+        let target_uuids: Vec<Uuid> = out.targets.iter().map(|(uuid, _)| *uuid).collect();
+        assert_eq!(
+            target_uuids,
+            vec![uuid_target_c, uuid_peer],
+            "源 1 目标在前；源 2 仅 profile_keys-only 无材料者进目标"
+        );
+        assert_eq!(
+            out.counts,
+            RefreshCounts {
+                skipped: 4,
+                ..RefreshCounts::default()
+            }
+        );
+        assert_eq!(
+            out.skips,
+            SkipReasonCounts {
+                no_key: 1,
+                named: 1,
+                material_present: 2,
+            }
+        );
+        assert!(out.profile_keys_enum_ok);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
 
     fn name_with(given: &str, family: Option<&str>) -> ProfileName<String> {
         ProfileName {

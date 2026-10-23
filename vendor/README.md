@@ -622,6 +622,15 @@
   已由 cipher 层消费入协议存储，投影层不投影臂为不可达防御臂；探针为
   真机观测面（官方客户端是否向我们分发 sender key）。
 
+- `presage/src/store.rs`（2026-10-23 profile 刷新目标集扩展批）—
+  `ContentsStore` 新增 `profile_keys()`：全表枚举 (uuid, ProfileKey)
+  有序对（ORDER BY uuid）。消费面：engine 刷新批目标收集（contacts sync
+  集 ∪ profile_keys 全表——不在手机通讯录的已会话对端/群成员进刷新目标，
+  未知联系人根因批）与 engine listContacts 非通讯录投影。
+- `presage-store-sqlite/src/content.rs`（同批）— `profile_keys()`
+  sqlite 实现（`SELECT uuid, key FROM profile_keys ORDER BY uuid`，坏行
+  filter_map 诚实丢弃；.sqlx 离线描述随批）。
+
 ## 更新纪律
 
 后续再动 `vendor/`：先 `diff -rq` 对照上表 rev 的 cargo checkout 确认

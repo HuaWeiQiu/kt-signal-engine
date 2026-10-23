@@ -318,6 +318,14 @@ pub trait ContentsStore: Send + Sync {
         service_id: &ServiceId,
     ) -> impl Future<Output = Result<Option<ProfileKey>, Self::ContentsStoreError>> + Send;
 
+    /// Enumerate every stored profile key together with its owner uuid
+    /// (KT additive, 2026-10-23 profile 刷新目标集扩展批：登录/手动刷新批的
+    /// 非通讯录对端目标收集与 listContacts 非通讯录投影的枚举数据面；
+    /// fork 清单见根仓 vendor/README.md)。
+    fn profile_keys(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(Uuid, ProfileKey)>, Self::ContentsStoreError>> + Send;
+
     /// Save a profile by [Uuid] and [ProfileKey].
     fn save_profile(
         &mut self,

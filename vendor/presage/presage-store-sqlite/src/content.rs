@@ -497,6 +497,20 @@ impl ContentsStore for SqliteStore {
         Ok(profile_key)
     }
 
+    async fn profile_keys(&self) -> Result<Vec<(Uuid, ProfileKey)>, Self::ContentsStoreError> {
+        let rows = query!("SELECT uuid, key FROM profile_keys ORDER BY uuid")
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let uuid = Uuid::from_slice(&row.uuid).ok()?;
+                let key = row.key.try_into().ok().map(ProfileKey::create)?;
+                Some((uuid, key))
+            })
+            .collect())
+    }
+
     async fn save_profile(
         &mut self,
         uuid: Uuid,

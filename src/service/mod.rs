@@ -4385,7 +4385,9 @@ impl Service {
             .await
             .map_err(|_| SendError::Internal)?;
         let mut out = Vec::new();
+        let mut contact_uuids = HashSet::new();
         for contact in contacts.filter_map(Result::ok) {
+            contact_uuids.insert(contact.uuid);
             let number = contact
                 .phone_number
                 .as_ref()
@@ -4397,6 +4399,12 @@ impl Service {
                 .map(|(given, family)| (given.as_str(), family.as_deref()));
             out.push(project_contact_entry(&number, &contact.name, profile));
         }
+        // additive 投影（2026-10-23 目标集扩展批，台账 §29.4 剩余项②）：
+        // profiles 表有名字材料的非通讯录对端作为 contact 条目（uuid +
+        // profile 名字；手机号/通讯录名诚实缺席）。§4.37 aci-only 不落行
+        // 纪律的 additive 裁定：既有 contacts 行语义零变化，本面只增行；
+        // 枚举失败退 contacts-only（读面 fail-open 不炸）。
+        out.extend(non_contact_profile_entries(manager.store(), &contact_uuids).await);
         Ok(out)
     }
 
@@ -11940,6 +11948,44 @@ async fn profile_name_material(
     let name = profile.name?;
     profile_refresh::profile_name_pair(&name)
         .map(|(given, family)| (given.to_owned(), family.map(str::to_owned)))
+}
+
+/// 非通讯录对端的 contact 条目投影（2026-10-23 目标集扩展批，§29.4 剩余
+/// 项②）：profile_keys 全表枚举 ∖ contact_uuids，profiles 表有名字材料者
+/// 按 `project_contact_entry` 同形投影（number = uuid 字符串，与 contacts
+/// 无号行同形；name/profile 键纪律同投影单点——no-null，材料全空不出行）。
+/// 枚举失败 = 空集（退 contacts-only 旧行为，读面 fail-open 不炸）。
+async fn non_contact_profile_entries(
+    store: &SqliteStore,
+    skip_uuids: &HashSet<presage::libsignal_service::prelude::Uuid>,
+) -> Vec<Value> {
+    let Ok(keys) = store.profile_keys().await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (uuid, key) in keys {
+        if skip_uuids.contains(&uuid) {
+            continue;
+        }
+        let material = store
+            .profile(uuid, key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|profile| profile.name)
+            .and_then(|name| {
+                profile_refresh::profile_name_pair(&name)
+                    .map(|(given, family)| (given.to_owned(), family.map(str::to_owned)))
+            });
+        if let Some((given, family)) = material {
+            out.push(project_contact_entry(
+                &uuid.to_string(),
+                "",
+                Some((&given, family.as_deref())),
+            ));
+        }
+    }
+    out
 }
 
 /// listContacts 条目投影（纯函数，profile 名字刷新批 additive 面）：`name`
@@ -23893,6 +23939,106 @@ mod tests {
             classify_typing_group_outcomes(outcomes),
             TypingGroupSendOutcome::Ok
         );
+    }
+
+    /// listContacts 非通讯录对端投影（2026-10-23 目标集扩展批）：profiles
+    /// 材料在库的非通讯录 uuid 出行（number=uuid 字符串、profile 面在、
+    /// name 键缺席）；无材料/材料全空不出行；contacts 集合 uuid 去重不出；
+    /// 枚举失败空集 fail-open。
+    #[tokio::test]
+    async fn non_contact_peer_entries_project_profile_material() {
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::profile_name::ProfileName;
+        use presage::libsignal_service::proto::Verified;
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+        use presage::libsignal_service::Profile;
+        use presage::model::contacts::Contact;
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-noncontact-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let mut store = open_store(&store_dir).await.unwrap();
+        let contact = Contact {
+            uuid: Uuid::parse_str("00000000-0000-4000-8000-00000000000a").unwrap(),
+            phone_number: None,
+            name: "Alice".to_owned(),
+            verified: Verified::default(),
+            profile_key: vec![0u8; 32],
+            expire_timer: 0,
+            expire_timer_version: 2,
+            inbox_position: 0,
+            avatar: None,
+        };
+        store.save_contact(&contact).await.unwrap();
+        let named = ProfileKey::create([0x21; 32]);
+        let bare = ProfileKey::create([0x22; 32]);
+        let blank = ProfileKey::create([0x23; 32]);
+        // 非通讯录 peer：材料在库 → 出行。
+        let uuid_peer = Uuid::parse_str("00000000-0000-4000-8000-00000000000b").unwrap();
+        store.upsert_profile_key(&uuid_peer, named).await.unwrap();
+        store
+            .save_profile(
+                uuid_peer,
+                named,
+                Profile {
+                    name: Some(ProfileName {
+                        given_name: "Dave".to_owned(),
+                        family_name: None,
+                    }),
+                    about: None,
+                    about_emoji: None,
+                    avatar: None,
+                    unrestricted_unidentified_access: false,
+                },
+            )
+            .await
+            .unwrap();
+        // 非通讯录 peer：无 profile 行 → 不出行。
+        let uuid_bare = Uuid::parse_str("00000000-0000-4000-8000-00000000000c").unwrap();
+        store.upsert_profile_key(&uuid_bare, bare).await.unwrap();
+        // 非通讯录 peer：两件全空材料 → 不出行。
+        let uuid_blank = Uuid::parse_str("00000000-0000-4000-8000-00000000000d").unwrap();
+        store.upsert_profile_key(&uuid_blank, blank).await.unwrap();
+        store
+            .save_profile(
+                uuid_blank,
+                blank,
+                Profile {
+                    name: Some(ProfileName {
+                        given_name: "".to_owned(),
+                        family_name: None,
+                    }),
+                    about: None,
+                    about_emoji: None,
+                    avatar: None,
+                    unrestricted_unidentified_access: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let skip_uuids: HashSet<presage::libsignal_service::prelude::Uuid> = store
+            .contacts()
+            .await
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|contact| contact.uuid)
+            .collect();
+        let out = non_contact_profile_entries(&store, &skip_uuids).await;
+        assert_eq!(out.len(), 1, "仅材料在库的 peer 出行");
+        assert_eq!(out[0]["number"], json!(uuid_peer.to_string()));
+        assert!(out[0].get("name").is_none(), "通讯录名键诚实缺席");
+        assert_eq!(out[0]["profile"]["givenName"], json!("Dave"));
+        assert!(out[0]["profile"].get("familyName").is_none());
+
+        // fail-open 臂：contacts 集合含全部 uuid 时恒空集。
+        let all: HashSet<presage::libsignal_service::prelude::Uuid> =
+            [contact.uuid, uuid_peer, uuid_bare, uuid_blank]
+                .into_iter()
+                .collect();
+        assert!(non_contact_profile_entries(&store, &all).await.is_empty());
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// listContacts 条目投影（profile 名字刷新批 additive 面，纯函数）：
