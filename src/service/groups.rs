@@ -324,6 +324,91 @@ pub(crate) fn build_add_members_change(
     Ok(actions)
 }
 
+/// 权限三臂动作合成（批 N，官方 access-control 写族对位）：attributes =
+/// modify_attributes_access（官方 buildAccessControlAttributesChange /
+/// groups.preload.ts:906-916）、members = modify_members_access（官方
+/// buildAccessControlMembersChange / :918-928）、memberLabel =
+/// modify_member_label_access（官方 buildAccessControlMemberLabelChange
+/// 权限半 / :930-944）。枚举直写 i32（proto enumeration tag），动作与
+/// 属性臂合成单 Actions（同 version 多 action 单次 PATCH，§5 合成裁定
+/// 顺延）。纯函数：零 IO。
+pub(crate) fn apply_access_control_actions(
+    actions: &mut presage::proto::group_change::Actions,
+    attributes_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    members_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    member_label_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+) {
+    if let Some(access) = attributes_access {
+        actions.modify_attributes_access = Some(
+            presage::proto::group_change::actions::ModifyAttributesAccessControlAction {
+                attributes_access: i32::from(access),
+            },
+        );
+    }
+    if let Some(access) = members_access {
+        actions.modify_member_access = Some(
+            presage::proto::group_change::actions::ModifyMembersAccessControlAction {
+                members_access: i32::from(access),
+            },
+        );
+    }
+    if let Some(access) = member_label_access {
+        actions.modify_member_label_access = Some(
+            presage::proto::group_change::actions::ModifyMemberLabelAccessControlAction {
+                member_label_access: i32::from(access),
+            },
+        );
+    }
+}
+
+/// 清除臂触发判定（官方 buildAccessControlMemberLabelChange 清除半
+/// groups.preload.ts:944-958 同式）：previous 非 ADMINISTRATOR 且新值为
+/// ADMINISTRATOR 才清——已仅管理员的群再设仅管理员不清（无标签可清，
+/// 官方同口径）；往 MEMBER 放宽永不触发清除。
+pub(crate) fn member_label_clear_due(
+    previous: presage::libsignal_service::groups_v2::AccessRequired,
+    access: presage::libsignal_service::groups_v2::AccessRequired,
+) -> bool {
+    use presage::libsignal_service::groups_v2::AccessRequired;
+    access == AccessRequired::Administrator && previous != AccessRequired::Administrator
+}
+
+/// 成员标签清除集合成（批 N，官方 buildAccessControlMemberLabelChange 清除
+/// 半 groups.preload.ts:944-972 行为对齐）：输入群态成员材料，输出逐员清零
+/// 动作——非管理员（官方 member.role 为 ADMINISTRATOR 者跳过同位）且带任
+/// 一标签材料（labelString ∨ labelEmoji）者逐员一条 modify_member_labels：
+/// userId = ACI 经群密参加密（官方 encryptServiceId 同原语，zkgroup
+/// serialize 同形），labelString/labelEmoji = 空 = 清除（vendored decrypt
+/// 侧空字节 = unset）。触发判定（previous 非 ADMINISTRATOR 且新值为
+/// ADMINISTRATOR）与 previous 缺席默认位归 update_group_change。纯函数：
+/// 零 IO，测试可全臂钉形。
+pub(crate) fn build_member_label_clear_actions(
+    secret_params: &GroupSecretParams,
+    members: &[presage::libsignal_service::groups_v2::Member],
+) -> Vec<presage::proto::group_change::actions::ModifyMemberLabelAction> {
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::libsignal_service::protocol::ServiceId;
+    let mut actions = Vec::new();
+    for member in members {
+        if member.role == Role::Administrator {
+            continue;
+        }
+        if member.label.is_none() && member.label_emoji.is_none() {
+            continue;
+        }
+        actions.push(
+            presage::proto::group_change::actions::ModifyMemberLabelAction {
+                user_id: zkgroup::serialize(
+                    &secret_params.encrypt_service_id(ServiceId::Aci(member.aci)),
+                ),
+                label_emoji: Vec::new(),
+                label_string: Vec::new(),
+            },
+        );
+    }
+    actions
+}
+
 /// removeMembers change 合成核心（官方 buildDeleteMemberChange/
 /// buildDeletePendingMemberChange/buildDeletePendingAdminApprovalMemberChange
 /// 行为对齐，群写面 P4 批 + P15b 审计项6 审批 deny 臂）：version =
@@ -1137,6 +1222,19 @@ pub(crate) struct GroupUpdateWrite {
     /// 公告群写面（admin 写面批）：modify_announcements_only 直写位
     /// （明文 bool，非加密 blob——官方 buildAnnouncementsOnlyChange 同形）。
     pub(crate) announcements_only: Option<bool>,
+    /// 群属性权限写面（批 N）：modify_attributes_access 直写位——官方
+    /// buildAccessControlAttributesChange（conversations.preload.ts
+    /// updateAccessControlAttributes → groups.preload.ts:906-916）同位，
+    /// 词表由 handler 解析（UNKNOWN 不作写意图词）。
+    pub(crate) attributes_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    /// 加人权限写面（批 N）：modify_members_access 直写位——官方
+    /// buildAccessControlMembersChange（groups.preload.ts:918-928）同位。
+    pub(crate) members_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
+    /// 成员标签权限写面（批 N）：modify_member_label_access 直写位——官方
+    /// buildAccessControlMemberLabelChange（groups.preload.ts:930-977）的
+    /// 权限半；MEMBER→ADMINISTRATOR 切换的标签清除半由 update_group_change
+    /// 按官方同式合成（非管理员且有标签逐员清零）。
+    pub(crate) member_label_access: Option<presage::libsignal_service::groups_v2::AccessRequired>,
 }
 
 /// updateGroup 合成编排（expiration/avatar 任意组合，至少一项在场由调用方
@@ -1243,6 +1341,9 @@ pub(crate) async fn update_group_change(
         add_from_invite_link_access,
         invite_link_password,
         announcements_only,
+        attributes_access,
+        members_access,
+        member_label_access,
     } = write;
     let title = title.as_deref();
     use presage::libsignal_service::groups_v2::GroupMemberCandidate;
@@ -1256,6 +1357,9 @@ pub(crate) async fn update_group_change(
         && add_from_invite_link_access.is_none()
         && invite_link_password.is_none()
         && announcements_only.is_none()
+        && attributes_access.is_none()
+        && members_access.is_none()
+        && member_label_access.is_none()
     {
         // 调用方参数闸后件（零可写字段整拒在 handler 面）；防御面 fail-closed。
         return Err(TerminateError::UnknownGroup);
@@ -1303,8 +1407,13 @@ pub(crate) async fn update_group_change(
     let (revision, group) = match group_state {
         Ok(group) => (group.version, Some(group)),
         Err(TerminateError::Unavailable) => {
-            if remove_members.is_empty() {
-                // 属性/add 臂群态读面退化 0（expiration 批同口径）。
+            if remove_members.is_empty() && member_label_access.is_none() {
+                // 属性/add 臂群态读面退化 0（expiration 批同口径）；权限三臂
+                // 中 attributes/members 同口径（纯权限位，无需群态）。成员
+                // 标签权限臂需群态两个真值：previous 权限位（清除臂触发判定）
+                // 与清除集（非管理员有标签成员）——缺席退化合成会静默漏清
+                //（官方 buildAccessControlMemberLabelChange 的两半都吃会话
+                // 真值），Unavailable 诚实透传（removeMembers 臂同纪律）。
                 (0, None)
             } else {
                 // removeMembers 需群态分类成员/待邀面，Unavailable 诚实透传。
@@ -1384,6 +1493,34 @@ pub(crate) async fn update_group_change(
         announcements_only,
         randomness,
     );
+    // 权限三臂（批 N，官方 access-control 写族对位）：纯权限位三动作与
+    // 属性臂合成单 Actions（同 version 多 action 单次 PATCH，§5 合成裁定
+    // 顺延）；成员标签臂的清除半随后按官方 buildAccessControlMemberLabelChange
+    // 同式合成。
+    apply_access_control_actions(
+        &mut actions,
+        attributes_access,
+        members_access,
+        member_label_access,
+    );
+    if let Some(access) = member_label_access {
+        // 清除半（官方 groups.preload.ts:944-972 同式）：previous（群态
+        // accessControl.member_label，缺席 = MEMBER——presage 存储默认位
+        // 与官方「?? AccessControlEnum.MEMBER」同口径）非 ADMINISTRATOR 且
+        // 新值 = ADMINISTRATOR 时，逐非管理员有标签成员合成清零动作；清零
+        // = 空 labelString/labelEmoji（vendored decrypt 侧空字节 = unset）。
+        let previous = group
+            .as_ref()
+            .and_then(|state| state.access_control.as_ref())
+            .map(|access_control| access_control.member_label)
+            .unwrap_or(presage::libsignal_service::groups_v2::AccessRequired::Member);
+        if member_label_clear_due(previous, access) {
+            if let Some(state) = group.as_ref() {
+                actions.modify_member_labels =
+                    build_member_label_clear_actions(&secret_params, &state.members);
+            }
+        }
+    }
     if !candidates.is_empty() {
         let member_actions =
             build_add_members_change(&secret_params, revision, &candidates, own_aci)?;
@@ -1479,15 +1616,28 @@ pub(crate) fn project_group_list_entry(
             ServiceIdType::PhoneNumberIdentity => ServiceId::Pni(uuid.into()),
         }
     };
+    // 成员标签 additive 投影（批 N，契约 §4.60 捕获同名面）：label/labelEmoji
+    // 键在成员有标签时逐键在场，无标签成员/键缺席 = 旧 wire 逐字节不变
+    //（absent-when-none；connector group_extra_json 只读这两键，预算面在
+    // connector 侧，引擎照实透传解密明文）。材料源 = presage Group.members
+    // 的解密 label 字段（vendored decrypt_member 填充，presage From 映射在
+    // 位——本批前该材料已在库，投影层此前丢弃）。
     let members: Vec<serde_json::Value> = group
         .members
         .iter()
         .map(|member| {
             let sid = ServiceId::from(member.aci);
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "number": label_of(&sid),
                 "role": role_name(&member.role),
-            })
+            });
+            if let Some(label) = member.label.as_deref() {
+                entry["label"] = serde_json::json!(label);
+            }
+            if let Some(label_emoji) = member.label_emoji.as_deref() {
+                entry["labelEmoji"] = serde_json::json!(label_emoji);
+            }
+            entry
         })
         .collect();
     let pending_members: Vec<serde_json::Value> = group
@@ -4165,6 +4315,223 @@ mod tests {
             project_group_list_entry(&master_key, &other_only, &HashMap::new(), own_aci, true);
         assert_eq!(entry["isMember"], json!(false));
         assert_eq!(entry["terminated"], json!(true));
+    }
+
+    /// 成员标签 additive 投影钉形（批 N，契约 §4.60 捕获同名面）：有标签
+    /// 成员 label/labelEmoji 两键逐键在场（官方 capture 键名 verbatim），
+    /// 无标签成员两键缺席 = 旧 wire 逐字节不变（absent-when-none）；
+    /// number/role 基础键不受影响（additive 纪律）。
+    #[test]
+    fn project_group_list_entry_member_labels() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::libsignal_service::prelude::ProfileKey;
+        use serde_json::json;
+        let master_key = [0x51u8; 32];
+        let labeled_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let emoji_only_aci = Aci::from(uuid::Uuid::from_u128(
+            0xaaaa_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let plain_aci = Aci::from(uuid::Uuid::from_u128(
+            0xcccc_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let build =
+            |aci: Aci, label: Option<&str>, emoji: Option<&str>| presage::model::groups::Member {
+                aci,
+                role: Role::Default,
+                profile_key: ProfileKey::create([0u8; 32]),
+                joined_at_revision: 3,
+                label: label.map(str::to_owned),
+                label_emoji: emoji.map(str::to_owned),
+            };
+        let group = presage::model::groups::Group {
+            title: "标签群".to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 4,
+            members: vec![
+                build(labeled_aci, Some("队长"), Some("\u{1f6e0}\u{fe0f}")),
+                build(emoji_only_aci, None, Some("\u{2b50}")),
+                build(plain_aci, None, None),
+            ],
+            pending_members: vec![],
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+            announcements_only: false,
+            banned_members: vec![],
+        };
+        let entry = project_group_list_entry(
+            &master_key,
+            &group,
+            &std::collections::HashMap::new(),
+            labeled_aci,
+            false,
+        );
+        let members = entry["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 3);
+        assert_eq!(
+            members[0]["number"],
+            json!("11112222-3333-4444-5555-666677778888")
+        );
+        assert_eq!(members[0]["role"], json!("DEFAULT"));
+        assert_eq!(
+            members[0]["label"],
+            json!("队长"),
+            "有标签成员 label 键在场"
+        );
+        assert!(members[0].get("labelEmoji").is_some(), "emoji 键在场");
+        assert_eq!(
+            members[1].get("label"),
+            None,
+            "仅 emoji 成员 label 键缺席（absent-when-none）"
+        );
+        assert_eq!(members[1].get("labelEmoji"), Some(&json!("\u{2b50}")));
+        assert_eq!(
+            members[2].get("label"),
+            None,
+            "无标签成员 label 键缺席 = 旧 wire 逐字节不变"
+        );
+        assert_eq!(members[2].get("labelEmoji"), None);
+    }
+
+    /// 成员标签清除集合成钉形（批 N，官方 buildAccessControlMemberLabelChange
+    /// 清除半同式）：非管理员且有任一标签材料者逐员一条（userId 解密回环 =
+    /// 原 ACI、labelString/labelEmoji 空 = 清除语义）；管理员带标签不入（官方
+    /// `member.role === ADMINISTRATOR` 跳过同位）、无标签成员不入、空成员表
+    /// = 空动作集。
+    #[test]
+    fn member_label_clear_actions_wire_shape() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::libsignal_service::prelude::ProfileKey;
+        use presage::libsignal_service::protocol::ServiceId;
+        let master_key = [0x48u8; 32];
+        // 群态材料 = libsignal-service 解密 Member（fetch_group_state 解密面，
+        // 非 presage 存储模型——写臂吃运行时群态）。
+        let build = |aci: Aci, role: Role, label: Option<&str>, emoji: Option<&str>| {
+            presage::libsignal_service::groups_v2::Member {
+                aci,
+                profile_key: ProfileKey::create([0u8; 32]),
+                role,
+                joined_at_version: 1,
+                label: label.map(str::to_owned),
+                label_emoji: emoji.map(str::to_owned),
+            }
+        };
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let admin_aci = Aci::from(uuid::Uuid::from_u128(
+            0x1111_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let labeled_aci = Aci::from(uuid::Uuid::from_u128(
+            0xaaaa_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let emoji_only_aci = Aci::from(uuid::Uuid::from_u128(
+            0xbbbb_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let plain_aci = Aci::from(uuid::Uuid::from_u128(
+            0xcccc_2222_3333_4444_5555_6666_7777_8888,
+        ));
+        let members = vec![
+            build(admin_aci, Role::Administrator, Some("管理员标签"), None),
+            build(
+                labeled_aci,
+                Role::Default,
+                Some("队长"),
+                Some("\u{1f6e0}\u{fe0f}"),
+            ),
+            build(emoji_only_aci, Role::Default, None, Some("\u{2b50}")),
+            build(plain_aci, Role::Default, None, None),
+        ];
+        let actions = build_member_label_clear_actions(&secret_params, &members);
+        assert_eq!(
+            actions.len(),
+            2,
+            "管理员带标签不入 + 无标签成员不入 = 两条（两非管理员有标签）"
+        );
+        for action in &actions {
+            assert!(action.label_string.is_empty(), "labelString 空 = 清除");
+            assert!(action.label_emoji.is_empty(), "labelEmoji 空 = 清除");
+            let ciphertext: presage::libsignal_service::zkgroup::api::groups::UuidCiphertext =
+                presage::libsignal_service::zkgroup::deserialize(&action.user_id)
+                    .expect("userId 反序列化 = UuidCiphertext");
+            let service_id = secret_params
+                .decrypt_service_id(ciphertext)
+                .expect("群密参解密回环");
+            let aci = match service_id {
+                ServiceId::Aci(aci) => aci,
+                ServiceId::Pni(_) => panic!("清除动作 userId 必为 ACI 加密"),
+            };
+            assert!(
+                aci == labeled_aci || aci == emoji_only_aci,
+                "解密回环命中两条非管理员有标签成员之一"
+            );
+        }
+        assert_eq!(
+            build_member_label_clear_actions(&secret_params, &[]).len(),
+            0,
+            "空成员表 = 空动作集"
+        );
+    }
+
+    /// 权限三臂动作合成 + 清除臂触发判定钉形（批 N）：None 臂 = 动作缺席；
+    /// Some 臂 = 枚举直写 i32（proto enumeration tag 同形）；触发判定四臂
+    /// （放宽永不触发/已仅管理员再设不清/未知词按非管理员/普通切换触发）。
+    #[test]
+    fn access_control_actions_and_clear_due_faces() {
+        use presage::libsignal_service::groups_v2::AccessRequired;
+        let mut actions = presage::proto::group_change::Actions::default();
+        apply_access_control_actions(&mut actions, None, None, None);
+        assert!(actions.modify_attributes_access.is_none());
+        assert!(actions.modify_member_access.is_none());
+        assert!(actions.modify_member_label_access.is_none());
+        let mut actions = presage::proto::group_change::Actions::default();
+        apply_access_control_actions(
+            &mut actions,
+            Some(AccessRequired::Member),
+            Some(AccessRequired::Administrator),
+            Some(AccessRequired::Unknown),
+        );
+        assert_eq!(
+            actions
+                .modify_attributes_access
+                .expect("attributes 臂在场")
+                .attributes_access,
+            i32::from(AccessRequired::Member),
+        );
+        assert_eq!(
+            actions
+                .modify_member_access
+                .expect("members 臂在场")
+                .members_access,
+            i32::from(AccessRequired::Administrator),
+        );
+        assert_eq!(
+            actions
+                .modify_member_label_access
+                .expect("memberLabel 臂在场")
+                .member_label_access,
+            i32::from(AccessRequired::Unknown),
+        );
+        // 触发判定四臂（previous 缺席由调用方折 MEMBER，Unknown 同非管理员）。
+        assert!(member_label_clear_due(
+            AccessRequired::Member,
+            AccessRequired::Administrator
+        ));
+        assert!(member_label_clear_due(
+            AccessRequired::Unknown,
+            AccessRequired::Administrator
+        ));
+        assert!(!member_label_clear_due(
+            AccessRequired::Administrator,
+            AccessRequired::Administrator,
+        ));
+        assert!(!member_label_clear_due(
+            AccessRequired::Administrator,
+            AccessRequired::Member
+        ));
     }
 
     /// 群头像 CDN 载荷加密面（upload_group_avatar 内联链的纯函数钉定）：

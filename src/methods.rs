@@ -4035,6 +4035,48 @@ async fn dispatch(
                     None => return internal_error(id),
                 },
             };
+            // 访问控制三臂写面（批 N，官方 access-control 写族）：词表解析
+            // 与链接访问臂同一词表（ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE，
+            // UNKNOWN 不作写意图词）；键在场但 null/未知词/非字符串恒拒，
+            // 与「合法缺席臂」同纪律。attributes = 群属性权限（官方
+            // modifyAttributesAccess）、members = 加人权限（官方
+            // modifyMemberAccess）、memberLabel = 成员标签权限（官方
+            // modifyMemberLabelAccess；MEMBER→ADMINISTRATOR 切换的标签清除
+            // 半由引擎按官方同式合成，对调用方单参数透明）。
+            let parse_access_word = |word: &str| {
+                use presage::libsignal_service::groups_v2::AccessRequired;
+                match word {
+                    "ANY" => Some(AccessRequired::Any),
+                    "MEMBER" => Some(AccessRequired::Member),
+                    "ADMINISTRATOR" => Some(AccessRequired::Administrator),
+                    "UNSATISFIABLE" => Some(AccessRequired::Unsatisfiable),
+                    _ => None,
+                }
+            };
+            let attributes_access = match params.get("attributesPermission") {
+                None => None,
+                Some(Value::String(word)) => match parse_access_word(word) {
+                    Some(access) => Some(access),
+                    None => return internal_error(id),
+                },
+                Some(_) => return internal_error(id),
+            };
+            let members_access = match params.get("membersPermission") {
+                None => None,
+                Some(Value::String(word)) => match parse_access_word(word) {
+                    Some(access) => Some(access),
+                    None => return internal_error(id),
+                },
+                Some(_) => return internal_error(id),
+            };
+            let member_label_access = match params.get("memberLabelPermission") {
+                None => None,
+                Some(Value::String(word)) => match parse_access_word(word) {
+                    Some(access) => Some(access),
+                    None => return internal_error(id),
+                },
+                Some(_) => return internal_error(id),
+            };
             // expiration 键在场但形状非法（null/字符串/负数/小数/超界）恒拒
             // ——与「合法缺席臂」（键不在场，avatar 在场时放行）区分。title
             // 键在场但 null/非字符串/空串恒拒（空串 = 官方 falsy no-op 语义
@@ -4046,7 +4088,8 @@ async fn dispatch(
                 return internal_error(id);
             }
             // 全缺 = 无操作整拒（不静默 no-op）：expiration/title/avatar/
-            // addMembers/removeMembers/链接两面/announcementsOnly 至少一项在场。
+            // addMembers/removeMembers/链接两面/announcementsOnly/权限三臂
+            // 至少一项在场。
             if expiration.is_none()
                 && title.is_none()
                 && avatar.is_none()
@@ -4055,6 +4098,9 @@ async fn dispatch(
                 && add_from_invite_link_access.is_none()
                 && invite_link_password.is_none()
                 && announcements_only.is_none()
+                && attributes_access.is_none()
+                && members_access.is_none()
+                && member_label_access.is_none()
             {
                 return internal_error(id);
             }
@@ -4070,6 +4116,9 @@ async fn dispatch(
                 add_from_invite_link_access,
                 invite_link_password,
                 announcements_only,
+                attributes_access,
+                members_access,
+                member_label_access,
             };
             match service
                 .update_group_change(account, master_key, write)
