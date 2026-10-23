@@ -44,6 +44,10 @@ use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUAR
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
 pub(crate) mod account_metrics;
+/// L1 AEP 获取（设备转移备份协议第一层，台账 §29.10/§29.10.1）：链接设备缺
+/// AccountEntropyPool 的索取（日级节律）与 keys sync 落库面，官方 ensureAEP
+/// 行为对齐（协议字面量/闸序/存储位见模块头）。
+pub(crate) mod aep;
 pub(crate) mod avatar;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
@@ -7490,6 +7494,27 @@ async fn serve_account_stream(
                         perf_metrics::keys::INITIAL_SYNC_REQUESTS,
                         sync_started.elapsed().as_micros() as u64,
                     );
+                    // L1 AEP 索取（设备转移备份协议第一层，台账 §29.10/
+                    // §29.10.1）：官方 afterEveryLinkedStartup → ensureAEP
+                    // 同位——链接启动（收流臂沉降时机）缺 AEP（链接期
+                    // provisioning 未带）时向主设备发 SyncMessage.Request
+                    // {KEYS}，日级书签节律防重（aep 模块头载协议面）。独立
+                    // 超时预算不阻塞收流；发送失败静默（零 stderr），书签
+                    // 未落、下轮臂即重试。
+                    if tokio::time::timeout(
+                        RECEIVE_JOB_TIMEOUT,
+                        aep::ensure_aep(&mut manager, number),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            target: "engine.receive",
+                            stage = "aep_request_timeout",
+                            account = %account_hash,
+                            "aep request timed out; receive loop stays live"
+                        );
+                    }
                     // T-9 登录期 manifest 自动拉（官方 afterFirstAuthSocket
                     // Connect 同位——首连授权 socket 建立即重读 manifest；
                     // 会话列表完整性含无消息群会话依赖它，正是「群会话登录
@@ -8272,6 +8297,32 @@ async fn project_content_inner(
             });
         }
         ContentBody::SynchronizeMessage(sync) => {
+            // L1 AEP 响应臂（设备转移备份协议第一层，台账 §29.10.1；aep
+            // 模块头载协议面）：官方分发序同位——stickerPackOperation 直挂
+            // 词条先于 content.keys（#handleSyncMessage if 链序），带词条
+            // 信封照走下方既有贴纸臂（臂内早退）。无词条的 keys 信封先过
+            // 官方闸序（own-ACI → 自设备 echo → primary）+ onKeysSync 落/
+            // 删库（AEP + SVR 派生 masterKey）；闸失败整封吞（官方 throw
+            // 丢封同语义），通过则放行下方既有 keys 投影臂（P14 组 6
+            // mediaRootBackupKey + accountEntropyPoolPresent 布尔，形状
+            // 零变化，AEP 材料照旧不出引擎边界）。
+            if sync.sticker_pack_operation.is_empty() {
+                if let Some(presage::proto::sync_message::Content::Keys(keys)) =
+                    sync.content.as_ref()
+                {
+                    if !aep::on_keys_envelope(
+                        store,
+                        keys,
+                        &content.metadata.sender,
+                        u32::from(content.metadata.sender_device),
+                        account,
+                    )
+                    .await
+                    {
+                        return Vec::new();
+                    }
+                }
+            }
             // stickerPackSync 收投影臂（接收完整性批③，N1 缺口闭合，compat
             // §3）：`syncMessage.stickerPackOperation` repeated 直挂字段独占
             // 分发（官方 #handleStickerPackOperation 词条同形，
@@ -15427,6 +15478,9 @@ mod tests {
     /// P14 组 6：Keys 整臂收投影——mediaRootBackupKey 标准 base64（非空才
     /// 投，官方 Bytes.isNotEmpty 同口径）；accountEntropyPool 密钥材料不投
     /// （键不在，§5 组 6 块）；键全缺照投空对象（信号面即事件）。
+    /// L1 AEP 批闸序对齐：官方 #handleSyncMessage keys 只认 own ACI 非
+    /// echo（:2979）——夹具播种 own 注册数据使既有投影断言过闸（落库副作用
+    /// 见 service::aep 测试面）。
     #[tokio::test]
     async fn keys_projection_carries_media_root_backup_key() {
         use base64::Engine as _;
@@ -15437,7 +15491,34 @@ mod tests {
             "kt-engine-keys-face-{:016x}",
             mix_seed_step(mix_seed())
         ));
-        let store = open_store(&store_dir).await.unwrap();
+        let mut store = open_store(&store_dir).await.unwrap();
+        {
+            use presage::libsignal_service::utils::TryIntoE164 as _;
+            let e164 = "+15551234567".try_into_e164().expect("e164");
+            let registration: RegistrationData = serde_json::from_str(
+                &json!({
+                    "signal_servers": "Production",
+                    "device_name": "KT Signal Engine",
+                    "phone_number": serde_json::to_value(
+                        phonenumber_from_signal(&e164)
+                    )
+                    .expect("phone serializes"),
+                    "uuid": "11111111-2222-4333-8444-555555555555",
+                    "pni": "7b3dc19e-11f2-4c5a-9d0e-2f6a8b4c1d3e",
+                    "password": "abcdefghijklmnopqrstuvwx",
+                    "device_id": Some(2u32),
+                    "registration_id": 1234u32,
+                    "pni_registration_id": Some(5678u32),
+                    "profile_key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+                })
+                .to_string(),
+            )
+            .expect("registration data parses");
+            store
+                .save_registration_data(&registration)
+                .await
+                .expect("registration stored");
+        }
         let registry = groups::TerminatedGroups::new();
         let sender =
             ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
