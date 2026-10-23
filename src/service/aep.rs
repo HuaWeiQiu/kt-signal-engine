@@ -348,6 +348,13 @@ mod tests {
         notifications.into_iter().next().expect("non-empty")
     }
 
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
     /// 响应臂落库：own ACI（非自设备 echo）回传 AEP → store AEP + 派生
     /// masterKey 落库；keys 信封零投影（整封吞）；随后无 AEP 字段的 keys
     /// 信封 → 本地 AEP + masterKey 删除（官方 onKeysSync put/remove 同构）。
@@ -477,6 +484,75 @@ mod tests {
                 .map(|pool| pool.to_string()),
             Some(existing.to_string()),
             "闸失败零落库（fail-closed）"
+        );
+    }
+
+    /// L1→L2 贯通（台账 §29.10.3）：官方已知向量 AEP 经 L1 keys sync 落库臂
+    /// 进 store kv（account_entropy_pool）→ StateStore 读取面 → L2
+    /// backup::keys::derive_keys 全套派生 → 官方已知向量逐字节命中
+    /// （BackupKey ea26a2dd…〔info 20240801_SIGNAL_BACKUP_KEY〕/ BackupId
+    /// 8a624fbc…〔20241024_SIGNAL_BACKUP_ID:〕/ MessageBackupKey legacy
+    /// hmac f425e22a… aes e143f4ad…〔20241007_SIGNAL_BACKUP_ENCRYPT_MESSAGE_
+    /// BACKUP:〕）——L1 kv 里的 AEP 即 L2/L3/L4 全链可用材料。
+    #[tokio::test]
+    async fn l1_stored_aep_feeds_l2_derivation_official_vectors() {
+        use presage::libsignal_service::protocol::Aci;
+
+        const OFFICIAL_AEP: &str =
+            "dtjs858asj6tv0jzsqrsmj0ubp335pisj98e9ssnss8myoc08drhtcktyawvx45l";
+        // 派生向量官方对（BackupId/MessageBackupKey 均含 ACI 入参——官方
+        // backup.rs FAKE_ACI）。注册身份与 keys sync sender 同用此 ACI：
+        // 整链同一账号，向量全对齐。
+        const OFFICIAL_ACI: &str = "659aa5f4-a28d-fcc1-1ea1-b997537a3d95";
+        const OFFICIAL_ACI_BYTES: [u8; 16] = [
+            0x65, 0x9a, 0xa5, 0xf4, 0xa2, 0x8d, 0xfc, 0xc1, 0x1e, 0xa1, 0xb9, 0x97, 0x53, 0x7a,
+            0x3d, 0x95,
+        ];
+
+        let store_dir = test_store_dir("l1-l2");
+        let mut store = super::super::open_store(&store_dir).await.unwrap();
+        store
+            .save_registration_data(&linked_registration(OFFICIAL_ACI))
+            .await
+            .expect("registration stored");
+        let own = ServiceId::parse_from_service_id_string(OFFICIAL_ACI).expect("own aci");
+        let registry = super::super::groups::TerminatedGroups::new();
+
+        // ① L1 响应臂：keys sync 官方向量 AEP → 落 store kv。
+        let content = keys_content(own, 1_u8, Some(OFFICIAL_AEP.to_string()));
+        let _ = super::super::project_content("acct", &store, &content, &registry, None).await;
+
+        // ② L1 kv 读取面（StateStore::fetch_account_entropy_pool，cloud_backup
+        // /snapshot_import 既有消费同款）。
+        let stored = store
+            .fetch_account_entropy_pool()
+            .await
+            .expect("aep fetch")
+            .expect("AEP in L1 kv");
+        assert_eq!(stored.to_string(), OFFICIAL_AEP, "kv 原值保真（字符串形）");
+
+        // ③ L2 派生：官方三向量逐字节命中。
+        let aci = Aci::from_uuid_bytes(OFFICIAL_ACI_BYTES);
+        let keys = crate::backup::keys::derive_keys(&stored, &aci);
+        assert_eq!(
+            keys.backup_key.0.to_vec(),
+            hex_decode("ea26a2ddb5dba5ef9e34e1b8dea1f5ae7f255306a6d2d883e542306eaa9fe985"),
+            "BackupKey 官方向量"
+        );
+        assert_eq!(
+            keys.backup_id.0.to_vec(),
+            hex_decode("8a624fbc45379043f39f1391cddc5fe8"),
+            "BackupId 官方向量"
+        );
+        assert_eq!(
+            keys.message_key.hmac_key.to_vec(),
+            hex_decode("f425e22a607c529717e1e1b29f9fe139f9d1c7e7d01e371c7753c544a3026649"),
+            "MessageBackupKey hmac 官方向量（legacy DST）"
+        );
+        assert_eq!(
+            keys.message_key.aes_key.to_vec(),
+            hex_decode("e143f4ad5668d8bfed2f88562f0693f53bda2c0e55c9d71730f30e24695fd6df"),
+            "MessageBackupKey aes 官方向量（legacy DST）"
         );
     }
 }
