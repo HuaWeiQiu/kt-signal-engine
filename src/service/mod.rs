@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -4689,7 +4689,7 @@ impl Service {
     /// 群会话，终止真值以登记表 + 服务器裁决为准）。官方发送面只看本地
     /// conversation.terminated 标志从不逐发送探测（shouldSendToConversation
     /// 同位），本缓存即该本地标志面；稳态群发 0 次探针 HTTPS。
-    async fn send_target_terminated(&self, account: &str, group_id: &str) -> bool {
+    async fn send_target_terminated(self: &Arc<Self>, account: &str, group_id: &str) -> bool {
         if self.terminated_groups.contains(group_id) {
             return true;
         }
@@ -6021,7 +6021,7 @@ impl Service {
     /// 策略）。NDJSON 产物落 `history-import-cloud.ndjson`（connector 消费链
     /// 与 transfer_archive 同位）。
     pub(crate) async fn cloud_backup_restore_start(
-        &self,
+        self: &Arc<Self>,
         account: &str,
     ) -> Result<(), cloud_backup::CloudRestoreError> {
         use presage::libsignal_service::protocol::IdentityKeyStore as _;
@@ -6166,7 +6166,7 @@ impl Service {
     /// key → 工件闸 → 单槽重入闸；装配段专用 OS 线程（§10.3 同款）+ 上行段
     /// LocalSet watcher（watch_and_upload 统一 finally：临时产物必删 + 闸释放）。
     pub(crate) async fn cloud_backup_upload_start(
-        &self,
+        self: &Arc<Self>,
         account: &str,
     ) -> Result<(), cloud_upload::CloudUploadError> {
         use presage::libsignal_service::protocol::IdentityKeyStore as _;
@@ -6273,6 +6273,11 @@ pub(crate) struct StorageContext {
     pub(crate) pni_uuid: presage::libsignal_service::prelude::Uuid,
     /// 群凭据双族缓存句柄（Service 共享，进程内存不落盘；P4c 切一）。
     pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
+    /// 所属 Service 弱句柄 + 账号名（群态成员 profileKey 新落 → profile
+    /// 刷新批触发联动，未知联系人根因批 2026-10-23；弱句柄不延长关停期
+    /// 生命周期）。
+    pub(crate) service: Weak<Service>,
+    pub(crate) account: String,
 }
 
 /// 凭据构造共用面（storage_context 上下文与 prekey remote config 读面同
@@ -6297,9 +6302,10 @@ pub(crate) fn push_service_from_registration(data: &RegistrationData) -> Option<
     ))
 }
 
-/// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。
+/// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。Arc 面
+/// 入参：群态 profileKey 新落触发面需要 Service 弱句柄（StorageContext.service）。
 async fn storage_context(
-    service: &Service,
+    service: &Arc<Service>,
     account: &str,
 ) -> Result<StorageContext, storage_sync::StorageSyncError> {
     let rel = {
@@ -6327,6 +6333,8 @@ async fn storage_context(
         aci_uuid: data.service_ids.aci,
         pni_uuid: data.service_ids.pni,
         group_credentials: service.group_credentials.clone(),
+        service: Arc::downgrade(service),
+        account: account.to_owned(),
     })
 }
 
