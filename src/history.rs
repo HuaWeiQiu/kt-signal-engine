@@ -30,8 +30,9 @@ use prost::Message as _;
 
 use crate::proto::group::GroupAttributeBlob;
 use crate::proto::{
-    chat_item, chat_update_message, frame, group_change_chat_update, quote, recipient, Chat,
-    ChatItem, ChatUpdateMessage, FilePointer, Frame, Recipient,
+    chat_item, chat_update_message, frame, group_change_chat_update, learned_profile_chat_update,
+    quote, recipient, simple_chat_update, Chat, ChatItem, ChatUpdateMessage, FilePointer, Frame,
+    Recipient,
 };
 
 /// 导出计数：结果与跳过都要可见，禁静默丢帧。
@@ -420,7 +421,15 @@ fn message_record(
         chat_item::Item::UpdateMessage(update) => {
             let timer = timer_change_record(update);
             let group = group_update_record(update, self_aci);
-            if timer.is_none() && group.is_none() {
+            let simple = simple_update_record(update);
+            let learned = learned_profile_change_record(update);
+            let merge = thread_merge_record(update);
+            if timer.is_none()
+                && group.is_none()
+                && simple.is_none()
+                && learned.is_none()
+                && merge.is_none()
+            {
                 return None;
             }
             if let Some(face) = timer {
@@ -428,6 +437,15 @@ fn message_record(
             }
             if let Some(face) = group {
                 record["groupUpdate"] = face;
+            }
+            if let Some(face) = simple {
+                record["simpleUpdate"] = face;
+            }
+            if let Some(face) = learned {
+                record["learnedProfileChange"] = face;
+            }
+            if let Some(face) = merge {
+                record["threadMerge"] = face;
             }
         }
         chat_item::Item::PaymentNotification(payment) => {
@@ -459,6 +477,70 @@ fn message_record(
         }
     };
     Some(record)
+}
+
+/// 批 A（时间线行族，engine-compat 契约 §5 追加）：非气泡 update 三面——
+/// 官方备份导入把它们落成时间线系统行，而我们此前的 export 只投 timer/
+/// group 两族，其余 update 整行跳过（`timer.is_none() && group.is_none()`
+/// → None），桌面因此永远收不到这几族行。官方取证（upstream Signal-Desktop
+/// 只读零抄码，AGPL）：
+///
+/// - `simpleUpdate.type` JOINED_SIGNAL → `joined-signal-notification`
+///   （import.preload.ts:3851-3854），CHANGE_NUMBER →
+///   `change-number-notification`（:3837-3840）——两词即本批 A2/A3 的
+///   唯一权威词表；其余词（IDENTITY_*/BLOCKED/…）落别的行族，不在本批，
+///   投影侧整面不投（行照旧跳过，绝不投半个）。
+/// - `learnedProfileChange.previousName` → `title-transition-notification`
+///   （:2957-2981）：e164/username 二选一（proto oneof），落成
+///   renderInfo {type:'private', e164?, username?}；官方 getTitle 解析后的
+///   oldTitle 由 connector 侧完成（消费方契约 §4.233）。
+/// - `threadMerge.previousE164` → `conversation-merge`
+///   （:2983-2997）：renderInfo {type:'private', e164}（官方 strictAssert
+///   要求 previousE164 在场）。
+///
+/// 形状 = 与 timer/group 同款的窄面（消费方 connector 契约 §4.231-§4.234）：
+/// `simpleUpdate {type}` 只投上面两词、`learnedProfileChange
+/// {previousE164?, previousUsername?}` 只投 oneof 里真在场的那一键、
+/// `threadMerge {previousE164}` 零值不投（proto3 标量原样语义在 e164 上
+/// 没有意义——号码 0 是「无号码」，投出去等于发明号码）。proto 只投影不发明：
+/// 空 oneof / 零 e164 整面省略，connector 视为缺席。
+fn simple_update_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> {
+    let chat_update_message::Update::SimpleUpdate(simple) = update.update.as_ref()? else {
+        return None;
+    };
+    let word = match simple_chat_update::Type::try_from(simple.r#type).ok()? {
+        simple_chat_update::Type::JoinedSignal => "JOINED_SIGNAL",
+        simple_chat_update::Type::ChangeNumber => "CHANGE_NUMBER",
+        _ => return None,
+    };
+    Some(serde_json::json!({ "type": word }))
+}
+
+fn learned_profile_change_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> {
+    let chat_update_message::Update::LearnedProfileChange(change) = update.update.as_ref()? else {
+        return None;
+    };
+    match change.previous_name.as_ref()? {
+        learned_profile_chat_update::PreviousName::E164(e164) if *e164 > 0 => {
+            Some(serde_json::json!({ "previousE164": e164 }))
+        }
+        learned_profile_chat_update::PreviousName::Username(username)
+            if !username.trim().is_empty() =>
+        {
+            Some(serde_json::json!({ "previousUsername": username }))
+        }
+        _ => None,
+    }
+}
+
+fn thread_merge_record(update: &ChatUpdateMessage) -> Option<serde_json::Value> {
+    let chat_update_message::Update::ThreadMerge(merge) = update.update.as_ref()? else {
+        return None;
+    };
+    if merge.previous_e164 == 0 {
+        return None;
+    }
+    Some(serde_json::json!({ "previousE164": merge.previous_e164 }))
 }
 
 /// E 批备份导出计时器变更行（connector 拿去做 system 行：会话归属 + 新
@@ -2049,6 +2131,127 @@ mod tests {
             ..Default::default()
         })
         .is_none());
+    }
+
+    /// 批 A（时间线行族）：非气泡 update 三面投影钉形——simpleUpdate 两词
+    /// 词表 / learnedProfileChange oneof 双臂 / threadMerge 号码面，坏形状
+    /// 整面省略（行不投，绝不投半截）。
+    #[test]
+    fn non_bubble_update_faces_projection() {
+        let update_message = |update: chat_update_message::Update| ChatUpdateMessage {
+            update: Some(update),
+        };
+        let simple = |word: simple_chat_update::Type| {
+            update_message(chat_update_message::Update::SimpleUpdate(
+                crate::proto::SimpleChatUpdate {
+                    r#type: word as i32,
+                },
+            ))
+        };
+
+        // A2/A3 两词：官方 import 词表逐个对位（JOINED_SIGNAL/CHANGE_NUMBER）。
+        let joined = simple_update_record(&simple(simple_chat_update::Type::JoinedSignal))
+            .expect("JOINED_SIGNAL 是行面");
+        assert_eq!(joined["type"], "JOINED_SIGNAL");
+        let changed = simple_update_record(&simple(simple_chat_update::Type::ChangeNumber))
+            .expect("CHANGE_NUMBER 是行面");
+        assert_eq!(changed["type"], "CHANGE_NUMBER");
+        // 词表外/UNKNOWN 整面不投（本批只认这两词，绝不冒充别的行族）。
+        for word in [
+            simple_chat_update::Type::Unknown,
+            simple_chat_update::Type::IdentityUpdate,
+            simple_chat_update::Type::Blocked,
+            simple_chat_update::Type::MessageRequestAccepted,
+        ] {
+            assert!(
+                simple_update_record(&simple(word)).is_none(),
+                "{word:?} 不在本批词表"
+            );
+        }
+        // 整行投影：simpleUpdate 命中即行（此前整行跳过）。
+        let row = test_record(&ChatItem {
+            chat_id: 3,
+            author_id: 7,
+            date_sent: 500,
+            directional_details: Some(chat_item::DirectionalDetails::Directionless(
+                DirectionlessMessageDetails::default(),
+            )),
+            item: Some(Item::UpdateMessage(simple(
+                simple_chat_update::Type::JoinedSignal,
+            ))),
+            ..Default::default()
+        })
+        .expect("simpleUpdate 是行");
+        assert_eq!(row["simpleUpdate"]["type"], "JOINED_SIGNAL");
+
+        // A4：learnedProfileChange oneof 双臂（号码 / 用户名）+ 空 oneof 不投。
+        for (name, previous, expected) in [
+            (
+                "e164",
+                learned_profile_chat_update::PreviousName::E164(15_550_100),
+                serde_json::json!({ "previousE164": 15_550_100_u64 }),
+            ),
+            (
+                "username",
+                learned_profile_chat_update::PreviousName::Username("ktuser.01".to_string()),
+                serde_json::json!({ "previousUsername": "ktuser.01" }),
+            ),
+        ] {
+            let face = learned_profile_change_record(&update_message(
+                chat_update_message::Update::LearnedProfileChange(
+                    crate::proto::LearnedProfileChatUpdate {
+                        previous_name: Some(previous),
+                    },
+                ),
+            ))
+            .expect(name);
+            assert_eq!(face, expected, "{name}: oneof 面对位");
+        }
+        for (name, previous) in [
+            ("empty-oneof", None),
+            (
+                "zero-e164",
+                Some(learned_profile_chat_update::PreviousName::E164(0)),
+            ),
+            (
+                "blank-username",
+                Some(learned_profile_chat_update::PreviousName::Username(
+                    "  ".to_string(),
+                )),
+            ),
+        ] {
+            assert!(
+                learned_profile_change_record(&update_message(
+                    chat_update_message::Update::LearnedProfileChange(
+                        crate::proto::LearnedProfileChatUpdate {
+                            previous_name: previous,
+                        },
+                    ),
+                ))
+                .is_none(),
+                "{name}: 无可用材料不投面"
+            );
+        }
+
+        // A5：threadMerge 号码面；0 = 无号码 → 面省略（官方 strictAssert 的
+        // KT 落法：不投假号码）。
+        let merge = thread_merge_record(&update_message(chat_update_message::Update::ThreadMerge(
+            crate::proto::ThreadMergeChatUpdate {
+                previous_e164: 15_550_100,
+            },
+        )))
+        .expect("threadMerge 是行面");
+        assert_eq!(merge["previousE164"], 15_550_100_u64);
+        assert!(
+            thread_merge_record(&update_message(chat_update_message::Update::ThreadMerge(
+                crate::proto::ThreadMergeChatUpdate { previous_e164: 0 }
+            )))
+            .is_none(),
+            "0 = 无号码，不投"
+        );
+
+        // 三面互不串：timer/group 面不被这三个臂影响（回归钉）。
+        assert!(timer_change_record(&simple(simple_chat_update::Type::JoinedSignal)).is_none());
     }
 
     /// E 批 chat/item 计时器字段两面：有（原样透出）/ 缺（键不在；proto3
