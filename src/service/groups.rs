@@ -514,7 +514,102 @@ pub(crate) async fn fetch_group_state(
         .map_err(|_| TerminateError::Unavailable)?;
     let encrypted = presage::proto::Group::decode(bytes.as_ref())
         .map_err(|_| TerminateError::Failed { status: None })?;
-    decrypt_group(master_key, encrypted).map_err(|_| TerminateError::Failed { status: None })
+    let group = decrypt_group(master_key, encrypted)
+        .map_err(|_| TerminateError::Failed { status: None })?;
+    // 群态成员 profileKey 落库 + 新键触发联动（未知联系人根因批，台账
+    // §29.13）：本函数是全部合并/应用群态路径（restore/写后刷新/读面/
+    // 发送探针）的解密必经点，在此单点提取；best-effort，零错误语义变化。
+    if persist_member_profile_keys(&context.store, &group).await {
+        spawn_profile_refresh_after_group_keys(context);
+    }
+    Ok(group)
+}
+
+/// 群态新落 profileKey 的 60s 一次性窗口（同批）：进程内存 per-account
+/// 触发窗，重连/群操作风暴不重复轰（登录窗自动批同款纪律）。
+const GROUP_KEY_REFRESH_WINDOW_MS: u64 = 60_000;
+
+static GROUP_KEY_REFRESH_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 群状态成员 profileKey 落库（未知联系人根因修复批，台账 §29.13）：官方
+/// V2 群态每成员携 profileKey（群密文随态下行，decrypt_group 已解明文，
+/// `Group.members` 的 aci/profile_key 成对在库）；V2 群发送信封无
+/// sourceName，名字只能经 profile 拉取，拉取目标需 profileKey 先行落库——
+/// 缺此面即「刷新无目标」死锁。逐成员落 presage profile_keys 表（contacts
+/// 同步 / receive profileKeyUpdate 同一位，不发明存储）：全零键诚实跳过
+/// （不发明材料）；同值键幂等跳过；仅首次/换 key 计新（返回值 = 有新
+/// 键，触发面据此联动刷新批）。best-effort：单成员失败不断链，读面零回
+/// 滚（下个群态窗自然收敛）。
+async fn persist_member_profile_keys(
+    store: &SqliteStore,
+    group: &presage::libsignal_service::groups_v2::Group,
+) -> bool {
+    use presage::store::ContentsStore as _;
+    let mut new_keys = false;
+    for member in &group.members {
+        if member.profile_key.bytes == [0u8; 32] {
+            continue;
+        }
+        let service_id = presage::libsignal_service::protocol::ServiceId::Aci(member.aci);
+        let existing = store
+            .profile_key(&service_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|key| key.bytes);
+        if existing == Some(member.profile_key.bytes) {
+            continue;
+        }
+        // upsert_profile_key 是 &mut 面（trait 纪律）：SqliteStore 是连接
+        // 池句柄（Clone 语义，receive_profile_key 先例同构），就近克隆写入。
+        let mut writable = store.clone();
+        if writable
+            .upsert_profile_key(&service_id.raw_uuid(), member.profile_key)
+            .await
+            .is_ok()
+        {
+            new_keys = true;
+        }
+    }
+    new_keys
+}
+
+/// 新键触发联动（同批）：群态合并新落 profileKey → 标记刷新待跑，形态沿
+/// 用登录窗自动批（+10s 沉降 → refresh_contact_profiles 单点；spawn_local
+/// 独立任务不阻塞当前链，读面幂等）；60s 一次性窗口内至多一批。LocalSet
+/// 单线程运行面（main.rs 装配）——fetch_group_state 现存调用点全部落在
+/// 收流/派发上下文，spawn_local 合法；Service 已卸载（关停窗）静默跳过。
+fn spawn_profile_refresh_after_group_keys(context: &StorageContext) {
+    let now = std::time::Instant::now();
+    {
+        let mut windows = GROUP_KEY_REFRESH_WINDOWS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !group_key_refresh_due(windows.get(&context.account).copied(), now) {
+            return;
+        }
+        windows.insert(context.account.clone(), now);
+    }
+    let Some(service) = context.service.upgrade() else {
+        return;
+    };
+    let account = context.account.clone();
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            super::profile_refresh::AUTO_REFRESH_SETTLE_MS,
+        ))
+        .await;
+        let _ = super::profile_refresh::refresh_contact_profiles(&service, &account).await;
+    });
+}
+
+/// 60s 窗口判定（纯函数面）：无窗或距上次触发 ≥ 窗口 = 到期。
+fn group_key_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| {
+        now.duration_since(last).as_millis() as u64 >= GROUP_KEY_REFRESH_WINDOW_MS
+    })
 }
 
 /// 发送面群态探针（真机上 send 前判定）：读面失败一律 None（不阻塞发送，
@@ -4182,5 +4277,139 @@ mod tests {
             .expect("pni parses");
         assert!(matches!(pni, ServiceId::Pni(_)));
         assert!(resolve_group_member(&store, "not-a-member").await.is_none());
+    }
+
+    /// 群态成员 profileKey 落库钉形（未知联系人根因批，台账 §29.13）：
+    /// ①带键成员落 profile_keys 表命中；②全零键成员诚实缺席（不发明）；
+    /// ③同态重放幂等不计新；④换键计新且表值随新；⑤落库后的非通讯录群
+    /// 成员进刷新批目标集（collect_refresh_targets 源 2 同一数据面）。
+    /// ⑥60s 触发窗纯函数判定（无窗到期 / 窗内不再触发 / 过期再触发）。
+    #[tokio::test]
+    async fn group_state_members_land_profile_keys_and_feed_refresh_targets() {
+        use presage::libsignal_service::groups_v2::{
+            Group as GroupState, Member as GroupStateMember, Role as GroupStateRole,
+        };
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::ServiceId;
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+        use presage::store::ContentsStore as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kt-engine-groupkeys-{:016x}",
+            crate::service::mix_seed_step(crate::service::mix_seed()),
+        ));
+        let store = crate::service::open_store(&dir).await.expect("store opens");
+
+        let uuid_of = |tail: &str| {
+            Uuid::parse_str(&format!("00000000-0000-4000-8000-{tail}")).expect("fixture uuid")
+        };
+        let uuid_member = uuid_of("0000000000a1");
+        let uuid_zero = uuid_of("0000000000b2");
+        let aci_of = |uuid| Aci::from(uuid);
+        let key_a = ProfileKey::create([0x21; 32]);
+        let key_a2 = ProfileKey::create([0x22; 32]);
+
+        let member_of = |aci, key| GroupStateMember {
+            aci,
+            role: GroupStateRole::Default,
+            profile_key: key,
+            joined_at_version: 1,
+            label: None,
+            label_emoji: None,
+        };
+        let state_of = |members| GroupState {
+            title: String::new(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            version: 1,
+            members,
+            members_pending_profile_key: Vec::new(),
+            members_pending_admin_approval: Vec::new(),
+            invite_link_password: Vec::new(),
+            description_text: None,
+            announcements_only: false,
+            members_banned: Vec::new(),
+            terminated: false,
+        };
+
+        let state = state_of(vec![
+            member_of(aci_of(uuid_member), key_a),
+            // 全零键 = 无键位成员（诚实跳过面）。
+            member_of(aci_of(uuid_zero), ProfileKey::create([0u8; 32])),
+        ]);
+
+        // ① 首次落键计新；带键成员表命中。
+        assert!(
+            persist_member_profile_keys(&store, &state).await,
+            "首次落键计新"
+        );
+        let landed = store
+            .profile_key(&ServiceId::Aci(aci_of(uuid_member)))
+            .await
+            .unwrap()
+            .expect("keyed member lands");
+        assert_eq!(landed.bytes, key_a.bytes);
+
+        // ② 全零键成员诚实缺席。
+        assert!(
+            store
+                .profile_key(&ServiceId::Aci(aci_of(uuid_zero)))
+                .await
+                .unwrap()
+                .is_none(),
+            "零键成员不落库"
+        );
+
+        // ③ 同态重放幂等不计新。
+        assert!(
+            !persist_member_profile_keys(&store, &state).await,
+            "同值键重放不计新"
+        );
+
+        // ④ 换键计新且表值随新。
+        let rotated = state_of(vec![member_of(aci_of(uuid_member), key_a2)]);
+        assert!(
+            persist_member_profile_keys(&store, &rotated).await,
+            "换键计新"
+        );
+        let rotated_landed = store
+            .profile_key(&ServiceId::Aci(aci_of(uuid_member)))
+            .await
+            .unwrap()
+            .expect("rotated key lands");
+        assert_eq!(rotated_landed.bytes, key_a2.bytes);
+
+        // ⑤ 非通讯录群成员进刷新批目标集（collect_refresh_targets 既有
+        // 目标集逻辑，零改动消费同一 profile_keys 数据面）。
+        let targets = crate::service::profile_refresh::collect_refresh_targets(&store)
+            .await
+            .unwrap();
+        assert!(
+            targets.targets.iter().any(|(uuid, _)| *uuid == uuid_member),
+            "群成员进刷新目标集"
+        );
+    }
+
+    /// ⑥ 60s 一次性触发窗判定（纯函数面）：无窗到期；窗内不重复；过期
+    /// 再触发。
+    #[test]
+    fn group_key_refresh_window_faces() {
+        let now = std::time::Instant::now();
+        assert!(group_key_refresh_due(None, now), "无窗 = 到期");
+        assert!(
+            !group_key_refresh_due(
+                Some(now - std::time::Duration::from_millis(GROUP_KEY_REFRESH_WINDOW_MS - 1_000,)),
+                now,
+            ),
+            "窗内不再触发"
+        );
+        assert!(
+            group_key_refresh_due(
+                Some(now - std::time::Duration::from_millis(GROUP_KEY_REFRESH_WINDOW_MS)),
+                now,
+            ),
+            "满窗 = 到期"
+        );
     }
 }
