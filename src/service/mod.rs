@@ -2502,10 +2502,18 @@ impl Service {
             .unwrap_or(&pending.store_dir)
             .to_string_lossy()
             .to_string();
-        self.state
+        // P0 重链孤儿批（2026-10-23）：注册表按号码唯一，写入新 dir 的同时
+        // 旧条目从表里消失。旧 store 目录随即成为「未登记目录」——启动清扫
+        // 会把它移进 `_quarantine`，隔离区非空又让引擎 fail-closed，桌面看到
+        // 的是「通道正在自恢复」死循环（真机：lk-7c63e095135726e1 因重链变
+        // 孤儿 → quarantine-log reason=unregistered_store_dir → 引擎拒绝启动，
+        // 手工归档才起来）。官方桌面重链 = 替换账号数据，无孤儿概念：收尾即
+        // 归档被取代目录（不删除凭证、不进隔离区），只有真异常残留才落隔离。
+        let superseded = self
+            .state
             .lock()
             .await
-            .add_account(number.clone(), Some(rel))
+            .add_account_superseding(number.clone(), Some(rel.clone()))
             .map_err(|_| LinkError::Internal)?;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
@@ -2548,7 +2556,43 @@ impl Service {
         // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
         let aci = account_aci(&pending.store_dir).await;
         self.spawn_pipeline(number.clone(), pending.store_dir).await;
+        // 旧 store 归档（顺序结构性锁死）：必须晚于 spawn_pipeline——它在
+        // 内部先 stop_pipeline 并等旧管线收口（store drop → SQLite 刷盘），
+        // 归档前不再有句柄写旧目录；也晚于 transfer 腿 cancel。仍然引用的
+        // 目录（极端：同 dir 被另一号码登记）不动；与本次新 dir 相同的也不动。
+        self.archive_superseded_link_dir(superseded, &rel).await;
         Ok(LinkedAccount { number, aci })
+    }
+
+    /// 重链收尾归档单点（P0 重链孤儿批）：把被取代的旧 store 目录归档到
+    /// `accounts/_archive/<ts>/`，永不删除凭证、永不进隔离区（重链是正常
+    /// 生命周期动作，官方桌面同语义：重链即替换账号数据）。
+    ///
+    /// 零动作闸：无旧条目 / 旧条目无 dir（fake 账号）/ 旧 dir == 新 dir /
+    /// 仍有其它注册表条目引用该 dir。归档失败只落 warn：归档不是链接主结局
+    /// 的一部分，失败时目录原地保留，下次启动清扫按既有 fail-closed 语义处置
+    /// （闸门不放宽）。
+    async fn archive_superseded_link_dir(&self, superseded: Option<AccountEntry>, new_dir: &str) {
+        let Some(entry) = superseded else {
+            return;
+        };
+        let Some(old_dir) = entry.dir.as_deref() else {
+            return;
+        };
+        if old_dir == new_dir {
+            return;
+        }
+        let still_referenced = {
+            let state = self.state.lock().await;
+            state
+                .accounts()
+                .iter()
+                .any(|existing| existing.dir.as_deref() == Some(old_dir))
+        };
+        if still_referenced {
+            return;
+        }
+        let _ = crate::state::archive_superseded_account_dir(&self.data_dir, &entry, now_ms());
     }
 
     /// listAccounts 读投影（wire additive `aci` 键，connector 契约 1.142
@@ -13698,6 +13742,124 @@ mod tests {
         std::fs::write(dir.join(crate::state::STORE_DB_FILE), b"credential-bytes")
             .expect("store.db");
         dir
+    }
+
+    /// P0 重链孤儿批端到端钉形（2026-10-23 真机事故）：
+    /// 同号重链写新 dir → 被取代的旧目录归档 → 启动清扫零隔离 → 注册表可
+    /// 重载。对照组（下一例）证明旧语义确实会隔离并造成启动 fail-closed——
+    /// 差异来自「重链收尾归档」而非清扫放宽。
+    #[tokio::test]
+    async fn relink_archives_superseded_store_dir_and_avoids_quarantine() {
+        use tokio::sync::Mutex as AsyncMutex;
+
+        const OBSERVED: u64 = 1_700_000_000_777;
+        let root = sweep_sandbox("relink-archive");
+        let accounts = root.join(ACCOUNTS_DIR);
+        // 先 load（空 accounts = 首次运行）再建 store：注册表缺失 + store 在场
+        // 是 P0-B 的 fail-closed 面。
+        let mut state = crate::state::EngineState::load(&root).expect("state");
+        write_store_file(&accounts, "lk-old");
+        write_store_file(&accounts, "lk-new");
+        state
+            .add_account(
+                "+15550001111".to_owned(),
+                Some("accounts/lk-old".to_owned()),
+            )
+            .expect("register old");
+        let state = Arc::new(AsyncMutex::new(state));
+        let (outbound, _rx) = crate::service::outbound::test_hub();
+        let service = Service::new(root.clone(), Arc::clone(&state), outbound);
+
+        // finish_link 同序：注册表先原子换新条目并把旧条目交回，再归档。
+        let superseded = state
+            .lock()
+            .await
+            .add_account_superseding(
+                "+15550001111".to_owned(),
+                Some("accounts/lk-new".to_owned()),
+            )
+            .expect("relink");
+        assert_eq!(
+            superseded.as_ref().and_then(|entry| entry.dir.as_deref()),
+            Some("accounts/lk-old")
+        );
+        service
+            .archive_superseded_link_dir(superseded, "accounts/lk-new")
+            .await;
+
+        assert!(
+            !accounts.join("lk-old").try_exists().unwrap(),
+            "被取代目录必须搬离 accounts/ 直接子目录（否则下次清扫当孤儿）"
+        );
+        let manifest =
+            std::fs::read_to_string(accounts.join("_archive").join("link-superseded-log.jsonl"))
+                .expect("archive manifest");
+        let record: serde_json::Value =
+            serde_json::from_str(manifest.lines().next().expect("one line")).expect("json");
+        assert_eq!(record["reason"], "superseded_by_relink");
+        assert_eq!(record["from"], "accounts/lk-old");
+        let to = record["to"].as_str().expect("to").to_owned();
+        assert_eq!(
+            std::fs::read(root.join(&to).join("store.db")).unwrap(),
+            b"credential-bytes".as_slice(),
+            "归档保留凭证字节（不是删除/截断）"
+        );
+
+        let referenced: HashSet<String> = state
+            .lock()
+            .await
+            .accounts()
+            .iter()
+            .filter_map(|entry| entry.dir.clone())
+            .collect();
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
+        assert_eq!(report.quarantined, 0, "重链后不得产生隔离条目");
+        assert_eq!(report.failed, 0);
+        assert!(
+            !accounts.join(QUARANTINE_DIR).exists(),
+            "隔离区必须保持空（非空 = 下次启动 fail closed）"
+        );
+        crate::state::EngineState::load(&root).expect("engine starts after relink");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 对照组：不归档的旧语义（= 修复前的重链收尾）——旧目录成孤儿，清扫
+    /// 隔离它，隔离区非空使下一次启动 fail closed，正是「通道正在自恢复」
+    /// 死循环的机制。本用例只证明机制，不改产品语义（fail-closed 保留）。
+    #[tokio::test]
+    async fn relink_without_archive_quarantines_and_blocks_next_start() {
+        const OBSERVED: u64 = 1_700_000_000_888;
+        let root = sweep_sandbox("relink-legacy");
+        let accounts = root.join(ACCOUNTS_DIR);
+        let mut state = crate::state::EngineState::load(&root).expect("state");
+        write_store_file(&accounts, "lk-old");
+        write_store_file(&accounts, "lk-new");
+        state
+            .add_account(
+                "+15550002222".to_owned(),
+                Some("accounts/lk-old".to_owned()),
+            )
+            .expect("register old");
+        // 修复前：注册表只换条目，旧目录原地留下。
+        state
+            .add_account(
+                "+15550002222".to_owned(),
+                Some("accounts/lk-new".to_owned()),
+            )
+            .expect("relink");
+
+        let referenced: HashSet<String> = state
+            .accounts()
+            .iter()
+            .filter_map(|entry| entry.dir.clone())
+            .collect();
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
+        assert_eq!(report.quarantined, 1, "旧语义下旧目录被隔离");
+        assert!(
+            crate::state::EngineState::load(&root).is_err(),
+            "隔离区非空 → 拒绝启动（fail-closed 语义保留）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// P0-B：未登记但带 store.db 的目录 → 隔离（保留凭证），绝不 remove。

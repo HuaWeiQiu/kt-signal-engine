@@ -43,6 +43,13 @@ pub(crate) const STORE_DB_FILE: &str = "store.db";
 pub(crate) const QUARANTINE_DIR: &str = "_quarantine";
 /// 隔离审计日志（JSONL，一行一条；恢复指引见 type `QuarantineRecord`）。
 pub(crate) const QUARANTINE_LOG: &str = "quarantine-log.jsonl";
+/// 重链接取代目录的归档区（P0 重链孤儿批，2026-10-23）。位于
+/// `accounts/_archive/`：既不匹配启动清扫的 `lk-*` 直接子目录规则，也不在
+/// `_quarantine` 内——归档是**正常生命周期动作**（重链换新 store 目录，旧
+/// 目录被取代），不该触发 fail-closed 闸门。隔离区只留给真异常残留。
+pub(crate) const ARCHIVE_DIR: &str = "_archive";
+/// 取代目录归档审计日志（JSONL，一行一条；凭证永不自动删除）。
+pub(crate) const ARCHIVE_LOG: &str = "link-superseded-log.jsonl";
 
 /// 进程内临时文件序号（D5：并发 persist 各写各的 tmp，rename 原子替换）。
 static TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -149,9 +156,34 @@ impl EngineState {
     }
 
     pub(crate) fn add_account(&mut self, number: String, dir: Option<String>) -> io::Result<()> {
-        self.accounts.retain(|existing| existing.number != number);
+        self.add_account_superseding(number, dir).map(|_| ())
+    }
+
+    /// 同上，但把被同号新链接**取代**的旧条目交回调用方（P0 重链孤儿批）。
+    ///
+    /// 注册表按号码唯一：同号重链写入新 `{number, dir}` 时旧 `dir` 从表里
+    /// 消失，旧 store 目录随即成为「未登记目录」——启动清扫按 fail-closed
+    /// 把它移进 `_quarantine`，隔离区非空又让引擎拒绝启动（2026-10-23 真机：
+    /// `accounts/lk-7c63e095135726e1` → quarantine-log 记
+    /// `reason=unregistered_store_dir` → 桌面「通道正在自恢复」死循环）。
+    /// 收尾方据此归档旧目录（`archive_superseded_account_dir`），把「正常
+    /// 生命周期动作」与「真异常残留」分开。
+    ///
+    /// 落盘在**同一次** persist 内完成：调用方拿到的旧条目与新条目来自同一
+    /// 次原子替换，不存在「新条目已落盘、旧条目还没交回」的中间态。
+    pub(crate) fn add_account_superseding(
+        &mut self,
+        number: String,
+        dir: Option<String>,
+    ) -> io::Result<Option<AccountEntry>> {
+        let superseded = self
+            .accounts
+            .iter()
+            .position(|existing| existing.number == number)
+            .map(|index| self.accounts.remove(index));
         self.accounts.push(AccountEntry { number, dir });
-        self.persist()
+        self.persist()?;
+        Ok(superseded)
     }
 
     /// 摘除并返回被删条目（fake 账号 dir=None；真实账号由调用方清目录）。
@@ -298,6 +330,160 @@ pub(crate) fn store_db_present(dir: &Path) -> io::Result<bool> {
     dir.join(STORE_DB_FILE).try_exists()
 }
 
+/// 被取代账号目录的归档记录（JSONL）。只含目录名/相对路径/时间戳，
+/// 不含号码或密钥——与隔离审计记录同纪律。
+#[derive(serde::Serialize)]
+struct SupersededRecord<'a> {
+    observed_at_ms: u64,
+    dir: &'a str,
+    from: String,
+    to: String,
+    reason: &'static str,
+    /// 归档区不是隔离区：引擎照常启动，本记录只是「旧凭证去哪了」的线索。
+    restore: &'static str,
+}
+
+/// 归档被重链接取代的账号目录（P0 重链孤儿批）：同文件系统 rename 到
+/// `accounts/_archive/<observedAtMs>/lk-<hex>`（目标名冲突加 `.1`/`.2`
+/// 后缀，不覆盖已有归档），并追加一条 `link-superseded-log.jsonl`。
+///
+/// 纪律（与清扫同源）：
+/// - **绝不删除凭证**：只 rename；任何一步失败原地保留并交回 `None`
+///   （调用方 warn 落日志，下次启动清扫按既有隔离语义处理——闸门不放宽）；
+/// - 只接受注册表形态的 store 目录（`accounts/<lk-*>`，恰好两级、无
+///   `.`/`..`、非符号链接），其他形状一律不动；
+/// - 目标目录已存在同名归档时加后缀，不覆盖既有归档内容。
+///
+/// 返回归档后的相对路径（`accounts/_archive/<ts>/lk-<hex>`）。
+pub(crate) fn archive_superseded_account_dir(
+    data_dir: &Path,
+    entry: &AccountEntry,
+    observed_at_ms: u64,
+) -> Option<String> {
+    let name = store_dir_name(entry.dir.as_deref()?)?;
+    let source = data_dir.join(ACCOUNTS_DIR).join(&name);
+    // 符号链接不跟随：归档会把链接目标搬走，越过数据目录的内容不归本层处置。
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        _ => return None,
+    }
+    let bucket = data_dir
+        .join(ACCOUNTS_DIR)
+        .join(ARCHIVE_DIR)
+        .join(observed_at_ms.to_string());
+    if fs::create_dir_all(&bucket).is_err() {
+        tracing::warn!(
+            cause = "SupersededArchiveFailed",
+            dir = %name,
+            stage = "bucket_create",
+            "cannot create archive bucket; leaving superseded account directory untouched"
+        );
+        return None;
+    }
+    let destination = unique_destination_in(&bucket, &name)?;
+    if let Err(error) = fs::rename(&source, &destination) {
+        tracing::warn!(
+            cause = "SupersededArchiveFailed",
+            dir = %name,
+            stage = "rename",
+            error = %error,
+            "archive rename failed; leaving superseded account directory untouched"
+        );
+        return None;
+    }
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name.as_str());
+    let relative_destination =
+        format!("{ACCOUNTS_DIR}/{ARCHIVE_DIR}/{observed_at_ms}/{destination_name}");
+    tracing::warn!(
+        cause = "SupersededStoreArchived",
+        dir = %name,
+        from = %format!("{ACCOUNTS_DIR}/{name}"),
+        to = %relative_destination,
+        archive_log = %format!("{ACCOUNTS_DIR}/{ARCHIVE_DIR}/{ARCHIVE_LOG}"),
+        "superseded account store archived by relink (not deleted, not quarantined)"
+    );
+    append_superseded_record(data_dir, &name, observed_at_ms, &relative_destination);
+    Some(relative_destination)
+}
+
+/// 注册表 `dir` 字段 → store 目录名，只接受 `accounts/<lk-*>` 形态
+/// （与清扫/隔离同一判定域；其他形状返回 None，本层不动）。
+fn store_dir_name(rel: &str) -> Option<String> {
+    let mut components = Path::new(rel).components();
+    let accounts = components.next()?;
+    let name = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    if accounts.as_os_str() != ACCOUNTS_DIR {
+        return None;
+    }
+    let name = name.as_os_str().to_str()?;
+    if !name.starts_with("lk-") || name.contains(['/', '\\']) || name == ".." || name == "." {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// 归档目标名：原目录名优先；已存在则 `.1`/`.2`…（不覆盖既有归档）。
+fn unique_destination_in(bucket: &Path, name: &str) -> Option<PathBuf> {
+    const MAX_SUFFIX: u32 = 1024;
+    for ordinal in 0..=MAX_SUFFIX {
+        let candidate = if ordinal == 0 {
+            bucket.join(name)
+        } else {
+            bucket.join(format!("{name}.{ordinal}"))
+        };
+        match candidate.try_exists() {
+            Ok(false) => return Some(candidate),
+            Ok(true) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn append_superseded_record(data_dir: &Path, name: &str, observed_at_ms: u64, destination: &str) {
+    use std::io::Write as _;
+    let root = data_dir.join(ACCOUNTS_DIR).join(ARCHIVE_DIR);
+    let path = root.join(ARCHIVE_LOG);
+    let record = SupersededRecord {
+        observed_at_ms,
+        dir: name,
+        from: format!("{ACCOUNTS_DIR}/{name}"),
+        to: destination.to_owned(),
+        reason: "superseded_by_relink",
+        restore: "this directory is an archived copy of a store replaced by a relink; it is never auto-deleted and never blocks startup — move it back under accounts/ and re-add its {number,dir} entry only if you need the old credentials",
+    };
+    let Ok(line) = serde_json::to_string(&record) else {
+        tracing::warn!(
+            cause = "SupersededArchiveLogFailed",
+            dir = %name,
+            "archive manifest not written; archived directory remains recoverable"
+        );
+        return;
+    };
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if writeln!(file, "{line}").is_err() {
+                tracing::warn!(
+                    cause = "SupersededArchiveLogFailed",
+                    dir = %name,
+                    "archive manifest not written; archived directory remains recoverable"
+                );
+            }
+        }
+        Err(_) => tracing::warn!(
+            cause = "SupersededArchiveLogFailed",
+            dir = %name,
+            "archive manifest not written; archived directory remains recoverable"
+        ),
+    }
+}
+
 /// 隔离区里真正的 `lk-*` 目录数（不把审计日志/空时间戳桶当凭证）。
 fn quarantined_store_count(data_dir: &Path) -> io::Result<usize> {
     let root = data_dir.join(ACCOUNTS_DIR).join(QUARANTINE_DIR);
@@ -360,7 +546,8 @@ fn reject_quarantined(data_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG, STATE_FILE, STORE_DB_FILE,
+        archive_superseded_account_dir, AccountEntry, EngineState, ACCOUNTS_DIR, ARCHIVE_DIR,
+        ARCHIVE_LOG, QUARANTINE_DIR, QUARANTINE_LOG, STATE_FILE, STORE_DB_FILE,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -587,6 +774,130 @@ mod tests {
         assert!(
             quarantined.join(STORE_DB_FILE).is_file(),
             "隔离内容必须保留"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0 重链孤儿批（state 面）：同号重链交回被取代条目 + 归档后旧目录
+    /// 不再是未登记目录（隔离区空、注册表可重载、凭证字节原样）。
+    #[test]
+    fn add_account_superseding_returns_old_entry_and_archive_clears_orphan() {
+        let dir = temp_dir("relink-supersede");
+        // 先 load（空目录 = 首次运行）再建 store：注册表缺失而 store 在场是
+        // P0-B 的 fail-closed 面，测试造数据顺序必须避开它。
+        let mut state = EngineState::load(&dir).expect("load");
+        let old_store = write_store(&dir, "lk-old");
+        state
+            .add_account(
+                "+15550000001".to_owned(),
+                Some("accounts/lk-old".to_owned()),
+            )
+            .expect("register old");
+        write_store(&dir, "lk-new");
+
+        let superseded = state
+            .add_account_superseding(
+                "+15550000001".to_owned(),
+                Some("accounts/lk-new".to_owned()),
+            )
+            .expect("relink")
+            .expect("old entry handed back");
+        assert_eq!(superseded.dir.as_deref(), Some("accounts/lk-old"));
+        assert_eq!(state.accounts().len(), 1, "同号唯一：注册表不留旧条目");
+        assert!(old_store.exists(), "交回条目时目录尚未被动过");
+
+        let to =
+            archive_superseded_account_dir(&dir, &superseded, 1_700_000_000_000).expect("archived");
+        assert_eq!(
+            to,
+            format!("{ACCOUNTS_DIR}/{ARCHIVE_DIR}/1700000000000/lk-old")
+        );
+        assert!(!old_store.exists(), "归档后 accounts/lk-old 不再存在");
+        assert_eq!(
+            std::fs::read(dir.join(&to).join(STORE_DB_FILE)).unwrap(),
+            b"credential-bytes".as_slice(),
+            "归档保留凭证字节"
+        );
+        assert!(
+            !dir.join(ACCOUNTS_DIR).join(QUARANTINE_DIR).exists(),
+            "归档不进隔离区（不触发 fail-closed）"
+        );
+        let manifest =
+            std::fs::read_to_string(dir.join(ACCOUNTS_DIR).join(ARCHIVE_DIR).join(ARCHIVE_LOG))
+                .expect("archive manifest");
+        let record: serde_json::Value =
+            serde_json::from_str(manifest.lines().next().expect("one line")).expect("json");
+        assert_eq!(record["reason"], "superseded_by_relink");
+        assert_eq!(record["to"], serde_json::json!(to));
+
+        let reloaded = EngineState::load(&dir).expect("reload after archive");
+        assert_eq!(reloaded.accounts().len(), 1);
+        assert_eq!(
+            reloaded.account_dir("+15550000001").as_deref(),
+            Some("accounts/lk-new")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归档形状闸：非 accounts/<lk-*> 形态、目录不存在、符号链接一律不动；
+    /// 同名归档目标已存在时加后缀不覆盖。
+    #[test]
+    fn archive_superseded_refuses_foreign_shapes_and_never_overwrites() {
+        let dir = temp_dir("relink-archive-guards");
+        // 非 accounts/lk-* 形态：原样不动。
+        for rel in [
+            "elsewhere/lk-x".to_owned(),
+            "accounts/nested/lk-x".to_owned(),
+            "accounts/not-lk".to_owned(),
+            "accounts/../lk-escape".to_owned(),
+        ] {
+            let entry = AccountEntry {
+                number: "+15550000002".to_owned(),
+                dir: Some(rel.clone()),
+            };
+            assert!(
+                archive_superseded_account_dir(&dir, &entry, 1).is_none(),
+                "形状外的 dir 不得归档: {rel}"
+            );
+        }
+        // 注册表形态但目录不存在：零动作（下一启动清扫自然处理）。
+        let missing = AccountEntry {
+            number: "+15550000003".to_owned(),
+            dir: Some("accounts/lk-missing".to_owned()),
+        };
+        assert!(archive_superseded_account_dir(&dir, &missing, 1).is_none());
+        // fake 账号（dir=None）零动作。
+        let fake = AccountEntry {
+            number: "+15550000004".to_owned(),
+            dir: None,
+        };
+        assert!(archive_superseded_account_dir(&dir, &fake, 1).is_none());
+
+        // 同名归档目标冲突：第二次归档加 .1，既有归档字节不被覆盖。
+        let entry = AccountEntry {
+            number: "+15550000005".to_owned(),
+            dir: Some("accounts/lk-dup".to_owned()),
+        };
+        write_store(&dir, "lk-dup");
+        let first =
+            archive_superseded_account_dir(&dir, &entry, 1_700_000_000_001).expect("first archive");
+        assert_eq!(
+            first,
+            format!("{ACCOUNTS_DIR}/{ARCHIVE_DIR}/1700000000001/lk-dup")
+        );
+        // 同名目录再现（第二轮重链）：目标名冲突 → 后缀，不覆盖既有归档。
+        let store = write_store(&dir, "lk-dup");
+        std::fs::write(store.join(STORE_DB_FILE), b"second-generation").expect("recreate store");
+        let second = archive_superseded_account_dir(&dir, &entry, 1_700_000_000_001)
+            .expect("second archive");
+        assert_eq!(
+            second,
+            format!("{ACCOUNTS_DIR}/{ARCHIVE_DIR}/1700000000001/lk-dup.1")
+        );
+        assert_eq!(
+            std::fs::read(dir.join(&first).join(STORE_DB_FILE)).unwrap(),
+            b"credential-bytes".as_slice(),
+            "既有归档不被覆盖"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
