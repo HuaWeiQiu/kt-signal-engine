@@ -11342,6 +11342,11 @@ async fn download_transfer_archive(
     use transfer_progress::failure;
     transfer_progress.begin(&account, None);
     let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
+    // D0 真机重验观测面（台账 §29.10.2 未知项①）：长轮询/下载/导出全程
+    // info 级打点——此前链路日志零证据，真机重验无法复盘 204 轮数/200 体
+    // 形状/失败档位。账号一律哈希形（probe_account8），key 值/明文材料
+    // 不落日志。
+    let account_hash = crate::methods::probe_account8(Some(&account));
 
     let (cdn, key) = {
         let mut polls = 0u32;
@@ -11354,12 +11359,34 @@ async fn download_transfer_archive(
                 .await
             {
                 Ok(backup_api::PollRound::Body(body)) => {
+                    // 200 体到达打点（分类终态另有进度快照面；这里只记
+                    // 到达与是否档案就绪，key/cdn 形状在 archive_ready 点）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_200",
+                        account = %account_hash,
+                        ready = matches!(
+                            body,
+                            backup_api::TransferArchiveBody::Ready { .. }
+                        ),
+                        "transfer_archive poll returned 200 body"
+                    );
                     match handle_transfer_archive_body(&transfer_progress, &account, body) {
                         Some(pair) => break pair,
                         None => return,
                     }
                 }
                 Ok(backup_api::PollRound::Retry) => {
+                    // 204 单轮打点：真机重验复盘手机端上传就绪节奏的直接
+                    // 证据（轮序/预算上限）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_204",
+                        account = %account_hash,
+                        round = polls + 1,
+                        max_polls = TRANSFER_ARCHIVE_MAX_POLLS,
+                        "transfer_archive poll 204; phone side not ready yet"
+                    );
                     if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS {
                         // 手机端没有可传档案：独立信息态（官方行为基准，
                         // 非故障），快照同样终态保留供桌面诚实呈现。
@@ -11369,7 +11396,16 @@ async fn download_transfer_archive(
                     polls += 1;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                Err(_) => {
+                Err(error) => {
+                    // 错误打点：rpc 词表 log-safe（detail 不含账号材料）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_error",
+                        account = %account_hash,
+                        code = error.rpc_code(),
+                        retryable = error.retryable(),
+                        "transfer_archive poll failed"
+                    );
                     transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
@@ -11377,6 +11413,15 @@ async fn download_transfer_archive(
         }
     };
 
+    // 档案就绪打点：200 体 Ready 臂的 cdn/key 形状（key 只记长度不记值）。
+    tracing::info!(
+        target: "engine.transfer",
+        stage = "archive_ready",
+        account = %account_hash,
+        cdn,
+        key_len = key.len(),
+        "transfer archive ready; downloading from cdn"
+    );
     // CDN 拉档案（下载面 download_request：档案体可达 GB 级，无总超时 +
     // 读停滞判死——65s 控制面预算会把健康慢流掐断误报 cdn_unreachable）。
     let response = match push.download_request(
@@ -11425,6 +11470,14 @@ async fn download_transfer_archive(
         }
     }
 
+    // 下载完成打点（字节数 = 真机档案体量第一手证据）。
+    tracing::info!(
+        target: "engine.transfer",
+        stage = "download_done",
+        account = %account_hash,
+        bytes = archive_bytes.len(),
+        "transfer archive downloaded"
+    );
     let archive_path = store_dir.join("transfer-archive.bin");
     if std::fs::write(&archive_path, &archive_bytes).is_err() {
         transfer_progress.fail(&account, failure::IO);
@@ -11451,6 +11504,29 @@ async fn download_transfer_archive(
         crate::history::export_archive(&archive_path, aci, backup_key, &mut writer).await;
     let _ = std::io::Write::flush(&mut writer);
     drop(writer);
+    // 导出结局打点（帧/缺席计数 = L5 映射面的真机第一手证据；失败带
+    // Display 词表）。
+    match &exported {
+        Ok(stats) => tracing::info!(
+            target: "engine.transfer",
+            stage = "export_done",
+            account = %account_hash,
+            frames = stats.frames,
+            messages = stats.messages,
+            update_events = stats.update_events,
+            skipped_polls = stats.skipped_polls,
+            skipped_gift_badges = stats.skipped_gift_badges,
+            skipped_payments = stats.skipped_payments,
+            "transfer archive exported to ndjson"
+        ),
+        Err(error) => tracing::info!(
+            target: "engine.transfer",
+            stage = "export_failed",
+            account = %account_hash,
+            error = %error,
+            "transfer archive export failed"
+        ),
+    }
     if exported.is_err() {
         let _ = std::fs::remove_file(&ndjson_path);
         transfer_progress.fail(&account, failure::DECODE_FAILED);
