@@ -45,6 +45,7 @@ use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUAR
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
 pub(crate) mod account_metrics;
 pub(crate) mod avatar;
+pub(crate) mod backup_api;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
 /// 通话中继配置（calls.relays）：认证 GET /v2/calling/relays + 官方同口径
@@ -11219,47 +11220,10 @@ const TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS: u64 = 60;
 /// 见 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]（总预算 ≈1h 的轮数臂）。
 const TRANSFER_ARCHIVE_MAX_POLLS: u32 = 60;
 
-/// transfer_archive 200 响应体四分类。官方契约是 union（Signal-Desktop
-/// WebAPI.preload.ts `TransferArchiveSchema`，行为对齐零拷贝）：既有
-/// `{cdn,key}` 档案就绪分支之外，还有 `{error:"RELINK_REQUESTED"}`
-/// （手机端要求重新扫码，原迁移作废）与 `{error:"CONTINUE_WITHOUT_UPLOAD"}`
-/// （手机端放弃迁移继续使用）——消费语义见 backups/index.preload.ts
-/// （RelinkRequestedError / 记日志后按无档案收尾）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TransferArchiveBody {
-    /// 手机端档案已就绪：去 CDN 拉。
-    Ready { cdn: u32, key: String },
-    /// 手机端要求重新扫码迁移。
-    RelinkRequested,
-    /// 手机端放弃迁移继续使用（无档案可拉）。
-    ContinueWithoutUpload,
-    /// 官方 union 两分支均不匹配（非法 JSON/未知 error 码/形状不符）。
-    Malformed,
-}
-
-/// 200 体解析纯函数（零 I/O 单测面）：分支序对齐官方 zod union——先试
-/// `{cdn,key}` 分支（齐且型对即 `Ready`，多余字段官方 strip 掉不碍事），
-/// 再试 `{error}` 分支（恰为官方两字面量之一），都不匹配落 `Malformed`
-/// （含非法 JSON、error 非 String/未知值、cdn 非 u64、key 非 String）。
-fn parse_transfer_archive_body(body: &[u8]) -> TransferArchiveBody {
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(value) => value,
-        Err(_) => return TransferArchiveBody::Malformed,
-    };
-    if let (Some(cdn), Some(key)) = (
-        value["cdn"]
-            .as_u64()
-            .and_then(|cdn| u32::try_from(cdn).ok()),
-        value["key"].as_str().map(str::to_owned),
-    ) {
-        return TransferArchiveBody::Ready { cdn, key };
-    }
-    match value["error"].as_str() {
-        Some("RELINK_REQUESTED") => TransferArchiveBody::RelinkRequested,
-        Some("CONTINUE_WITHOUT_UPLOAD") => TransferArchiveBody::ContinueWithoutUpload,
-        _ => TransferArchiveBody::Malformed,
-    }
-}
+// transfer_archive 200 体解析（`TransferArchiveBody` +
+// `parse_transfer_archive_body`）已上收 `service::backup_api` 单点（L3 客户端
+// 模块，长轮询/CDN/gRPC 同仓同面），此处按分类处置进度终态。
+use backup_api::TransferArchiveBody;
 
 /// 轮询循环 200 体处置：`Ready` 放行 (cdn, key) 进 CDN 段；两 error 变体
 /// 各落 `relink_requested`/`continue_without_upload` 终态，`Malformed`
@@ -11331,58 +11295,30 @@ async fn download_transfer_archive(
     let (cdn, key) = {
         let mut polls = 0u32;
         loop {
-            let path =
-                format!("v1/devices/transfer_archive?timeout={TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS}");
-            let response = match push.request(
-                Method::GET,
-                Endpoint::service(&path),
-                HttpAuthOverride::NoOverride,
-            ) {
-                Ok(builder) => builder,
-                Err(_) => {
-                    transfer_progress.fail(&account, failure::NETWORK);
-                    return;
-                }
-            };
-            let response = match response.send().await {
-                Ok(response) => response,
-                Err(_) => {
-                    transfer_progress.fail(&account, failure::NETWORK);
-                    return;
-                }
-            };
-            match response.status().as_u16() {
-                200 => {
-                    let bytes = match response.bytes().await {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            transfer_progress.fail(&account, failure::NETWORK);
-                            return;
-                        }
-                    };
-                    // 200 体官方契约除 {cdn,key} 外还有手机端主动通知两态
-                    // （要求重扫码/放弃迁移）：分类后各落其位，不再一律
-                    // 误报 decode_failed。
-                    match handle_transfer_archive_body(
-                        &transfer_progress,
-                        &account,
-                        parse_transfer_archive_body(&bytes),
-                    ) {
+            // 单轮长轮询客户端（backup_api 单点：请求/解析与 L3 客户端面同
+            // 仓同形）；200 体官方契约除 {cdn,key} 外还有手机端主动通知两态
+            // （要求重扫码/放弃迁移）：分类后各落其位，不再一律误报
+            // decode_failed。
+            match backup_api::poll_transfer_archive_round(&push, TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS)
+                .await
+            {
+                Ok(backup_api::PollRound::Body(body)) => {
+                    match handle_transfer_archive_body(&transfer_progress, &account, body) {
                         Some(pair) => break pair,
                         None => return,
                     }
                 }
-                204 if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS => {
-                    // 手机端没有可传档案：独立信息态（官方行为基准，非故障），
-                    // 快照同样终态保留供桌面诚实呈现。
-                    transfer_progress.fail(&account, failure::NO_ARCHIVE);
-                    return;
-                }
-                204 => {
+                Ok(backup_api::PollRound::Retry) => {
+                    if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS {
+                        // 手机端没有可传档案：独立信息态（官方行为基准，
+                        // 非故障），快照同样终态保留供桌面诚实呈现。
+                        transfer_progress.fail(&account, failure::NO_ARCHIVE);
+                        return;
+                    }
                     polls += 1;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                _ => {
+                Err(_) => {
                     transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
@@ -23751,56 +23687,8 @@ mod tests {
         );
     }
 
-    /// 200 体四分类钉形（官方 TransferArchiveSchema union 对齐，行为对齐
-    /// 零拷贝）：{cdn,key} 即 Ready（两分支字段并存时官方 zod union 先试
-    /// {cdn,key} 分支，多余字段 strip——同形序）；error 恰为官方两字面量
-    /// 之一对应对应变体；其余（非法 JSON/未知 error/cdn·key 缺失或型不对）
-    /// 一律 Malformed。
-    #[test]
-    fn transfer_archive_body_classification() {
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"cdn":3,"key":"manifold://cb#k"}"#),
-            TransferArchiveBody::Ready {
-                cdn: 3,
-                key: "manifold://cb#k".to_owned()
-            }
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"cdn":0,"key":"k","error":"RELINK_REQUESTED"}"#),
-            TransferArchiveBody::Ready {
-                cdn: 0,
-                key: "k".to_owned()
-            },
-            "官方 zod union 分支序：{{cdn,key}} 齐 = Ready 赢"
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"error":"RELINK_REQUESTED"}"#),
-            TransferArchiveBody::RelinkRequested
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#),
-            TransferArchiveBody::ContinueWithoutUpload
-        );
-        let malformed_bodies: [&[u8]; 9] = [
-            b"not json",
-            br#"{}"#,
-            br#"{"cdn":3}"#,
-            br#"{"key":"k"}"#,
-            br#"{"cdn":"3","key":"k"}"#,
-            br#"{"cdn":3.5,"key":"k"}"#,
-            br#"{"error":"SOMETHING_ELSE"}"#,
-            br#"{"error":123}"#,
-            br#"{"error":"relink_requested"}"#,
-        ];
-        for body in malformed_bodies {
-            assert_eq!(
-                parse_transfer_archive_body(body),
-                TransferArchiveBody::Malformed,
-                "「{}」应判 Malformed",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
+    // 200 体四分类钉形已随解析面上收 `backup_api::tests`
+    // （transfer_archive_body_classification），此处只钉处置终态路径。
 
     /// 轮询循环 200 体处置终态路径：两 error 变体各落 `relink_requested`/
     /// `continue_without_upload` 终态（不再误报 decode_failed），`Malformed`
