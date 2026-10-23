@@ -30,7 +30,7 @@ use libsignal_service::{
         ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -796,9 +796,49 @@ impl<S: Store> Manager<S, Registered> {
         // `discoverable_by_phone_number` hard-coded `true` here would
         // silently flip the account's discoverability privacy setting.
         // Official Signal-Desktop linked devices never PUT attributes.
+        // KT (handover race, §29.6): 兜底重试组件 —— 任务是 `async move`，
+        // 无法借用 `self`，提前捕获拨号组件（消息管道还要用
+        // `identified_push_service`，这里只进 clone）。
+        let gate_push_service = identified_push_service.clone();
+        let gate_credentials = self.credentials();
         let refresh_registration_task = async move {
-            if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
-                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
+            // KT (handover race, §29.6): 初次注册用现成 account_manager
+            // （与消息管道共享刚拨的连接）；在途请求被后续 handover 杀掉时
+            // （WsClosing）兜底重试：等 500ms 让 handover 稳定，经 slot
+            // （require_unused=false，复用活连接/只顶死连接，不杀消息管道）
+            // 拿连接重发，上限 2 次。pre-keys 上传幂等，重发安全；重试耗尽
+            // 仍只落日志（消息流不因此停止）。语义同
+            // `register_with_ws_handover_retry`（此处因 `&mut
+            // account_manager` 借用进 future 的所有权结构而手写展开）。
+            let mut result = register_pre_keys(&store_inner, &mut account_manager).await;
+            let mut retries_done = 0usize;
+            loop {
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if is_ws_handover_kill(&error)
+                            && retries_done < PRE_KEYS_HANDOVER_RETRIES =>
+                    {
+                        retries_done += 1;
+                        warn!(
+                            %error,
+                            attempt = retries_done,
+                            retries_left = PRE_KEYS_HANDOVER_RETRIES - retries_done,
+                            "pre-keys registration killed by ws handover; retrying on a fresh connection"
+                        );
+                        tokio::time::sleep(PRE_KEYS_HANDOVER_RETRY_DELAY).await;
+                        result = match dial_pre_keys_connection(&gate_push_service, &gate_credentials)
+                            .await
+                        {
+                            Ok(mut fresh) => register_pre_keys(&store_inner, &mut fresh).await,
+                            Err(dial_error) => Err(Error::ServiceError(dial_error)),
+                        };
+                    }
+                    Err(error) => {
+                        error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
+                        break;
+                    }
+                }
             }
 
             // Never return, which keeps the messages stream alive.
@@ -2107,8 +2147,26 @@ impl<S: Store> Manager<S, Registered> {
     /// semantics), exposed for the engine's periodic maintenance ticker so a
     /// long-lived connection still tops up one-time keys.
     pub async fn refresh_pre_keys(&mut self) -> Result<(), Error<S::Error>> {
-        let mut account_manager = self.account_manager().await?;
-        register_pre_keys(&self.store, &mut account_manager).await
+        // KT (handover race, §29.6): 每次尝试统一走 require_unused=false
+        // 的 slot 拨号（复用活连接/只顶死连接），不再经 account_manager()
+        // 的 require_unused=true —— 那条路会 handover 杀掉占用 request
+        // stream 的消息管道（本方法被 engine 的 pre-keys 时序闸与 prekey
+        // 巡检共用；闸场景下接收流连接可能正占着 stream）。WsClosing 由
+        // 骨架兜底重试（上限 2 次、间隔 500ms）。
+        let push_service = self.identified_push_service();
+        let credentials = self.credentials();
+        let store = &self.store;
+        register_with_ws_handover_retry(move || {
+            let push_service = push_service.clone();
+            let credentials = credentials.clone();
+            async move {
+                let mut account_manager = dial_pre_keys_connection(&push_service, &credentials)
+                    .await
+                    .map_err(Error::ServiceError)?;
+                register_pre_keys(store, &mut account_manager).await
+            }
+        })
+        .await
     }
 
     /// KT (pre-key maintenance): age-based signed pre-key rotation for both
@@ -2126,12 +2184,10 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     async fn account_manager(&self) -> Result<AccountManager, Error<S::Error>> {
-        // KT (single-connection): reuse the live identified websocket instead
-        // of dialing a fresh one — the slot would terminate the receive pipe
-        // on handover, killing the stream mid-maintenance (observed as the
-        // 48s reconnect loop). Responses are multiplexed by request id in
-        // the websocket process, so sharing the connection is safe.
-        let identified_websocket = self.identified_websocket(false).await?;
+        // KT EXPERIMENT REVERTED (2026-10-23): the reuse (require_unused=false)
+        // broke connector link tests (ACCOUNT_ALREADY_LINKED in
+        // per_account_pool) — root fix deferred to the multiplexing rework.
+        let identified_websocket = self.identified_websocket(true).await?;
         Ok(AccountManager::new(
             self.identified_push_service(),
             identified_websocket,
@@ -3234,6 +3290,86 @@ async fn upsert_contact_from_profile<S: Store>(
     Ok(())
 }
 
+/// KT (handover race, §29.6): pre-keys 注册被 WS handover 杀死后的重试
+/// 参数。单连接纪律的 kill-before-create handover 不看前连接的在途请求：
+/// 在途的 pre-keys 注册以 `WsClosing`（"Websocket closing: ..."）随连接
+/// 死亡（2026-10-23 09:30 故障链：重链接 → 接收流拨号 handover →
+/// "should never happen" ERROR + 3s 附件 UPSTREAM_ERROR 降级窗 + 推送
+/// 延迟 16-24s）。pre-keys 上传幂等（服务器按内容补水位），等 handover
+/// 稳定后在新连接上重发安全。
+const PRE_KEYS_HANDOVER_RETRIES: usize = 2;
+const PRE_KEYS_HANDOVER_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// KT (handover race, §29.6): 判定错误是否为 WS 被单连接纪律 handover
+/// 杀掉一类（在途请求以 `WsClosing` 告终）。其余错误（协议/存储/HTTP
+/// 4xx-5xx）语义上不是断连，重试无意义。
+fn is_ws_handover_kill<S: std::error::Error>(error: &Error<S>) -> bool {
+    matches!(error, Error::ServiceError(ServiceError::WsClosing { .. }))
+}
+
+/// KT (handover race, §29.6): pre-keys 注册的 WsClosing 重试骨架。
+/// `attempt` 每次调用都应拿到可用连接（初次 = 调用方现成连接；重试 =
+/// 调用方经 slot 新拨/复用）。上限：初试 1 次 + 重试
+/// [`PRE_KEYS_HANDOVER_RETRIES`] 次，重试前等
+/// [`PRE_KEYS_HANDOVER_RETRY_DELAY`] 让 handover 稳定。骨架与拨号解耦，
+/// 单测用假 attempt 注入断连序列（`prekeys_handover_retry_tests`）。
+async fn register_with_ws_handover_retry<E, F, Fut>(
+    mut attempt: F,
+) -> Result<(), Error<E>>
+where
+    E: std::error::Error,
+    F: FnMut() -> Fut,
+    Fut: futures::Future<Output = Result<(), Error<E>>>,
+{
+    let mut retries_done: usize = 0;
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_ws_handover_kill(&error) && retries_done < PRE_KEYS_HANDOVER_RETRIES =>
+            {
+                retries_done += 1;
+                warn!(
+                    %error,
+                    attempt = retries_done,
+                    retries_left = PRE_KEYS_HANDOVER_RETRIES - retries_done,
+                    "pre-keys registration killed by ws handover; retrying on a fresh connection"
+                );
+                tokio::time::sleep(PRE_KEYS_HANDOVER_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// KT (handover race, §29.6): pre-keys 注册专用的连接供给 ——
+/// `require_unused=false` 经单连接 slot 拨号：slot 里的活连接直接复用
+/// （pre-keys 上传不需要 server-request stream），仅当连接已死才重拨
+/// 替换；不会杀占用 request stream 的消息管道连接。组件显式传参
+/// （credentials/push_service），供接收流的 `async move` 任务在无法借用
+/// `self` 时复用同一拨号纪律。
+async fn dial_pre_keys_connection(
+    push_service: &PushService,
+    credentials: &ServiceCredentials,
+) -> Result<AccountManager, ServiceError> {
+    let key = credentials.login();
+    websocket::slot::acquire_identified(&key, false, async {
+        let headers = &[("X-Signal-Receive-Stories", "false")];
+        let mut push_service = push_service.clone();
+        push_service
+            .ws(
+                "/v1/websocket/",
+                "/v1/keepalive",
+                headers,
+                Some(credentials.clone()),
+            )
+            .await
+    })
+    .await
+    .map(|ws| AccountManager::new(push_service.clone(), ws, None))
+}
+
 async fn register_pre_keys<S: Store>(
     store: &S,
     account_manager: &mut AccountManager,
@@ -3579,5 +3715,95 @@ mod receive_batch_tests {
         assert!(!group_fetch_gone(&ServiceError::Unauthorized));
 
         assert_eq!(GROUP_FETCH_MAX_ATTEMPTS, 2);
+    }
+}
+
+
+/// KT (handover race, §29.6): WsClosing 重试骨架的注入式单测 —— 不触网，
+/// 用假 attempt 序列钉死「断连一次 → 新连接重试成功 / 非断连不重试 /
+/// 重试上限后放弃」三条语义。
+#[cfg(test)]
+mod prekeys_handover_retry_tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    type TestError = Error<Infallible>;
+
+    /// 故障链 2026-10-23 09:30 的原始错误形态：在途请求随被 handover 杀掉
+    /// 的连接死亡（libsignal websocket/mod.rs:829 的 reason 字面量）。
+    fn ws_closing() -> TestError {
+        TestError::ServiceError(ServiceError::WsClosing {
+            reason: "WebSocket closing while waiting for a response",
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_once_after_a_websocket_closing_kill_and_succeeds() {
+        // mock 断连一次：首次请求在途时连接被 handover 杀掉（WsClosing），
+        // 第二次（新连接）成功 —— 引擎侧观测即「重试成功，无
+        // should-never-happen ERROR」。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let result: Result<(), TestError> = register_with_ws_handover_retry(move || {
+            let attempt_no = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt_no == 0 {
+                    Err(ws_closing())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "retry on a fresh connection must succeed: {result:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one retry expected (initial + 1)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_handover_errors_fail_fast_without_retry() {
+        // 协议/存储/HTTP 类失败不是断连：重发无意义，必须原样上抛。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let result: Result<(), TestError> = register_with_ws_handover_retry(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { Err(TestError::UpdatePreKeyFailure) }
+        })
+        .await;
+
+        assert!(matches!(result, Err(TestError::UpdatePreKeyFailure)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry for non-handover errors");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_the_retry_cap_on_persistent_handover_kills() {
+        // 每次尝试都被 handover 杀：初试 1 + 重试 2 = 3 次后放弃，原错误
+        // 上抛（引擎侧据此落降级态，不无限重试）。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let result: Result<(), TestError> = register_with_ws_handover_retry(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { Err(ws_closing()) }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(TestError::ServiceError(ServiceError::WsClosing { .. }))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + PRE_KEYS_HANDOVER_RETRIES,
+            "initial attempt plus the bounded retries"
+        );
     }
 }

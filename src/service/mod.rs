@@ -7200,6 +7200,64 @@ const RECEIVE_SIDE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 永久失败；仍然有界，不会无限挂在 manager 未 ready 上。
 const RECEIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// KT (pre-keys gate, §29.6): 接收流拨号前 pre-keys 注册的等待上限。正常
+/// 注册亚秒级（服务器计数 ≥10 时零上传仅一次计数查询），30s 覆盖慢网 +
+/// §29.6 WsClosing 重试链（2×500ms）+ 一次完整重拨，超时不再死等。
+const PREKEYS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// KT (pre-keys gate, §29.6): 闸结局 —— `Registered` = 注册完成放行；
+/// `Degraded` = 注册未确认（重试耗尽/超时）仍放行，原因串进降级日志。
+#[derive(Debug, PartialEq, Eq)]
+enum PreKeysGateOutcome {
+    Registered,
+    Degraded(&'static str),
+}
+
+/// KT (pre-keys gate, §29.6): pre-keys 时序闸（生产包装）。接收流拨号前
+/// 串行等待 `refresh_pre_keys` 完成（内部自带 WsClosing 兜底重试与
+/// require_unused=false 的 slot 拨号——复用活连接，不杀消息管道）。任何
+/// 失败模式都放行接收流（显式落降级 warn），不把注册面故障变成接收面
+/// 停摆。证据行 warn 级 = 滚动日志（与 receive_stream_established 同位，
+/// 链接窗口的时序对账直接可查）。
+async fn prekeys_gate(
+    manager: &mut Manager<SqliteStore, Registered>,
+    account: &str,
+) -> PreKeysGateOutcome {
+    let outcome = run_prekeys_gate(|| manager.refresh_pre_keys(), PREKEYS_GATE_TIMEOUT).await;
+    match &outcome {
+        PreKeysGateOutcome::Registered => tracing::warn!(
+            target: "engine.receive",
+            stage = "prekeys_gate_registered",
+            account = %crate::methods::probe_account8(Some(account)),
+            "pre-keys registered before receive stream dial"
+        ),
+        PreKeysGateOutcome::Degraded(reason) => tracing::warn!(
+            target: "engine.receive",
+            stage = "prekeys_gate_degraded",
+            account = %crate::methods::probe_account8(Some(account)),
+            reason,
+            "pre-keys gate released the receive stream in degraded mode"
+        ),
+    }
+    outcome
+}
+
+/// KT (pre-keys gate, §29.6): 闸核心（预算注入，单测用假注册 future 钉
+/// 语义）。`register` 只调用一次；预算内完成且成功 = `Registered`，否则
+/// `Degraded`（失败 / 超时各有原因串）。
+async fn run_prekeys_gate<E, F, Fut>(register: F, budget: Duration) -> PreKeysGateOutcome
+where
+    E: std::error::Error,
+    F: FnOnce() -> Fut,
+    Fut: futures::Future<Output = Result<(), presage::Error<E>>>,
+{
+    match tokio::time::timeout(budget, register()).await {
+        Ok(Ok(())) => PreKeysGateOutcome::Registered,
+        Ok(Err(_)) => PreKeysGateOutcome::Degraded("registration_failed"),
+        Err(_) => PreKeysGateOutcome::Degraded("timeout"),
+    }
+}
+
 /// 后台维护作业上限（manifest 拉取内部可能串多次 HTTP，单次控制面预算
 /// 65s）。它已在独立任务里运行，不阻塞收流；120s 只用于防止任务永久悬挂。
 const RECEIVE_JOB_TIMEOUT: Duration = Duration::from_secs(120);
@@ -7306,6 +7364,16 @@ async fn serve_account_stream(
             ),
         }
     }
+    // KT (pre-keys gate, §29.6): 时序闸 —— 接收流拨号必须等 pre-keys 注册
+    // 完成（所有建流路径的咽喉：finish_link 重链 / startup on-start /
+    // supervisor 重启都经此）。因果：pre-keys 未上服务器 → 入站初始会话
+    // 无法用 pre-key 解密 → 服务器投递重试 → 降级窗（2026-10-23 09:30：
+    // 附件 UPSTREAM_ERROR×3 + 推送延迟 16-24s，且 "receive pipeline
+    // spawned" 先于 pre-keys 注册失败落日志——当时两条腿并发）。注册完成
+    // 放行；重试耗尽/超时放行但记降级 warn——服务器可能仍有存量 pre-keys，
+    // 接收面健康优先于注册面严格，缺口由 prekey 巡检与 §29.6 WsClosing
+    // 重试兜底补齐。
+    prekeys_gate(&mut manager, &account_hash).await;
     let mut stream =
         match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, manager.receive_messages()).await {
             Ok(Ok(stream)) => stream,
@@ -23922,6 +23990,73 @@ mod tests {
         assert_eq!(
             parse_pipeline_shutdown_grace(Some(&PIPELINE_SHUTDOWN_GRACE_MAX_MS.to_string())),
             Some(Duration::from_millis(PIPELINE_SHUTDOWN_GRACE_MAX_MS))
+        );
+    }
+
+    // KT (pre-keys gate, §29.6): 闸语义一 —— 注册未完成时接收流不得拨号
+    // （串行闸因果序）。事件序向量钉死「register_started → register_done →
+    // stream_dial」：闸 pending 期间任何拨号步都是违序；这正是 2026-10-23
+    // 09:30 故障链的结构性反面（当时 "receive pipeline spawned" 先于
+    // pre-keys 注册完成落账，两条腿并发）。
+    #[tokio::test(start_paused = true)]
+    async fn prekeys_gate_blocks_stream_dial_until_registration_completes() {
+        let events: Arc<StdMutex<Vec<&'static str>>> = Default::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let ev = events.clone();
+        let rel = release.clone();
+        let register = move || {
+            let events = ev.clone();
+            let release = rel.clone();
+            async move {
+                events.lock().unwrap().push("register_started");
+                release.notified().await;
+                events.lock().unwrap().push("register_done");
+                Ok::<(), presage::Error<std::convert::Infallible>>(())
+            }
+        };
+
+        let gate = run_prekeys_gate(register, Duration::from_secs(30));
+        tokio::pin!(gate);
+        // 闸 pending 期间：注册未完成，拨号步不得发生。
+        for _ in 0..10 {
+            assert!(
+                futures::poll!(gate.as_mut()).is_pending(),
+                "gate released before registration completed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["register_started"],
+            "stream dial must not happen while registration is in flight"
+        );
+
+        // 注册完成后闸放行；随后的拨号步严格落在 register_done 之后。
+        release.notify_waiters();
+        let outcome = gate.await;
+        assert_eq!(outcome, PreKeysGateOutcome::Registered);
+        events.lock().unwrap().push("stream_dial");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["register_started", "register_done", "stream_dial"]
+        );
+    }
+
+    // KT (pre-keys gate, §29.6): 闸语义二 —— 注册卡死（在途悬挂）时按预算
+    // 超时放行，结局 = Degraded("timeout")（调用方据此落降级 warn），闸
+    // 自身不悬死、等待完整预算。
+    #[tokio::test(start_paused = true)]
+    async fn prekeys_gate_times_out_and_releases_with_degraded_record() {
+        let register = || async {
+            futures::future::pending::<Result<(), presage::Error<std::convert::Infallible>>>().await
+        };
+        let started = tokio::time::Instant::now();
+        let outcome = run_prekeys_gate(register, Duration::from_millis(50)).await;
+        assert_eq!(outcome, PreKeysGateOutcome::Degraded("timeout"));
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "gate must wait the full budget before releasing"
         );
     }
 }
