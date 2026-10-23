@@ -1863,6 +1863,23 @@ fn storage_pull_notification(
     })
 }
 
+/// 链接期初始同步完成事件（收件箱闸批①，wire additive，compat §5 新增契约——`engine.initialSyncComplete`）：登录窗 sync 臂（每链路 60s 一次性）三件套全部落定后恒发恰一条——初始三请求已上行（臂内串行先行）、manifest 登录拉（30s 上限独立任务）与首轮 profile 刷新（+10s 沉降独立任务）两腿 join 完成时刻。params = account（通道惯例域）/ manifestOk / profilesOk——两腿逐腿如实布尔（false = 该腿 Err 或超时），官方 contactSync:complete/storageService:syncComplete 仅成功路径发的语义由消费方按 ok face 落定（引擎只报态，零 stderr 纪律 fire-and-forget，receive.emptied 同款：发射不连坐结果、不重试；失败由下次链路建立重补 + 消费方半边超时兜底）。桌面收件箱闸第三半边（首轮 profile 刷新）的唯一定局信号——官方 background.preload.ts:1926-1948 步骤 7 对位。
+fn initial_sync_complete_notification(
+    account: &str,
+    manifest_ok: bool,
+    profiles_ok: bool,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "engine.initialSyncComplete",
+        "params": {
+            "account": account,
+            "manifestOk": manifest_ok,
+            "profilesOk": profiles_ok,
+        },
+    })
+}
+
 /// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
 /// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
 /// SyncMessage.content.Request{type}，padded sync message。
@@ -7509,10 +7526,14 @@ async fn serve_account_stream(
                     // 独立任务 + 30s 上限：manifest 拉取再慢也不许把收流
                     // 循环按在原地（2026-10-21 事故：维护臂无限等待 =
                     // 收流静默）。
+                    // （收件箱闸批①）：JoinHandle 保留给本臂末尾的完成
+                    // join——`engine.initialSyncComplete` 在 manifest +
+                    // 首轮 profile 刷新两腿全部落定（含超时面）后才发，
+                    // 任务体的 30s 上限与超时日志面零变化。
                     let manifest_service = Arc::clone(service);
                     let manifest_account = number.to_owned();
-                    tokio::task::spawn_local(async move {
-                        if tokio::time::timeout(
+                    let manifest_join = tokio::task::spawn_local(async move {
+                        let outcome = tokio::time::timeout(
                             RECEIVE_JOB_TIMEOUT,
                             pull_storage_manifest(
                                 &manifest_service,
@@ -7521,8 +7542,8 @@ async fn serve_account_stream(
                             ),
                         )
                         .await
-                        .is_err()
-                        {
+                        .ok();
+                        if outcome.is_none() {
                             tracing::warn!(
                                 target: "engine.receive",
                                 stage = "storage_manifest_pull_login_timeout",
@@ -7530,6 +7551,7 @@ async fn serve_account_stream(
                                 "login manifest pull timed out; receive loop stays live"
                             );
                         }
+                        outcome
                     });
                     // profile 名字材料自动批（2026-10-16 profile 名字刷新
                     // 批，compat §5）：contacts sync / manifest 异步回传，
@@ -7538,18 +7560,56 @@ async fn serve_account_stream(
                     // best-effort 失败静默（零 stderr 纪律，显式方法/下次
                     // 链路建立重补；读面幂等）。触发面继承 60s 一次性纪律
                     // （重连风暴不重复），每窗至多一批。
+                    // （收件箱闸批①）：JoinHandle 保留给完成 join；预热
+                    // 两步移入 join 臂随通知之后（见下）。
                     let refresh_service = Arc::clone(service);
                     let refresh_account = number.to_owned();
-                    tokio::task::spawn_local(async move {
+                    let refresh_join = tokio::task::spawn_local(async move {
                         tokio::time::sleep(Duration::from_millis(
                             profile_refresh::AUTO_REFRESH_SETTLE_MS,
                         ))
                         .await;
-                        let _ = profile_refresh::refresh_contact_profiles(
+                        profile_refresh::refresh_contact_profiles(
                             &refresh_service,
                             &refresh_account,
                         )
-                        .await;
+                        .await
+                    });
+                    // 收件箱闸批① join 臂：官方 background.preload.ts 步骤 7
+                    // 「Wait for critical post-registration syncs before
+                    // showing inbox」的引擎侧完成时刻——两腿 join 落定后恒发
+                    // 一条 `engine.initialSyncComplete`（逐腿如实布尔，失败
+                    // 腿 false；官方 complete 信号仅成功路径发的语义由消费方
+                    // 按 ok face 落定）。预热两步（send 性能批/whitelist 批，
+                    // compat §5）沿原序随其后：gate 放行前收件箱不可达，预热
+                    // 顺位后移零观感、语义零变化（≤10s 整批 + 失败静默不变）。
+                    let join_service = Arc::clone(service);
+                    let join_account = number.to_owned();
+                    tokio::task::spawn_local(async move {
+                        // JoinHandle 本身是 Result（JoinError = 任务 panic）——
+                        // 两层都如实折进 face：内层超时（None）/该腿 Err/外层
+                        // JoinError 任一 = false（官方失败不发 complete 同义，
+                        // 桌面半边超时兜底）。
+                        let manifest_ok = match manifest_join.await {
+                            Ok(Some((contacts, groups))) => {
+                                contacts.is_ok() && groups.is_ok()
+                            }
+                            _ => false,
+                        };
+                        let profiles_ok = refresh_join
+                            .await
+                            .map(|refreshed| refreshed.is_ok())
+                            .unwrap_or(false);
+                        join_service
+                            .notify(
+                                &join_account,
+                                initial_sync_complete_notification(
+                                    &join_account,
+                                    manifest_ok,
+                                    profiles_ok,
+                                ),
+                            )
+                            .await;
                         // 启动预热批（send 性能批 2026-10-16，compat §5）：
                         // 刷新批之后同一沉降带一次发送路径预热（近活跃会话
                         // 目标收集 → 独立 Manager ensure_session，零真实
@@ -7557,8 +7617,8 @@ async fn serve_account_stream(
                         // 计数）。触发面继承 60s 一次性纪律（重连风暴不
                         // 重复轰），每窗至多一批。
                         send_warmup::warm_after_profile_refresh(
-                            &refresh_service,
-                            &refresh_account,
+                            &join_service,
+                            &join_account,
                         )
                         .await;
                         // whitelist 冷启动预热（发送长尾修3，compat §5）：
@@ -7570,8 +7630,8 @@ async fn serve_account_stream(
                         // 上抛、失败不毒缓存；60s 一次性纪律随本臂继承
                         // （重连风暴不重复轰），每窗至多一次。
                         send_warmup::warm_whitelist_cache(
-                            &refresh_service,
-                            &refresh_account,
+                            &join_service,
+                            &join_account,
                         )
                         .await;
                     });
@@ -21289,6 +21349,37 @@ mod tests {
         assert_eq!(
             strict_parse(&fetch),
             Some(("acct".to_owned(), "fetchLatest".to_owned(), false, true))
+        );
+        // 词表外方法名整拒（consumer 侧 default 臂语义）。
+        assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
+    }
+
+    /// `engine.initialSyncComplete` 通知帧消费方测试替身（收件箱闸批①
+    /// wire additive）：方法名入词表、params 恰三键逐键验型，坏形状整拒
+    /// ——storagePull 同款验收纪律，connector/desktop 转发链照此对账。
+    #[test]
+    fn initial_sync_complete_notification_shape_pins_wire_contract() {
+        fn strict_parse(value: &Value) -> Option<(String, bool, bool)> {
+            if value["method"] != "engine.initialSyncComplete" || value["jsonrpc"] != "2.0" {
+                return None;
+            }
+            let params = value["params"].as_object()?;
+            if params.len() != 3 {
+                return None;
+            }
+            Some((
+                params["account"].as_str()?.to_owned(),
+                params["manifestOk"].as_bool()?,
+                params["profilesOk"].as_bool()?,
+            ))
+        }
+
+        let ok = initial_sync_complete_notification("acct", true, true);
+        assert_eq!(strict_parse(&ok), Some(("acct".to_owned(), true, true)));
+        let partial = initial_sync_complete_notification("acct", false, true);
+        assert_eq!(
+            strict_parse(&partial),
+            Some(("acct".to_owned(), false, true))
         );
         // 词表外方法名整拒（consumer 侧 default 臂语义）。
         assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
