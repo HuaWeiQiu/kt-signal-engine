@@ -229,15 +229,39 @@ fn write_json(out: &mut dyn Write, value: serde_json::Value) -> Result<(), Histo
     Ok(())
 }
 
+/// given/family 拼接（两空 = 空串；官方 "given family" 空格规则）。
+fn join_given_family(given: &str, family: &str) -> String {
+    let mut name = given.trim().to_string();
+    let family = family.trim();
+    if !family.is_empty() {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(family);
+    }
+    name
+}
+
 fn recipient_record(r: &Recipient) -> serde_json::Value {
     let (kind, name) = match &r.destination {
         Some(recipient::Destination::Contact(c)) => {
-            let mut name = c.system_given_name.clone();
-            if !c.system_family_name.is_empty() {
-                if !name.is_empty() {
-                    name.push(' ');
-                }
-                name.push_str(&c.system_family_name);
+            // 官方名字优先级（台账 §29.22）：nickname（用户备注）>
+            // profile_given/family（对端资料名）> system_given/family（遗留）。
+            // 现代手机备份只填 profile 面，系统名恒空——旧实现只读系统名
+            // 导致迁移档案 recipient 名字全空（群成员/直聊永久「未知联系人」
+            // 的最后一跳根因）。
+            let mut name = String::new();
+            if let Some(nick) = c.nickname.as_ref() {
+                name = join_given_family(&nick.given, &nick.family);
+            }
+            if name.is_empty() {
+                name = join_given_family(
+                    c.profile_given_name.as_deref().unwrap_or(""),
+                    c.profile_family_name.as_deref().unwrap_or(""),
+                );
+            }
+            if name.is_empty() {
+                name = join_given_family(&c.system_given_name, &c.system_family_name);
             }
             ("contact", name)
         }
