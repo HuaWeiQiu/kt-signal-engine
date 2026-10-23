@@ -5259,7 +5259,7 @@ b719997（T-2/T-9 批）落地后的两个信号缺口之第 1 缺的事件面�
     "method": "engine.storagePull",
     "params": {
       "account": "+1555…",
-      "trigger": "login" | "fetchLatest",
+      "trigger": "login" | "fetchLatest" | "reconnect",
       "contactsOk": <bool>,
       "groupsOk": <bool>
     }
@@ -5268,10 +5268,13 @@ b719997（T-2/T-9 批）落地后的两个信号缺口之第 1 缺的事件面�
 
   `account` 为通知通道惯例域（receive.emptied/receive.clockskew 同款，多账号归属
   必需）；`trigger` 与 T-9 打点触发键单射（`storage_manifest_pull_login` →
-  `login`、`storage_manifest_pull` → `fetchLatest`）；`contactsOk`/`groupsOk` 两腿
+  `login`、`storage_manifest_pull` → `fetchLatest`、批 R 增补
+  `storage_manifest_pull_reconnect` → `reconnect`）；`contactsOk`/`groupsOk` 两腿
   逐腿如实布尔（`false` = 该腿 Err，含未注册账号 UnknownAccount——失败如实上报
-  正是本批目的）。规格三字段 `trigger/contactsOk/groupsOk` 逐字不动。
-- **触发面恰两臂**：登录期自动拉（60s 闸臂体）与 fetchLatest 消费臂窗沿，都走
+  正是本批目的）。规格三字段 `trigger/contactsOk/groupsOk` 逐字不动；未知
+  `trigger` 值消费方透传不受影响（additive 纪律）。
+- **触发面恰三臂**（批 R 起）：登录期自动拉（60s 闸臂体）、fetchLatest 消费臂
+  窗沿与 landing 版本闸触发臂（见下批 R 增补段），都走
   `pull_storage_manifest` 单点 → 每拉恰一条，不重不漏。connector 显式 RPC 链
   （storage.mergeContacts/storage.importGroups 直调 Service 方法）不经本单点，
   **不产生本事件**（消费方勿把本事件当 RPC 应答面）。
@@ -5296,6 +5299,50 @@ b719997（T-2/T-9 批）落地后的两个信号缺口之第 1 缺的事件面�
   「零通知出站」断言由结果事件契约取代（每拉恰一条 storagePull + 观测批空
   conversationState 零帧）。既有事件通道测试不动（receive.emptied/clockskew/
   conversationState 形状面原样）。
+
+### 批 R landing 版本轻检查 + 重连触发臂（2026-10-24，`engine.storagePull` trigger `reconnect` additive【engine-compat】）
+
+用户质询「重连语义已一致」后的两缺口复核收口。官方锚（只读取证，零抄码）：
+
+1. **协议面无 storage 变更独立 push 类型**：`Envelope.Type` 枚举仅
+   UNKNOWN/DOUBLE_RATCHET/PREKEY_MESSAGE/SERVER_DELIVERY_RECEIPT/
+   UNIDENTIFIED_SENDER/PLAINTEXT_CONTENT（SignalService.proto:14-71）；
+   Storage Service 纯 HTTP 无 watch/notification（WebAPI.preload.ts:1838 仅
+   chatService 走 websocket，SignalStorage.proto 无 watch 消息）——官方
+   「实时」增量同样只有改 manifest 设备发的 `SyncMessage.fetchLatest
+   {STORAGE_MANIFEST}` E2E 信封（background.preload.ts:3689-3692），我方
+   T-9 消费臂（500ms 防抖）已在位。**trigger `push` 无 wire 面，不做假
+   实现**（如实记档，留待协议面出现再补）。
+2. **官方重连版本比较**：每次 auth socket 连接 `enableStorageService()`
+   （background.preload.ts:1919-1924——实现只是置 enabled 旗标，
+   storage.preload.ts:2718-2728）；sync job 的 `fetchManifest(localVersion)`
+   走条件 GET `/v1/storage/manifest/version/{v}`，204 = "no newer manifest,
+   ok" 恰跳过（storage.preload.ts:1398-1424）。
+
+引擎对位（替代官方 watch 语义，零差零流量）：
+
+- **landing 版本轻检查**：每次链路建立无视 60s 窗裁定一腿——登录腿已排程
+  （首连 60s 窗开）让位（登录全量拉即版本处理超集，
+  `landing_version_check_due` 纯函数钉形）；窗内重连（登录腿被闸压掉，恰
+  是旧实现跳过重拉的缺口）→ `manifest_version_probe`：本地 manifest 状态
+  version（storage-manifest-state.json）为基线条件 GET（vendored
+  `StorageService::manifest_if_changed`，与官方 greaterThanVersion 同面）→
+  版本闸纯函数落裁：Same/NoServerState → 跳过（skip 打点），Newer/
+  Unavailable → 全量拉 `trigger="reconnect"`（fail-open：探测不可判不跳，
+  读面幂等正确性优先）。
+- **拉后版本落账**：`pull_storage_manifest` 单点新增——任一腿 Ok 且
+  version ≥1 → 覆盖本地状态文件 version（contacts 腿优先、groups 兜底，
+  `pulled_manifest_version` 纯函数钉形）；version 0（fake 零汇总早退/服务
+  器无 storage 态）不落。两 outcome 增 `version` 字段（serde skip，
+  mergeContacts/importGroups RPC 应答形状冻结零变化）。并发写竞态旧值覆
+  盖自愈（服务器为真相源，探测 fail-open 重拉幂等）。
+- **wire additive 面**：`engine.storagePull.params.trigger` 增 `reconnect`
+  一词（消费方未知值透传不受影响）；无新方法、无新帧形。perf 键新增
+  `storage_manifest_pull_reconnect`/`storage_reconnect_check_skip`/
+  `storage_reconnect_check_err`（词表已登记）。
+- **单测（+4，改 2）**：版本闸 fail-open 四臂、landing 让位两臂、拉后版本
+  裁定四臂（新）；trigger 单射补 reconnect 臂、通知帧严格解析补 reconnect
+  词（改）。
 
 ### finishLink/listAccounts 账号自有 ACI 透出批（2026-10-13，connector 契约 1.142 消费面，wire additive）
 

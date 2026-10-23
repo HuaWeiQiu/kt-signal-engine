@@ -61,6 +61,11 @@ pub(crate) struct MergeOutcome {
     pub(crate) contacts_name_updated: u32,
     /// sidecar 信任态随 identityState 收敛次数。
     pub(crate) trust_states_synced: u32,
+    /// 本腿读到的 manifest version（批 R 重连版本闸拉后落账基线；
+    /// manifest 404/无 master key 早退 = 0 =「无 storage 态」哨兵）。
+    /// 引擎内部簿记面，RPC 应答序列化冻结（serde skip——wire 零变化）。
+    #[serde(skip)]
+    pub(crate) version: u64,
 }
 
 /// identityState（Storage ContactRecord 枚举）→ sidecar 信任态（官方
@@ -170,6 +175,9 @@ pub(crate) async fn merge_contacts(
         )) => return Ok((outcome, observed)),
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
+    // 批 R：本腿 manifest version 随行汇总（空 keys 早退前落值——version
+    // 是 manifest 面事实，与会话条目有无无关）。
+    outcome.version = manifest.version;
     let keys: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
@@ -340,6 +348,10 @@ pub(crate) struct GroupImportOutcome {
     pub(crate) already_known: u32,
     /// master key 坏形（≠32B）/群态拉取失败/落库失败。
     pub(crate) failed: u32,
+    /// 本腿读到的 manifest version（语义与 MergeOutcome::version 同构，
+    /// serde skip 同款冻结）。
+    #[serde(skip)]
+    pub(crate) version: u64,
 }
 
 /// Storage GroupV2Record masterKey → 群导入（窗D A5）：manifest 全部
@@ -385,6 +397,8 @@ pub(crate) async fn import_groups(
         )) => return Ok((outcome, observed)),
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
+    // 批 R：本腿 manifest version 随行汇总（merge_contacts 同位）。
+    outcome.version = manifest.version;
     let keys: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()

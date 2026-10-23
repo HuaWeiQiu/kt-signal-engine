@@ -1820,6 +1820,14 @@ async fn pull_storage_manifest(
     if groups.is_err() {
         perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
     }
+    // 批 R 版本落账：任一腿 Ok 且读到 version ≥1 → 覆盖本地 manifest 状态
+    // 文件的 version（重连版本闸比对基线；其余字段沿用旧值）。落账 best-
+    // effort：账号解析缺席静默跳过（基线缺失只影响下次 skip 判定，探测
+    // fail-open 重拉幂等自愈）；并发写竞态下旧值覆盖同理自愈（服务器为
+    // 真相源）。version 0（fake 早退/无 storage 态）不落。
+    if let Some(version) = pulled_manifest_version(&contacts, &groups) {
+        record_pulled_manifest_version(service, account, version).await;
+    }
     service
         .notify(
             account,
@@ -1829,28 +1837,115 @@ async fn pull_storage_manifest(
     (contacts, groups)
 }
 
+/// 批 R 拉后版本裁定（纯函数）：contacts 腿 Ok 优先、groups 腿 Ok 兜底；
+/// 双腿 Err 或版本 0（fake 零汇总早退/服务器无 storage 态哨兵）→ None
+/// 不落账。
+fn pulled_manifest_version(
+    contacts: &Result<storage_merge::MergeOutcome, storage_sync::StorageSyncError>,
+    groups: &Result<storage_merge::GroupImportOutcome, storage_sync::StorageSyncError>,
+) -> Option<u64> {
+    let version = contacts
+        .as_ref()
+        .ok()
+        .map(|outcome| outcome.version)
+        .or_else(|| groups.as_ref().ok().map(|outcome| outcome.version))?;
+    (version > 0).then_some(version)
+}
+
+/// 批 R 版本落账单点：账号目录解析（UnknownAccount/目录缺席 → 跳过）→
+/// manifest 状态文件 version 覆盖（save_manifest_state 临时文件 + rename
+/// 原子写，accountItemKey/stickerItemKeys None 沿旧值）。
+async fn record_pulled_manifest_version(service: &Arc<Service>, account: &str, version: u64) {
+    let rel = {
+        let state = service.state.lock().await;
+        state.account_dir(account)
+    };
+    let Some(rel) = rel else {
+        return;
+    };
+    storage_sync::save_manifest_state(
+        &service.data_dir.join(rel),
+        &storage_sync::ManifestState {
+            version,
+            account_item_key: None,
+            sticker_item_keys: None,
+        },
+    );
+}
+
 /// manifest 拉取结果通知（T-9b，wire additive，`engine.storagePull`，
-/// compat §5 契约 1.141 由 connector 侧登记、形状以本仓为权威）：两触发
+/// compat §5 契约 1.141 由 connector 侧登记、形状以本仓为权威）：各触发
 /// 臂解析后恒发恰一条。params = account（通道惯例域，receive.emptied 同
-/// 款）/ trigger（login | fetchLatest，perf 触发键单射映射）/ contactsOk
-/// / groupsOk——两腿逐腿如实布尔（false = 该腿 Err，含未注册账号
+/// 款）/ trigger（login | fetchLatest | reconnect，perf 触发键单射映射
+/// ——reconnect 为批 R landing 版本闸触发臂 additive 值，消费方未知值
+/// 透传不受影响）/ contactsOk / groupsOk——两腿逐腿如实布尔（false = 该腿 Err，含未注册账号
 /// UnknownAccount），成功面与 conversationState 差分正交（manifest 无
 /// 变化零翻转也有本事件可等）。补 b719997 双信号缺口之第 1 缺：失败此前
 /// 只有内部打点（storage_manifest_pull_err），桌面不可观测。best-effort：
 /// notify fire-and-forget（receive.emptied/receive.clockskew 同款），发射
 /// 不连坐拉取结果、不重试；connector 显式 RPC 链（storage.mergeContacts
 /// /storage.importGroups 直调）不经本单点，零新增通知。
+/// trigger perf 键 → wire 名单射（T-9b 批 R additive：reconnect 为
+/// landing 版本闸触发臂；词表外键沿旧兜底 fetchLatest——未知值透传
+/// 不炸消费面，与 connector/desktop 消费臂的透传纪律同构）。
+fn storage_pull_trigger_name(trigger: &str) -> &'static str {
+    match trigger {
+        perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN => "login",
+        perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT => "reconnect",
+        _ => "fetchLatest",
+    }
+}
+
+/// landing 版本轻检查让位裁定（纯函数）：登录腿已排程（首连 60s 窗开）
+/// → false——登录腿全量拉即版本处理超集，轻检查并行跑只剩双 GET；窗内
+/// 重连（登录腿被 60s 一次性闸压掉）→ true——本腿即官方「每次连接版本
+/// 比较处理增量」（background.preload.ts:1919-1924）的对位。
+fn landing_version_check_due(login_pull_scheduled: bool) -> bool {
+    !login_pull_scheduled
+}
+
+/// 批 R landing 版本轻检查 + 重连拉单腿（每次链路建立由 receive 臂
+/// spawn_local 调用，登录腿未排程时）：storage_sync::manifest_version_probe
+/// 条件 GET 落闸 → Skip 零流量恰跳过 / Pull（版本有差或探测不可判
+/// fail-open）全量拉（trigger=reconnect，经 pull_storage_manifest 单点：
+/// 两腿与版本落账照走、engine.storagePull 通知照发）。账号解析失败静默
+/// 早退（账号在收流建立后解绑，无 landing 语义可报）。
+async fn storage_reconnect_version_check(
+    service: &Arc<Service>,
+    account: &str,
+) -> Option<ManifestPullOutcome> {
+    let context = storage_context(service, account).await.ok()?;
+    let probe = storage_sync::manifest_version_probe(&context).await;
+    match storage_sync::manifest_version_gate(probe) {
+        storage_sync::VersionGateDecision::Skip => {
+            perf_metrics::add(perf_metrics::keys::STORAGE_RECONNECT_CHECK_SKIP, 1);
+            None
+        }
+        // Pull = 版本有差或探测不可判（fail-open）；后者加发探测失败计，
+        // 拉取面同臂（读面幂等，失败腿在 storagePull 事件如实位）。
+        storage_sync::VersionGateDecision::Pull => {
+            if probe == storage_sync::ManifestVersionProbe::Unavailable {
+                perf_metrics::add(perf_metrics::keys::STORAGE_RECONNECT_CHECK_ERR, 1);
+            }
+            Some(
+                pull_storage_manifest(
+                    service,
+                    account,
+                    perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+                )
+                .await,
+            )
+        }
+    }
+}
+
 fn storage_pull_notification(
     account: &str,
     trigger: &str,
     contacts_ok: bool,
     groups_ok: bool,
 ) -> Value {
-    let trigger_name = if trigger == perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN {
-        "login"
-    } else {
-        "fetchLatest"
-    };
+    let trigger_name = storage_pull_trigger_name(trigger);
     json!({
         "jsonrpc": "2.0",
         "method": "engine.storagePull",
@@ -7466,6 +7561,28 @@ async fn serve_account_stream(
     // T-9 fetchLatest 消费臂防抖簿（触发位在 Received::Content 臂；
     // 500ms trailing 窗沿毫秒簿记，窗沿 select 臂执行拉取）。
     let mut manifest_debounce = ManifestPullDebounce::default();
+    // 批 R landing 版本轻检查（官方 background.preload.ts:1919-1924 每次
+    // 连接 enableStorageService + storage.preload.ts:1398-1424
+    // fetchManifest(greaterThanVersion) 版本比较语义的对位）：每次链路
+    // 建立无视 60s 窗裁定一腿——登录腿已排程（首连窗开）时让位
+    // （landing_version_check_due：登录全量拉即版本处理超集，并行轻
+    // 检查只剩双 GET）；窗内重连（登录腿被 60s 闸压掉）时本腿补官方
+    // 「重连版本比较处理增量」缺口——条件 GET 版本有差/探测不可判 →
+    // 全量拉（trigger=reconnect），同版本 → 零差零流量恰跳过。独立任务
+    // 不阻塞收流循环；探测+拉取幂等，失败由下次链路建立重补。
+    // 协议面记档（如实记档不做假实现）：服务器 storage 变更无独立 push
+    // 类型——Envelope.Type 枚举无该变体（SignalService.proto:14-71），Storage
+    // Service 纯 HTTP 无 watch/notification（WebAPI.preload.ts:1838 仅
+    // chatService 走 websocket；SignalStorage.proto 无 watch 消息），官方
+    // 实时增量同样只有 fetchLatest E2E 信封（已有消费臂）——trigger
+    // "push" 无 wire 面，不设空映射。
+    if landing_version_check_due(sync_pending.is_some()) {
+        let landing_service = Arc::clone(service);
+        let landing_account = number.to_owned();
+        tokio::task::spawn_local(async move {
+            let _ = storage_reconnect_version_check(&landing_service, &landing_account).await;
+        });
+    }
     // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
@@ -21275,9 +21392,10 @@ mod tests {
         assert!(rx.try_recv().is_err(), "无其他帧");
     }
 
-    /// T-9b 结果事件面（契约 1.141 引擎腿）：两触发臂各发恰一条，trigger
+    /// T-9b 结果事件面（契约 1.141 引擎腿）：三触发臂各发恰一条，trigger
     /// wire 名与 perf 触发键单射（storage_manifest_pull → fetchLatest、
-    /// storage_manifest_pull_login → login），腿位如实，通道无残余帧。
+    /// storage_manifest_pull_login → login、storage_manifest_pull_reconnect
+    /// → reconnect 批 R additive），腿位如实，通道无残余帧。
     #[tokio::test]
     async fn storage_pull_result_event_fires_per_trigger_with_truthy_legs() {
         let data_dir = std::env::temp_dir().join(format!(
@@ -21306,6 +21424,16 @@ mod tests {
         )
         .await;
         expect_storage_pull_notice(&mut rx, "+15550000001", "fetchLatest", legs_ok, legs_ok);
+
+        // 批 R：重连版本闸触发臂（landing 轻检查裁定拉取 → trigger
+        // reconnect additive 值）。
+        let _ = pull_storage_manifest(
+            &service,
+            "+15550000001",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+        )
+        .await;
+        expect_storage_pull_notice(&mut rx, "+15550000001", "reconnect", legs_ok, legs_ok);
 
         assert!(rx.try_recv().is_err(), "每拉恰一帧，无其他通知");
     }
@@ -21350,8 +21478,74 @@ mod tests {
             strict_parse(&fetch),
             Some(("acct".to_owned(), "fetchLatest".to_owned(), false, true))
         );
+        // 批 R：reconnect additive 触发词（landing 版本闸臂）。
+        let reconnect = storage_pull_notification(
+            "acct",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+            true,
+            true,
+        );
+        assert_eq!(
+            strict_parse(&reconnect),
+            Some(("acct".to_owned(), "reconnect".to_owned(), true, true))
+        );
         // 词表外方法名整拒（consumer 侧 default 臂语义）。
         assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
+    }
+
+    /// 批 R landing 版本轻检查让位裁定钉形：登录腿排程 = 首连窗开，登录
+    /// 全量拉即版本处理超集，轻检查让位（防同 landing 双 GET 双拉）；登录
+    /// 腿被 60s 一次性闸压掉（重连）= 轻检查登场（官方重连版本比较对位）。
+    #[test]
+    fn landing_version_check_yields_to_login_pull() {
+        assert!(
+            !landing_version_check_due(true),
+            "登录腿排程时让位（首连全量拉为超集）"
+        );
+        assert!(
+            landing_version_check_due(false),
+            "窗内重连（登录腿缺席）时轻检查登场"
+        );
+    }
+
+    /// 批 R 拉后版本裁定钉形：contacts 腿 Ok 优先、groups 腿 Ok 兜底、
+    /// 双腿 Err → None、version 0（fake 零汇总早退/服务器无 storage 态
+    /// 哨兵）→ None 不落账。
+    #[test]
+    fn pulled_manifest_version_prefers_contacts_then_groups() {
+        let contacts_ok = |version: u64| {
+            Ok(storage_merge::MergeOutcome {
+                version,
+                ..storage_merge::MergeOutcome::default()
+            })
+        };
+        let groups_ok = |version: u64| {
+            Ok(storage_merge::GroupImportOutcome {
+                version,
+                ..storage_merge::GroupImportOutcome::default()
+            })
+        };
+        let err = || storage_sync::StorageSyncError::UnknownAccount;
+        assert_eq!(
+            pulled_manifest_version(&contacts_ok(7), &groups_ok(9)),
+            Some(7),
+            "contacts 腿 Ok 优先"
+        );
+        assert_eq!(
+            pulled_manifest_version(&Err(err()), &groups_ok(9)),
+            Some(9),
+            "contacts Err → groups 腿兜底"
+        );
+        assert_eq!(
+            pulled_manifest_version(&Err(err()), &Err(err())),
+            None,
+            "双腿 Err 不落账"
+        );
+        assert_eq!(
+            pulled_manifest_version(&contacts_ok(0), &Err(err())),
+            None,
+            "version 0 哨兵不落账"
+        );
     }
 
     /// `engine.initialSyncComplete` 通知帧消费方测试替身（收件箱闸批①
