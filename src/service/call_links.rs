@@ -673,7 +673,7 @@ pub(crate) async fn group_members(
     context: &StorageContext,
     master_key: &[u8],
 ) -> Result<Vec<MemberMaterial>, CallCredentialError> {
-    let group = super::groups::fetch_group_state(context, master_key).await?;
+    let group = super::groups::fetch_group_state(context, master_key, "call_members").await?;
     let key: [u8; 32] = master_key
         .try_into()
         .map_err(|_| CallCredentialError::UnknownGroup)?;

@@ -4989,7 +4989,7 @@ impl Service {
             return Err(groups::TerminateError::InviteLinkUnset);
         }
         let context = storage_context(self, account).await?;
-        let group = groups::fetch_group_state(&context, master_key).await?;
+        let group = groups::fetch_group_state(&context, master_key, "invite_link").await?;
         if group.invite_link_password.is_empty() {
             return Err(groups::TerminateError::InviteLinkUnset);
         }
@@ -5354,8 +5354,26 @@ impl Service {
         if !self.real {
             return Ok(storage_merge::GroupImportOutcome::default());
         }
+        // P1 群状态链打点（§29.18）：链入口行——登录窗 manifest 自动拉、
+        // fetchLatest 消费臂、connector 显式 RPC 三链都经本单点。有入口行
+        // 才谈得上「链跑没跑」；无入口行 = 消费方从未调用（诊断分叉点）。
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "import_groups_enter",
+            account = %crate::methods::probe_account8(Some(account)),
+            "group state import leg entered"
+        );
         let context = storage_context(self, account).await?;
-        let (outcome, observed) = storage_merge::import_groups(context).await?;
+        let result = storage_merge::import_groups(context).await;
+        if result.is_err() {
+            tracing::warn!(
+                target: "engine.groupstate",
+                stage = "import_groups_error",
+                account = %crate::methods::probe_account8(Some(account)),
+                "group state import leg failed"
+            );
+        }
+        let (outcome, observed) = result?;
         self.publish_conversation_state_observations(account, observed)
             .await;
         Ok(outcome)
