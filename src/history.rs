@@ -22,9 +22,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use libsignal_account_keys::BackupKey;
 use libsignal_message_backup::frame::{FileReaderFactory, FramesReader, VerifyHmac};
-use libsignal_message_backup::key::MessageBackupKey;
 use libsignal_message_backup::parse::VarintDelimitedReader;
 use prost::Message as _;
 
@@ -67,6 +65,11 @@ pub enum HistoryError {
     Json(#[from] serde_json::Error),
     #[error("no frames in archive")]
     NoFrames,
+    /// 首帧 BackupInfo.version ≠ 1（官方 constants.std.ts:14
+    /// `BACKUP_VERSION = 1n`；import.preload.ts:342-344
+    /// UnsupportedBackupVersion 同语义——未知未来版本拒绝，不猜）。
+    #[error("unsupported backup version: {0} (supported: 1)")]
+    UnsupportedBackupVersion(u64),
 }
 
 /// 解密 `archive` 并把逐帧中间表示写入 `out`（NDJSON，一行一记录）。
@@ -80,13 +83,17 @@ pub async fn export_archive(
     ephemeral_backup_key: [u8; 32],
     out: &mut dyn Write,
 ) -> Result<ExportStats, HistoryError> {
-    let backup_key: BackupKey = BackupKey(ephemeral_backup_key);
-    let backup_id =
-        backup_key.derive_backup_id(&presage::libsignal_service::protocol::Aci::from(aci));
-    let key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+    // 容器钥 = L2 单点 `BackupKeys::from_raw_key` 的 legacy 臂（官方
+    // index.preload.ts:840 `getKeyMaterial(new BackupKey(ephemeralKey))`
+    // 同一派生面只换根钥来源：裸根 32B → BackupId → MessageBackupKey
+    // DST 20241007 无 FS token；remote 臂见 `backup::transfer`）。
+    let keys = crate::backup::keys::BackupKeys::from_raw_key(
+        &ephemeral_backup_key,
+        &presage::libsignal_service::protocol::Aci::from(aci),
+    );
 
     let factory = FileReaderFactory { path: archive };
-    let frames = FramesReader::new(&key, factory).await?;
+    let frames = FramesReader::new(&keys.message_key, factory).await?;
     let mut delimited = VarintDelimitedReader::new(frames);
 
     let stats = export_frames_loop(&mut delimited, out, &aci).await?;
@@ -118,6 +125,11 @@ where
 {
     let first = delimited.read_next().await?.ok_or(HistoryError::NoFrames)?;
     let info = crate::proto::BackupInfo::decode(&first[..])?;
+    // 首帧版本硬校验（官方 import.preload.ts:342-344 同位）：≠1 即拒，
+    // 档案级早失败先于任何投影。
+    if info.version != 1 {
+        return Err(HistoryError::UnsupportedBackupVersion(info.version));
+    }
     let mut stats = ExportStats {
         backup_version: info.version,
         frames: 1,
@@ -1432,9 +1444,11 @@ mod tests {
         GroupChangeChatUpdate, GroupExpirationTimerUpdate, StandardMessage, Text,
     };
     use base64::Engine as _;
+    use libsignal_account_keys::BackupKey;
     use libsignal_message_backup::export::{
         aes_cbc_encrypt, gzip_compress, hmac_checksum, pad_gzipped_bucketed,
     };
+    use libsignal_message_backup::key::MessageBackupKey;
 
     /// 16 字节档案 aci → 小写连字 UUID「6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b」。
     const CONTACT_ACI_BYTES: [u8; 16] = [
