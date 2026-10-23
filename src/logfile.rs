@@ -53,8 +53,31 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// 轮转保留代数：`.log.1` + `.log.2`（契约保留 2 个轮转）。
 const ROTATED_KEEP: usize = 2;
 /// 文件级别上限：warn（vendor error!/warn! 失败证据 + 引擎自有 warn 行；
-/// trace 恒关——headers/URI 仅在 trace 级，纪律红线）。
-const MAX_LEVEL: LevelFilter = LevelFilter::WARN;
+/// trace 恒关——headers/URI 仅在 trace 级，纪律红线）。唯一窄口例外见
+/// [`OBSERVABILITY_INFO_TARGETS`]。
+///
+/// 注：`tracing::Level` 的 Ord 是 `ERROR > WARN > INFO > DEBUG > TRACE`，
+/// 因此「warn 上限」不能用 `level <= Level::WARN` 表达（那样连 info 也放
+/// 行）。逐事件判定收在 [`event_observable`]，这里只给订阅器 hint。
+const HINT_LEVEL: LevelFilter = LevelFilter::INFO;
+
+/// 观测白名单（info 级允许落盘的 target）：D0 转移归档链全程打点
+/// （`engine.transfer`，D0 真机重验前置，台账 §29.10.8/§29.18）必须在
+/// `engine-stderr.log` 可复盘——否则这些 info 打点等于不存在（hint 曾在
+/// warn，info 调用点注册期即被判 `Interest::never`，一条也出不来）。只有
+/// 白名单 target 的 info 落盘，其余 info 恒弃，日志体量与既有 warn+ 语义
+/// 不变（2026-10-23 合流批，D0 观测准备）。
+const OBSERVABILITY_INFO_TARGETS: &[&str] = &["engine.transfer"];
+
+/// 事件是否落盘：error/warn 恒落（原契约）；info 仅白名单 target 落；
+/// debug/trace 恒弃。hint 上界是 info，逐事件在此收紧。
+fn event_observable(level: Level, target: &str) -> bool {
+    match level {
+        Level::ERROR | Level::WARN => true,
+        Level::INFO => OBSERVABILITY_INFO_TARGETS.contains(&target),
+        Level::DEBUG | Level::TRACE => false,
+    }
+}
 
 /// 日志文件名（data 目录下 logs/ 子目录内）。
 const LOG_FILE_NAME: &str = "engine-stderr.log";
@@ -237,7 +260,7 @@ pub(crate) struct RollingFileSubscriber {
 
 impl Subscriber for RollingFileSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        *metadata.level() <= Level::WARN
+        event_observable(*metadata.level(), metadata.target())
     }
 
     fn new_span(&self, _span: &Attributes<'_>) -> Id {
@@ -271,11 +294,15 @@ impl Subscriber for RollingFileSubscriber {
         // 临终现场环形缓冲 + ka_diag 沉淀（现场保全批）：warn+ 每行顺手
         // 进 ring（克隆代价可忽略——warn 级稀疏）；ka_diag 行另记时间戳与
         // 整行作连接退化第一证据。锁顺序：ring/ka 锁与 state 锁互不嵌套。
-        if let Ok(mut ring) = LAST_MOMENTS_RING.lock() {
-            if ring.len() >= LAST_MOMENTS_RING_LINES {
-                ring.pop_front();
+        // 环形缓冲维持 warn+ 语义（白名单 info 打点不得挤占临终现场：
+        // poll_204 单次重链可至 60 行）。
+        if matches!(event.metadata().level(), &Level::ERROR | &Level::WARN) {
+            if let Ok(mut ring) = LAST_MOMENTS_RING.lock() {
+                if ring.len() >= LAST_MOMENTS_RING_LINES {
+                    ring.pop_front();
+                }
+                ring.push_back(line.clone());
             }
-            ring.push_back(line.clone());
         }
         if line.contains("ka_diag") {
             LAST_KA_DIAG_AT_MS.store(
@@ -300,11 +327,13 @@ impl Subscriber for RollingFileSubscriber {
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(MAX_LEVEL)
+        Some(HINT_LEVEL)
     }
 
     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
-        if *metadata.level() <= Level::WARN {
+        // 白名单 target 的 info 调用点必须注册（否则 hint 之外的静态闸会
+        // 把它判成 never）；其余 target 仍按 warn+ 注册。
+        if event_observable(*metadata.level(), metadata.target()) {
             Interest::always()
         } else {
             Interest::never()
@@ -519,6 +548,74 @@ mod tests {
         assert_eq!(ts.len(), 24, "RFC3339 毫秒长度: {ts}");
         assert_eq!(&ts[4..5], "-", "ts 分隔: {ts}");
         assert!(ts.ends_with('Z'), "ts UTC 尾: {ts}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 观测白名单闸（D0 观测准备批）：warn/error 恒落盘；info 仅在白名单
+    /// target（`engine.transfer`）落盘；debug/trace 恒弃。
+    #[test]
+    fn info_observability_whitelist_arms() {
+        assert!(event_observable(Level::ERROR, "anything"));
+        assert!(event_observable(Level::WARN, "kt_signal_engine::service"));
+        assert!(event_observable(Level::INFO, "engine.transfer"));
+        assert!(!event_observable(Level::INFO, "kt_signal_engine::service"));
+        assert!(!event_observable(Level::DEBUG, "engine.transfer"));
+        assert!(!event_observable(Level::TRACE, "engine.transfer"));
+    }
+
+    /// 端到端：白名单 target 的 info 事件真落盘（D0 真机复盘面），且不进
+    /// 临终现场环形缓冲；非白名单 info 仍被挡下。
+    #[test]
+    fn subscriber_writes_whitelisted_info_target_only() {
+        let dir = sandbox("info-whitelist");
+        let current = dir.join(LOG_FILE_NAME);
+        fs::create_dir_all(&dir).expect("dir");
+        let state = LogState {
+            dir: dir.clone(),
+            current: current.clone(),
+            file: open_log_file(&current),
+            size: 0,
+        };
+        let subscriber = RollingFileSubscriber {
+            state: Mutex::new(state),
+        };
+        reset_last_moments_for_test();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "engine.transfer",
+                stage = "poll_204",
+                round = 1u32,
+                "transfer_archive poll 204; phone side not ready yet"
+            );
+            tracing::info!(target: "kt_signal_engine::service", "plain-info-must-not-land");
+            tracing::warn!(target: "engine.transfer", "transfer_archive poll failed");
+        });
+        let content = fs::read_to_string(&current).expect("log content");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "info(白名单)+warn 各一行: {content:?}");
+        assert!(
+            lines[0].contains(" INFO engine.transfer: transfer_archive poll 204"),
+            "白名单 info 行: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("stage=\"poll_204\""),
+            "字段: {}",
+            lines[0]
+        );
+        assert!(
+            !content.contains("plain-info-must-not-land"),
+            "非白名单 info 不得落盘"
+        );
+        // 环形缓冲（临终现场）仍只收 warn+：白名单 info 行不占位（ring 是
+        // 进程级静态，并行测试别的 warn 行可能已入队，故按内容判定）。
+        let ring = LAST_MOMENTS_RING.lock().expect("ring lock");
+        assert!(
+            !ring.iter().any(|line| line.contains("poll 204")),
+            "info 不得进 ring: {:?}",
+            ring.iter().collect::<Vec<_>>()
+        );
+        drop(ring);
         let _ = fs::remove_dir_all(&dir);
     }
 }
