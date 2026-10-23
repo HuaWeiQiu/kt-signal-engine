@@ -489,8 +489,35 @@ pub(crate) async fn patch_group(
 pub(crate) async fn fetch_group_state(
     context: &StorageContext,
     master_key: &[u8],
+    caller: &'static str,
 ) -> Result<presage::libsignal_service::groups_v2::Group, TerminateError> {
-    let authorization = group_authorization(context, master_key).await?;
+    // P1 群状态链打点（§29.18）：单点入口行——caller 逐调用路径标注
+    // （approve_join/terminate/update_group/leave_group/write_refresh/
+    // migrate_probe/call_members/send_probe），「链有没有跑到群态解密」
+    // 从此是第一手证据而不是推测。只落固定字面量 + 计数/时长，无群名、
+    // 无成员、无密钥材料。
+    let started = std::time::Instant::now();
+    tracing::warn!(
+        target: "engine.groupstate",
+        stage = "group_state_fetch",
+        caller,
+        account = %crate::methods::probe_account8(Some(context.account.as_str())),
+        master_key_len = master_key.len(),
+        "group state fetch entered"
+    );
+    let authorization = match group_authorization(context, master_key).await {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            tracing::warn!(
+                target: "engine.groupstate",
+                stage = "group_state_failed",
+                caller,
+                phase = "authorization",
+                "group state fetch failed before network (authorization)"
+            );
+            return Err(error);
+        }
+    };
     let response = context
         .push
         .request(
@@ -504,6 +531,14 @@ pub(crate) async fn fetch_group_state(
         .map_err(|_| TerminateError::Unavailable)?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "group_state_failed",
+            caller,
+            phase = "http_status",
+            status,
+            "group state fetch rejected by server"
+        );
         return Err(TerminateError::Failed {
             status: Some(status),
         });
@@ -514,12 +549,51 @@ pub(crate) async fn fetch_group_state(
         .map_err(|_| TerminateError::Unavailable)?;
     let encrypted = presage::proto::Group::decode(bytes.as_ref())
         .map_err(|_| TerminateError::Failed { status: None })?;
-    let group = decrypt_group(master_key, encrypted)
-        .map_err(|_| TerminateError::Failed { status: None })?;
+    let group = match decrypt_group(master_key, encrypted) {
+        Ok(group) => group,
+        Err(_) => {
+            tracing::warn!(
+                target: "engine.groupstate",
+                stage = "group_state_failed",
+                caller,
+                phase = "decrypt",
+                "group state decrypt failed"
+            );
+            return Err(TerminateError::Failed { status: None });
+        }
+    };
+    // P1 群状态链打点（§29.18）：解密成功行 = 「群态真的过了解密」。
+    // 成员数/版本/终止位是群态自身的非身份字段（无群名、无成员 ACI）。
+    tracing::warn!(
+        target: "engine.groupstate",
+        stage = "group_state_decrypted",
+        caller,
+        account = %crate::methods::probe_account8(Some(context.account.as_str())),
+        members = group.members.len(),
+        pending_members = group.members_pending_profile_key.len(),
+        revision = group.version,
+        terminated = group.terminated,
+        dur_ms = started.elapsed().as_millis() as u64,
+        "group state decrypted"
+    );
     // 群态成员 profileKey 落库 + 新键触发联动（未知联系人根因批，台账
     // §29.13）：本函数是全部合并/应用群态路径（restore/写后刷新/读面/
     // 发送探针）的解密必经点，在此单点提取；best-effort，零错误语义变化。
-    if persist_member_profile_keys(&context.store, &group).await {
+    let keys = persist_member_profile_keys(&context.store, &group).await;
+    tracing::warn!(
+        target: "engine.groupstate",
+        stage = "group_state_member_keys",
+        caller,
+        account = %crate::methods::probe_account8(Some(context.account.as_str())),
+        members = keys.members,
+        with_key = keys.with_key,
+        new_keys = keys.new_keys,
+        same_skipped = keys.same_skipped,
+        zero_skipped = keys.zero_skipped,
+        write_failed = keys.write_failed,
+        "group state member profile keys extracted"
+    );
+    if keys.new_keys > 0 {
         spawn_profile_refresh_after_group_keys(context);
     }
     Ok(group)
@@ -533,25 +607,48 @@ static GROUP_KEY_REFRESH_WINDOWS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// 群态成员 profileKey 提取计数（P1 群状态链打点批，§29.18）：把
+/// 「提取点到底跑了没有、跑了产出什么」变成本仓可观测的第一手计数。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemberKeyOutcome {
+    /// 群态成员总数。
+    pub(crate) members: usize,
+    /// 携非零 profileKey 的成员数（= 可落库材料）。
+    pub(crate) with_key: usize,
+    /// 本次实际新落/换键的成员数（触发刷新联动的唯一判据）。
+    pub(crate) new_keys: usize,
+    /// 键已在库且同值（幂等重放）。
+    pub(crate) same_skipped: usize,
+    /// 全零键（官方不发明材料，诚实跳过）。
+    pub(crate) zero_skipped: usize,
+    /// 落库失败的成员数（best-effort，不断链）。
+    pub(crate) write_failed: usize,
+}
+
 /// 群状态成员 profileKey 落库（未知联系人根因修复批，台账 §29.13）：官方
 /// V2 群态每成员携 profileKey（群密文随态下行，decrypt_group 已解明文，
 /// `Group.members` 的 aci/profile_key 成对在库）；V2 群发送信封无
 /// sourceName，名字只能经 profile 拉取，拉取目标需 profileKey 先行落库——
 /// 缺此面即「刷新无目标」死锁。逐成员落 presage profile_keys 表（contacts
 /// 同步 / receive profileKeyUpdate 同一位，不发明存储）：全零键诚实跳过
-/// （不发明材料）；同值键幂等跳过；仅首次/换 key 计新（返回值 = 有新
-/// 键，触发面据此联动刷新批）。best-effort：单成员失败不断链，读面零回
-/// 滚（下个群态窗自然收敛）。
+/// （不发明材料）；同值键幂等跳过；仅首次/换 key 计新（`new_keys` =
+/// 触发面判据）。best-effort：单成员失败不断链，读面零回滚（下个群态窗
+/// 自然收敛）。返回逐臂计数（P1 打点批起为结构体，语义不变）。
 async fn persist_member_profile_keys(
     store: &SqliteStore,
     group: &presage::libsignal_service::groups_v2::Group,
-) -> bool {
+) -> MemberKeyOutcome {
     use presage::store::ContentsStore as _;
-    let mut new_keys = false;
+    let mut outcome = MemberKeyOutcome {
+        members: group.members.len(),
+        ..MemberKeyOutcome::default()
+    };
     for member in &group.members {
         if member.profile_key.bytes == [0u8; 32] {
+            outcome.zero_skipped += 1;
             continue;
         }
+        outcome.with_key += 1;
         let service_id = presage::libsignal_service::protocol::ServiceId::Aci(member.aci);
         let existing = store
             .profile_key(&service_id)
@@ -560,6 +657,7 @@ async fn persist_member_profile_keys(
             .flatten()
             .map(|key| key.bytes);
         if existing == Some(member.profile_key.bytes) {
+            outcome.same_skipped += 1;
             continue;
         }
         // upsert_profile_key 是 &mut 面（trait 纪律）：SqliteStore 是连接
@@ -570,10 +668,12 @@ async fn persist_member_profile_keys(
             .await
             .is_ok()
         {
-            new_keys = true;
+            outcome.new_keys += 1;
+        } else {
+            outcome.write_failed += 1;
         }
     }
-    new_keys
+    outcome
 }
 
 /// 新键触发联动（同批）：群态合并新落 profileKey → 标记刷新待跑，形态沿
@@ -619,7 +719,7 @@ pub(crate) async fn fetch_group_state_for_send(
     context: &StorageContext,
     master_key: &[u8],
 ) -> Option<bool> {
-    fetch_group_state(context, master_key)
+    fetch_group_state(context, master_key, "send_probe")
         .await
         .ok()
         .map(|group| group.terminated)
@@ -929,7 +1029,7 @@ pub(crate) async fn approve_join_request(
 ) -> Result<(), TerminateError> {
     use presage::libsignal_service::protocol::ServiceId;
     use presage::libsignal_service::zkgroup;
-    let group = fetch_group_state(context, master_key).await?;
+    let group = fetch_group_state(context, master_key, "approve_join").await?;
     let service_id = resolve_group_member(&context.store, recipient)
         .await
         .ok_or(TerminateError::UnknownGroup)?;
@@ -981,7 +1081,7 @@ pub(crate) async fn terminate_group(
     let mut terminated = registry.contains(&group_id);
     let mut revision = 0u32;
     if !terminated {
-        match fetch_group_state(context, master_key).await {
+        match fetch_group_state(context, master_key, "terminate").await {
             Ok(group) => {
                 terminated = group.terminated;
                 revision = group.version;
@@ -1199,7 +1299,7 @@ pub(crate) async fn update_group_change(
         }
     }
     use rand::RngCore as _;
-    let group_state = fetch_group_state(context, master_key).await;
+    let group_state = fetch_group_state(context, master_key, "update_group").await;
     let (revision, group) = match group_state {
         Ok(group) => (group.version, Some(group)),
         Err(TerminateError::Unavailable) => {
@@ -1324,7 +1424,7 @@ pub(crate) async fn leave_group(
     master_key: &[u8],
 ) -> Result<(), TerminateError> {
     use presage::libsignal_service::protocol::{Aci, ServiceId};
-    let group = fetch_group_state(context, master_key).await?;
+    let group = fetch_group_state(context, master_key, "leave_group").await?;
     let own_aci = Aci::from(context.aci_uuid);
     let own_pni = if context.pni_uuid.is_nil() {
         None
@@ -1992,7 +2092,7 @@ async fn put_group(
 ///（写意图已由服务器裁决），后续群更新消息/发送前刷群态自愈。
 async fn refresh_local_group_state(context: &StorageContext, master_key: &[u8]) {
     use presage::store::ContentsStore as _;
-    if let Ok(group) = fetch_group_state(context, master_key).await {
+    if let Ok(group) = fetch_group_state(context, master_key, "write_refresh").await {
         if let Ok(key) = <[u8; 32]>::try_from(master_key) {
             let _ = context
                 .store
@@ -2133,7 +2233,7 @@ async fn create_group_with_master_key(
         Err(err) if probe_already_migrated => {
             // 已迁移兜底（官方 hasV1GroupBeenMigrated 同语义简化版）：
             // 读面探测成功 = 群已在服务器，诚实返回既有 revision。
-            match fetch_group_state(context, &master_key).await {
+            match fetch_group_state(context, &master_key, "migrate_probe").await {
                 Ok(existing) => existing.version,
                 Err(_) => return Err(err),
             }
@@ -4340,10 +4440,13 @@ mod tests {
         ]);
 
         // ① 首次落键计新；带键成员表命中。
-        assert!(
-            persist_member_profile_keys(&store, &state).await,
-            "首次落键计新"
-        );
+        let first = persist_member_profile_keys(&store, &state).await;
+        assert_eq!(first.new_keys, 1, "首次落键计新");
+        assert_eq!(first.members, 2);
+        assert_eq!(first.with_key, 1, "零键成员不计 with_key");
+        assert_eq!(first.zero_skipped, 1, "零键成员诚实跳过计数");
+        assert_eq!(first.same_skipped, 0);
+        assert_eq!(first.write_failed, 0);
         let landed = store
             .profile_key(&ServiceId::Aci(aci_of(uuid_member)))
             .await
@@ -4361,16 +4464,16 @@ mod tests {
             "零键成员不落库"
         );
 
-        // ③ 同态重放幂等不计新。
-        assert!(
-            !persist_member_profile_keys(&store, &state).await,
-            "同值键重放不计新"
-        );
+        // ③ 同态重放幂等不计新（幂等臂记 same_skipped）。
+        let replay = persist_member_profile_keys(&store, &state).await;
+        assert_eq!(replay.new_keys, 0, "同值键重放不计新");
+        assert_eq!(replay.same_skipped, 1);
 
         // ④ 换键计新且表值随新。
         let rotated = state_of(vec![member_of(aci_of(uuid_member), key_a2)]);
-        assert!(
-            persist_member_profile_keys(&store, &rotated).await,
+        assert_eq!(
+            persist_member_profile_keys(&store, &rotated).await.new_keys,
+            1,
             "换键计新"
         );
         let rotated_landed = store

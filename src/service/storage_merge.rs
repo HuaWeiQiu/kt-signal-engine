@@ -367,12 +367,24 @@ pub(crate) async fn import_groups(
 > {
     let mut outcome = GroupImportOutcome::default();
     let mut observed = Vec::new();
+    // P1 群状态链打点（§29.18）：本函数是登录/manifest 自动拉与
+    // storage.importGroups RPC 的唯一群态入口。三个早退臂此前全部静默
+    // 返回零汇总——桌面「群状态同步中」到底卡在哪一环无法归因，本批
+    // 逐臂给固定 reason 词（无群名、无成员、无密钥）。
+    let account8 = crate::methods::probe_account8(Some(context.account.as_str()));
     let Some(master_key) = context
         .store
         .fetch_master_key()
         .await
         .map_err(|_| StorageSyncError::ReadFailed)?
     else {
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "import_groups_skip",
+            reason = "no_master_key",
+            account = %account8,
+            "group state import skipped (storage master key absent)"
+        );
         return Ok((outcome, observed));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
@@ -382,7 +394,16 @@ pub(crate) async fn import_groups(
         Ok(manifest) => manifest,
         Err(presage::libsignal_service::StorageServiceError::Service(
             ServiceError::NotFoundError,
-        )) => return Ok((outcome, observed)),
+        )) => {
+            tracing::warn!(
+                target: "engine.groupstate",
+                stage = "import_groups_skip",
+                reason = "no_manifest",
+                account = %account8,
+                "group state import skipped (storage manifest not found)"
+            );
+            return Ok((outcome, observed));
+        }
         Err(_) => return Err(StorageSyncError::Unavailable),
     };
     let keys: Vec<Vec<u8>> = manifest
@@ -397,6 +418,14 @@ pub(crate) async fn import_groups(
         .map(|identifier| identifier.raw.clone())
         .collect();
     if keys.is_empty() {
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "import_groups_skip",
+            reason = "no_groupv2_identifiers",
+            account = %account8,
+            identifiers = manifest.identifiers.len(),
+            "group state import skipped (manifest has no GROUPV2 identifiers)"
+        );
         return Ok((outcome, observed));
     }
     let record_ikm = if manifest.record_ikm.is_empty() {
@@ -445,7 +474,9 @@ pub(crate) async fn import_groups(
             outcome.already_known += 1;
             continue;
         }
-        match super::groups::fetch_group_state(&context, &group_record.master_key).await {
+        match super::groups::fetch_group_state(&context, &group_record.master_key, "storage_import")
+            .await
+        {
             Ok(group) => {
                 if context
                     .store
@@ -461,6 +492,19 @@ pub(crate) async fn import_groups(
             Err(_) => outcome.failed += 1,
         }
     }
+    // P1 完成行（§29.18）：manifest 群态记录数 / 本轮新导入 / 本地已知跳过 /
+    // 失败 —— 「群态合并链跑完了吗、产出什么」的第一手证据。
+    tracing::warn!(
+        target: "engine.groupstate",
+        stage = "import_groups_done",
+        account = %account8,
+        identifiers = keys.len(),
+        records_read = outcome.records_read,
+        imported = outcome.imported,
+        already_known = outcome.already_known,
+        failed = outcome.failed,
+        "group state import finished"
+    );
     Ok((outcome, observed))
 }
 
