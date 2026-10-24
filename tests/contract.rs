@@ -320,13 +320,16 @@ fn unregistered_store_is_quarantined_not_deleted_on_startup() {
         "manifest 不得含账号号码: {manifest}"
     );
 
-    // 隔离后重启必须 fail closed（恢复闸门），隔离内容不得被二次启动破坏。
+    // 批 W2（§29.73）语义重构：隔离后重启照常启动（隔离件=待决区，不再
+    // 绑架健康账号——§29.72 实证的每秒 QuarantinePresent 循环已废），隔离
+    // 内容不得被二次启动破坏，日志留待决指引。未完成注册件此后由成功链接
+    // 事件触发的弃置清扫自动带走（单元面四象限钉形）。
     drop(engine);
-    let restart = run_engine_to_completion(&dir, &[]);
+    let restart = run_engine_to_completion(&dir, FAKE_SERVICE);
     assert_eq!(
         restart.status.code(),
-        Some(1),
-        "隔离区非空须 fail closed；stderr: {}",
+        Some(0),
+        "隔离区非空不得再拒启动；stderr: {}",
         String::from_utf8_lossy(&restart.stderr)
     );
     assert_eq!(
@@ -335,7 +338,11 @@ fn unregistered_store_is_quarantined_not_deleted_on_startup() {
         "重启不得破坏隔离内容"
     );
     let log = std::fs::read_to_string(dir.join("logs/engine-stderr.log")).expect("engine log");
-    assert!(log.contains("QuarantinePresent"), "恢复闸门日志: {log}");
+    assert!(log.contains("QuarantinePending"), "待决区日志: {log}");
+    assert!(
+        !log.contains("QuarantinePresent"),
+        "旧 fail-closed 循环语义不得再现: {log}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

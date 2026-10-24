@@ -2175,6 +2175,10 @@ pub(crate) struct Service {
     /// 账号 → 回填位 + 过期时刻，TTL [`own_capabilities::CAPABILITIES_CACHE_TTL`]，
     /// 失败不缓存；进程内存不落盘不跨重启。delete/重链摘除。
     own_capabilities_cache: own_capabilities::CapabilitiesCache,
+    /// 隔离区弃置清扫互斥（批 W2，§29.73）：成功链接事件触发的
+    /// `discard_incomplete_quarantine_stores` 全进程单飞——重复链接事件
+    /// 幂等（后到者扫到已清空的区零通知），并发链接事件不双计。
+    quarantine_discard: AsyncMutex<()>,
 }
 
 /// 接收管线停机宽限（S5 关停宽限可配）：停旗发出后等待任务收口（drop
@@ -2282,6 +2286,7 @@ impl Service {
             mrm_pool: group_mrm::MrmPool::new(group_mrm::MRM_CONNECTION_LIMIT),
             whitelist_cache: StdMutex::new(HashMap::new()),
             own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
+            quarantine_discard: AsyncMutex::new(()),
         })
     }
 
@@ -2661,6 +2666,18 @@ impl Service {
         // 归档前不再有句柄写旧目录；也晚于 transfer 腿 cancel。仍然引用的
         // 目录（极端：同 dir 被另一号码登记）不动；与本次新 dir 相同的也不动。
         self.archive_superseded_link_dir(superseded, &rel).await;
+        // 批 W2（§29.73）：成功链接事件 = 旧孤儿可弃的定局信号（§29.72 硬闸
+        // 待办闭环）。隔离区未完成注册件此刻自动清扫；含注册数据件保留并随
+        // engine.quarantineDiscarded 待决明细上报（桌面「恢复/弃置」数据面，
+        // 桌面面另批）。fire-and-forget：清扫/通知不连坐链接主结局；并发与
+        // 重复事件的幂等由 quarantine_discard 互斥承担。
+        {
+            let service = Arc::clone(self);
+            let linked = number.clone();
+            tokio::task::spawn_local(async move {
+                discard_incomplete_quarantine_stores(&service, &linked).await;
+            });
+        }
         Ok(LinkedAccount { number, aci })
     }
 
@@ -13195,12 +13212,13 @@ fn random_dir_name() -> String {
 /// - 隔离区在 `accounts/_quarantine/` 下，不匹配直接子目录 `lk-*` 扫描规则，
 ///   二次启动不会再次清扫；重复隔离靠唯一目标名保证幂等。
 ///
-/// 恢复入口（隔离后必须人工显式恢复；隔离区非空时 `EngineState::load`
-/// fail closed，这是防止静默丢凭证的闸门）：看
+/// 恢复入口（批 W2 后隔离区不拦启动，隔离件是待决区而非全员停摆闸）：看
 /// `accounts/_quarantine/quarantine-log.jsonl` 的 `from`/`to`/`restore`
 /// 字段——把 `<observedAtMs>/lk-<hex>` 移回 `accounts/lk-<hex>` **并**在
 /// `engine-state.json` 补回 `{number, dir}` 登记（或走连接器重新链接流程）
 /// 后重启；确认放弃则把该时间戳目录整体移出 `accounts/_quarantine/`。
+/// 自动路径（批 W2）：未完成注册件由成功链接事件触发的弃置清扫带走，
+/// 含注册数据件保留等显式恢复（`discard_incomplete_quarantine_stores`）。
 /// 本层纪律：无 stderr 输出；失败一律保留原目录（下次启动重试），日志只打
 /// 目录名/相对路径，不打号码/密钥。
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -13528,6 +13546,269 @@ fn append_quarantine_record(data_dir: &Path, name: &str, observed_at_ms: u64, de
             );
         }
     }
+}
+
+/// 弃置审计记录（JSONL，与隔离记录同文件追加）：只含目录名/相对路径/时刻，
+/// 不含号码或密钥。自动弃置的显式留痕——审计日志仍是唯一的隔离历史权威面。
+#[derive(serde::Serialize)]
+struct QuarantineDiscardRecord<'a> {
+    discarded_at_ms: u64,
+    dir: &'a str,
+    from: String,
+    reason: &'static str,
+}
+
+fn append_quarantine_discard_record(data_dir: &Path, name: &str, from_rel: &str) {
+    use std::io::Write as _;
+    let path = data_dir
+        .join(ACCOUNTS_DIR)
+        .join(QUARANTINE_DIR)
+        .join(QUARANTINE_LOG);
+    let record = QuarantineDiscardRecord {
+        discarded_at_ms: now_ms(),
+        dir: name,
+        from: from_rel.to_owned(),
+        reason: "auto_discarded_unregistered_store",
+    };
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineDiscardLogWriteFailed",
+                dir = %name,
+                error = %error,
+                "quarantine discard record not written; discard itself already applied"
+            );
+            return;
+        }
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "{line}") {
+                tracing::warn!(
+                    cause = "QuarantineDiscardLogWriteFailed",
+                    dir = %name,
+                    error = %error,
+                    "quarantine discard record not written; discard itself already applied"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineDiscardLogWriteFailed",
+                dir = %name,
+                error = %error,
+                "quarantine discard record not written; discard itself already applied"
+            );
+        }
+    }
+}
+
+/// 成功链接事件触发的隔离区自动弃置清扫（批 W2，§29.73；§29.72 硬闸待办
+/// 闭环——「重链成功 = 旧孤儿可弃」）。
+///
+/// 判别器是「store 有无可用 ACI」（account_aci 单点，finishLink/listAccounts
+/// 同一真值面）：有注册数据 = 已完成注册 → **保留**（显式恢复口的数据面，
+/// 不自动弃）；无 store.db / 注册数据缺席 / store 打不开（探测错误如实折叠
+/// 成无可用 ACI——隔离件本身已是未登记废件）= 未完成注册 → 弃置
+/// （remove_dir_all）+ 审计留痕。
+///
+/// 语义纪律：
+/// - 全进程互斥单飞（quarantine_discard）：重复链接事件幂等——后到者扫到
+///   已清空的区，零动作零通知；并发链接事件不双计。
+/// - 通知只在「确有动静」时发（弃置数 > 0 或仍有待决件）：空区零事件，
+///   消费方不收噪音帧。
+/// - 弃置失败（权限/盘错）不吞件：原位保留并进 retained 明细，绝不带病计数。
+/// - 通知 fire-and-forget（receive.emptied/storagePull 同款）：发射不连坐
+///   链接主结局、不重试。
+async fn discard_incomplete_quarantine_stores(service: &Arc<Service>, account: &str) {
+    // 同一时刻至多一个弃置清扫在飞（Service 字段注释载幂等理由）。
+    let _guard = service.quarantine_discard.lock().await;
+    let quarantine_root = service.data_dir.join(ACCOUNTS_DIR).join(QUARANTINE_DIR);
+    let buckets = match std::fs::read_dir(&quarantine_root) {
+        Ok(buckets) => buckets,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return; // 无隔离区：常态路径，零动作零通知。
+        }
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineDiscardSkipped",
+                error = %error,
+                "cannot inspect quarantine dir; leaving every quarantined item untouched"
+            );
+            return;
+        }
+    };
+    // 扫描两层级：时间戳桶内 lk-*（sweep 唯一落点）与桶根直挂 lk-*（防御性
+    // 兼容人工搬移的形态，quarantined_store_count 同口径）。非目录/非 lk-*
+    // 条目（审计日志、散文件）一律不碰。
+    let mut items: Vec<(String, PathBuf, Option<PathBuf>)> = Vec::new();
+    let mut bucket_dirs: Vec<PathBuf> = Vec::new();
+    for bucket in buckets {
+        let bucket = match bucket {
+            Ok(bucket) => bucket,
+            Err(error) => {
+                tracing::warn!(
+                    cause = "QuarantineDiscardSkipped",
+                    error = %error,
+                    "quarantine bucket entry unreadable; skipping it"
+                );
+                continue;
+            }
+        };
+        let file_type = match bucket.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::warn!(
+                    cause = "QuarantineDiscardSkipped",
+                    error = %error,
+                    "quarantine bucket entry unreadable; skipping it"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let bucket_name = bucket.file_name().to_string_lossy().into_owned();
+        if bucket_name.starts_with("lk-") {
+            // 桶根直挂形态。
+            items.push((
+                format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{bucket_name}"),
+                bucket.path(),
+                None,
+            ));
+            continue;
+        }
+        bucket_dirs.push(bucket.path());
+        let inner = match std::fs::read_dir(bucket.path()) {
+            Ok(inner) => inner,
+            Err(error) => {
+                tracing::warn!(
+                    cause = "QuarantineDiscardSkipped",
+                    bucket = %bucket_name,
+                    error = %error,
+                    "quarantine bucket unreadable; its items stay untouched"
+                );
+                continue;
+            }
+        };
+        for item in inner {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    tracing::warn!(
+                        cause = "QuarantineDiscardSkipped",
+                        bucket = %bucket_name,
+                        error = %error,
+                        "quarantined item unreadable; staying untouched"
+                    );
+                    continue;
+                }
+            };
+            let name = item.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("lk-") {
+                continue;
+            }
+            match item.file_type() {
+                Ok(file_type) if file_type.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => continue, // 探测失败：保守不动（宁留勿误删）。
+            }
+            items.push((
+                format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{bucket_name}/{name}"),
+                item.path(),
+                None,
+            ));
+        }
+    }
+    let mut discarded: usize = 0;
+    let mut retained: Vec<Value> = Vec::new();
+    for (rel, path, _) in items {
+        let has_store = crate::state::store_db_present(&path).unwrap_or(false);
+        let aci = if has_store {
+            account_aci(&path).await
+        } else {
+            None
+        };
+        if let Some(aci) = aci {
+            // 已完成注册：显式恢复口保留（不自动弃），明细随事件上报桌面。
+            tracing::info!(
+                cause = "QuarantineStoreRetained",
+                dir = %rel,
+                "quarantined store holds registration data; kept for explicit recovery"
+            );
+            retained.push(json!({ "dir": rel, "aci": aci }));
+            continue;
+        }
+        // 未完成注册 → 弃置。NotFound = 并发清扫已收走（互斥下的防御臂）：
+        // 不计数不重复报，幂等面保持。
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                discarded += 1;
+                tracing::warn!(
+                    cause = "QuarantineStoreDiscarded",
+                    dir = %rel,
+                    "unregistered quarantined store discarded after a successful link"
+                );
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                append_quarantine_discard_record(&service.data_dir, &name, &rel);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    cause = "QuarantineDiscardFailed",
+                    dir = %rel,
+                    error = %error,
+                    "quarantined store could not be discarded; kept in place for explicit recovery"
+                );
+                retained.push(json!({ "dir": rel }));
+            }
+        }
+    }
+    // 桶空则顺手摘壳（remove_dir 只在空目录成功；留有 retained 件的桶自然
+    // 失败无害）。
+    for bucket in bucket_dirs {
+        let _ = std::fs::remove_dir(bucket);
+    }
+    if discarded == 0 && retained.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        cause = "QuarantineDiscardSweep",
+        discarded,
+        retained = retained.len(),
+        "post-link quarantine discard sweep finished"
+    );
+    service
+        .notify(
+            account,
+            quarantine_discarded_notification(discarded, &retained),
+        )
+        .await;
+}
+
+/// 隔离弃置事件（批 W2，wire additive，engine.quarantineDiscarded）：成功
+/// 链接事件触发的弃置清扫收口后恒发恰一条（空区零事件——幂等面）。params =
+/// count（本次弃置数）+ retained（仍在隔离区的待决件明细：dir 恒在，aci 键
+/// 仅当该件含可用注册数据——桌面「恢复/弃置」按钮的数据面，桌面面另批）。
+fn quarantine_discarded_notification(count: usize, retained: &[Value]) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "engine.quarantineDiscarded",
+        "params": {
+            "count": count,
+            "retained": retained,
+        },
+    })
 }
 
 fn now_ms() -> u64 {
@@ -14065,17 +14346,19 @@ mod tests {
         assert_eq!(report.failed, 0);
         assert!(
             !accounts.join(QUARANTINE_DIR).exists(),
-            "隔离区必须保持空（非空 = 下次启动 fail closed）"
+            "隔离区必须保持空（非空 = 待决区废件，批 W2 §29.73.1 起 warn 不拒启）"
         );
         crate::state::EngineState::load(&root).expect("engine starts after relink");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 对照组：不归档的旧语义（= 修复前的重链收尾）——旧目录成孤儿，清扫
-    /// 隔离它，隔离区非空使下一次启动 fail closed，正是「通道正在自恢复」
-    /// 死循环的机制。本用例只证明机制，不改产品语义（fail-closed 保留）。
+    /// 隔离它。批 W2（§29.73.1）之前隔离区非空使下一次启动 fail closed
+    /// （「通道正在自恢复」死循环的机制）；§29.73.1 起隔离区降级为待决区
+    /// （QuarantinePending warn，注册件原位保留），启动不再被废件绑架。
+    /// 本用例钉住机制两段：隔离仍发生（清扫面零放宽），且隔离非空不再拒启。
     #[tokio::test]
-    async fn relink_without_archive_quarantines_and_blocks_next_start() {
+    async fn relink_without_archive_quarantines_and_pends_next_start() {
         const OBSERVED: u64 = 1_700_000_000_888;
         let root = sweep_sandbox("relink-legacy");
         let accounts = root.join(ACCOUNTS_DIR);
@@ -14103,11 +14386,269 @@ mod tests {
             .collect();
         let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
         assert_eq!(report.quarantined, 1, "旧语义下旧目录被隔离");
+        // 批 W2（§29.73.1，88302bf）：reject_quarantined 废除 →
+        // note_quarantined 落 QuarantinePending warn；fail-closed 面收窄至
+        // 注册数据本身不可信，隔离区非空只进待决区、照常启动。
         assert!(
-            crate::state::EngineState::load(&root).is_err(),
-            "隔离区非空 → 拒绝启动（fail-closed 语义保留）"
+            crate::state::EngineState::load(&root).is_ok(),
+            "隔离区非空 → 待决区 warn（QuarantinePending），不再拒启"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- 批 W2（§29.73）隔离区自动弃置四象限 ----
+    //
+    // 语义：启动面隔离件原位保留（待决区，state.rs 侧已钉①②两象限的
+    // load 面）；成功链接事件触发的弃置清扫只带走「无可用 ACI」的未完成
+    // 注册件，含注册数据件保留并随 engine.quarantineDiscarded 上报明细；
+    // 重复事件互斥单飞幂等。
+
+    /// 测试夹具：隔离桶内一个「未完成注册」件（store.db 在、注册数据缺席
+    /// ——链接半途死掉的形态，ACI 判别器读出 None）。
+    async fn seed_quarantine_incomplete(root: &Path, bucket: &str, name: &str) -> PathBuf {
+        let dir = root
+            .join(ACCOUNTS_DIR)
+            .join(QUARANTINE_DIR)
+            .join(bucket)
+            .join(name);
+        open_store(&dir).await.expect("empty store opens");
+        dir
+    }
+
+    /// 测试夹具：隔离桶内一个「已完成注册」件（注册数据带 ACI）。
+    async fn seed_quarantine_registered(
+        root: &Path,
+        bucket: &str,
+        name: &str,
+        aci: &str,
+    ) -> PathBuf {
+        seed_store_with_aci(
+            root,
+            &format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{bucket}/{name}"),
+            aci,
+        )
+        .await
+    }
+
+    async fn discard_service(
+        root: &Path,
+    ) -> (
+        Arc<Service>,
+        tokio::sync::mpsc::Receiver<crate::OutboundFrame>,
+    ) {
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(root).expect("state loads"),
+        ));
+        let (outbound, rx) = outbound::test_hub();
+        let service = Service::new(root.to_path_buf(), state, outbound);
+        (service, rx)
+    }
+
+    /// 四象限①：孤儿 + 健康账号并存——弃置只带走隔离件，健康注册账号
+    /// 目录/注册表零波及；弃置审计落 quarantine-log.jsonl。
+    #[tokio::test]
+    async fn discard_sweep_removes_orphan_and_spares_healthy_account() {
+        let root = sweep_sandbox("discard-coexist");
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&root).expect("state loads"),
+        ));
+        seed_store_with_aci(
+            &root,
+            "accounts/lk-healthy",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550001111".to_owned(),
+                Some("accounts/lk-healthy".to_owned()),
+            )
+            .expect("healthy account registered");
+        let (outbound, mut rx) = outbound::test_hub();
+        let service = Service::new(root.clone(), state, outbound);
+        let orphan = seed_quarantine_incomplete(&root, "1700000000000", "lk-orphan").await;
+
+        discard_incomplete_quarantine_stores(&service, "+15550001111").await;
+
+        assert!(!orphan.try_exists().unwrap(), "未完成注册件必须被弃置");
+        assert!(
+            root.join("accounts/lk-healthy/store.db").is_file(),
+            "健康账号 store 零波及"
+        );
+        assert_eq!(service.state.lock().await.accounts().len(), 1, "注册表不动");
+        assert!(
+            !root
+                .join(ACCOUNTS_DIR)
+                .join(QUARANTINE_DIR)
+                .join("1700000000000")
+                .exists(),
+            "空桶摘壳"
+        );
+        let crate::OutboundFrame::Notice { value, .. } = rx.try_recv().expect("弃置后恰一条通知")
+        else {
+            panic!("expected Notice frame");
+        };
+        assert_eq!(value["method"], json!("engine.quarantineDiscarded"));
+        assert_eq!(value["params"]["count"], json!(1));
+        assert_eq!(value["params"]["retained"], json!([]));
+        let manifest = std::fs::read_to_string(
+            root.join(ACCOUNTS_DIR)
+                .join(QUARANTINE_DIR)
+                .join(QUARANTINE_LOG),
+        )
+        .expect("audit log");
+        assert!(
+            manifest.contains(r#""reason":"auto_discarded_unregistered_store""#),
+            "弃置审计留痕: {manifest}"
+        );
+    }
+
+    /// 四象限②：只有孤儿——整区清空 + 空桶摘壳 + 通知 count 如实。
+    #[tokio::test]
+    async fn discard_sweep_clears_quarantine_with_only_orphans() {
+        let root = sweep_sandbox("discard-orphans");
+        let (service, mut rx) = discard_service(&root).await;
+        let first = seed_quarantine_incomplete(&root, "1700000000001", "lk-a").await;
+        let second = seed_quarantine_incomplete(&root, "1700000000002", "lk-b").await;
+
+        discard_incomplete_quarantine_stores(&service, "+15550001111").await;
+
+        assert!(!first.try_exists().unwrap());
+        assert!(!second.try_exists().unwrap());
+        let crate::OutboundFrame::Notice { value, .. } = rx.try_recv().expect("弃置后恰一条通知")
+        else {
+            panic!("expected Notice frame");
+        };
+        assert_eq!(value["params"]["count"], json!(2));
+        assert_eq!(value["params"]["retained"], json!([]));
+        assert!(rx.try_recv().is_err(), "恒发恰一条，无重复帧");
+    }
+
+    /// 四象限③：隔离件含已完成注册（有 ACI）——不自动弃，保留原位；通知
+    /// retained 携带 {dir, aci} 明细（桌面「恢复/弃置」数据面）。
+    #[tokio::test]
+    async fn discard_sweep_retains_completed_registration_with_details() {
+        let root = sweep_sandbox("discard-registered");
+        let (service, mut rx) = discard_service(&root).await;
+        let kept = seed_quarantine_registered(
+            &root,
+            "1700000000003",
+            "lk-full",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+
+        discard_incomplete_quarantine_stores(&service, "+15550001111").await;
+
+        assert!(
+            kept.join("store.db").is_file(),
+            "含注册数据件必须原位保留（显式恢复口）"
+        );
+        let crate::OutboundFrame::Notice { value, .. } =
+            rx.try_recv().expect("待决件也构成一次事件")
+        else {
+            panic!("expected Notice frame");
+        };
+        assert_eq!(value["method"], json!("engine.quarantineDiscarded"));
+        assert_eq!(value["params"]["count"], json!(0));
+        let retained = value["params"]["retained"]
+            .as_array()
+            .expect("retained list");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0]["dir"],
+            json!("accounts/_quarantine/1700000000003/lk-full")
+        );
+        assert_eq!(
+            retained[0]["aci"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    /// 四象限④：重复成功链接事件幂等——第二次清扫扫到已清空的区，零动作
+    /// 零通知（互斥单飞 + 空区零事件），count 不双计。
+    #[tokio::test]
+    async fn discard_sweep_is_idempotent_across_repeat_events() {
+        let root = sweep_sandbox("discard-idempotent");
+        let (service, mut rx) = discard_service(&root).await;
+        let orphan = seed_quarantine_incomplete(&root, "1700000000004", "lk-once").await;
+
+        discard_incomplete_quarantine_stores(&service, "+15550001111").await;
+        let crate::OutboundFrame::Notice { value, .. } = rx.try_recv().expect("首次事件恰一条通知")
+        else {
+            panic!("expected Notice frame");
+        };
+        assert_eq!(value["params"]["count"], json!(1));
+
+        // 第二次成功链接事件：区已清空 → 无第二帧。
+        discard_incomplete_quarantine_stores(&service, "+15550001111").await;
+        assert!(rx.try_recv().is_err(), "空区幂等：重复事件零通知");
+        assert!(!orphan.try_exists().unwrap(), "弃置件不复活");
+        let manifest = std::fs::read_to_string(
+            root.join(ACCOUNTS_DIR)
+                .join(QUARANTINE_DIR)
+                .join(QUARANTINE_LOG),
+        )
+        .expect("audit log");
+        assert_eq!(
+            manifest.lines().count(),
+            1,
+            "审计只留首次弃置一行: {manifest}"
+        );
+    }
+
+    /// engine.quarantineDiscarded 通知帧消费方测试替身（批 W2 wire additive）：
+    /// 方法名入词表、params 恰两键逐键验型、retained 条目 dir 恒在 + aci
+    /// 可选键、坏形状整拒——storagePull/initialSyncComplete 同款验收纪律。
+    #[test]
+    fn quarantine_discarded_notification_shape_pins_wire_contract() {
+        /// 消费方替身解析态：count + retained 条目（dir, aci 可选）。
+        type RetainedFace = (u64, Vec<(String, Option<String>)>);
+        fn strict_parse(value: &Value) -> Option<RetainedFace> {
+            if value["method"] != "engine.quarantineDiscarded" || value["jsonrpc"] != "2.0" {
+                return None;
+            }
+            let params = value["params"].as_object()?;
+            if params.len() != 2 {
+                return None;
+            }
+            let count = params["count"].as_u64()?;
+            let retained = params["retained"].as_array()?;
+            let mut items = Vec::new();
+            for entry in retained {
+                let dir = entry["dir"].as_str()?.to_owned();
+                let aci = entry["aci"].as_str().map(str::to_owned);
+                items.push((dir, aci));
+            }
+            Some((count, items))
+        }
+
+        let mixed = quarantine_discarded_notification(
+            2,
+            &[
+                json!({
+                    "dir": "accounts/_quarantine/1700000000000/lk-full",
+                    "aci": "11111111-2222-4333-8444-555555555555",
+                }),
+                json!({ "dir": "accounts/_quarantine/1700000000001/lk-failed" }),
+            ],
+        );
+        let (count, items) = strict_parse(&mixed).expect("shape parses");
+        assert_eq!(count, 2);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].1.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(items[1].1, None, "弃置失败件无 aci 键（不出 null）");
+
+        let empty = quarantine_discarded_notification(1, &[]);
+        assert_eq!(strict_parse(&empty).expect("empty retained parses").0, 1);
+
+        // 词表外方法名整拒（consumer 侧 default 臂语义）。
+        assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
     }
 
     /// P0-B：未登记但带 store.db 的目录 → 隔离（保留凭证），绝不 remove。
