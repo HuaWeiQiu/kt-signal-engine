@@ -8821,7 +8821,8 @@ async fn project_content_inner(
                 // 因子权重（messageRequestResponseType === ACCEPT）的引擎侧
                 // 真数据面。
                 Some(presage::proto::sync_message::Content::MessageRequestResponse(mrr)) => {
-                    let Some(projection) = project_message_request_response(mrr) else {
+                    let Some(projection) = project_message_request_response(mrr, envelope_ts)
+                    else {
                         return Vec::new();
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
@@ -9483,6 +9484,7 @@ async fn project_sync_read_entries<T>(
 /// （桌面 conversationAttrs.messageRequestResponseType 同位，ACCEPT=1）。
 fn project_message_request_response(
     mrr: &presage::proto::sync_message::MessageRequestResponse,
+    timestamp: u64,
 ) -> Option<Value> {
     use base64::Engine as _;
     use presage::proto::sync_message::message_request_response::Type;
@@ -9503,6 +9505,15 @@ fn project_message_request_response(
             .r#type
             .and_then(|value| Type::try_from(value).ok())
             .unwrap_or(Type::Unknown) as i32,
+        // sync 时刻 additive 投影（batch X · S7②，compat §5）：官方 MRR_SYNC
+        // 行的 `sent_at = responseInfo.timestamp`（background.preload.ts:3803
+        // sentAt → models/conversations.preload.ts:2513-2518）= sync 信封自身
+        // 的发送时刻，官方 proto 本体不携（MessageRequestResponse 只带
+        // thread/groupId/type）。本端 sync 信封时刻 = content.metadata.
+        // client_timestamp（随信封到投影点），additive 键投影给消费方作镜像
+        // 行 sent_at 基准；缺席键容忍（旧引擎 pre-1.258 无此键，消费方本地
+        // 时钟退化不变）。
+        "timestamp": timestamp,
     });
     if let Some(aci) = thread_aci {
         out["threadAci"] =
@@ -20410,6 +20421,9 @@ mod tests {
         let projection = &envelope["syncMessage"]["messageRequestResponse"];
         assert_eq!(projection["threadAci"], json!(thread));
         assert_eq!(projection["messageRequestResponseType"], json!(1));
+        // S7② additive：投影 timestamp = sync 信封时刻（envelope timestamp
+        // 同源——官方 MRR_SYNC 行 sent_at = sync sentAt 的本端真数据面）。
+        assert_eq!(projection["timestamp"], envelope["timestamp"]);
 
         // 拒绝（DELETE=2）对称：同形状，枚举值 2（不做任何 ACCEPT 化变换）。
         let notifications = project_content(
@@ -20802,6 +20816,12 @@ mod tests {
         use presage::proto::sync_message::{message_request_response, MessageRequestResponse};
         let thread = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
 
+        /// 测试替身：sync 时刻注入固定值（S7② additive timestamp 键钉形）。
+        const SYNC_TS: u64 = 1_700_000_000_000;
+        fn mrr_face(mrr: &MessageRequestResponse) -> Option<Value> {
+            project_message_request_response(mrr, SYNC_TS)
+        }
+
         // 六枚举值全部原值往返（数字 = 官方因子词汇，无字符串映射发明）。
         for (value, wire) in [
             (message_request_response::Type::Unknown, 0),
@@ -20812,7 +20832,7 @@ mod tests {
             (message_request_response::Type::Spam, 5),
             (message_request_response::Type::BlockAndSpam, 6),
         ] {
-            let out = project_message_request_response(&MessageRequestResponse {
+            let out = mrr_face(&MessageRequestResponse {
                 r#type: Some(value as i32),
                 thread_aci: Some(thread.to_owned()),
                 thread_aci_binary: None,
@@ -20825,7 +20845,7 @@ mod tests {
         }
 
         // thread 双形：string-only / binary-only 都投影（binary 优先）。
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -20833,7 +20853,7 @@ mod tests {
         })
         .expect("dual form parses");
         assert_eq!(out["threadAci"], json!(thread));
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -20844,7 +20864,7 @@ mod tests {
 
         // 线程双缺但有合法群：只投 groupId + type（官方两形态各自路由同构）。
         let group_key = [0x88u8; 32];
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: None,
             thread_aci: None,
             thread_aci_binary: None,
@@ -20859,7 +20879,7 @@ mod tests {
         assert_eq!(out["messageRequestResponseType"], json!(0));
 
         // 枚举外数值（未来枚举 99）→ UNKNOWN=0 不丢弃。
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(99),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: None,
@@ -20870,14 +20890,14 @@ mod tests {
 
         // 丢弃面：群长度非法（31B/33B）整事件丢弃（官方 removeFromCache 同果
         // ——即使线程可解析也不路由）。
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: None,
             group_id: Some(vec![0x99u8; 31]),
         })
         .is_none());
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -20886,20 +20906,35 @@ mod tests {
         .is_none());
 
         // 丢弃面：线程不可解析（binary 坏 + string 缺/坏）且无群。
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some("not-a-uuid".to_owned()),
             thread_aci_binary: Some(vec![0xde, 0xad]),
             group_id: None,
         })
         .is_none());
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: None,
             group_id: None,
         })
         .is_none());
+
+        // S7② additive：timestamp 键逐字通过（sync 信封时刻，消费方镜像行
+        // sent_at 基准）；同一 face 换时刻键值随之（非常量烙死）。
+        let out = project_message_request_response(
+            &MessageRequestResponse {
+                r#type: Some(message_request_response::Type::Accept as i32),
+                thread_aci: Some(thread.to_owned()),
+                thread_aci_binary: None,
+                group_id: None,
+            },
+            1_700_000_000_123,
+        )
+        .expect("timestamped face projects");
+        assert_eq!(out["timestamp"], json!(1_700_000_000_123u64));
+        assert_eq!(out["messageRequestResponseType"], json!(1));
     }
 
     /// 消息请求写面 type 词汇表全口径：六值驼峰词逐一映射 proto 枚举序数

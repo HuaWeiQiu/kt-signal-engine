@@ -17,7 +17,7 @@
 
 use presage::manager::{Manager, Registered};
 use presage::proto::GroupContextV2;
-use presage::store::{ContentsStore as _, Store};
+use presage::store::{ContentsStore as _, StateStore as _, Store};
 use presage_store_sqlite::SqliteStore;
 use std::sync::Arc;
 
@@ -140,24 +140,62 @@ pub(crate) async fn get_avatar(
     Ok(AvatarPayload { data_uri, size })
 }
 
-/// 1:1 头像下行：store profile_key（未同步 → Unavailable，诚实「无头像」）
-/// → presage retrieve_profile_avatar_by_uuid（None = 对端未设头像 →
-/// Unavailable）。
+/// 1:1 头像下行：store profile_key（未同步 → S6② self 读面 additive 回退，
+/// 其余诚实「无头像」）→ presage retrieve_profile_avatar_by_uuid（None =
+/// 对端未设头像 → Unavailable）。
 async fn profile_avatar(
     manager: &mut Manager<SqliteStore, Registered>,
     service_id: ServiceId,
 ) -> Result<Vec<u8>, AvatarError> {
-    let profile_key = manager
+    let stored = manager
         .store()
         .profile_key(&service_id)
         .await
-        .map_err(|_| AvatarError::FetchFailed)?
-        .ok_or(AvatarError::Unavailable)?;
+        .map_err(|_| AvatarError::FetchFailed)?;
+    let profile_key = match stored {
+        Some(key) => key,
+        // S6② self-avatar 读面查证（batch X，additive 修复）：setProfile 后
+        // 自身 Read face 曾恒 UNAVAILABLE——根因 = 自有 profile key 只活在
+        // 注册数据（RegistrationData.profile_key，setProfile 上行就用它），
+        // 从不落 contacts 随行的 profile_keys 位，而读面只认该位（contacts
+        // 同步永不携带 self）。官方对位：自有头像本地即知（官方桌面 setProfile
+        // 后 model 自持 avatarUrl/字节，不经 server GET 也能显示），读面语义
+        // = 请求 own ACI 时以注册数据的 profile key 应答。additive：仅命中
+        // 「requested = 本账号 ACI」这一先前恒 UNAVAILABLE 的形状，对端读面
+        // 零变化。
+        None => {
+            let own = manager
+                .store()
+                .load_registration_data()
+                .await
+                .ok()
+                .flatten()
+                .map(|data| (ServiceId::Aci(data.service_ids.aci()), data.profile_key()));
+            self_profile_key_fallback(service_id, own).ok_or(AvatarError::Unavailable)?
+        }
+    };
     manager
         .retrieve_profile_avatar_by_uuid(service_id.raw_uuid(), profile_key)
         .await
         .map_err(|ref error| avatar_error_of(error))?
         .ok_or(AvatarError::Unavailable)
+}
+
+/// S6② self 读面回退的纯判定：requested = 本账号 ACI → 注册数据 profile
+/// key；其余（对端 ACI/PNI、self PNI 形、无注册数据）→ None（诚实缺席，
+/// 不发明）。钉形测试在 tests 模块。
+fn self_profile_key_fallback(
+    requested: ServiceId,
+    own: Option<(
+        ServiceId,
+        presage::libsignal_service::zkgroup::profiles::ProfileKey,
+    )>,
+) -> Option<presage::libsignal_service::zkgroup::profiles::ProfileKey> {
+    let ServiceId::Aci(_) = requested else {
+        return None;
+    };
+    let (own_aci, key) = own?;
+    (own_aci == requested).then_some(key)
 }
 
 /// 群头像下行：presage retrieve_group_avatar（master key 派生解密；群无头
@@ -196,6 +234,35 @@ fn avatar_error_of(error: &presage::Error<<SqliteStore as Store>::Error>) -> Ava
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S6② self 读面回退纯判定：own ACI 命中回退；对端 ACI / self PNI 形 /
+    /// 无注册数据诚实缺席（不发明）。
+    #[test]
+    fn self_avatar_profile_key_fallback_faces() {
+        let own_uuid = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
+        let other_uuid = "11111111-2222-4333-8444-555555555555";
+        let own = ServiceId::parse_from_service_id_string(own_uuid).expect("own");
+        let other = ServiceId::parse_from_service_id_string(other_uuid).expect("other");
+        let key = presage::libsignal_service::zkgroup::profiles::ProfileKey::create([7u8; 32]);
+
+        // own ACI 命中 → 注册数据的 profile key（官方自有头像本地即知同语义）。
+        assert_eq!(
+            self_profile_key_fallback(own, Some((own, key))).map(|fallback| fallback.bytes),
+            Some(key.bytes)
+        );
+        // 对端 ACI 请求不回退（对端读面走 contacts 随行位，缺席诚实）。
+        assert!(self_profile_key_fallback(other, Some((own, key))).is_none());
+        // self PNI 形不回退（self 读面是 ACI 面语义）。
+        let pni = format!("PNI:{own_uuid}");
+        let own_pni = ServiceId::parse_from_service_id_string(&pni).expect("pni");
+        assert!(self_profile_key_fallback(own_pni, Some((own, key))).is_none());
+        // 无注册数据 → None。
+        assert!(self_profile_key_fallback(
+            ServiceId::parse_from_service_id_string(other_uuid).expect("other"),
+            None
+        )
+        .is_none());
+    }
 
     /// 会话参数分派形状面：ServiceId UUID 直通（ACI/PNI 前缀形态亦收）、
     /// 32B 标准 base64 → 群、纯数字/带 + 号码 → Number；空串/垃圾/任意
