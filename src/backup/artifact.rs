@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use super::export::MainStreamWriter;
 use super::frames::ChatItemDirection;
 use super::BackupError;
+use crate::proto;
 
 /// 工件文件名（与 backup5 出方向的 `history-import.ndjson` 同目录对称，
 /// 契约 §10.2）。
@@ -135,6 +136,60 @@ struct ChatItemLine {
     date_received: u64,
     read: Option<bool>,
     body: String,
+    /// 附件行（S13 扩面）：pointer 面§4.38 v2 NDJSON 同构（工程两端文档
+    /// 同形登记）。缺省键 = 旧行为（§10.2 边界期工件照常解析）。
+    #[serde(default)]
+    attachments: Option<Vec<ArtifactAttachment>>,
+}
+
+/// 单条消息附件帽（与 connector §4.13 live 接收帽同值——工件行是 live 行的
+/// 投影，不该比 live 能表达的更多；超帽 fail-closed）。
+const MAX_CHAT_ITEM_ATTACHMENTS: usize = 32;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ArtifactAttachment {
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    /// 官方 MessageAttachment.Flag 词（voiceMessage/borderless/gif）；
+    /// 缺席 = None。
+    #[serde(default)]
+    flag: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    blur_hash: Option<String>,
+    #[serde(default)]
+    incremental_mac: Option<String>,
+    #[serde(default)]
+    chunk_size: Option<u32>,
+    #[serde(default)]
+    locator: Option<ArtifactLocator>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ArtifactLocator {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    cdn_key: Option<String>,
+    #[serde(default)]
+    cdn_number: Option<u32>,
+    #[serde(default)]
+    upload_timestamp: Option<u64>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    plaintext_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +203,147 @@ enum ParsedLine {
     Chat(ChatLine),
     ChatItem(ChatItemLine),
     AllChatFolder(AllChatFolderLine),
+}
+
+// ---------------------------------------------------------------------------
+// 附件媒体面（S13，§6.2 扩面落地）：官方 pointer 校验规则逐条前置。校验器
+// 锚（libsignal message-backup file.rs，AGPL 只读参照零抄码）——LocatorInfo
+// integrity 必备（MissingIntegrityCheck）；plaintextHash⇒key 非空
+// （has_content/has_key 梯）；digest⇒key+transit 对
+// （EncryptedDigestMissingTransitInfo/MissingKey）；cdnKey/cdnNumber 同进同退
+// （TransitCdnMismatch），uploadTimestamp 仅随 transit 对
+// （UnexpectedTransitCdnUploadTimestamp）；增量 MAC 成对且非空
+// （IncrementalMacMismatch/MissingIncrementalMac）。任何违规 = 整任务
+// fail-closed（BACKUP_ARTIFACT_INVALID，§10.2）——跳条决策只在 connector
+// 建工件时做。
+// ---------------------------------------------------------------------------
+
+fn build_attachment(entry: &ArtifactAttachment) -> Result<proto::MessageAttachment, ArtifactError> {
+    use base64::Engine as _;
+    let flag = match entry.flag.as_deref() {
+        None => proto::message_attachment::Flag::None,
+        Some("voiceMessage") => proto::message_attachment::Flag::VoiceMessage,
+        Some("borderless") => proto::message_attachment::Flag::Borderless,
+        Some("gif") => proto::message_attachment::Flag::Gif,
+        Some(_) => return Err(ArtifactError::InvalidField("attachments.flag")),
+    };
+    let locator = entry
+        .locator
+        .as_ref()
+        .ok_or(ArtifactError::InvalidField("attachments.locator"))?;
+    let key = locator
+        .key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .ok_or(ArtifactError::InvalidField("attachments.locator.key"))?;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .map_err(|_| ArtifactError::InvalidField("attachments.locator.key"))?;
+    let transit = match (
+        locator.cdn_key.as_deref(),
+        locator.cdn_number,
+        locator.upload_timestamp,
+    ) {
+        (None, None, None) => None,
+        (Some(cdn_key), Some(cdn_number), timestamp) if !cdn_key.is_empty() => {
+            Some((cdn_key.to_owned(), cdn_number, timestamp))
+        }
+        _ => return Err(ArtifactError::InvalidField("attachments.locator.cdn")),
+    };
+    let integrity = match (&locator.plaintext_hash, &locator.digest) {
+        (Some(_), Some(_)) => {
+            return Err(ArtifactError::InvalidField("attachments.locator.integrity"))
+        }
+        (Some(hash), None) => {
+            let bytes = hex_decode(hash).ok_or(ArtifactError::InvalidField(
+                "attachments.locator.plaintextHash",
+            ))?;
+            proto::file_pointer::locator_info::IntegrityCheck::PlaintextHash(bytes)
+        }
+        (None, Some(digest)) => {
+            if transit.is_none() {
+                return Err(ArtifactError::InvalidField("attachments.locator.transit"));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(digest)
+                .map_err(|_| ArtifactError::InvalidField("attachments.locator.digest"))?;
+            if bytes.is_empty() {
+                return Err(ArtifactError::InvalidField("attachments.locator.digest"));
+            }
+            proto::file_pointer::locator_info::IntegrityCheck::EncryptedDigest(bytes)
+        }
+        (None, None) => return Err(ArtifactError::InvalidField("attachments.locator.integrity")),
+    };
+    let downloaded = matches!(
+        integrity,
+        proto::file_pointer::locator_info::IntegrityCheck::PlaintextHash(_)
+    );
+    let (mac, chunk_size) = match (&entry.incremental_mac, entry.chunk_size) {
+        (None, None) => (None, None),
+        (Some(mac), Some(chunk)) if !mac.is_empty() && chunk > 0 => (
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(mac)
+                    .map_err(|_| ArtifactError::InvalidField("attachments.incrementalMac"))?,
+            ),
+            Some(chunk),
+        ),
+        _ => return Err(ArtifactError::InvalidField("attachments.incrementalMac")),
+    };
+    // LocatorInfo.size 是 plaintext uint32（官方 proto 注释：空内容附件合法，
+    // 0 即陈述）；描述子 u64 按饱和钳制。
+    let size = entry.size.unwrap_or(0).min(u32::MAX as u64) as u32;
+    Ok(proto::MessageAttachment {
+        pointer: Some(proto::FilePointer {
+            content_type: entry.content_type.clone().filter(|text| !text.is_empty()),
+            incremental_mac: mac,
+            incremental_mac_chunk_size: chunk_size,
+            file_name: entry.file_name.clone().filter(|text| !text.is_empty()),
+            width: entry.width,
+            height: entry.height,
+            caption: entry.caption.clone().filter(|text| !text.is_empty()),
+            blur_hash: entry.blur_hash.clone().filter(|text| !text.is_empty()),
+            locator_info: Some(proto::file_pointer::LocatorInfo {
+                key,
+                size,
+                transit_cdn_key: transit.as_ref().map(|(key, _, _)| key.clone()),
+                transit_cdn_number: transit.as_ref().map(|(_, number, _)| *number),
+                transit_tier_upload_timestamp: transit.as_ref().and_then(|(_, _, ts)| *ts),
+                media_tier_cdn_number: None,
+                local_key: None,
+                integrity_check: Some(integrity),
+            }),
+        }),
+        flag: flag as i32,
+        was_downloaded: downloaded,
+        client_uuid: None,
+    })
+}
+
+/// 小写 hex（官方 Bytes.toHex 同形，plaintextHash 投影形状）→ 字节；
+/// 非小写/奇长/非 hex 一律 None。
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            u8::try_from(high * 16 + low).ok()
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    // 小写纪律：重编码须逐字节相等（大写 hex 在此拒收）。
+    let mut text = String::with_capacity(value.len());
+    for byte in &bytes {
+        text.push(char::from_digit(u32::from(byte >> 4), 16)?);
+        text.push(char::from_digit(u32::from(byte & 0x0f), 16)?);
+    }
+    (text == value).then_some(bytes)
 }
 
 fn parse_line(buf: &[u8]) -> Result<ParsedLine, ArtifactError> {
@@ -417,14 +613,40 @@ fn assemble_with_limits<W: std::io::Write>(
                     _ => return Err(ArtifactError::InvalidField("direction").into()),
                 };
                 // body 非空且 ≤128 KiB 由状态机强制（EmptyMessageBody/
-                // MessageBodyTooLong → BACKUP_ARTIFACT_INVALID）。
-                out.chat_item_text(
-                    chat_engine_id,
-                    author_engine_id,
-                    line.date_sent,
-                    direction,
-                    &line.body,
-                )?;
+                // MessageBodyTooLong → BACKUP_ARTIFACT_INVALID）；S13 起
+                // 纯媒体行（空 body + 附件在场）合法（官方
+                // standard_message.rs:88-107 同界），状态机同规。
+                let attachments = match line.attachments.as_deref() {
+                    None | Some(&[]) => Vec::new(),
+                    Some(entries) => {
+                        if entries.len() > MAX_CHAT_ITEM_ATTACHMENTS {
+                            return Err(ArtifactError::InvalidField("attachments").into());
+                        }
+                        entries
+                            .iter()
+                            .map(build_attachment)
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                };
+                if attachments.is_empty() {
+                    // 纯文本行走原文本臂（§4.46 原生装配路径原样保留）。
+                    out.chat_item_text(
+                        chat_engine_id,
+                        author_engine_id,
+                        line.date_sent,
+                        direction,
+                        &line.body,
+                    )?;
+                } else {
+                    out.chat_item_standard(
+                        chat_engine_id,
+                        author_engine_id,
+                        line.date_sent,
+                        direction,
+                        &line.body,
+                        attachments,
+                    )?;
+                }
             }
             ParsedLine::AllChatFolder(_) => {
                 out.all_chat_folder()?;
@@ -876,6 +1098,107 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // S13 附件媒体面（§6.2 扩面）：工件附件行 → 官方帧 → 环回 NDJSON。
+    // -------------------------------------------------------------------
+
+    /// 附件指针面定值：key = base64("0123456789abcdef")，plaintextHash =
+    /// 32 位小写 hex，transit 三件齐全（校验器 happy path）。
+    fn attachment_item_line(chat: u64, author: u64, body: &str) -> String {
+        format!(
+            "{{\"type\":\"chat_item\",\"chat\":{chat},\"author\":{author},\"dateSent\":1760000003000,\
+             \"direction\":\"incoming\",\"dateReceived\":1760000003005,\"body\":\"{body}\",\
+             \"attachments\":[{{\"contentType\":\"image/png\",\"fileName\":\"pic.png\",\"size\":64,\
+             \"flag\":\"borderless\",\"width\":320,\"height\":240,\
+             \"incrementalMac\":\"MDEyMzQ1Njc4OWFiY2RlZg==\",\"chunkSize\":1024,\
+             \"locator\":{{\"key\":\"MDEyMzQ1Njc4OWFiY2RlZg==\",\"cdnKey\":\"ABCDEFG\",\
+             \"cdnNumber\":2,\"uploadTimestamp\":1760000000000,\
+             \"plaintextHash\":\"0123456789abcdef0123456789abcdef\"}}}}]}}"
+        )
+    }
+
+    #[tokio::test]
+    async fn attachment_artifact_round_trips_to_pointer_complete_ndjson() {
+        let mut lines = golden_lines();
+        lines.push(attachment_item_line(101, 10, "pic"));
+        // 先过官方校验（写入即合法，validator 无豁免）。
+        let (sink, _lines, _frames) = assemble_archive(&lines);
+        assert_official_validation(&sink).await;
+        // 真快照目录（export 通路产出）→ 官方 reader 收向 → NDJSON。
+        let root = unique_test_dir("s13-roundtrip");
+        let artifact = artifact_bytes(&lines);
+        let p = params();
+        let report = crate::backup::export_local_backup(&root, &p, |out| {
+            assemble(out, Cursor::new(&artifact), p.backup_time_ms)?;
+            Ok(())
+        })
+        .expect("snapshot export");
+        let mut ndjson = Vec::new();
+        let stats = crate::backup::export_snapshot_frames(
+            &report.snapshot_dir,
+            &tests_official_keys(),
+            &mut ndjson,
+        )
+        .await
+        .expect("snapshot frames export");
+        assert!(stats.messages >= 1);
+        let text = String::from_utf8(ndjson).expect("utf8");
+        let row = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .find(|value| value.get("attachments").is_some())
+            .expect("attachment row exported");
+        let att = &row["attachments"][0];
+        assert_eq!(att["contentType"], "image/png");
+        assert_eq!(att["fileName"], "pic.png");
+        assert_eq!(att["size"], 64, "LocatorInfo.size = plaintext 陈述");
+        assert_eq!(att["width"], 320);
+        assert_eq!(att["height"], 240);
+        assert_eq!(att["flag"], 2, "borderless 词 → 官方 Flag 枚举原值");
+        assert_eq!(att["incrementalMac"], "MDEyMzQ1Njc4OWFiY2RlZg==");
+        assert_eq!(att["chunkSize"], 1024);
+        let locator = &att["locator"];
+        assert_eq!(
+            locator["key"], "MDEyMzQ1Njc4OWFiY2RlZg==",
+            "环回 NDJSON locator 与工件同键同值（§4.38 v2 面复用 project_pointer_common）"
+        );
+        assert_eq!(locator["cdnKey"], "ABCDEFG");
+        assert_eq!(locator["cdnNumber"], 2);
+        assert_eq!(locator["uploadTimestamp"], 1_760_000_000_000u64);
+        assert_eq!(
+            locator["plaintextHash"], "0123456789abcdef0123456789abcdef",
+            "小写 hex 往返不变形"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn attachment_only_item_assembles_and_validates_officially() {
+        // 纯媒体行（空 body + 附件在场）：官方 standard_message.rs:88-107 界
+        // ——文本缺席 + 附件在场 = 合法；文本附件双缺 = StandardMessageIsEmpty。
+        let mut lines = golden_lines();
+        lines.push(attachment_item_line(101, 10, ""));
+        let (sink, _lines, _frames) = assemble_archive(&lines);
+        assert_official_validation(&sink).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_pointer_hole_fails_closed() {
+        // 无 integrity 的 locator（官方 MissingIntegrityCheck 形）整任务拒绝
+        // ——跳条决策只在 connector（§10.2），引擎永不静默吞。
+        let mut lines = golden_lines();
+        let hole = attachment_item_line(101, 10, "hole").replace(
+            ",\"plaintextHash\":\"0123456789abcdef0123456789abcdef\"",
+            "",
+        );
+        lines.push(hole);
+        let error = assemble_error(&lines);
+        match artifact_error_of(error) {
+            ArtifactError::InvalidField("attachments.locator.integrity") => {}
+            other => panic!("expected integrity hole fail-closed, got {other:?}"),
         }
     }
 }

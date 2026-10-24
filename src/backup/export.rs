@@ -194,6 +194,27 @@ impl<W: Write> MainStreamWriter<W> {
         self.emit(frame)
     }
 
+    /// 附件媒体面（S13）：带 MessageAttachment 的标准消息帧透传。
+    pub fn chat_item_standard(
+        &mut self,
+        chat_id: u64,
+        author_id: u64,
+        date_sent_ms: u64,
+        direction: ChatItemDirection,
+        body: &str,
+        attachments: Vec<crate::proto::MessageAttachment>,
+    ) -> Result<(), BackupError> {
+        let frame = self.sequencer.chat_item_standard(
+            chat_id,
+            author_id,
+            date_sent_ms,
+            direction,
+            body,
+            attachments,
+        )?;
+        self.emit(frame)
+    }
+
     pub fn all_chat_folder(&mut self) -> Result<(), BackupError> {
         let frame = self.sequencer.all_chat_folder()?;
         self.emit(frame)

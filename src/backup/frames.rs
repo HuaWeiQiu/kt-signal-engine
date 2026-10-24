@@ -388,6 +388,32 @@ impl FrameSequencer {
         direction: ChatItemDirection,
         body: &str,
     ) -> Result<proto::Frame, FrameSequenceError> {
+        self.chat_item_standard(
+            chat_id,
+            author_id,
+            date_sent_ms,
+            direction,
+            body,
+            Vec::new(),
+        )
+    }
+
+    /// 附件媒体面（S13，§6.2 扩面落地）：标准消息携带 MessageAttachment
+    /// （pointer + flag + 媒体元数据），与文本同帧。官方校验器边界
+    /// （libsignal message-backup standard_message.rs:88-107）：文本缺席 +
+    /// 附件缺席 = StandardMessageIsEmpty；文本缺席 + 附件在场 = 合法纯媒体
+    /// 消息。附件条目已由 artifact 层按官方 pointer 规则 fail-closed 校验
+    /// （integrity 必备、plaintextHash⇒key、digest⇒key+transit 对、增量 MAC
+    /// 成对），此处只做装配。
+    pub fn chat_item_standard(
+        &mut self,
+        chat_id: u64,
+        author_id: u64,
+        date_sent_ms: u64,
+        direction: ChatItemDirection,
+        body: &str,
+        attachments: Vec<proto::MessageAttachment>,
+    ) -> Result<proto::Frame, FrameSequenceError> {
         if !self.chats.contains_key(&chat_id) {
             return Err(FrameSequenceError::UnknownChat(chat_id));
         }
@@ -403,7 +429,7 @@ impl FrameSequencer {
                 return Err(FrameSequenceError::InvalidChatAuthor(author_id))
             }
         }
-        if body.is_empty() {
+        if body.is_empty() && attachments.is_empty() {
             return Err(FrameSequenceError::EmptyMessageBody);
         }
         const MAX_BODY: usize = 128 * 1024;
@@ -441,10 +467,15 @@ impl FrameSequencer {
                 directional_details: Some(directional_details),
                 item: Some(proto::chat_item::Item::StandardMessage(
                     proto::StandardMessage {
-                        text: Some(proto::Text {
-                            body: body.to_owned(),
-                            body_ranges: Vec::new(),
-                        }),
+                        text: if body.is_empty() {
+                            None
+                        } else {
+                            Some(proto::Text {
+                                body: body.to_owned(),
+                                body_ranges: Vec::new(),
+                            })
+                        },
+                        attachments,
                         ..Default::default()
                     },
                 )),

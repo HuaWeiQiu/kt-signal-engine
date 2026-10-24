@@ -133,7 +133,7 @@ pad     = padded_length(gzip长度) - gzip长度    [libsignal v0.99.0::padded_l
 | `Recipient{contact}` | aci(16B)/e164/profileKey/profile 名；aci/e164/pni/username 去重（validator） | 同上 + 官方 ContactArchiveExporter 字段面 |
 | `Recipient{group}` | masterKey（去重）；**snapshot 必带最小合法面**（消费批 validator 实证：缺席=硬错 `MissingSnapshot`）——引擎无群元数据真相源（§6.2 群全量面不做），状态机投影为空 avatarUrl/零 version/空 members 的占位快照（官方 group.rs 验收面全绿） | 同上 + libsignal v0.99.0 `backup/recipient/group.rs` 硬校验口径 |
 | `Chat` | id、recipientId（引用已登记 Recipient）、expireTimerMs/expireTimerVersion（有则带） | 官方 ChatArchiveExporter |
-| `ChatItem{standardMessage}` | text.body；directional：`Incoming{dateReceived,read}` / `Outgoing{dateReceived}`；authorId（self 用 Self recipient id）；dateSent | 官方 ChatItemArchiveExporter 最小面 |
+| `ChatItem{standardMessage}` | text.body；directional：`Incoming{dateReceived,read}` / `Outgoing{dateReceived}`；authorId（self 用 Self recipient id）；dateSent；**attachments[]（S13 扩面，2026-10-24）**：`MessageAttachment{pointer(FilePointer+LocatorInfo), flag(voiceMessage/borderless/gif), width/height/caption/blurHash, incrementalMac+chunkSize}`——§10.2 附件行面，官方校验器逐条前置（integrity 必备、plaintextHash⇒key、digest⇒key+transit 对、增量 MAC 成对、cdn 三件同进同退） | 官方 ChatItemArchiveExporter 最小面 + libsignal message-backup `standard_message.rs:88-107`（文本缺席+附件在场=合法纯媒体消息）/`file.rs`（NoFilePointer/MissingIntegrityCheck/TransitCdnMismatch/IncrementalMacMismatch） |
 | `ChatFolder{all}` | ALL folder 一帧（validator 空集容忍、Android 端缺省自动补；带上以贴近官方档案并通过 validator） | BackupRepository.import 兜底 + validator |
 
 ### 6.2 全量帧面清单（官方存在，本批不做，标后续）
@@ -143,8 +143,10 @@ pad     = padded_length(gzip长度) - gzip长度    [libsignal v0.99.0::padded_l
 - ChatItem 变体：`ContactMessage`、`StickerMessage`、`RemoteDeletedMessage`、
   `ChatUpdateMessage`（成员变更/计时器更新/群改名等）、`PaymentNotification`、
   `GiftBadge`、`ViewOnceMessage`、`revisions`（编辑）、`pinDetails`。
-- StandardMessage 扩展：`Quote`、`Reaction`、`MessageAttachment`（附件指针 +
-  files/ 附件导出 + FilesFrame 索引）、`LinkPreview`、`longText`（CDN 指针）、
+- StandardMessage 扩展：`Quote`、`Reaction`、~~`MessageAttachment`~~
+  （**指针面 S13 已落地，2026-10-24**：附件指针随 §10.2 工件附件行进帧；
+  bytes/ 附件导出 + FilesFrame 索引仍属后续——媒体字节面 §6.2 附件媒体面
+  条目不动）、`LinkPreview`、`longText`（CDN 指针）、
   `SendStatus` 细粒度。
 - AccountData 扩展：username/usernameLink、svrPin（**凭据，引擎边界外，永不
   导出**）、AccountSettings 全量（见引擎 `setAccountConfiguration` 各真相源
@@ -332,15 +334,20 @@ kt-desktop / Android 真机
 | `contact` | `id`(u64≥1)、`aci`?(hex32)、`pni`?(hex32)、`e164`?(u64≠0)、`username`?、`profileKey`?(hex64)、`givenName`?、`familyName`?、`registration`?("registered"\|"unregistered"；**缺省 = "registered"**——官方 validator 对缺席 registration 硬错 `ContactRegistrationUnknown`) | `contact_recipient(Contact)`；aci/pni/e164 至少一项；givenName/familyName → `profileGivenName`/`profileFamilyName`（Contact 无 bio 字段，bio 只属于 account 行）；`unregistered` 由引擎盖 `unregisteredTimestamp = backup_time_ms`（官方 validator 对 NotRegistered 的非零时间戳口径） |
 | `group` | `id`(u64≥1)、`masterKey`(hex64 必填) | `group_recipient(master_key)` |
 | `chat` | `id`(u64≥1)、`recipient`(引用已声明 contact/group id 或 0=self) | `chat(recipient_id)` |
-| `chat_item` | `chat`(引用已声明 chat id)、`author`(引用已声明 contact id 或 0=self；group 不能作 author——官方 v2 归档群消息署名到个人，帧序状态机 `InvalidChatAuthor` 拒绝)、`dateSent`(u64 ms)、`direction`("incoming"\|"outgoing")、`dateReceived`(u64 ms 两方向都必填)、`read`?(bool，仅 incoming 有意义，缺省 false)、`body`(非空 str，≤128 KiB) | `chat_item_text(chat_id, author_id, date_sent_ms, direction, body)` |
+| `chat_item` | `chat`(引用已声明 chat id)、`author`(引用已声明 contact id 或 0=self；group 不能作 author——官方 v2 归档群消息署名到个人，帧序状态机 `InvalidChatAuthor` 拒绝)、`dateSent`(u64 ms)、`direction`("incoming"\|"outgoing")、`dateReceived`(u64 ms 两方向都必填)、`read`?(bool，仅 incoming 有意义，缺省 false)、`body`(str，≤128 KiB；**空 body 仅当 `attachments` 非空**——官方 standard_message 校验器文本/附件双缺即 `StandardMessageIsEmpty`)、`attachments`?(附件行数组，≤32 条，S13 扩面见下) | `chat_item_text(...)`（纯文本臂）/`chat_item_standard(...)`（附件臂，S13） |
+| `chat_item.attachments[]` | `contentType`?、`fileName`?、`size`?(u64，帧内钳至 uint32)、`flag`?("voiceMessage"\|"borderless"\|"gif"，缺省=None)、`width`?/`height`?(u32)、`caption`?、`blurHash`?、`incrementalMac`?(base64)+`chunkSize`?(u32，**成对必备**)、`locator`{`key`(base64 必备)、`cdnKey`+`cdnNumber`(u32，**成对**)、`uploadTimestamp`?(u64>0，仅随 cdn 对)、`plaintextHash`(小写 hex)\|`digest`(base64) **二选一必备**；digest 形另须 `cdnKey`+`cdnNumber` 对（官方 `EncryptedDigestMissingTransitInfo`）} | `chat_item_standard(...)` 的 `MessageAttachment` 帧；字段键与 §4.38 v2 NDJSON locator 面同构（引擎出方向 `project_pointer_common` 的逆形），环回重导（§11）经同一收向投影闭合 |
 | `all_chat_folder` | （无字段） | `all_chat_folder()`；可省略——缺省时引擎收尾自动补一帧（validator 通过面，§6.1），出现则恰一次 |
 
 - self recipient 不是行类型：引擎在 account 行之后自动发出（恰一次、id=1，
   frames.rs 常量）。chat 的 `recipient: 0` 即 Note to Self。
 - **引擎侧永不静默丢行**：未知 type、顺序违规、引用未声明、id 重复、id=0
-  声明、hex 非法、body 空/超长、JSON 非法——一律任务失败
+  声明、hex 非法、body 空/超长、JSON 非法、**附件行违规（S13：integrity
+  缺席、plaintextHash 无 key、digest 无 transit 对、cdn 三件不成对、
+  uploadTimestamp 裸奔、增量 MAC 半对、超 32 条）**——一律任务失败
   `BACKUP_ARTIFACT_INVALID`（§10.7）。跳行决策只属于 connector 建工件时
-  （其契约 §4.46 逐因计数），引擎只做「全部成帧或整体失败」。
+  （其契约 §4.46 逐因计数：pointer 面建不成官方帧的附件条目 = 该行
+  `skippedAttachments` 诚实计数，行本体照常出行），引擎只做「全部成帧或
+  整体失败」。
 - **帽值**（写死，两端文档与实现一致；超帽 fail-closed 同上）：
 
 | 帽 | 值 | 依据 |
@@ -349,6 +356,7 @@ kt-desktop / Android 真机
 | 总行数 | 4,000,000 行 | connector store 有界保留（2000 行/会话 ×8 会话帽 ×冗余系数）之上的纯 fail-closed 闸 |
 | 工件总字节 | 2 GiB = 2,147,483,648 B | 同上， runaway 文件熔断 |
 | chat_item body | 128 KiB = 131,072 B | frames.rs validator 前置（§7 API） |
+| chat_item attachments | ≤32 条/消息（S13） | connector live 接收帽（其 §4.13）同值；官方无硬帽，两端有界纪律 |
 | chat/contact/group id | u64，可声明域 ≥1；0 保留 self | §10.2 引用规则 |
 | exportStatus 快照清单 | ≤32 条，新→旧 | 响应有界 |
 
