@@ -2292,6 +2292,91 @@ mod tests {
         assert!(timer_change_record(&simple(simple_chat_update::Type::JoinedSignal)).is_none());
     }
 
+    /// Z9-44 共同源码锁（台账 §29.84）：摘要面与专属面并存超集的双侧同锁。
+    ///
+    /// §29.38.5 合流裁定：\`update\` 摘要面是部署线既有形状（旧宿主按
+    /// \`update.kind\` 逐字节读，simpleUpdate/learnedProfileChange/
+    /// threadMerge 三族在合流前已经以 \`update\` 键上 wire，删面即断既有
+    /// 宿主），批 A 三专属面是官方 import 行族窄面——两侧互不替代，
+    /// 不采用「有专属面就不投摘要面」的排他裁法。此前两侧各有钉形但无
+    /// 共同锁：后来者「去重」删掉任一面，既有测试不红（§29.38.10-3
+    /// 风险项挂账）。本测试双臂合锁：
+    /// ① 行为臂——同一行必须同时携 \`update\`（摘要）与专属面键，
+    ///    任一面缺席即红；
+    /// ② 源码臂——include_str! 锁装配点与两族函数段源在，删任一臂即红
+    ///    并指回合流裁定（恢复该面，或显式重立裁定并记台账，绝不静默
+    ///    去重）。
+    #[test]
+    fn summary_and_dedicated_faces_coexistence_lock() {
+        // ① 行为臂：simpleUpdate 行 = 摘要面 update.{kind,type} 与专属面
+        // simpleUpdate 同行并存（additive 超集的 wire 直证）。
+        let row = test_record(&ChatItem {
+            chat_id: 41,
+            author_id: 7,
+            date_sent: 900,
+            directional_details: Some(chat_item::DirectionalDetails::Directionless(
+                DirectionlessMessageDetails::default(),
+            )),
+            item: Some(Item::UpdateMessage(ChatUpdateMessage {
+                update: Some(chat_update_message::Update::SimpleUpdate(
+                    crate::proto::SimpleChatUpdate {
+                        r#type: simple_chat_update::Type::JoinedSignal as i32,
+                    },
+                )),
+            })),
+            ..Default::default()
+        })
+        .expect("simpleUpdate 行在");
+        assert_eq!(
+            row["update"]["kind"], "simpleUpdate",
+            "摘要面（部署线既有形状）缺席——删面即断既有宿主；恢复 record[\"update\"] = \
+             update_event_record(update) 装配臂，或重立 §29.38.5 合流裁定"
+        );
+        assert_eq!(
+            row["update"]["type"], "JOINED_SIGNAL",
+            "摘要面形状漂移——旧宿主按逐字节形状读（官方词表名不变）"
+        );
+        assert_eq!(
+            row["simpleUpdate"]["type"], "JOINED_SIGNAL",
+            "专属面缺席——官方 import 行族窄面被删；恢复 simple_update_record 臂，或重立 §29.38.5 合流裁定"
+        );
+
+        // ② 源码臂：六装配点 + 摘要面函数段源在（防「去重」静默删面）。
+        let source = include_str!("history.rs");
+        for (marker, why) in [
+            (
+                "record[\"update\"] = update_event_record(update)?;",
+                "摘要面装配臂（部署线既有形状，§29.38.5 裁定原样保留）",
+            ),
+            ("fn update_event_record(", "摘要面投影函数"),
+            (
+                "record[\"simpleUpdate\"]",
+                "simpleUpdate 专属面装配臂（批 A 官方窄面）",
+            ),
+            (
+                "record[\"learnedProfileChange\"]",
+                "learnedProfileChange 专属面装配臂（批 A）",
+            ),
+            (
+                "record[\"threadMerge\"]",
+                "threadMerge 专属面装配臂（批 A）",
+            ),
+            (
+                "record[\"groupUpdate\"]",
+                "groupUpdate 专属面装配臂（B1 群变更批）",
+            ),
+            (
+                "record[\"expirationTimerChange\"]",
+                "expirationTimerChange 专属面装配臂",
+            ),
+        ] {
+            assert!(
+                source.contains(marker),
+                "history.rs 共同源码锁：{why} 源不在场（{marker}）——摘要面与专属面是并存超集\n（§29.38.5 合流裁定：删任一面即断现网/官方窄面形状），恢复该面或显式重立裁定并记台账，绝不静默去重（§29.38.10-3 / §29.84）"
+            );
+        }
+    }
+
     /// E 批 chat/item 计时器字段两面：有（原样透出）/ 缺（键不在；proto3
     /// 标量 0 视同未设；item 级 Some(0) 不投）。
     #[test]
