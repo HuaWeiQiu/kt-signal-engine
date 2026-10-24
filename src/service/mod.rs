@@ -2111,6 +2111,10 @@ pub mod cloud_backup;
 /// uploadStatus；装配段专用线程 + 上行段 LocalSet watcher）。
 pub(crate) mod cloud_upload;
 
+/// 会话 hidden 独立位存储面（S16，KT 扩展方法 setConversationHidden;
+/// connector 落位写引擎存储，listContacts 读投影按位收敛）。
+pub(crate) mod conversation_hidden;
+
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
@@ -4592,11 +4596,17 @@ impl Service {
             let sharing = whitelist
                 .get(&contact.uuid.to_string().to_lowercase())
                 .copied();
+            // S16 hidden 独立位（setConversationHidden 落位）：有位用位，
+            // 无位维持反演近似（contacts 表行 = false）——读面键形零变化，
+            // 位值语义按存储收敛。
+            let hidden = conversation_hidden::hidden_of(manager.store(), &contact.uuid.to_string())
+                .await
+                .or(Some(false));
             out.push(project_contact_entry(
                 &number,
                 &contact.name,
                 profile,
-                Some(false),
+                hidden,
                 sharing,
             ));
         }
@@ -5792,6 +5802,36 @@ impl Service {
         ));
         let _ = manager.send_message(own_aci, body, now_ms()).await;
         Ok(())
+    }
+
+    /// setConversationHidden（S16 引擎 hidden 半边，KT 扩展方法，wire
+    /// additive，compat §5 契约）：connector 落位 hidden 独立位写引擎存储
+    /// （kv per-peer 版本化键，幂等；存储面见 conversation_hidden 模块）。
+    /// peerAci 只收 ACI（1:1 会话键；PNI: 前缀拒绝，绝不按裸 UUID 误收
+    /// PNI）；写前归一化为标准字符串形（大小写不敏感输入收敛同键）。
+    /// 读投影臂 = listContacts isHidden 位按存储收敛（有位用位，无位维持
+    /// inSystemContacts 反演近似，§29.4 反演近似语义不动）。
+    pub(crate) async fn set_conversation_hidden(
+        self: &Arc<Self>,
+        account: &str,
+        peer_aci: &str,
+        hidden: bool,
+    ) -> Result<(), conversation_hidden::SetHiddenError> {
+        if !self.real {
+            return Ok(());
+        }
+        let peer = ServiceId::parse_from_service_id_string(peer_aci)
+            .ok_or(conversation_hidden::SetHiddenError::InvalidPeer)?;
+        if !matches!(peer, ServiceId::Aci(_)) {
+            return Err(conversation_hidden::SetHiddenError::InvalidPeer);
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(conversation_hidden::SetHiddenError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
+        conversation_hidden::set_hidden(manager.store(), &peer.service_id_string(), hidden)
+            .await
+            .map_err(|_| conversation_hidden::SetHiddenError::Store)
     }
 
     /// chatFolders.list（Storage 跨设备同步批）：ChatFolder 记录读投影
@@ -12432,11 +12472,16 @@ async fn non_contact_profile_entries(
                     .map(|(given, family)| (given.to_owned(), family.map(str::to_owned)))
             });
         if let Some((given, family)) = material {
+            // S16 hidden 独立位（setConversationHidden 落位）：有位用位，
+            // 无位维持反演近似（非通讯录 profile 行 = true）。
+            let hidden = conversation_hidden::hidden_of(store, &uuid.to_string())
+                .await
+                .unwrap_or(true);
             out.push(project_contact_entry(
                 &uuid.to_string(),
                 "",
                 Some((&given, family.as_deref())),
-                Some(true),
+                Some(hidden),
                 None,
             ));
         }
