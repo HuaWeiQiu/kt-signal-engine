@@ -2696,6 +2696,25 @@ async fn dispatch(
                 Err(TrustError::UnknownAccount) | Err(TrustError::Io) => internal_error(id),
             }
         }
+        // S16 引擎 hidden 半边（KT 扩展方法，wire additive，compat §5 契约）：
+        // connector 落位 hidden 独立位写引擎存储（kv per-peer 版本化键，
+        // 幂等）。参数恰三键 strict-parse（词表钉见 parse 助手测试），
+        // fail-closed -32603；成功回空对象（trust 写面同款）。
+        "setConversationHidden" => {
+            let Some((account, peer_aci, hidden)) = parse_set_conversation_hidden_params(params)
+            else {
+                return internal_error(id);
+            };
+            match service
+                .set_conversation_hidden(account, peer_aci, hidden)
+                .await
+            {
+                Ok(()) => jsonrpc::success_response(id, json!({})),
+                // 账号未注册 / peerAci 非法（PNI: 前缀拒）/ store 写失败：
+                // 引擎通用内部错误（变体仅归因日志，零内容）。
+                Err(_) => internal_error(id),
+            }
+        }
         // Storage 跨设备同步批（KT 扩展方法；官方 chatFolder/
         // notificationProfile 记录面 upload 语义，compat §3 行 + §5 块）：
         // 参数 fail-closed -32603；storage 链路四码折叠 storage_error。
@@ -5080,6 +5099,22 @@ fn poll_option_indexes_face(value: &Value) -> Option<Vec<u32>> {
         .collect()
 }
 
+/// setConversationHidden 参数 strict-parse（S16，KT 扩展方法）：恰三键
+/// account/peerAci/hidden——字符串/字符串/布尔；缺键/坏型/多余键整拒
+/// （词表纪律，坏形状 fail-closed -32603）。返回 (account, peer_aci,
+/// hidden)。
+fn parse_set_conversation_hidden_params(
+    params: &serde_json::Map<String, Value>,
+) -> Option<(&str, &str, bool)> {
+    if params.len() != 3 {
+        return None;
+    }
+    Some((
+        params.get("account")?.as_str()?,
+        params.get("peerAci")?.as_str()?,
+        params.get("hidden")?.as_bool()?,
+    ))
+}
 /// records/removeIds 双参批解析（chatFolders/notificationProfiles/
 /// storyDistributionLists setRecords 共用，compat §3 各行错误面）：records
 /// 条目逐条过 parse 闸；removeIds 条目过 id 闸（folder/story list=uuid 串 /
@@ -5367,6 +5402,55 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// setConversationHidden 参数词表 strict-parse 面（S16）：恰三键
+    /// account/peerAci/hidden 逐键验型；缺键/坏型/多余键整拒（fail-closed
+    /// -32603 的解析半边，connector 落位写面对账钉）。
+    #[test]
+    fn parse_set_conversation_hidden_params_pins_wire_contract() {
+        let ok = json!({
+            "account": "+15551234567",
+            "peerAci": "11111111-2222-4333-8444-555555555555",
+            "hidden": true,
+        });
+        assert_eq!(
+            parse_set_conversation_hidden_params(ok.as_object().expect("object")),
+            Some(("+15551234567", "11111111-2222-4333-8444-555555555555", true)),
+        );
+
+        // 坏型：hidden 非布尔整拒。
+        let bad_hidden = json!({
+            "account": "+15551234567",
+            "peerAci": "11111111-2222-4333-8444-555555555555",
+            "hidden": "true",
+        });
+        assert_eq!(
+            parse_set_conversation_hidden_params(bad_hidden.as_object().expect("object")),
+            None
+        );
+
+        // 缺键整拒。
+        let missing = json!({
+            "account": "+15551234567",
+            "peerAci": "11111111-2222-4333-8444-555555555555",
+        });
+        assert_eq!(
+            parse_set_conversation_hidden_params(missing.as_object().expect("object")),
+            None
+        );
+
+        // 多余键整拒。
+        let extra = json!({
+            "account": "+15551234567",
+            "peerAci": "11111111-2222-4333-8444-555555555555",
+            "hidden": false,
+            "peerKey": "unused",
+        });
+        assert_eq!(
+            parse_set_conversation_hidden_params(extra.as_object().expect("object")),
+            None
+        );
+    }
 
     /// 2026-10-20 隐私修复：账号前缀日志必须不可逆。原实现取 E.164 前 8
     /// 字符（`+8618827…`）直接落盘；改为 SHA-256 前 8 hex 后，同一账号
