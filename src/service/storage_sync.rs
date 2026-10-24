@@ -311,6 +311,89 @@ pub(crate) fn save_manifest_state(account_dir: &Path, state: &ManifestState) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 批 R 重连版本闸（landing 轻检查）：官方 storage.preload.ts:1398-1424
+// fetchManifest(greaterThanVersion) 语义同构——条件 GET
+// `/v1/storage/manifest/version/{v}`，204 = 同版本零差零流量跳过；协议面
+// 无 storage 变更独立 push 类型（Envelope.Type 枚举无该变体、Storage
+// Service 纯 HTTP 无 watch，SignalStorage.proto 无 notification 消息），
+// 本闸 + fetchLatest E2E 信封（T-9 消费臂已有）合起来就是官方「实时 +
+// 重连版本比较」两增量通道的完整对位。
+// ---------------------------------------------------------------------------
+
+/// 版本探测结果三面（网络面剥离后的纯闸输入；本地基线 version 只作
+/// 条件 GET 参数，不参与裁定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestVersionProbe {
+    /// 服务器条件 GET 204：版本与本地一致（官方 "no newer manifest, ok"）。
+    Same,
+    /// 服务器返回更新 manifest（解密后 version 随行，仅日志/观测用）。
+    Newer(u64),
+    /// 服务器无 storage 态（manifest 404：账号从未启用/已清空；本机
+    /// master key 缺失同义早退）。
+    NoServerState,
+    /// 探测失败（网络/auth/解密）：版本不可判。
+    Unavailable,
+}
+
+/// 版本闸裁定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionGateDecision {
+    /// 同版本/服务器空态 → 跳过全量拉（零差零流量）。
+    Skip,
+    /// 版本有差/不可判 → 全量拉（读面幂等；拉后版本落账由 pull 单点
+    /// 以两腿 outcome 承载，不取探测值——拉取期间服务器可能又前进）。
+    Pull,
+}
+
+/// 落闸裁定纯函数（fail-open 纪律钉形）：只有「确证同版本」与「服务器
+/// 确证空态」跳过；探测不可判一律全量拉兜底（读面幂等，正确性优先于
+/// 流量）。
+pub(crate) fn manifest_version_gate(probe: ManifestVersionProbe) -> VersionGateDecision {
+    match probe {
+        ManifestVersionProbe::Same | ManifestVersionProbe::NoServerState => {
+            VersionGateDecision::Skip
+        }
+        ManifestVersionProbe::Newer(_) | ManifestVersionProbe::Unavailable => {
+            VersionGateDecision::Pull
+        }
+    }
+}
+
+/// landing 版本探测腿（网络面）：本地 manifest 状态 version 为基线
+/// （无记录按 0）→ `StorageService::manifest_if_changed` 条件 GET。
+/// master key 缺失（从未有 storage 态）零网络早退；探测失败如实折
+/// `Unavailable`（调用方落闸 fail-open）。
+pub(crate) async fn manifest_version_probe(context: &StorageContext) -> ManifestVersionProbe {
+    let local = load_manifest_state(&context.account_dir).map(|state| state.version);
+    let master_key = context
+        .store
+        .fetch_master_key()
+        .await
+        .map_err(|_| StorageSyncError::ReadFailed)
+        .ok()
+        .flatten();
+    let Some(master_key) = master_key else {
+        return ManifestVersionProbe::NoServerState;
+    };
+    let Ok(storage) = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await
+    else {
+        return ManifestVersionProbe::Unavailable;
+    };
+    match storage.manifest_if_changed(local.unwrap_or(0)).await {
+        Ok(None) => ManifestVersionProbe::Same,
+        Ok(Some(manifest)) => ManifestVersionProbe::Newer(manifest.version),
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+            ManifestVersionProbe::NoServerState
+        }
+        Err(_) => ManifestVersionProbe::Unavailable,
+    }
+}
+
 /// 新 Account item id（官方 generateStorageID 同构：16 随机字节）。
 pub(crate) fn new_item_key() -> Vec<u8> {
     let mut key = [0u8; 16];
@@ -2555,6 +2638,34 @@ pub(crate) async fn storage_auth(
 mod tests {
     use super::*;
     use prost::Message;
+
+    /// 批 R 重连版本闸落闸裁定钉形（fail-open 纪律）：确证同版本（204）
+    /// 与服务器确证空态（404/master key 缺席）恰跳过——零差零流量；版本
+    /// 有差与探测不可判一律全量拉（读面幂等，正确性优先于流量；不可判
+    /// 不跳是本闸的唯一安全侧）。
+    #[test]
+    fn manifest_version_gate_fails_open_on_unavailable() {
+        assert_eq!(
+            manifest_version_gate(ManifestVersionProbe::Same),
+            VersionGateDecision::Skip,
+            "204 同版本恰跳过"
+        );
+        assert_eq!(
+            manifest_version_gate(ManifestVersionProbe::NoServerState),
+            VersionGateDecision::Skip,
+            "服务器空态恰跳过（无可拉）"
+        );
+        assert_eq!(
+            manifest_version_gate(ManifestVersionProbe::Newer(9)),
+            VersionGateDecision::Pull,
+            "版本有差全量拉"
+        );
+        assert_eq!(
+            manifest_version_gate(ManifestVersionProbe::Unavailable),
+            VersionGateDecision::Pull,
+            "探测不可判 fail-open 仍全量拉（唯一安全侧）"
+        );
+    }
 
     fn contact_pinned(uuid: &str) -> PinnedConversation {
         let sid = presage::libsignal_service::protocol::ServiceId::Aci(

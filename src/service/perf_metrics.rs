@@ -94,6 +94,14 @@ pub(crate) mod keys {
     /// T-9 manifest 自动拉逐腿失败计（mergeContacts/importGroups 各自计；
     /// 读面幂等，失败靠下次触发/下次链路建立重补）。
     pub const STORAGE_MANIFEST_PULL_ERR: &str = "storage_manifest_pull_err";
+    /// 批 R 重连版本闸触发源（landing 轻检查裁定「有差/不可判」→ 全量拉
+    /// 一次一计；trigger wire 名 reconnect）。
+    pub const STORAGE_MANIFEST_PULL_RECONNECT: &str = "storage_manifest_pull_reconnect";
+    /// 批 R landing 版本轻检查「同版本跳过」计（官方 fetchManifest
+    /// greaterThanVersion 204 同义——零差零流量面证据）。
+    pub const STORAGE_RECONNECT_CHECK_SKIP: &str = "storage_reconnect_check_skip";
+    /// 批 R landing 版本轻检查探测失败计（fail-open → 全量拉兜底）。
+    pub const STORAGE_RECONNECT_CHECK_ERR: &str = "storage_reconnect_check_err";
     pub const RECEIVE_KIND_CONTENT: &str = "receive_kind_content";
     pub const RECEIVE_KIND_IDENTITY_CHANGE: &str = "receive_kind_identity_change";
     pub const RECEIVE_KIND_DECRYPTION_ERROR: &str = "receive_kind_decryption_error";
@@ -152,6 +160,9 @@ const KNOWN_KEYS: &[&str] = &[
     keys::STORAGE_MANIFEST_PULL,
     keys::STORAGE_MANIFEST_PULL_LOGIN,
     keys::STORAGE_MANIFEST_PULL_ERR,
+    keys::STORAGE_MANIFEST_PULL_RECONNECT,
+    keys::STORAGE_RECONNECT_CHECK_SKIP,
+    keys::STORAGE_RECONNECT_CHECK_ERR,
     keys::RECEIVE_KIND_CONTENT,
     keys::RECEIVE_KIND_IDENTITY_CHANGE,
     keys::RECEIVE_KIND_DECRYPTION_ERROR,
