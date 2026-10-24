@@ -1,0 +1,1694 @@
+use std::{collections::HashSet, time::SystemTime};
+
+use base64::prelude::*;
+use chrono::prelude::*;
+use libsignal_core::{curve::CurveError, InvalidDeviceId};
+use libsignal_protocol::{
+    process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair,
+    PlaintextContent, Pni, ProtocolStore, SenderCertificate, SenderKeyStore,
+    ServiceId, SessionNotFound, SignalProtocolError,
+};
+use rand::{rng, CryptoRng, Rng};
+use tracing::{debug, error, info, trace, warn};
+use tracing_futures::Instrument;
+use uuid::Uuid;
+use zkgroup::GROUP_IDENTIFIER_LEN;
+
+use crate::{
+    cipher::{get_preferred_protocol_address, ServiceCipher},
+    content::ContentBody,
+    proto::{
+        attachment_pointer::{
+            AttachmentIdentifier, Flags as AttachmentPointerFlags,
+        },
+        sync_message::{
+            self, message_request_response, MessageRequestResponse,
+        },
+        AttachmentPointer, SyncMessage,
+    },
+    push_service::*,
+    service_address::ServiceIdExt,
+    session_store::SessionStoreExt,
+    unidentified_access::UnidentifiedAccess,
+    utils::{serde_device_id, serde_service_id, BASE64_RELAXED},
+    websocket::{self, SignalWebSocket},
+};
+
+pub use crate::proto::ContactDetails;
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OutgoingPushMessage {
+    pub r#type: u32,
+    #[serde(with = "serde_device_id")]
+    pub destination_device_id: DeviceId,
+    pub destination_registration_id: u32,
+    pub content: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct OutgoingPushMessages {
+    #[serde(with = "serde_service_id")]
+    pub destination: ServiceId,
+    pub timestamp: u64,
+    pub messages: Vec<OutgoingPushMessage>,
+    pub online: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageResponse {
+    pub needs_sync: bool,
+}
+
+pub type SendMessageResult = Result<SentMessage, MessageSenderError>;
+
+#[derive(Debug, Clone)]
+pub struct SentMessage {
+    pub recipient: ServiceId,
+    pub used_identity_key: IdentityKey,
+    pub unidentified: bool,
+    pub needs_sync: bool,
+}
+
+/// Attachment specification to be used for uploading.
+///
+/// Loose equivalent of Java's `SignalServiceAttachmentStream`.
+#[derive(Debug, Default)]
+pub struct AttachmentSpec {
+    pub content_type: String,
+    pub length: usize,
+    pub file_name: Option<String>,
+    pub preview: Option<Vec<u8>>,
+    pub voice_note: Option<bool>,
+    pub borderless: Option<bool>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub caption: Option<String>,
+    pub blur_hash: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct MessageSender<S> {
+    identified_ws: SignalWebSocket<websocket::Identified>,
+    unidentified_ws: SignalWebSocket<websocket::Unidentified>,
+    service: PushService,
+    cipher: ServiceCipher<S>,
+    protocol_store: S,
+    local_aci: Aci,
+    local_pni: Pni,
+    aci_identity: IdentityKeyPair,
+    pni_identity: Option<IdentityKeyPair>,
+    device_id: DeviceId,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AttachmentUploadError {
+    #[error("{0}")]
+    ServiceError(#[from] ServiceError),
+
+    #[error("Could not read attachment contents")]
+    IoError(#[from] std::io::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum MessageSenderError {
+    #[error("service error: {0}")]
+    ServiceError(#[from] ServiceError),
+
+    #[error("protocol error: {0}")]
+    ProtocolError(#[from] SignalProtocolError),
+
+    #[error("invalid private key: {0}")]
+    InvalidPrivateKey(#[from] CurveError),
+
+    #[error("invalid device ID: {0}")]
+    InvalidDeviceId(#[from] InvalidDeviceId),
+
+    #[error("Failed to upload attachment {0}")]
+    AttachmentUploadError(#[from] AttachmentUploadError),
+
+    #[error("primary device can't send sync message {0:?}")]
+    SendSyncMessageError(sync_message::request::Type),
+
+    #[error("Untrusted identity key with {address:?}")]
+    UntrustedIdentity { address: ServiceId },
+
+    #[error("Exceeded maximum number of retries")]
+    MaximumRetriesLimitExceeded,
+
+    #[error("Proof of type {options:?} required using token {token}")]
+    ProofRequired { token: String, options: Vec<String> },
+
+    #[error("Recipient not found: {service_id:?}")]
+    NotFound { service_id: ServiceId },
+
+    #[error("no messages were encrypted: this should not really happen and most likely implies a logic error")]
+    NoMessagesToSend,
+}
+
+pub type GroupV2Id = [u8; GROUP_IDENTIFIER_LEN];
+
+#[derive(Debug)]
+pub enum ThreadIdentifier {
+    Aci(Uuid),
+    Group(GroupV2Id),
+}
+
+#[derive(Debug)]
+pub struct EncryptedMessages {
+    messages: Vec<OutgoingPushMessage>,
+    used_identity_key: IdentityKey,
+}
+
+impl<S> MessageSender<S>
+where
+    S: ProtocolStore + SenderKeyStore + SessionStoreExt + Sync + Clone,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        identified_ws: SignalWebSocket<websocket::Identified>,
+        unidentified_ws: SignalWebSocket<websocket::Unidentified>,
+        service: PushService,
+        cipher: ServiceCipher<S>,
+        protocol_store: S,
+        local_aci: impl Into<Aci>,
+        local_pni: impl Into<Pni>,
+        aci_identity: IdentityKeyPair,
+        pni_identity: Option<IdentityKeyPair>,
+        device_id: DeviceId,
+    ) -> Self {
+        MessageSender {
+            service,
+            identified_ws,
+            unidentified_ws,
+            cipher,
+            protocol_store,
+            local_aci: local_aci.into(),
+            local_pni: local_pni.into(),
+            aci_identity,
+            pni_identity,
+            device_id,
+        }
+    }
+
+    /// Encrypts and uploads an attachment
+    ///
+    /// Contents are accepted as an owned, plain text Vec, because encryption happens in-place.
+    #[tracing::instrument(skip(self, contents, csprng), fields(size = contents.len()))]
+    pub async fn upload_attachment<R: Rng + CryptoRng>(
+        &mut self,
+        spec: AttachmentSpec,
+        mut contents: Vec<u8>,
+        csprng: &mut R,
+    ) -> Result<AttachmentPointer, AttachmentUploadError> {
+        let len = contents.len();
+        // Encrypt
+        let (key, iv) = {
+            let mut key = [0u8; 64];
+            let mut iv = [0u8; 16];
+            csprng.fill_bytes(&mut key);
+            csprng.fill_bytes(&mut iv);
+            (key, iv)
+        };
+
+        // Padded length uses an exponential bracketting thingy.
+        // If you want to see how it looks:
+        // https://www.wolframalpha.com/input/?i=plot+floor%281.05%5Eceil%28log_1.05%28x%29%29%29+for+x+from+0+to+5000000
+        let padded_len: usize = {
+            // Java:
+            // return (int) Math.max(541, Math.floor(Math.pow(1.05, Math.ceil(Math.log(size) / Math.log(1.05)))))
+            std::cmp::max(
+                541,
+                1.05f64.powf((len as f64).log(1.05).ceil()).floor() as usize,
+            )
+        };
+        if padded_len < len {
+            error!(
+                "Padded len {} < len {}. Continuing with a privacy risk.",
+                padded_len, len
+            );
+        } else {
+            contents.resize(padded_len, 0);
+        }
+
+        tracing::trace_span!("encrypting attachment").in_scope(|| {
+            crate::attachment_cipher::encrypt_in_place(iv, key, &mut contents)
+        });
+
+        // Request upload attributes
+        // TODO: we can actually store the upload spec to be able to resume the upload later
+        // if it fails or stalls (= we should at least split the API calls so clients can decide what to do)
+        let attachment_upload_form = self
+            .service
+            .get_attachment_v4_upload_attributes()
+            .instrument(tracing::trace_span!("requesting upload attributes"))
+            .await?;
+
+        let resumable_upload_url = self
+            .service
+            .get_attachment_resumable_upload_url(&attachment_upload_form)
+            .await?;
+
+        let attachment_digest = self
+            .service
+            .upload_attachment_v4(
+                attachment_upload_form.cdn,
+                &resumable_upload_url,
+                contents.len() as u64,
+                attachment_upload_form.headers,
+                &mut std::io::Cursor::new(&contents),
+            )
+            .await?;
+
+        Ok(AttachmentPointer {
+            content_type: Some(spec.content_type),
+            key: Some(key.to_vec()),
+            size: Some(len as u32),
+            // thumbnail: Option<Vec<u8>>,
+            digest: Some(attachment_digest.digest),
+            file_name: spec.file_name,
+            flags: Some(
+                if spec.voice_note == Some(true) {
+                    AttachmentPointerFlags::VoiceMessage as u32
+                } else {
+                    0
+                } | if spec.borderless == Some(true) {
+                    AttachmentPointerFlags::Borderless as u32
+                } else {
+                    0
+                },
+            ),
+            width: spec.width,
+            height: spec.height,
+            caption: spec.caption,
+            blur_hash: spec.blur_hash,
+            upload_timestamp: Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("unix epoch in the past")
+                    .as_millis() as u64,
+            ),
+            cdn_number: Some(attachment_upload_form.cdn),
+            attachment_identifier: Some(AttachmentIdentifier::CdnKey(
+                attachment_upload_form.key,
+            )),
+            ..Default::default()
+        })
+    }
+
+    /// Upload contact details to the CDN
+    ///
+    /// Returns attachment ID and the attachment digest
+    #[tracing::instrument(skip(self, contacts))]
+    async fn upload_contact_details<Contacts>(
+        &mut self,
+        contacts: Contacts,
+    ) -> Result<AttachmentPointer, AttachmentUploadError>
+    where
+        Contacts: IntoIterator<Item = ContactDetails>,
+    {
+        use prost::Message;
+        let mut out = Vec::new();
+        for contact in contacts {
+            contact
+                .encode_length_delimited(&mut out)
+                .expect("infallible encoding");
+            // XXX add avatar here
+        }
+
+        let spec = AttachmentSpec {
+            content_type: "application/octet-stream".into(),
+            length: out.len(),
+            file_name: None,
+            preview: None,
+            voice_note: None,
+            borderless: None,
+            width: None,
+            height: None,
+            caption: None,
+            blur_hash: None,
+        };
+        self.upload_attachment(spec, out, &mut rng()).await
+    }
+
+    /// Return whether we have to prepare sync messages for other devices
+    ///
+    /// - If we are the main registered device, and there are established sub-device sessions (linked clients), return true
+    /// - If we are a secondary linked device, return true
+    async fn is_multi_device(&self) -> bool {
+        if self.device_id == *DEFAULT_DEVICE_ID {
+            self.protocol_store
+                .get_sub_device_sessions(&self.local_aci.into())
+                .await
+                .is_ok_and(|s| !s.is_empty())
+        } else {
+            true
+        }
+    }
+
+    /// Send a message `content` to a single `recipient`.
+    #[tracing::instrument(
+        skip(self, unidentified_access, message),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    pub async fn send_message(
+        &mut self,
+        recipient: &ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        let (result, sync_body) = self
+            .send_message_split_sync(
+                recipient,
+                unidentified_access,
+                message,
+                timestamp,
+                include_pni_signature,
+                online,
+            )
+            .await;
+        if let Some(body) = sync_body {
+            debug!("sending multi-device sync message");
+            // KT (best-effort transcript): official wrapWithSyncMessageSend /
+            // Android SignalServiceMessageSender keep the main send result
+            // when the multi-device copy fails; a transcript error must not
+            // turn an already-delivered message into a send failure.
+            if let Err(error) = self
+                .try_send_message(
+                    self.local_aci.into(),
+                    None,
+                    None,
+                    &body,
+                    timestamp,
+                    false,
+                    false,
+                )
+                .await
+            {
+                warn!(%error, "multi-device sync transcript failed; keeping main send result");
+            }
+        }
+        result
+    }
+
+    /// KT fork (deferred self sync): like [`Self::send_message`], but the
+    /// multi-device sync transcript is **not** awaited — the direct-leg
+    /// result comes back together with the prepared transcript body, which
+    /// the caller delivers later via [`Self::send_sync_transcript`].
+    /// Official Desktop resolves the send promise on the direct ack and runs
+    /// the sync copy afterwards
+    /// (ts/util/wrapWithSyncMessageSend.preload.ts).
+    #[tracing::instrument(
+        skip(self, unidentified_access, message),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    pub async fn send_message_split_sync(
+        &mut self,
+        recipient: &ServiceId,
+        mut unidentified_access: Option<&UnidentifiedAccess>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> (SendMessageResult, Option<ContentBody>) {
+        let content_body = message.into();
+        let message_to_self = recipient == &self.local_aci;
+        let sync_message =
+            matches!(content_body, ContentBody::SynchronizeMessage(..));
+        let is_multi_device = self.is_multi_device().await;
+
+        // only send a sync message when sending to self and skip the rest of the process
+        if message_to_self && is_multi_device && !sync_message {
+            debug!("sending note to self");
+            if let Some(sync_message) = self
+                .create_multi_device_sent_transcript_content(
+                    Some(recipient),
+                    content_body,
+                    timestamp,
+                    None,
+                )
+            {
+                let result = self
+                    .try_send_message(
+                        *recipient,
+                        None,
+                        None,
+                        &sync_message,
+                        timestamp,
+                        include_pni_signature,
+                        online,
+                    )
+                    .await;
+                // the note-to-self transcript *is* the message; no second
+                // leg is due.
+                return (result, None);
+            } else {
+                // KT (sync transcript): same as the group path — None is the
+                // documented "not syncing to self" case, not a failure.
+                debug!("message body has no sent transcript form; not syncing message to self");
+                return (
+                    SendMessageResult::Err(
+                        MessageSenderError::NoMessagesToSend,
+                    ),
+                    None,
+                );
+            }
+        }
+
+        // sync messages are never sent as unidentified (reasons unclear), see: https://github.com/signalapp/Signal-Android/blob/main/libsignal-service/src/main/java/org/whispersystems/signalservice/api/SignalServiceMessageSender.java#L779
+        if sync_message {
+            unidentified_access.take();
+        }
+
+        // try to send the original message to all the recipient's devices
+        let result = self
+            .try_send_message(
+                *recipient,
+                unidentified_access,
+                None,
+                &content_body,
+                timestamp,
+                include_pni_signature,
+                online,
+            )
+            .await;
+
+        let needs_sync = match &result {
+            Ok(SentMessage { needs_sync, .. }) => *needs_sync,
+            _ => false,
+        };
+
+        let sync_body = if needs_sync || is_multi_device {
+            if sync_message {
+                Some(content_body)
+            } else {
+                // Only some ContentBody types are syncable to self,
+                // not getting a content body to sync is not an error.
+                self.create_multi_device_sent_transcript_content(
+                    Some(recipient),
+                    content_body,
+                    timestamp,
+                    Some(&result),
+                )
+            }
+        } else {
+            None
+        };
+        (result, sync_body)
+    }
+
+    /// KT fork (deferred self sync): deliver a prepared sync transcript to
+    /// the local devices — counterpart of [`Self::send_message_split_sync`]
+    /// and [`Self::send_message_to_group_split_sync`].
+    pub async fn send_sync_transcript(
+        &mut self,
+        body: ContentBody,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        self.try_send_message(
+            self.local_aci.into(),
+            None,
+            None,
+            &body,
+            timestamp,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Send `PlaintextContent` (e.g. a resend request) to `recipient` without
+    /// session encryption, as Envelope type PLAINTEXT_CONTENT.
+    ///
+    /// Devices without an existing session are skipped: they cannot have
+    /// decrypted the original message, so asking them to resend is pointless.
+    pub async fn send_plaintext_content(
+        &mut self,
+        recipient: &ServiceId,
+        plaintext: &PlaintextContent,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let mut devices: HashSet<DeviceId> = self
+            .protocol_store
+            .get_sub_device_sessions(recipient)
+            .await?
+            .into_iter()
+            .collect();
+
+        // always send to the primary device no matter what
+        devices.insert(*DEFAULT_DEVICE_ID);
+
+        // never try to send messages to the sender device
+        match recipient {
+            ServiceId::Aci(aci) => {
+                if *aci == self.local_aci {
+                    devices.remove(&self.device_id);
+                }
+            },
+            ServiceId::Pni(pni) => {
+                if *pni == self.local_pni {
+                    devices.remove(&self.device_id);
+                }
+            },
+        };
+
+        let content = BASE64_RELAXED.encode(plaintext.serialized());
+        let mut messages = vec![];
+        for device_id in devices {
+            let address = recipient.to_protocol_address(device_id);
+            let Some(session) =
+                self.protocol_store.load_session(&address).await?
+            else {
+                trace!("skipping plaintext send to {} (no session)", address);
+                continue;
+            };
+            messages.push(OutgoingPushMessage {
+                r#type: crate::proto::envelope::Type::PlaintextContent as u32,
+                destination_device_id: device_id,
+                destination_registration_id: session
+                    .remote_registration_id()?,
+                content: content.clone(),
+            });
+        }
+
+        if messages.is_empty() {
+            return Err(MessageSenderError::NoMessagesToSend);
+        }
+
+        let SendMessageResponse { needs_sync } = self
+            .identified_ws
+            .send_messages(OutgoingPushMessages {
+                destination: *recipient,
+                timestamp,
+                messages,
+                online: false,
+            })
+            .await?;
+
+        Ok(SentMessage {
+            recipient: *recipient,
+            used_identity_key: self
+                .protocol_store
+                .get_identity(
+                    &recipient.to_protocol_address(*DEFAULT_DEVICE_ID),
+                )
+                .await?
+                .ok_or(MessageSenderError::UntrustedIdentity {
+                    address: *recipient,
+                })?,
+            unidentified: false,
+            needs_sync,
+        })
+    }
+
+    /// Send a message to the recipients in a group.
+    ///
+    /// Recipients are a list of tuples, each containing:
+    /// - The recipient's address
+    /// - The recipient's unidentified access
+    /// - Whether the recipient requires a PNI signature
+    #[tracing::instrument(
+        skip(self, recipients, message),
+        fields(recipients = recipients.as_ref().len()),
+    )]
+    pub async fn send_message_to_group(
+        &mut self,
+        recipients: impl AsRef<[(ServiceId, Option<UnidentifiedAccess>, bool)]>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        online: bool,
+    ) -> Vec<SendMessageResult> {
+        let (results, sync_body) = self
+            .send_message_to_group_split_sync(
+                recipients, message, timestamp, online,
+            )
+            .await;
+        if let Some(sync_message) = sync_body {
+            // Note: the result of sending a sync message is not included in results
+            // See Signal Android `SignalServiceMessageSender.java:2817`
+            if let Err(error) = self
+                .try_send_message(
+                    self.local_aci.into(),
+                    None,
+                    None,
+                    &sync_message,
+                    timestamp,
+                    false, // XXX: maybe the sync device does want a PNI signature?
+                    false,
+                )
+                .await
+            {
+                error!(%error, "failed to send a synchronization message");
+            }
+        }
+        results
+    }
+
+    /// KT fork (deferred self sync): group counterpart of
+    /// [`Self::send_message_split_sync`] — per-recipient results return
+    /// without awaiting the group sync transcript; the prepared body (when
+    /// one is due) is delivered later via [`Self::send_sync_transcript`].
+    #[tracing::instrument(
+        skip(self, recipients, message),
+        fields(recipients = recipients.as_ref().len()),
+    )]
+    pub async fn send_message_to_group_split_sync(
+        &mut self,
+        recipients: impl AsRef<[(ServiceId, Option<UnidentifiedAccess>, bool)]>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        online: bool,
+    ) -> (Vec<SendMessageResult>, Option<ContentBody>) {
+        let content_body: ContentBody = message.into();
+        let mut results = vec![];
+
+        let mut needs_sync_in_results = false;
+
+        for (recipient, unidentified_access, include_pni_signature) in
+            recipients.as_ref()
+        {
+            let result = self
+                .try_send_message(
+                    *recipient,
+                    unidentified_access.as_ref(),
+                    None,
+                    &content_body,
+                    timestamp,
+                    *include_pni_signature,
+                    online,
+                )
+                .await;
+
+            match result {
+                Ok(SentMessage { needs_sync, .. }) if needs_sync => {
+                    needs_sync_in_results = true;
+                },
+                _ => (),
+            };
+
+            results.push(result);
+        }
+
+        // we only need to send a synchronization message once
+        let sync_body = if needs_sync_in_results || self.is_multi_device().await
+        {
+            let body = self.create_multi_device_sent_transcript_content(
+                None,
+                content_body.clone(),
+                timestamp,
+                &results,
+            );
+            if body.is_none() {
+                // KT (sync transcript): a None here is the documented
+                // "not syncing to self" case (only DataMessage/EditMessage
+                // have a Sent form), not a failure — typing and friends
+                // hitting the group path must not log as errors.
+                debug!("message body has no sent transcript form; not syncing group message to self")
+            }
+            body
+        } else {
+            None
+        };
+        (results, sync_body)
+    }
+
+    /// Send a sender-key retry receipt
+    ///
+    /// The receipt goes out as a regular encrypted (or sealed-sender encrypted,
+    /// when `unidentified_access` is supplied) `Content`, so it rides the same
+    /// fan-out, session repair, and retry machinery as any other message.
+    ///
+    /// Divergences from the official clients:
+    /// - Official clients deliver retry receipts as unencrypted `PlaintextContent`;
+    ///   receiving clients accept the DEM inside an encrypted `Content` too.
+    /// - Under sealed sender they use `ContentHint::Implicit` and attach the
+    ///   group id; our sealed path hardcodes `ContentHint::Default` without a
+    ///   group id (see `sealed_sender_encrypt`).  Harmless in practice: the
+    ///   receipt's original sender finds its send-log entry by timestamp.
+    #[tracing::instrument(
+        skip(self, unidentified_access),
+        fields(recipient = recipient.service_id_string(), unidentified_send = unidentified_access.is_some(), failed_timestamp),
+    )]
+    pub async fn send_sender_key_decryption_error_message(
+        &mut self,
+        recipient: &ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        failed_timestamp: u64,
+        failed_device: DeviceId,
+    ) -> Result<(), MessageSenderError> {
+        info!("sending retry receipt/decryption error");
+
+        // The absent `ratchet_key` marks this as a sender-key failure.
+        // This function assumes the 1:1 session is intact, and hence tries to
+        // transmit the DME through the 1:1 encrypted (sealed, if available) channel.
+        //
+        // A DME for a 1:1 decrypt failure carries `ratchet_key`
+        // and must be deliverable *without* depending on the session under
+        // repair; upstream sends those as unencrypted `PlaintextContent`
+        // (or sealed USMC) envelopes.  Implement that case as a sibling
+        // function producing plaintext envelopes over this same fan-out.
+        let content_body = ContentBody::DecryptionErrorMessage(
+            crate::proto::DecryptionErrorMessage {
+                ratchet_key: None,
+                timestamp: Some(failed_timestamp),
+                device_id: Some(failed_device.into()),
+            },
+        );
+
+        self.try_send_message(
+            *recipient,
+            unidentified_access,
+            None,
+            &content_body,
+            Utc::now().timestamp_millis() as u64,
+            false,
+            false,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Send a message (`content`) to an address (`recipient`).
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, unidentified_access, content_body, recipient),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    // KT (Stories E1): the `story` parameter pushed this one over
+    // clippy::too_many_arguments; a params-struct refactor is deferred.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_send_message(
+        &mut self,
+        recipient: ServiceId,
+        mut unidentified_access: Option<&UnidentifiedAccess>,
+        // KT fork (stories): story 发送模式。Some = sealed sender 加密用该
+        // sender certificate（不派生 UAK 头）、经 `?story=true` 传输面分发；
+        // None = 上游既有行为逐字保持。官方依据见 send_story_message 与
+        // websocket/sender.rs `send_messages_unidentified_story` 文档。
+        story: Option<&SenderCertificate>,
+        content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        trace!("trying to send a message");
+
+        use prost::Message;
+
+        let mut content = content_body.clone().into_proto();
+        if include_pni_signature {
+            content.pni_signature_message = Some(self.create_pni_signature()?);
+        }
+
+        let content_bytes = content.encode_to_vec();
+
+        let mut rng = rng();
+
+        // KT (send latency probe): typing rides this same funnel (service
+        // send_typing → send_message) — level gating needs the content kind.
+        let probe_is_typing =
+            matches!(content_body, ContentBody::TypingMessage(_));
+
+        for _ in 0..4u8 {
+            let Some(EncryptedMessages {
+                messages,
+                used_identity_key,
+            }) = self
+                .create_encrypted_messages(
+                    &recipient,
+                    story.or(unidentified_access.map(|x| &x.certificate)),
+                    &content_bytes,
+                    probe_is_typing,
+                )
+                .await?
+            else {
+                // this can happen for example when a device is primary, without any secondaries
+                // and we send a message to ourselves (which is only a SyncMessage { sent: ... })
+                // addressed to self
+                return Err(MessageSenderError::NoMessagesToSend);
+            };
+
+            let messages = OutgoingPushMessages {
+                destination: recipient,
+                timestamp,
+                messages,
+                online,
+            };
+
+            let send_started = std::time::Instant::now();
+            let send = if let Some(_sender_certificate) = story {
+                tracing::debug!("sending via unidentified (story)");
+                self.unidentified_ws
+                    .send_messages_unidentified_story(messages)
+                    .await
+            } else if let Some(unidentified) = &unidentified_access {
+                tracing::debug!("sending via unidentified");
+                self.unidentified_ws
+                    .send_messages_unidentified(messages, unidentified)
+                    .await
+            } else {
+                tracing::debug!("sending identified");
+                self.identified_ws.send_messages(messages).await
+            };
+            // KT (send perf): one series entry per ws round trip, including
+            // every mismatched-device repair round.
+            crate::perf_hook::emit(
+                crate::perf_hook::keys::WS_RTT,
+                std::time::Instant::now()
+                    .duration_since(send_started)
+                    .as_micros() as u64,
+            );
+            // KT (send latency probe): the ws round trip IS the ack wait (the
+            // PUT /v1/messages response closes the wait); typing stays debug.
+            let ws_probe_ms = send_started.elapsed().as_millis() as u64;
+            if probe_is_typing {
+                tracing::debug!(
+                    target: "send_latency_probe",
+                    stage = "engine.ws",
+                    dur_ms = ws_probe_ms,
+                    peer = if recipient == self.local_aci { "self" } else { "direct" },
+                    "send-latency-probe",
+                );
+            } else {
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.ws",
+                    dur_ms = ws_probe_ms,
+                    peer = if recipient == self.local_aci { "self" } else { "direct" },
+                    "send-latency-probe",
+                );
+            }
+
+            match send {
+                Ok(SendMessageResponse { needs_sync }) => {
+                    tracing::debug!("message sent!");
+                    return Ok(SentMessage {
+                        recipient,
+                        used_identity_key,
+                        unidentified: unidentified_access.is_some(),
+                        needs_sync,
+                    });
+                },
+                Err(ServiceError::Unauthorized)
+                    if unidentified_access.is_some() =>
+                {
+                    tracing::trace!("unauthorized error using unidentified; retry over identified");
+                    unidentified_access = None;
+                },
+                Err(ServiceError::MismatchedDevicesException(ref m)) => {
+                    tracing::debug!("{:?}", m);
+                    for extra_device_id in &m.extra_devices {
+                        tracing::debug!(
+                            "dropping session with device {}",
+                            extra_device_id
+                        );
+                        self.protocol_store
+                            .delete_service_addr_device_session(
+                                &recipient
+                                    .to_protocol_address(*extra_device_id)?,
+                            )
+                            .await?;
+                    }
+
+                    for missing_device_id in &m.missing_devices {
+                        tracing::debug!(
+                            "creating session with missing device {}",
+                            missing_device_id
+                        );
+                        let remote_address = recipient
+                            .to_protocol_address(*missing_device_id)?;
+                        let pre_key = self
+                            .identified_ws
+                            .get_pre_key(&recipient, *missing_device_id)
+                            .await?;
+
+                        process_prekey_bundle(
+                            &remote_address,
+                            &self
+                                .local_aci
+                                .to_protocol_address(self.device_id)
+                                .expect("valid device id"),
+                            &mut self.protocol_store.clone(),
+                            &mut self.protocol_store,
+                            &pre_key,
+                            SystemTime::now(),
+                            &mut rng,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("failed to create session: {}", e);
+                            MessageSenderError::UntrustedIdentity {
+                                address: recipient,
+                            }
+                        })?;
+                    }
+                },
+                Err(ServiceError::StaleDevices(ref m)) => {
+                    tracing::debug!("{:?}", m);
+                    for extra_device_id in &m.stale_devices {
+                        tracing::debug!(
+                            "dropping session with device {}",
+                            extra_device_id
+                        );
+                        self.protocol_store
+                            .delete_service_addr_device_session(
+                                &recipient
+                                    .to_protocol_address(*extra_device_id)?,
+                            )
+                            .await?;
+                    }
+                },
+                Err(ServiceError::ProofRequiredError(ref p)) => {
+                    tracing::debug!("{:?}", p);
+                    return Err(MessageSenderError::ProofRequired {
+                        token: p.token.clone(),
+                        options: p.options.clone(),
+                    });
+                },
+                Err(ServiceError::UnregisteredRecipient) => {
+                    tracing::debug!(?recipient, "recipient is not registered");
+                    return Err(MessageSenderError::NotFound {
+                        service_id: recipient,
+                    });
+                },
+                Err(e) => {
+                    tracing::debug!(
+                        "Default error handler for ws.send_messages: {}",
+                        e
+                    );
+                    return Err(MessageSenderError::ServiceError(e));
+                },
+            }
+        }
+
+        Err(MessageSenderError::MaximumRetriesLimitExceeded)
+    }
+
+    /// Upload contact details to the CDN and send a sync message
+    #[tracing::instrument(
+        skip(self, unidentified_access, contacts, recipient),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    pub async fn send_contact_details<Contacts>(
+        &mut self,
+        recipient: &ServiceId,
+        unidentified_access: Option<UnidentifiedAccess>,
+        // XXX It may be interesting to use an intermediary type,
+        //     instead of ContactDetails directly,
+        //     because it allows us to add the avatar content.
+        contacts: Contacts,
+        online: bool,
+        complete: bool,
+    ) -> Result<(), MessageSenderError>
+    where
+        Contacts: IntoIterator<Item = ContactDetails>,
+    {
+        let ptr = self.upload_contact_details(contacts).await?;
+
+        let msg = SyncMessage {
+            content: Some(crate::proto::sync_message::Content::Contacts(
+                sync_message::Contacts {
+                    blob: Some(ptr),
+                    complete: Some(complete),
+                },
+            )),
+            ..SyncMessage::with_padding(&mut rng())
+        };
+
+        self.send_sync_message(msg).await?;
+
+        Ok(())
+    }
+
+    /// Send `MessageRequestResponse` synchronization message with either a recipient ACI or a GroupV2 ID
+    #[tracing::instrument(skip(self), fields(recipient = recipient.service_id_string()))]
+    pub async fn send_message_request_response(
+        &mut self,
+        recipient: &ServiceId,
+        thread: &ThreadIdentifier,
+        action: message_request_response::Type,
+    ) -> Result<(), MessageSenderError> {
+        let message_request_response = match thread {
+            ThreadIdentifier::Aci(aci) => {
+                tracing::debug!(
+                    "sending message request response {:?} for recipient {:?}",
+                    action,
+                    aci
+                );
+                MessageRequestResponse {
+                    thread_aci: Some(aci.to_string()),
+                    thread_aci_binary: Some(aci.into_bytes().to_vec()),
+                    group_id: None,
+                    r#type: Some(action.into()),
+                }
+            },
+            ThreadIdentifier::Group(id) => {
+                tracing::debug!(
+                    "sending message request response {:?} for group {:?}",
+                    action,
+                    id
+                );
+                MessageRequestResponse {
+                    thread_aci: None,
+                    thread_aci_binary: None,
+                    group_id: Some(id.to_vec()),
+                    r#type: Some(action.into()),
+                }
+            },
+        };
+
+        let msg = SyncMessage {
+            content: Some(
+                crate::proto::sync_message::Content::MessageRequestResponse(
+                    message_request_response,
+                ),
+            ),
+            ..SyncMessage::with_padding(&mut rng())
+        };
+
+        let ts = Utc::now().timestamp_millis() as u64;
+        self.send_message(recipient, None, msg, ts, false, false)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Send a `SyncMessage` to own devices, if any.
+    pub async fn send_sync_message(
+        &mut self,
+        sync: impl Into<SyncMessage>,
+    ) -> Result<(), MessageSenderError> {
+        if self.is_multi_device().await {
+            let content = sync.into().into();
+            let timestamp = Utc::now().timestamp_millis() as u64;
+            debug!(
+                "sending multi-device sync message with content {content:?}"
+            );
+            self.try_send_message(
+                self.local_aci.into(),
+                None,
+                None,
+                &content,
+                timestamp,
+                false,
+                false,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// KT fork (stories): send a story message (ContentBody::StoryMessage)
+    /// to a single recipient over the official story transport face:
+    /// sealed-sender encryption with `sender_certificate` and the
+    /// `?story=true` request suffix, with no per-recipient access key.
+    ///
+    /// Official behavior mirrored (behavioral comparison, no code copied):
+    /// - Signal-Desktop `ts/textsecure/OutgoingMessage.preload.ts:392-394`:
+    ///   story sends take the sealed-sender path unconditionally (auth =
+    ///   `'story'` outranks access key / group send token); no fallback to
+    ///   the identified channel on authorization failures.
+    /// - libsignal v0.99.0 `rust/net/chat/src/ws/messages.rs:141-150` +
+    ///   `:39`: `PUT /v1/messages/{destination}?story=true`, no
+    ///   user-based authorization header for story sends.
+    /// - Signal-Desktop `ts/jobs/helpers/sendStory.preload.ts:338-340`
+    ///   ("Don't send normal sync messages; a story sync is sent at the end
+    ///   of the process"): this method deliberately does **not** build a
+    ///   sent-transcript; the caller is responsible for the story sync
+    ///   (`SyncMessage.Sent` with `story_message` +
+    ///   `story_message_recipients`), which the upstream
+    ///   `create_multi_device_sent_transcript_content` does not cover.
+    ///
+    /// Errors (including `Unauthorized`) are returned as-is: retry/backoff
+    /// policy belongs to the caller, matching upstream `send_message`.
+    pub async fn send_story_message(
+        &mut self,
+        recipient: &ServiceId,
+        sender_certificate: &SenderCertificate,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let content_body = message.into();
+        self.try_send_message(
+            *recipient,
+            None,
+            Some(sender_certificate),
+            &content_body,
+            timestamp,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Send a `SyncMessage` request message
+    #[tracing::instrument(skip(self))]
+    pub async fn send_sync_message_request(
+        &mut self,
+        recipient: &ServiceId,
+        request_type: sync_message::request::Type,
+    ) -> Result<(), MessageSenderError> {
+        if self.device_id == *DEFAULT_DEVICE_ID {
+            return Err(MessageSenderError::SendSyncMessageError(request_type));
+        }
+
+        let msg = SyncMessage {
+            content: Some(crate::proto::sync_message::Content::Request(
+                sync_message::Request {
+                    r#type: Some(request_type.into()),
+                },
+            )),
+            ..SyncMessage::with_padding(&mut rng())
+        };
+        self.send_sync_message(msg).await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    fn create_pni_signature(
+        &mut self,
+    ) -> Result<crate::proto::PniSignatureMessage, MessageSenderError> {
+        let mut rng = rng();
+        let signature = self
+            .pni_identity
+            .expect("PNI key set when PNI signature requested")
+            .sign_alternate_identity(
+                self.aci_identity.identity_key(),
+                &mut rng,
+            )?;
+        Ok(crate::proto::PniSignatureMessage {
+            pni: Some(self.local_pni.service_id_binary()),
+            signature: Some(signature.into()),
+        })
+    }
+
+    // Equivalent with `getEncryptedMessages`
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, unidentified_access, content),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    async fn create_encrypted_messages(
+        &mut self,
+        recipient: &ServiceId,
+        unidentified_access: Option<&SenderCertificate>,
+        content: &[u8],
+        is_typing: bool,
+    ) -> Result<Option<EncryptedMessages>, MessageSenderError> {
+        let mut messages = vec![];
+
+        let mut devices: HashSet<DeviceId> = self
+            .protocol_store
+            .get_sub_device_sessions(recipient)
+            .await?
+            .into_iter()
+            .collect();
+
+        // always send to the primary device no matter what
+        devices.insert(*DEFAULT_DEVICE_ID);
+
+        // never try to send messages to the sender device
+        match recipient {
+            ServiceId::Aci(aci) => {
+                if *aci == self.local_aci {
+                    devices.remove(&self.device_id);
+                }
+            },
+            ServiceId::Pni(pni) => {
+                if *pni == self.local_pni {
+                    devices.remove(&self.device_id);
+                }
+            },
+        };
+
+        for device_id in devices {
+            trace!("sending message to device {}", device_id);
+            // `create_encrypted_message` may fail with `SessionNotFound` if the session is corrupted;
+            // see https://github.com/whisperfish/libsignal-client/commit/601454d20.
+            // If this happens, delete the session and retry.
+            for _attempt in 0..2 {
+                match self
+                    .create_encrypted_message(
+                        recipient,
+                        unidentified_access,
+                        device_id,
+                        content,
+                        is_typing,
+                    )
+                    .await
+                {
+                    Ok(message) => {
+                        messages.push(message);
+                        break;
+                    },
+                    Err(MessageSenderError::ServiceError(
+                        ServiceError::SignalProtocolError(
+                            SignalProtocolError::SessionNotFound(
+                                SessionNotFound {
+                                    address: Some(addr),
+                                    op,
+                                },
+                            ),
+                        ),
+                    )) => {
+                        // SessionNotFound is returned on certain session corruption.
+                        // Since delete_session *creates* a session if it doesn't exist,
+                        // the NotFound error is an indicator of session corruption.
+                        // Try to delete this session, if it gets succesfully deleted, retry.  Otherwise, fail.
+                        tracing::warn!("Potential session corruption for {}, deleting session", addr);
+                        match self.protocol_store.delete_session(&addr).await {
+                            Ok(()) => continue,
+                            Err(error) => {
+                                tracing::warn!(%error, %addr, "failed to delete session");
+                                return Err(
+                                    SignalProtocolError::SessionNotFound(
+                                        SessionNotFound::new(addr, op),
+                                    )
+                                    .into(),
+                                );
+                            },
+                        }
+                    },
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        if messages.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(EncryptedMessages {
+                messages,
+                used_identity_key: self
+                    .protocol_store
+                    .get_identity(
+                        &recipient.to_protocol_address(*DEFAULT_DEVICE_ID),
+                    )
+                    .await?
+                    .ok_or(MessageSenderError::UntrustedIdentity {
+                        address: *recipient,
+                    })?,
+            }))
+        }
+    }
+
+    /// Equivalent to `getEncryptedMessage`
+    ///
+    /// When no session with the recipient exists, we need to create one.
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, unidentified_access, content),
+        fields(unidentified_access = unidentified_access.is_some(), recipient = recipient.service_id_string()),
+    )]
+    pub(crate) async fn create_encrypted_message(
+        &mut self,
+        recipient: &ServiceId,
+        unidentified_access: Option<&SenderCertificate>,
+        device_id: DeviceId,
+        content: &[u8],
+        is_typing: bool,
+    ) -> Result<OutgoingPushMessage, MessageSenderError> {
+        let recipient_protocol_address =
+            recipient.to_protocol_address(device_id);
+
+        tracing::trace!(
+            "encrypting message for {}",
+            recipient_protocol_address
+        );
+
+        // establish a session with the recipient/device if necessary
+        // no need to establish a session with ourselves (and our own current device)
+        self.ensure_session(recipient, device_id).await?;
+
+        let encrypt_started = std::time::Instant::now();
+        let message = self
+            .cipher
+            .encrypt(
+                &recipient_protocol_address,
+                unidentified_access,
+                content,
+                &mut rng(),
+            )
+            .instrument(tracing::trace_span!("encrypting message"))
+            .await?;
+        crate::perf_hook::emit(
+            crate::perf_hook::keys::ENCRYPT,
+            encrypt_started.elapsed().as_micros() as u64,
+        );
+        // KT (send latency probe): per-device encrypt duration; typing stays
+        // debug (noise discipline 4e168c5/5463bc0), real sends land warn.
+        let encrypt_probe_ms = encrypt_started.elapsed().as_millis() as u64;
+        if is_typing {
+            tracing::debug!(
+                target: "send_latency_probe",
+                stage = "engine.encrypt",
+                dur_ms = encrypt_probe_ms,
+                "send-latency-probe",
+            );
+        } else {
+            tracing::warn!(
+                target: "send_latency_probe",
+                stage = "engine.encrypt",
+                dur_ms = encrypt_probe_ms,
+                "send-latency-probe",
+            );
+        }
+
+        Ok(message)
+    }
+
+    /// Establish a session with `recipient`/`device_id` when none exists,
+    /// fetching the peer's prekey bundles (`GET /v2/keys/{id}/*` — one
+    /// request covers every device) over the identified websocket and
+    /// processing them locally. Returns whether a new session was built.
+    ///
+    /// KT (send warmup): the single shared session-establishment point for
+    /// the send path (`create_encrypted_message`) and the host's warmup;
+    /// sends nothing.
+    pub async fn ensure_session(
+        &mut self,
+        recipient: &ServiceId,
+        device_id: DeviceId,
+    ) -> Result<bool, MessageSenderError> {
+        let recipient_protocol_address =
+            recipient.to_protocol_address(device_id);
+        if self
+            .protocol_store
+            .load_session(&recipient_protocol_address)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        info!(
+            "establishing new session with {}",
+            recipient_protocol_address
+        );
+        // KT (send perf): the whole cold-session arm — the prekey fetch
+        // over the identified websocket plus local bundle processing.
+        let session_started = std::time::Instant::now();
+        let pre_keys =
+            match self.identified_ws.get_pre_keys(recipient, device_id).await {
+                Ok(ok) => {
+                    tracing::trace!("Get prekeys OK");
+                    ok
+                },
+                Err(ServiceError::NotFoundError) => {
+                    return Err(MessageSenderError::NotFound {
+                        service_id: *recipient,
+                    });
+                },
+                Err(e) => Err(e)?,
+            };
+
+        let mut rng = rng();
+
+        for pre_key_bundle in pre_keys {
+            if recipient == &self.local_aci
+                && self.device_id == pre_key_bundle.device_id()?
+            {
+                trace!("not establishing a session with myself!");
+                continue;
+            }
+
+            let pre_key_address = get_preferred_protocol_address(
+                &self.protocol_store,
+                recipient,
+                pre_key_bundle.device_id()?,
+            )
+            .await?;
+
+            process_prekey_bundle(
+                &pre_key_address,
+                &self
+                    .local_aci
+                    .to_protocol_address(self.device_id)
+                    .expect("valid device id"),
+                &mut self.protocol_store.clone(),
+                &mut self.protocol_store,
+                &pre_key_bundle,
+                SystemTime::now(),
+                &mut rng,
+            )
+            .await?;
+        }
+        crate::perf_hook::emit(
+            crate::perf_hook::keys::SESSION_ESTABLISH,
+            session_started.elapsed().as_micros() as u64,
+        );
+        // KT (send latency probe): new-session arm only (cold prekey fetch +
+        // bundle processing — the send long-tail suspect); log level warn so
+        // it lands in the engine rolling file (info is gated off there).
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.prekey",
+            dur_ms = session_started.elapsed().as_millis() as u64,
+            peer = if *recipient == self.local_aci { "self" } else { "direct" },
+            "send-latency-probe",
+        );
+        Ok(true)
+    }
+
+    fn create_multi_device_sent_transcript_content<'a>(
+        &mut self,
+        recipient: Option<&ServiceId>,
+        content_body: ContentBody,
+        timestamp: u64,
+        send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
+    ) -> Option<ContentBody> {
+        sent_transcript_body(
+            recipient,
+            content_body,
+            timestamp,
+            send_message_results,
+        )
+    }
+}
+
+/// Build the `SyncMessage.sent` transcript body for a completed send, or
+/// `None` for bodies that have no sent-transcript form: only DataMessage and
+/// EditMessage can be carried in `SyncMessage.Sent` (official clients never
+/// sync typing/receipt/call/etc. to own devices), so `None` there means
+/// "deliberately not syncing", not a failure.
+fn sent_transcript_body<'a>(
+    recipient: Option<&ServiceId>,
+    content_body: ContentBody,
+    timestamp: u64,
+    send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
+) -> Option<ContentBody> {
+    use sync_message::sent::UnidentifiedDeliveryStatus;
+    let (message, edit_message) = match content_body {
+        ContentBody::DataMessage(m) => (Some(m), None),
+        ContentBody::EditMessage(m) => (None, Some(m)),
+        content_body => {
+            tracing::trace!(?content_body, "not syncing to self");
+            return None;
+        },
+    };
+    let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
+        send_message_results
+            .into_iter()
+            .filter_map(|result| result.as_ref().ok())
+            .map(|sent| {
+                let SentMessage {
+                    recipient,
+                    unidentified,
+                    used_identity_key,
+                    ..
+                } = sent;
+                UnidentifiedDeliveryStatus {
+                    destination_service_id: Some(
+                        recipient.service_id_string(),
+                    ),
+                    destination_service_id_binary: Some(
+                        recipient.service_id_binary(),
+                    ),
+                    unidentified: Some(*unidentified),
+                    destination_pni_identity_key: Some(
+                        used_identity_key.serialize().into(),
+                    ),
+                }
+            })
+            .collect();
+    Some(ContentBody::SynchronizeMessage(SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: recipient
+                .map(ServiceId::service_id_string),
+            destination_service_id_binary: recipient
+                .map(ServiceId::service_id_binary),
+            destination_e164: None,
+            expiration_start_timestamp: message
+                .as_ref()
+                .and_then(|m| m.expire_timer)
+                .map(|_| timestamp),
+            message,
+            edit_message,
+            timestamp: Some(timestamp),
+            unidentified_status,
+            ..Default::default()
+        })),
+        ..SyncMessage::with_padding(&mut rng())
+    }))
+}
+
+#[cfg(test)]
+mod sent_transcript_body_tests {
+    use super::*;
+    use crate::proto::{
+        CallMessage, DataMessage, DecryptionErrorMessage, EditMessage,
+        NullMessage, ReceiptMessage, StoryMessage, TypingMessage,
+    };
+    use libsignal_protocol::{Aci, KeyPair, SenderKeyDistributionMessage};
+
+    fn aci(n: u128) -> Aci {
+        Aci::from(Uuid::from_u128(n))
+    }
+
+    fn identity_key() -> IdentityKey {
+        IdentityKey::decode(&[
+            0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ])
+        .expect("valid test identity key")
+    }
+
+    fn sent_ok(n: u128) -> SendMessageResult {
+        Ok(SentMessage {
+            recipient: ServiceId::from(aci(n)),
+            used_identity_key: identity_key(),
+            unidentified: true,
+            needs_sync: false,
+        })
+    }
+
+    fn sent_body_of(body: Option<ContentBody>) -> sync_message::Sent {
+        match body {
+            Some(ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::Sent(sent)),
+                ..
+            })) => sent,
+            other => panic!("expected Sent transcript body, got {other:?}"),
+        }
+    }
+
+    fn sender_key_distribution_message() -> SenderKeyDistributionMessage {
+        SenderKeyDistributionMessage::new(
+            3,
+            Uuid::from_u128(9),
+            1,
+            0,
+            vec![0x2a; 32],
+            KeyPair::generate(&mut rng()).public_key,
+        )
+        .expect("valid test SKDM")
+    }
+
+    const TS: u64 = 1_700_000_000_000;
+    const EMPTY_RESULTS: &[SendMessageResult] = &[];
+
+    #[test]
+    fn group_data_message_transcript_carries_recipients_and_expiration() {
+        let mut data = DataMessage {
+            expire_timer: Some(60),
+            ..DataMessage::default()
+        };
+        data.body = Some("hi".to_owned());
+        let results = [sent_ok(1), Err(MessageSenderError::NoMessagesToSend)];
+        let body = sent_transcript_body(
+            None,
+            ContentBody::DataMessage(data.clone()),
+            TS,
+            &results,
+        )
+        .expect("DataMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert_eq!(
+            sent.message.as_ref().map(|m| m.body.as_deref()),
+            Some(Some("hi"))
+        );
+        assert_eq!(sent.timestamp, Some(TS));
+        // expire_timer present -> expiration start pinned to the send timestamp.
+        assert_eq!(sent.expiration_start_timestamp, Some(TS));
+        // Group transcript: no single destination, UDS only for Ok results.
+        assert_eq!(sent.destination_service_id, None);
+        assert_eq!(sent.destination_service_id_binary, None);
+        let uds = sent.unidentified_status;
+        assert_eq!(uds.len(), 1);
+        assert_eq!(
+            uds[0].destination_service_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(uds[0].unidentified, Some(true));
+    }
+
+    #[test]
+    fn self_data_message_transcript_carries_destination() {
+        let own = ServiceId::from(aci(7));
+        let body = sent_transcript_body(
+            Some(&own),
+            ContentBody::DataMessage(DataMessage::default()),
+            TS,
+            EMPTY_RESULTS.iter(),
+        )
+        .expect("DataMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert_eq!(
+            sent.destination_service_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000007")
+        );
+        assert_eq!(
+            sent.destination_service_id_binary,
+            Some(aci(7).service_id_binary())
+        );
+        // No expire_timer -> no expiration start.
+        assert_eq!(sent.expiration_start_timestamp, None);
+        assert!(sent.message.is_some());
+    }
+
+    #[test]
+    fn edit_message_transcript_uses_edit_slot() {
+        let own = ServiceId::from(aci(7));
+        let body = sent_transcript_body(
+            Some(&own),
+            ContentBody::EditMessage(EditMessage::default()),
+            TS,
+            EMPTY_RESULTS.iter(),
+        )
+        .expect("EditMessage must produce a transcript");
+        let sent = sent_body_of(Some(body));
+        assert!(sent.message.is_none());
+        assert!(sent.edit_message.is_some());
+    }
+
+    #[test]
+    fn non_syncable_bodies_return_none() {
+        let own = ServiceId::from(aci(7));
+        let cases: Vec<ContentBody> = vec![
+            ContentBody::NullMessage(NullMessage::default()),
+            ContentBody::SynchronizeMessage(SyncMessage::default()),
+            ContentBody::CallMessage(CallMessage::default()),
+            ContentBody::ReceiptMessage(ReceiptMessage::default()),
+            ContentBody::TypingMessage(TypingMessage::default()),
+            ContentBody::SenderKeyDistributionMessage(
+                sender_key_distribution_message(),
+            ),
+            ContentBody::DecryptionErrorMessage(DecryptionErrorMessage::default()),
+            ContentBody::StoryMessage(StoryMessage::default()),
+        ];
+        for body in cases {
+            assert!(
+                sent_transcript_body(Some(&own), body.clone(), TS, EMPTY_RESULTS.iter())
+                    .is_none(),
+                "expected None for {body:?}"
+            );
+        }
+    }
+}

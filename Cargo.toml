@@ -12,9 +12,15 @@ serde_json = "1"
 
 # presage 全家桶按 rev 钉定（ADR 0003：服务层 = presage + libsignal-service，
 # 传递钉 libsignal tag v0.99.0）。许可：两者均 AGPL-3.0-only，与本仓一致。
-# default-features=false：不引 cdsi（联系方式发现）与 sqlcipher 捆绑构建。
-presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", default-features = false }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", default-features = false }
+# default-features=false + cdsi：开启按手机号查找（CDSI，E 批）——cdsi 只把
+# libsignal-net/net-infra 从 optional 转必选（两者已在依赖图，零新增 crate）；
+# sqlcipher 捆绑面在 presage-store-sqlite（store-sqlite 的 cdsi feature 已在
+# P12/R2 批移除），本 feature 不触碰 sqlcipher。store-sqlite 维持
+# default-features=false。
+presage = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false, features = [
+    "cdsi",
+] }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", default-features = false }
 
 # 接收管线（Stream 组合）与异步运行时；io-std/io-util 供 stdout writer。
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
@@ -32,9 +38,35 @@ libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 # additive 归一，不改变上游用法；reqwest 许可 MIT/Apache-2.0。
 reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 
+# 群发 MRM 发后落库时间戳（C 批：Metadata.client/server_timestamp 构造）；
+# presage 传递同版，MIT/Apache-2.0。
+chrono = "0.4"
+# 群 sender key 分发台账 distribution id（C 批 SenderKeyInfo，官方
+# distributionId 同形 v4）；uuid 1.26 已在图（presage 传递），v4 feature
+# 开启生成面，MIT/Apache-2.0。
+uuid = { version = "1", features = ["v4"] }
+
 # 仅 backup5-spike bin（ADR 0005 S1）生成链接密码用；与 presage 传递的 rand
 # 0.9 同源，许可 MIT/Apache-2.0。
 rand = "0.9"
+# libsignal-net chat gRPC 头构造（confirmation_header_name from_static）。
+http = "1"
+
+# 群发 MRM 单请求面（C 批）：PUT /v1/messages/multi_recipient 载荷类型
+# bytes::Bytes（libsignal-net-chat send_multi_recipient_message 入参）；
+# 同 crate 已在依赖图（libsignal-net/reqwest 传递），许可 MIT/Apache-2.0。
+bytes = "1"
+
+# 引擎自身日志面（2026-10-16 send 可观测批）：vendor 栈 tracing 事件的
+# 订阅入口（tracing 已在依赖图——presage/libsignal-service 传递 0.1.44，
+# 本声明零新增版本入图；订阅器为 src/logfile.rs 零依赖自实现，不引
+# tracing-subscriber 依赖树），许可 MIT/Apache-2.0。
+tracing = "0.1"
+# 同上批：Subscriber::current_span 返回类型的直接命名面（tracing 的 span
+# 模块未再导出 Current）；tracing-core 已在依赖图（tracing 传递 0.1.36），
+# 本声明零新增版本入图（default-features = false 防止 valuable 可选件
+# 入图——tracing 自身使用面不启它），许可 MIT/Apache-2.0。
+tracing-core = { version = "0.1", default-features = false }
 
 # ADR 0005 S2：存量历史迁移（backup5）接收侧。
 # - libsignal-message-backup（官方，v0.99.0 与传递钉定同 tag）：frame（HMAC+AES-CBC+gzip
@@ -45,6 +77,15 @@ rand = "0.9"
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
 # BackupKey/BackupId 派生（ADR 0005 S2，同 tag 直接依赖）。
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+# 云备份凭据 zkgroup 面（cloud-backup-contract.md §0 报备在案）：BackupAuth
+# Credential 请求/兑换/呈现（rust/zkgroup/src/api/backups/auth_credential.rs）。
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+# 云备份 restore gRPC 面（cloud-backup-contract.md §0，2026-10-08 批）：
+# chat 未鉴权 gRPC-over-WS（get_backup_cdn_credentials/get_message_backup_info，
+# rust/net/chat/src/grpc/backups.rs:284/:436）+ WS 传输栈（ChatConnection）。
+# 同 tag 同源，AGPL-3.0-only 与本仓一致；许可与用途按 AGENTS.md 报备在案。
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 thiserror = "2"
 
@@ -59,7 +100,67 @@ hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"
 
+# 个人资料写面（setProfile）：`PUT /v1/profile` 的 commitment 需上游同款
+# 原始字节序列化（libsignal-service websocket/profile.rs 以 bincode 序列化
+# ProfileKeyCommitment/ProfileKeyVersion）。版本与 Cargo.lock 既有解析一致
+#（1.3.3，presage 传递钉定），不新增依赖图版本；许可 MIT/Apache-2.0。
+bincode = "1.3"
+
+# Android 本地备份导出（docs/backup-export-contract.md §4）：官方
+# EncryptedBackupWriter/export.rs 同款原语——gzip（flate2）→ padded_length
+# 补零 → AES-256-CBC/PKCS7（cbc，官方 export.rs 同款 encrypt_padded）→
+# 尾部 HMAC-SHA256；metadata backupId 用 AES-256-CTR32（ctr，官方 Android
+# Aes256Ctr32 同构）。四者均 RustCrypto/flate2 生态，许可 MIT/Apache-2.0；
+# 版本与 Cargo.lock 既有解析完全一致（aes 0.9.3/cbc 0.2.1/ctr 0.10.1 经
+# aes-gcm 传递、flate2 1.1.x 已在图），不新增任何版本入图。
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+aes = "0.9"
+cbc = "0.2"
+ctr = "0.10.1"
+
+# 用户名面（getUsername/usernameLookup/usernameReserve/usernameConfirm/
+# usernameDelete）：libsignal-usernames 官方原语——Username::new/from_parts
+# （语法面）、hash/proof（服务端 reserve/confirm 的 ZK 材料）、
+# candidates_from（裸昵称候选拒绝器）、create_for_username/decrypt_username
+# （username link 加解密）。与 message-backup/account-keys 同 tag 直接依赖
+#（v0.99.0，Cargo.lock 既有解析——经 libsignal-service/libsignal-message-backup
+# 已在图），不新增任何版本入图；许可 AGPL-3.0-only 与本仓一致。
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false }
+
+# 语音笔记波形+时长生成（send `;voice=true` 发送面，2026-10-14 批）：官方
+# 算法（AttachmentPointer.audioWaveform=21/audioDurationSeconds=22）需把
+# 音频解码为 PCM 后降采样。全图此前零音频解码能力，两 crate 为最小充分集：
+# - ogg 0.9（BSD-3-Clause）：OGG 物理流解包（页/包/granule），零传递依赖、
+#   纯 Rust——拆出 Opus 逻辑流与官方容器时长（granule）。
+# - opus-decoder 0.1（MIT OR Apache-2.0）：纯 Rust Opus 解码（RFC 8251
+#   同构，no unsafe/no FFI），零传递依赖——KT 语音链路主格式 audio/ogg(Opus)
+#   （connector §4.30 voiceNote 闸 audio/*、fixture 即 audio/ogg）。
+# 两者均不引 C/系统依赖，保持本仓 bundled 纯构建姿态；WAV/PCM 走仓内自
+# 解析；其余容器（mp3/m4a/ogg-vorbis 等）按官方「生成失败即不带波形」
+# 姿态发裸附件（覆盖矩阵见 docs/jsonrpc-compat.md §5 同日批）。
+ogg = "0.9"
+opus-decoder = "0.1"
+
 [dev-dependencies]
+# 接收重连/维护超时单测用 paused 时钟（tokio test-util；仅测试编译面合并，
+# 不进运行时依赖图）。
+tokio = { version = "1", features = ["test-util"] }
+
 # fixture 构建专用：官方 export 原语（gzip/pad/AES-CBC/HMAC）造加密备份样本。
 # 仅测试编译面合并，不进运行时依赖图。
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", default-features = false, features = ["test-util"] }
+
+# Stories 发送面（E1/E2 批，2026-10-08）：presage 与 libsignal-service 以
+# 原样拷贝进 `vendor/`（上表 git 依赖行保留作来源锚点），经 [patch] 指向
+# 本地路径后叠加最小 story 面（改动清单见 vendor/README.md）。任务书原文
+# 写「[patch.crates-io] 指本地路径」，实际两仓均为 git 源依赖（Cargo.lock
+# `git+https://…`），[patch.crates-io] 不生效——按事实改用对应 git 源
+# URL 的 [patch] 段（汇报偏差项）。
+# 许可：libsignal-service AGPL-3.0-only、presage AGPL-3.0-only（与其 git
+# 源一致，本仓同为 AGPL-3.0-only，无新增许可面）。
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "vendor/libsignal-service" }
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage/presage" }
+presage-store-sqlite = { path = "vendor/presage/presage-store-sqlite" }

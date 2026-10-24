@@ -34,3 +34,27 @@ smoke 脚本、契约测试。替换引擎时 IPC 形状有两个选项：
   为准并在兼容层文档登记差异，connector 侧同步对齐。
 - 本仓维护一份 `docs/jsonrpc-compat.md`：逐方法列出参数/返回/错误码与 signal-cli
   的对齐状态（P1 起建）。
+
+## argv 形状兼容：`--ignore-*` 系旗标恒为 no-op（2026-10-14 澄清）
+
+connector 拉起引擎的 argv 沿用 signal-cli（JVM）启动形状，含
+`--ignore-attachments`（可选）/`--ignore-stories`/`--ignore-stickers`。引擎
+**接受这三个旗标但恒为 no-op**（`src/main.rs` 严格 argv 解析中空臂通过）：仅为
+connector 启动器形状不变而存在，引擎的收发行为与它们**无关**。
+
+这不是 signal-cli 时代的「贴纸/故事消息被主动丢弃」语义——引擎接收管线照常解析并
+投影这两类消息，媒体字节一律不在引擎侧下载（metadata-only 立项红线，按需取字节
+归 connector transit 链）：
+
+- **贴纸**：`DataMessage.Sticker` metadata-only 投影（packId/packKey/stickerId/
+  emoji/data 附件指针，字节永不下载）。
+- **story**：transient 投影（信封级 `storyMessage`/`isStory`，presage 收侧不落
+  StoryMessage，connector 据此走 story 时间线）；story 回复本身是普通 DataMessage
+  照常落库（官方同构）。
+- **附件**：`locator` 指针投影，字节按需由 connector 取。
+
+逐方法对齐状态与差异登记见 `docs/jsonrpc-compat.md` §1（启动契约）与 §5（story
+块、附件 locator 勘误）。
+
+（澄清动机：2026-10-14 外部调研把三旗标误读为「引擎主动丢弃贴纸/故事消息」——
+那是 signal-cli（JVM）时代的语义，引擎不沿用；本节钉定 no-op 口径防再读偏。）
