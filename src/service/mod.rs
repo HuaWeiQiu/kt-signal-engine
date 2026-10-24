@@ -6561,6 +6561,69 @@ async fn storage_context(
 // 接收管线与投影
 // ---------------------------------------------------------------------------
 
+/// S15 引擎 session reset 收侧投影（wire additive，compat §5 新增契约
+/// `engine.sessionReset`）：官方桌面两类 session-reset 事件的引擎收流投影。
+/// 词臂① "endSession" = 收到对端 END_SESSION 信封——线上形态是
+/// DataMessage.flags 的 END_SESSION 位（桌面 processDataMessage.preload.ts
+/// :605-624：flags 位判定后清 body/attachments 落 ResetSession 行；钉定
+/// rev proto 把该位标 reserved 无实名变体，按裸位 1 判）。词臂②
+/// "chatSessionRefresh" = 我方解密失败时刻——桌面
+/// handleRetry.preload.ts:706-748 startAutomaticSessionReset 同位（解密
+/// 失败 = 调度自动 session reset + 本地落 ChatSessionRefreshed 行的触发
+/// 时刻；引擎只投影事件，reset 发送面不在本批边界内）。形状：params
+/// {account, peerAci, word, sentAt}——sentAt = 发送方 client timestamp
+/// （解密失败臂未知时缺席键不在，additive 缺席纪律）；零内容泄漏（只有
+/// 对端服务标识与时刻，绝不带正文）。peerAci 值 = ServiceId 字符串
+/// （1:1 场景即 ACI UUID；PNI 路径按 service_id_string 原样 PNI: 前缀）。
+/// notify fire-and-forget（receive.emptied/engine.initialSyncComplete
+/// 同款）：零 stderr、发射不连坐结果、不重试、不阻塞收流循环。
+fn session_reset_notification(
+    account: &str,
+    word: &str,
+    peer: &ServiceId,
+    sent_at: Option<u64>,
+) -> Value {
+    let mut params = json!({
+        "account": account,
+        "peerAci": peer.service_id_string(),
+        "word": word,
+    });
+    if let Some(sent_at) = sent_at {
+        params["sentAt"] = json!(sent_at);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "engine.sessionReset",
+        "params": params,
+    })
+}
+
+/// S15：DataMessage END_SESSION 位判定（裸位 1，钉定 rev proto 该位标
+/// reserved——SignalService.proto DataMessage.Flags `reserved /*END_SESSION*/ 1`，
+/// prost 不生成变体；桌面 FLAGS.END_SESSION 同值同语义）。
+fn is_end_session_row(data_message: &presage::proto::DataMessage) -> bool {
+    const END_SESSION_FLAG: u32 = 1;
+    data_message
+        .flags
+        .is_some_and(|flags| flags & END_SESSION_FLAG != 0)
+}
+
+/// S15：收流体 session-reset 词提取——END_SESSION 位 dataMessage →
+/// "endSession"；其余体 None（"chatSessionRefresh" 由解密失败臂直发，
+/// 不经本判定）。
+fn session_reset_word_of(
+    content: &presage::libsignal_service::content::Content,
+) -> Option<&'static str> {
+    match &content.body {
+        presage::libsignal_service::content::ContentBody::DataMessage(data_message)
+            if is_end_session_row(data_message) =>
+        {
+            Some("endSession")
+        }
+        _ => None,
+    }
+}
+
 /// DecryptionError 结构化事件（止血批①：解密失败不再静默丢弃）。加面不改
 /// 既有投影字段；形状 = receive 事件族同构（{account, envelope:{...}}），
 /// 信封面带 sourceUuid 与（已知时）发送方 client timestamp。官方语义：
@@ -8053,6 +8116,24 @@ async fn serve_account_stream(
                             decryption_error_notification(number, &sender, timestamp),
                         )
                         .await;
+                    // S15 "chatSessionRefresh" 词臂（wire additive，
+                    // `engine.sessionReset`）：解密失败 = 官方
+                    // startAutomaticSessionReset 的触发时刻（桌面
+                    // handleRetry.preload.ts:706-748 同位——调度自动 session
+                    // reset + 落 ChatSessionRefreshed 行）；引擎 additive
+                    // 投影事件，decryptionError 事件照旧并存，零重试零
+                    // 阻塞（receive.emptied 同款纪律）。
+                    service
+                        .notify(
+                            number,
+                            session_reset_notification(
+                                number,
+                                "chatSessionRefresh",
+                                &sender,
+                                timestamp,
+                            ),
+                        )
+                        .await;
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
@@ -9317,6 +9398,18 @@ async fn project_content_inner(
             envelope_ts,
             &content.metadata.sender,
             &aci,
+        ));
+    }
+    // S15 session reset 收侧投影（wire additive，`engine.sessionReset`）：
+    // END_SESSION 位 dataMessage additive 上抛 session-reset 事件——既有
+    // dataMessage 信封投影零变化（旧宿主行为不动），系统行由 connector
+    // 按官方 ResetSession 语义落（桌面 wire 键已备，数据到手即亮）。
+    if let Some(word) = session_reset_word_of(content) {
+        notifications.push(session_reset_notification(
+            account,
+            word,
+            &content.metadata.sender,
+            Some(envelope_ts),
         ));
     }
     notifications.push(json!({
@@ -18350,6 +18443,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// S15 session reset 收侧投影触发面（wire additive）：END_SESSION 位
+    /// dataMessage → `engine.sessionReset` 通知 additive 上抛（词臂
+    /// endSession，peerAci/word/sentAt 逐键钉），既有 dataMessage 信封行
+    /// 照投（双通知并存，旧宿主零变化）；非 END_SESSION dataMessage 零
+    /// sessionReset 通知（flags 缺席/EXPIRATION_TIMER_UPDATE 位负例）。
+    #[tokio::test]
+    async fn receive_end_session_data_message_projects_session_reset() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-endsession-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+
+        // 词臂①：flags = END_SESSION 裸位 1（钉定 rev proto reserved 无
+        // 实名变体，桌面 FLAGS.END_SESSION 同值）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                flags: Some(1),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
+        assert_eq!(
+            notifications.len(),
+            2,
+            "endSession: envelope + sessionReset"
+        );
+        let reset = notifications
+            .iter()
+            .find(|notification| notification["method"] == "engine.sessionReset")
+            .expect("sessionReset projected");
+        assert_eq!(reset["jsonrpc"], json!("2.0"));
+        assert_eq!(reset["params"]["account"], json!("acct"));
+        assert_eq!(
+            reset["params"]["peerAci"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(reset["params"]["word"], json!("endSession"));
+        assert_eq!(reset["params"]["sentAt"], json!(1_700_000_000_000_u64));
+        // additive：既有 dataMessage 信封行照投（零变化）。
+        assert!(notifications.iter().any(|notification| {
+            notification["method"] == "receive"
+                && notification["params"]["envelope"]
+                    .get("dataMessage")
+                    .is_some()
+        }));
+
+        // 负例：flags 缺席 → 零 sessionReset 通知。
+        let plain = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata.clone(),
+        );
+        let notifications = project_content("acct", &store, &plain, &registry, None).await;
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| notification["method"] != "engine.sessionReset"),
+            "plain dataMessage must not project sessionReset"
+        );
+
+        // 负例：EXPIRATION_TIMER_UPDATE 位（2）不触发。
+        let expiration = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                flags: Some(2),
+                ..Default::default()
+            }),
+            metadata,
+        );
+        let notifications = project_content("acct", &store, &expiration, &registry, None).await;
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| notification["method"] != "engine.sessionReset"),
+            "expiration-timer flag must not project sessionReset"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// P15a 项3 contacts sync 投影（vendored ContactSync 载体）：records 逐
     /// 条 aci/number/name/expireTimer 族（0 值不投、空名不投）、complete
     /// 旗标、信封公共位（sourceUuid/sourceDevice/timestamp）、空记录照投
@@ -21741,6 +21940,75 @@ mod tests {
             json!("11111111-2222-4333-8444-555555555555")
         );
         assert_eq!(envelope["decryptionError"], json!({}));
+    }
+
+    /// `engine.sessionReset` 通知帧消费方测试替身（S15 session reset 收侧
+    /// 投影 wire additive）：方法名入词表、词表恰二词 strict-parse、
+    /// params 键形逐键验型（sentAt 已知四键/未知三键缺席），坏形状整拒
+    /// ——engine.initialSyncComplete 同款验收纪律，connector/desktop
+    /// 转发链照此对账。
+    #[test]
+    fn session_reset_notification_shape_pins_wire_contract() {
+        fn strict_parse(value: &Value) -> Option<(String, String, String, Option<u64>)> {
+            if value["method"] != "engine.sessionReset" || value["jsonrpc"] != "2.0" {
+                return None;
+            }
+            let params = value["params"].as_object()?;
+            let expected_len = if params.contains_key("sentAt") { 4 } else { 3 };
+            if params.len() != expected_len {
+                return None;
+            }
+            let word = params["word"].as_str()?;
+            if word != "endSession" && word != "chatSessionRefresh" {
+                return None;
+            }
+            Some((
+                params["account"].as_str()?.to_owned(),
+                params["peerAci"].as_str()?.to_owned(),
+                word.to_owned(),
+                params.get("sentAt").and_then(|value| value.as_u64()),
+            ))
+        }
+
+        let peer = ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+            .expect("peer aci");
+
+        // 词臂① endSession：sentAt 恒在（dataMessage client timestamp）。
+        let end_session =
+            session_reset_notification("acct", "endSession", &peer, Some(1_700_000_000_000));
+        assert_eq!(
+            strict_parse(&end_session),
+            Some((
+                "acct".to_owned(),
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                "endSession".to_owned(),
+                Some(1_700_000_000_000),
+            )),
+        );
+
+        // 词臂② chatSessionRefresh：sentAt 未知 → 缺席键不在（恰三键）。
+        let refresh = session_reset_notification("acct", "chatSessionRefresh", &peer, None);
+        assert_eq!(
+            strict_parse(&refresh),
+            Some((
+                "acct".to_owned(),
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                "chatSessionRefresh".to_owned(),
+                None,
+            )),
+        );
+        assert!(refresh["params"].get("sentAt").is_none());
+
+        // 词表外词整拒（consumer 侧 default 臂语义）。
+        assert!(strict_parse(&session_reset_notification(
+            "acct",
+            "sessionRestart",
+            &peer,
+            None
+        ))
+        .is_none());
+        // 词表外方法名整拒。
+        assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
     }
 
     /// G3 排空通知形状面：`receive.emptied` 独立方法（非 envelope 载体——
