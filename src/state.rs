@@ -19,9 +19,16 @@
 //!
 //! P0-B（2026-10-21，存储对账）：注册表是清扫的唯一权威，但「读不到」绝不
 //! 等于「空表」。文件存在但损坏/版本未知、文件缺失但 accounts/ 下仍有带
-//! `store.db` 的 `lk-*`（注册表被删/恢复不完整）、以及隔离区非空，一律
-//! fail closed：`load` 返回错误、进程退出、清扫不运行。只有「文件缺失且
-//! 没有任何带 store 的账号目录」才按首次运行给空表。
+//! `store.db` 的 `lk-*`（注册表被删/恢复不完整），一律 fail closed：
+//! `load` 返回错误、进程退出、清扫不运行。只有「文件缺失且没有任何带
+//! store 的账号目录」才按首次运行给空表。
+//!
+//! 批 W2（2026-10-24，§29.73 语义重构）：隔离区（`accounts/_quarantine/`）
+//! 非空**不再**拒启动。fail-closed 只针对「注册数据本身不可信」；隔离件是
+//! 「旁边的废件」，原位保留为待决区——未完成注册件由成功链接事件触发的
+//! 弃置清扫自动带走（service 层 `engine.quarantineDiscarded`），含注册数
+//! 据的件保留等显式恢复。官方无「隔离区常驻即全员停摆」的卡死态（§29.72
+//! 实证：孤儿隔离件曾把健康账号绑架成每秒重启循环）。
 
 use std::fs;
 use std::io;
@@ -74,7 +81,8 @@ impl EngineState {
     ///   ADR 0004 重置为空；存在任一 store 同样返回错误；
     /// - 文件缺失：先看 `accounts/lk-*/store.db`。存在任一 store 即视为
     ///   「注册表被删/恢复不完整」，同样返回错误；不存在才是首次运行（空表）；
-    /// - 隔离区非空：返回错误，等用户显式恢复（见 sweep 的恢复指引）。
+    /// - 隔离区非空：warn 待决区计数后照常加载（批 W2 语义重构——隔离件是
+    ///   废件不是坏注册表；弃置/恢复见 service 层成功链接清扫）。
     pub(crate) fn load(data_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
         let path = data_dir.join(STATE_FILE);
@@ -114,7 +122,7 @@ impl EngineState {
                 ));
             }
         };
-        reject_quarantined(data_dir)?;
+        note_quarantined(data_dir);
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             accounts,
@@ -337,24 +345,30 @@ fn quarantined_store_count(data_dir: &Path) -> io::Result<usize> {
     Ok(count)
 }
 
-/// 隔离区非空 = 有待用户显式恢复的凭证目录，启动 fail closed。返回错误信息
-/// 指向审计日志（恢复入口），不打印账号号码/密钥。
-fn reject_quarantined(data_dir: &Path) -> io::Result<()> {
-    let count = quarantined_store_count(data_dir)?;
+/// 隔离区非空 = 有待决件（废件/待恢复凭证），原位保留不拦启动（批 W2）。
+/// 结构化 warn 留恢复入口指针，不打印账号号码/密钥；检查失败同样只 warn——
+/// 清扫永不触碰隔离区，「看不清废件」不升级成「全员停摆」。
+fn note_quarantined(data_dir: &Path) {
+    let count = match quarantined_store_count(data_dir) {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                cause = "QuarantineUnreadable",
+                error = %error,
+                "cannot inspect quarantine dir; continuing startup (sweep never touches the quarantine zone)"
+            );
+            return;
+        }
+    };
     if count == 0 {
-        return Ok(());
+        return;
     }
-    tracing::error!(
-        cause = "QuarantinePresent",
+    tracing::warn!(
+        cause = "QuarantinePending",
         quarantined = count,
-        "quarantined account stores require explicit recovery; refusing to start (fail closed)"
+        recovery_log = %format!("{ACCOUNTS_DIR}/{QUARANTINE_DIR}/{QUARANTINE_LOG}"),
+        "quarantined account stores retained in place as a pending zone; unregistered leftovers are auto-discarded after the next successful link, stores holding registration data await explicit recovery"
     );
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "account store quarantine is not empty ({count} dir(s)); inspect {ACCOUNTS_DIR}/{QUARANTINE_DIR}/{QUARANTINE_LOG} and recover explicitly before restarting"
-        ),
-    ))
 }
 
 #[cfg(test)]
@@ -570,10 +584,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 隔离区非空 = 有待显式恢复的凭证：启动 fail closed，且不移动/删除。
+    /// 批 W2 四象限②（只有孤儿）：隔离区有未登记废件、注册表缺位 → 照常
+    /// 启动（待决区语义），隔离内容原位保留不移动/不删除。旧语义（§29.72
+    /// 事故）此处 fail closed 循环拒启。
     #[test]
-    fn load_fails_closed_when_quarantine_has_entries() {
-        let dir = temp_dir("quarantine-present");
+    fn load_continues_with_quarantine_pending_entries() {
+        let dir = temp_dir("quarantine-pending");
         let quarantined = dir
             .join(ACCOUNTS_DIR)
             .join(QUARANTINE_DIR)
@@ -581,12 +597,43 @@ mod tests {
             .join("lk-old");
         std::fs::create_dir_all(&quarantined).expect("quarantine dir");
         std::fs::write(quarantined.join(STORE_DB_FILE), b"credential-bytes").expect("store db");
-        let err = load_err(&dir);
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "cause: {err}");
-        assert!(err.to_string().contains("quarantine"), "cause: {err}");
+        let state = EngineState::load(&dir).expect("quarantine leftovers must not block startup");
+        assert!(state.accounts().is_empty(), "注册表缺位仍按首次运行给空表");
         assert!(
             quarantined.join(STORE_DB_FILE).is_file(),
-            "隔离内容必须保留"
+            "隔离内容必须原位保留"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批 W2 四象限①（孤儿 + 健康账号并存）：健康注册账号不被旁边的隔离
+    /// 废件绑架——load 成功、账号表逐条保真、隔离件不动。
+    #[test]
+    fn load_starts_with_quarantine_and_healthy_accounts_coexisting() {
+        let dir = temp_dir("quarantine-coexist");
+        let mut state = EngineState::load(&dir).expect("load");
+        state
+            .add_account(
+                "+15550000001".to_owned(),
+                Some("accounts/lk-healthy".to_owned()),
+            )
+            .expect("add healthy");
+        let quarantined = dir
+            .join(ACCOUNTS_DIR)
+            .join(QUARANTINE_DIR)
+            .join("1700000000000")
+            .join("lk-old");
+        std::fs::create_dir_all(&quarantined).expect("quarantine dir");
+        std::fs::write(quarantined.join(STORE_DB_FILE), b"credential-bytes").expect("store db");
+        let reloaded = EngineState::load(&dir).expect("healthy accounts must start normally");
+        assert_eq!(
+            reloaded.accounts(),
+            state.accounts(),
+            "健康账号表不受隔离件影响"
+        );
+        assert!(
+            quarantined.join(STORE_DB_FILE).is_file(),
+            "隔离件待决区原位保留"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
