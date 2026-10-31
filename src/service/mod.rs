@@ -2402,7 +2402,10 @@ impl Service {
         let store_dir = self.data_dir.join("accounts").join(random_dir_name());
         let store = open_store(&store_dir)
             .await
-            .map_err(|_| LinkError::Internal)?;
+            .map_err(|error| {
+                tracing::warn!(target: "engine.link", stage = "open_store", ?error, "startLink store open failed");
+                LinkError::Internal
+            })?;
 
         let (url_tx, url_rx) = futures::channel::oneshot::channel::<url::Url>();
         let slot = Arc::new(LinkResultSlot::new());
@@ -2421,7 +2424,16 @@ impl Service {
         // url_rx 随返回值丢弃，链接任务自行收口。
         let uri = match tokio::time::timeout(Duration::from_secs(30), url_rx).await {
             Ok(Ok(uri)) => uri.to_string(),
-            _ => return Err(LinkError::Internal),
+            Ok(Err(_)) => {
+                tracing::warn!(target: "engine.link", stage = "url_channel_closed", "startLink provisioning URL channel closed");
+                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                return Err(LinkError::Internal);
+            }
+            Err(_) => {
+                tracing::warn!(target: "engine.link", stage = "url_timeout", "startLink provisioning URL timed out");
+                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                return Err(LinkError::Internal);
+            }
         };
 
         inner.pending = Some(PendingLink {
@@ -11181,7 +11193,17 @@ async fn link_flow(
     )
     .await;
 
+    if let Err(error) = &link_outcome {
+        tracing::warn!(target: "engine.link", stage = "link_device", ?error, "link_device failed");
+    }
     link_outcome.map_err(|_| ())?;
+    let registration = match registration {
+        Ok(data) => data,
+        Err(()) => {
+            tracing::warn!(target: "engine.link", stage = "registration_missing", "provisioning registration message missing");
+            return Err(());
+        }
+    };
     let NewDeviceRegistration {
         phone_number,
         device_id,
@@ -11195,7 +11217,7 @@ async fn link_flow(
         profile_key,
         account_entropy_pool,
         ephemeral_backup_key,
-    } = registration.map_err(|_| ())?;
+    } = registration;
 
     // dev 诊断（`KT_ENGINE_LINK_DEBUG=1` 时向 /tmp/kt-engine-link-debug.log
     // 追加一行；生产 env 缺席零输出零文件，compat §1 不破）：直接记录手机
@@ -12631,6 +12653,50 @@ async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
         .map_err(|error| {
             eprintln!("kt-signal-engine: sqlite store open failed: {error}");
         })
+}
+
+/// 回收「注册表缺失」时遗留的失败链接 store。
+///
+/// 官方 presage 在 startLink 时 clear_registration，失败链接没有
+/// registration_data；只有这类目录可以安全回收。任何含注册数据的目录
+/// 都保留给 EngineState::load 继续 fail-closed，绝不靠删除账号恢复。
+pub(crate) async fn cleanup_abandoned_link_stores(data_dir: &Path) -> std::io::Result<usize> {
+    if data_dir.join("engine-state.json").exists() {
+        return Ok(0);
+    }
+    let accounts = data_dir.join(ACCOUNTS_DIR);
+    let entries = match std::fs::read_dir(&accounts) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.file_type()?.is_dir()
+            || !name.starts_with("lk-")
+            || !path.join("store.db").exists()
+        {
+            continue;
+        }
+        let registration = match open_store(&path).await {
+            Ok(store) => store.load_registration_data().await,
+            Err(_) => continue,
+        };
+        match registration {
+            Ok(None) => {
+                tokio::fs::remove_dir_all(&path).await?;
+                removed += 1;
+                tracing::warn!(target: "engine.link", store = %name, "removed abandoned unregistered link store");
+            }
+            Ok(Some(_)) | Err(_) => {
+                // 有注册数据或无法证明为空：保留给注册表 fail-closed。
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// 账号自有 ACI（wire additive：finishLink/listAccounts 的 `aci` 键真值源，
@@ -17431,6 +17497,30 @@ mod tests {
             .await
             .expect("registration data saves");
         store_dir
+    }
+
+    #[tokio::test]
+    async fn abandoned_link_cleanup_removes_only_unregistered_empty_stores() {
+        let root = std::env::temp_dir().join(format!("kt-link-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = root.join("accounts/lk-empty");
+        let store = open_store(&empty).await.expect("empty store opens");
+        drop(store);
+        let registered = seed_store_with_aci(
+            &root,
+            "accounts/lk-registered",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+
+        let removed = cleanup_abandoned_link_stores(&root)
+            .await
+            .expect("cleanup succeeds");
+
+        assert_eq!(removed, 1);
+        assert!(!empty.exists(), "未注册空 store 可以安全回收");
+        assert!(registered.exists(), "含注册数据的 store 必须保留");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// wire additive `aci` 键真值面（connector 契约 1.142 消费面）：注册

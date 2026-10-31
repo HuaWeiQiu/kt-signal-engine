@@ -429,6 +429,10 @@ async fn amain() -> ExitCode {
         service::perf_metrics::record_us(key, us)
     })
     .expect("perf hook installs exactly once per process");
+    if let Err(error) = service::cleanup_abandoned_link_stores(&args.data_dir).await {
+        eprintln!("kt-signal-engine: abandoned link store cleanup failed: {error}");
+        return ExitCode::from(1);
+    }
     let state = match EngineState::load(&args.data_dir) {
         Ok(state) => state,
         Err(_) => return ExitCode::from(1),
