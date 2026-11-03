@@ -363,15 +363,33 @@ pub async fn link_device<
             aci,
             pni,
             device_id,
-        } = push_service
-            .link_device(
-                &request,
-                HttpAuth {
-                    username: phone_number.to_string(),
-                    password: password.to_owned(),
-                },
-            )
-            .await?;
+        } = {
+            let mut transport_attempt = 0u8;
+            loop {
+                match push_service
+                    .link_device(
+                        &request,
+                        HttpAuth {
+                            username: phone_number.to_string(),
+                            password: password.to_owned(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(ServiceError::Http(error))
+                        if transport_attempt < 2 && (error.is_connect() || error.is_timeout()) =>
+                    {
+                        transport_attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            250 * u64::from(transport_attempt),
+                        ))
+                        .await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
 
         tx.send(SecondaryDeviceProvisioning::NewDeviceRegistration(
             NewDeviceRegistration {
